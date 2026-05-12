@@ -2,15 +2,18 @@
 
 Small C-ABI dogfood viewer for `capture-transfer`.
 
-The current viewer runs a synthetic producer in-process because cross-process
-session discovery is not implemented yet. It still consumes frames only through
-the public C ABI, which keeps the producer/consumer boundary honest before
-porthole publishes real ScreenCaptureKit frames.
+The viewer has two modes:
+
+- default: runs a synthetic producer in-process and consumes frames through the
+  public C ABI.
+- `--porthole-socket`: asks `portholed` to create a synthetic capture session,
+  connects back through a session descriptor, then receives frames through the
+  fd-passing transport.
 
 Build:
 
 ```sh
-cargo build -p capture-transfer --locked
+cargo build -p capture-transfer -p portholed --locked
 cmake -S tools/capture-viewer-sdl -B target/capture-viewer-sdl \
   -DCAPTURE_TRANSFER_LIB="$PWD/target/debug/libcapture_transfer.dylib"
 cmake --build target/capture-viewer-sdl
@@ -28,8 +31,22 @@ Headless smoke test:
 SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl --frames 3
 ```
 
-Expected future command shape once porthole has session discovery:
+Daemon-backed smoke test:
 
 ```sh
-capture-viewer-sdl --session <session-descriptor-or-uds-path>
+runtime_dir="$(mktemp -d)"
+PORTHOLE_RUNTIME_DIR="$runtime_dir" target/debug/portholed >"$runtime_dir/portholed.log" 2>&1 &
+portholed_pid=$!
+
+for _ in $(seq 1 50); do
+  [ -S "$runtime_dir/porthole.sock" ] && break
+  sleep 0.1
+done
+
+SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl \
+  --porthole-socket "$runtime_dir/porthole.sock" \
+  --frames 3
+
+kill "$portholed_pid"
+rm -rf "$runtime_dir"
 ```

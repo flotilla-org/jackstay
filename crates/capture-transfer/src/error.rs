@@ -12,6 +12,9 @@ pub enum CaptureTransferError {
     #[error("fd passing response did not include a file descriptor")]
     MissingPassedFd,
 
+    #[error("daemon transport {operation} failed: {message}")]
+    DaemonTransport { operation: &'static str, message: String },
+
     #[error("shared memory segment length must be greater than zero")]
     InvalidSharedMemoryLength,
 

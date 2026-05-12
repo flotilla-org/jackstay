@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    daemon::{self, DaemonFrame, SessionInfo},
     model::{PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId, VideoTrackDesc},
     state::{Event, EventKind, SessionState},
     video::{AcquiredVideoFrame, ConsumerId, VideoFrameDesc, VideoSlotManager},
@@ -45,6 +46,22 @@ pub struct FtProducerOptions {
 #[derive(Debug, Clone, Copy)]
 pub struct FtConsumerOptions {
     pub producer: *mut FtProducer,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FtSessionDescriptor {
+    pub control_socket_path: *const c_char,
+    pub session_id: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct FtSyntheticSession {
+    pub session_id: [c_char; 64],
+    pub source_id: u64,
+    pub track_id: u64,
+    pub fd_socket_path: [c_char; 4096],
 }
 
 #[repr(C)]
@@ -98,7 +115,7 @@ pub struct FtVideoFrame {
     pub desc: FtVideoFrameDesc,
     pub data: *const c_void,
     pub len: usize,
-    handle: *mut AcquiredVideoFrame,
+    handle: *mut FtFrameHandle,
 }
 
 impl Default for FtVideoFrame {
@@ -125,9 +142,27 @@ pub struct FtProducer {
 
 #[derive(Debug)]
 pub struct FtConsumer {
-    inner: Rc<RefCell<ProducerInner>>,
-    consumer_id: ConsumerId,
-    event_cursor: usize,
+    kind: FtConsumerKind,
+}
+
+#[derive(Debug)]
+enum FtConsumerKind {
+    InProcess {
+        inner: Rc<RefCell<ProducerInner>>,
+        consumer_id: ConsumerId,
+        event_cursor: usize,
+    },
+    Daemon {
+        info: SessionInfo,
+        events: Vec<FtEvent>,
+        event_cursor: usize,
+    },
+}
+
+#[derive(Debug)]
+enum FtFrameHandle {
+    InProcess(AcquiredVideoFrame),
+    Daemon(DaemonFrame),
 }
 
 /// # Safety
@@ -289,11 +324,104 @@ pub unsafe extern "C" fn ft_consumer_connect(options: *const FtConsumerOptions, 
     };
 
     let consumer = Box::new(FtConsumer {
-        inner: Rc::clone(&producer.inner),
-        consumer_id: ConsumerId::new(1),
-        event_cursor: 0,
+        kind: FtConsumerKind::InProcess {
+            inner: Rc::clone(&producer.inner),
+            consumer_id: ConsumerId::new(1),
+            event_cursor: 0,
+        },
     });
 
+    // SAFETY: out was checked for null and points to caller-owned storage.
+    unsafe {
+        *out = Box::into_raw(consumer);
+    }
+    FT_STATUS_OK
+}
+
+/// # Safety
+///
+/// `control_socket_path` must point to a NUL-terminated string. `out` must
+/// point to writable storage. String buffers in `out` are filled on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_create_synthetic_session(control_socket_path: *const c_char, out: *mut FtSyntheticSession) -> FtStatus {
+    if control_socket_path.is_null() || out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: control_socket_path was checked for null and must be NUL-terminated by caller.
+    let Some(control_socket_path) = (unsafe { c_string_to_str(control_socket_path) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    let Ok(session) = daemon::create_synthetic_session(control_socket_path) else {
+        return FT_STATUS_ERROR;
+    };
+    let mut ffi = FtSyntheticSession {
+        session_id: [0; 64],
+        source_id: session.source_id,
+        track_id: session.track_id,
+        fd_socket_path: [0; 4096],
+    };
+    // SAFETY: ffi owns both fixed-size destination buffers.
+    if !(unsafe { daemon::copy_string_to_c_buffer(&session.session_id, ffi.session_id.as_mut_ptr(), ffi.session_id.len()) })
+        || !(unsafe { daemon::copy_string_to_c_buffer(&session.fd_socket_path, ffi.fd_socket_path.as_mut_ptr(), ffi.fd_socket_path.len()) })
+    {
+        return FT_STATUS_ERROR;
+    }
+    // SAFETY: out was checked for null and points to caller-owned storage.
+    unsafe {
+        *out = ffi;
+    }
+    FT_STATUS_OK
+}
+
+/// # Safety
+///
+/// `descriptor` and `out` must be valid, non-null pointers. Descriptor string
+/// pointers must point to NUL-terminated strings for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_consumer_connect_session(descriptor: *const FtSessionDescriptor, out: *mut *mut FtConsumer) -> FtStatus {
+    if descriptor.is_null() || out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: descriptor was checked for null and is only read during this call.
+    let descriptor = unsafe { &*descriptor };
+    if descriptor.control_socket_path.is_null() || descriptor.session_id.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: descriptor strings were checked for null and must be NUL-terminated by caller.
+    let Some(control_socket_path) = (unsafe { c_string_to_str(descriptor.control_socket_path) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    // SAFETY: descriptor strings were checked for null and must be NUL-terminated by caller.
+    let Some(session_id) = (unsafe { c_string_to_str(descriptor.session_id) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+
+    let Ok(info) = daemon::get_session(control_socket_path, session_id) else {
+        return FT_STATUS_ERROR;
+    };
+    let events = vec![
+        FtEvent {
+            kind: FT_EVENT_SOURCE_REGISTERED,
+            source_id: info.source_id,
+            ..FtEvent::default()
+        },
+        FtEvent {
+            kind: FT_EVENT_TRACK_REGISTERED,
+            source_id: info.source_id,
+            track_id: info.track_id,
+            track_type: FT_TRACK_TYPE_VIDEO,
+            width: info.width,
+            height: info.height,
+            pixel_format: pixel_format_to_ffi(info.pixel_format),
+        },
+    ];
+    let consumer = Box::new(FtConsumer {
+        kind: FtConsumerKind::Daemon {
+            info,
+            events,
+            event_cursor: 0,
+        },
+    });
     // SAFETY: out was checked for null and points to caller-owned storage.
     unsafe {
         *out = Box::into_raw(consumer);
@@ -314,15 +442,28 @@ pub unsafe extern "C" fn ft_consumer_poll_event(consumer: *mut FtConsumer, out_e
         return FT_STATUS_INVALID_ARGUMENT;
     }
 
-    let events = consumer.inner.borrow().state.replay_events();
-    let Some(event) = events.get(consumer.event_cursor) else {
-        return FT_STATUS_EMPTY;
-    };
-    consumer.event_cursor += 1;
-
-    // SAFETY: out_event was checked for null and points to caller-owned storage.
-    unsafe {
-        *out_event = event_to_ffi(event);
+    match &mut consumer.kind {
+        FtConsumerKind::InProcess { inner, event_cursor, .. } => {
+            let events = inner.borrow().state.replay_events();
+            let Some(event) = events.get(*event_cursor) else {
+                return FT_STATUS_EMPTY;
+            };
+            *event_cursor += 1;
+            // SAFETY: out_event was checked for null and points to caller-owned storage.
+            unsafe {
+                *out_event = event_to_ffi(event);
+            }
+        }
+        FtConsumerKind::Daemon { events, event_cursor, .. } => {
+            let Some(event) = events.get(*event_cursor) else {
+                return FT_STATUS_EMPTY;
+            };
+            *event_cursor += 1;
+            // SAFETY: out_event was checked for null and points to caller-owned storage.
+            unsafe {
+                *out_event = *event;
+            }
+        }
     }
     FT_STATUS_OK
 }
@@ -345,24 +486,37 @@ pub unsafe extern "C" fn ft_consumer_acquire_latest_video_frame(
         return FT_STATUS_INVALID_ARGUMENT;
     }
 
-    match consumer
-        .inner
-        .borrow_mut()
-        .video
-        .acquire_latest(consumer.consumer_id, TrackId::new(track_id))
-    {
-        Ok(frame) => {
-            let desc = video_frame_desc_to_ffi(&frame.desc);
-            let data = frame.bytes().as_ptr().cast::<c_void>();
-            let len = frame.bytes().len();
-            let handle = Box::into_raw(Box::new(frame));
-            // SAFETY: out_frame was checked for null and points to caller-owned storage.
-            unsafe {
-                *out_frame = FtVideoFrame { desc, data, len, handle };
+    match &mut consumer.kind {
+        FtConsumerKind::InProcess { inner, consumer_id, .. } => {
+            match inner.borrow_mut().video.acquire_latest(*consumer_id, TrackId::new(track_id)) {
+                Ok(frame) => {
+                    let desc = video_frame_desc_to_ffi(&frame.desc);
+                    let data = frame.bytes().as_ptr().cast::<c_void>();
+                    let len = frame.bytes().len();
+                    let handle = Box::into_raw(Box::new(FtFrameHandle::InProcess(frame)));
+                    // SAFETY: out_frame was checked for null and points to caller-owned storage.
+                    unsafe {
+                        *out_frame = FtVideoFrame { desc, data, len, handle };
+                    }
+                    FT_STATUS_OK
+                }
+                Err(_) => FT_STATUS_ERROR,
             }
-            FT_STATUS_OK
         }
-        Err(_) => FT_STATUS_ERROR,
+        FtConsumerKind::Daemon { info, .. } => match daemon::latest_frame(info, track_id) {
+            Ok(frame) => {
+                let desc = video_frame_desc_to_ffi(&frame.desc);
+                let data = frame.bytes().as_ptr().cast::<c_void>();
+                let len = frame.bytes().len();
+                let handle = Box::into_raw(Box::new(FtFrameHandle::Daemon(frame)));
+                // SAFETY: out_frame was checked for null and points to caller-owned storage.
+                unsafe {
+                    *out_frame = FtVideoFrame { desc, data, len, handle };
+                }
+                FT_STATUS_OK
+            }
+            Err(_) => FT_STATUS_ERROR,
+        },
     }
 }
 
@@ -388,7 +542,14 @@ pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsum
 
     // SAFETY: handle was produced by ft_consumer_acquire_latest_video_frame and is consumed once here.
     let acquired = unsafe { *Box::from_raw(frame.handle) };
-    consumer.inner.borrow_mut().video.release(acquired);
+    match acquired {
+        FtFrameHandle::InProcess(acquired_frame) => {
+            if let FtConsumerKind::InProcess { inner, .. } = &mut consumer.kind {
+                inner.borrow_mut().video.release(acquired_frame);
+            }
+        }
+        FtFrameHandle::Daemon(_frame) => {}
+    }
     frame.handle = ptr::null_mut();
     frame.data = ptr::null();
     frame.len = 0;
@@ -403,7 +564,9 @@ pub unsafe extern "C" fn ft_consumer_destroy(consumer: *mut FtConsumer) {
     if !consumer.is_null() {
         // SAFETY: consumer must be a pointer returned by ft_consumer_connect and not already destroyed.
         let consumer = unsafe { Box::from_raw(consumer) };
-        consumer.inner.borrow_mut().video.disconnect_consumer(consumer.consumer_id);
+        if let FtConsumerKind::InProcess { inner, consumer_id, .. } = consumer.kind {
+            inner.borrow_mut().video.disconnect_consumer(consumer_id);
+        }
     }
 }
 
@@ -423,6 +586,11 @@ fn consumer_as_mut(consumer: *mut FtConsumer) -> Option<&'static mut FtConsumer>
         // SAFETY: caller-provided pointer is assumed to come from ft_consumer_connect.
         Some(unsafe { &mut *consumer })
     }
+}
+
+unsafe fn c_string_to_str(value: *const c_char) -> Option<&'static str> {
+    // SAFETY: caller guarantees value points to a NUL-terminated C string.
+    unsafe { CStr::from_ptr(value) }.to_str().ok()
 }
 
 unsafe fn source_desc_from_ffi(desc: &FtSourceDesc) -> Option<SourceDesc> {

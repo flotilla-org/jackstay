@@ -45,6 +45,18 @@ typedef struct ft_consumer_options {
   ft_producer *producer;
 } ft_consumer_options;
 
+typedef struct ft_session_descriptor {
+  const char *control_socket_path;
+  const char *session_id;
+} ft_session_descriptor;
+
+typedef struct ft_synthetic_session {
+  char session_id[64];
+  ft_source_id source_id;
+  ft_track_id track_id;
+  char fd_socket_path[4096];
+} ft_synthetic_session;
+
 typedef struct ft_source_desc {
   uint32_t kind;
   const char *label;
@@ -103,6 +115,10 @@ ft_status ft_producer_publish_video_frame(ft_producer *producer,
 void ft_producer_destroy(ft_producer *producer);
 
 ft_status ft_consumer_connect(const ft_consumer_options *options, ft_consumer **out);
+ft_status ft_create_synthetic_session(const char *control_socket_path,
+                                      ft_synthetic_session *out);
+ft_status ft_consumer_connect_session(const ft_session_descriptor *descriptor,
+                                      ft_consumer **out);
 ft_status ft_consumer_poll_event(ft_consumer *consumer, ft_event *out_event);
 ft_status ft_consumer_acquire_latest_video_frame(ft_consumer *consumer,
                                                  ft_track_id track_id,

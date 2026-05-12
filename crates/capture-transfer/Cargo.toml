@@ -1,0 +1,15 @@
+[package]
+name = "capture-transfer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

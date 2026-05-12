@@ -1,4 +1,5 @@
 pub mod error;
+pub mod ffi;
 pub mod model;
 pub mod shm;
 pub mod state;

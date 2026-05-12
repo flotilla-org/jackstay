@@ -87,6 +87,26 @@ impl Event {
     pub const fn kind(&self) -> EventKind {
         self.kind
     }
+
+    #[must_use]
+    pub const fn source_id(&self) -> Option<SourceId> {
+        self.source_id
+    }
+
+    #[must_use]
+    pub const fn track_id(&self) -> Option<TrackId> {
+        self.track_id
+    }
+
+    #[must_use]
+    pub const fn source_desc(&self) -> Option<&SourceDesc> {
+        self.source_desc.as_ref()
+    }
+
+    #[must_use]
+    pub const fn track_desc(&self) -> Option<&TrackDesc> {
+        self.track_desc.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

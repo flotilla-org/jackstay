@@ -80,11 +80,18 @@ rm -rf "$runtime_dir"
 Real surface capture:
 
 ```sh
-surface_id="$(porthole attach --containing-pid $$ --frontmost --json | jq -r .surface_id)"
+surface_id="$(porthole attach --frontmost --json | jq -r .surface_id)"
 descriptor="$(porthole capture-session surface "$surface_id")"
 session_id="$(printf '%s\n' "$descriptor" | awk '/^session_id:/ { print $2 }')"
+porthole_socket="$(printf '%s\n' "$descriptor" | awk '/^porthole_socket:/ { print $2 }')"
 
 target/capture-viewer-sdl/capture-viewer-sdl \
-  --porthole-socket "$PORTHOLE_RUNTIME_DIR/porthole.sock" \
+  --porthole-socket "$porthole_socket" \
   --session-id "$session_id"
+```
+
+The same flow is available as a bounded smoke test:
+
+```sh
+./scripts/manual-capture-transfer-smoke.sh --frames 300
 ```

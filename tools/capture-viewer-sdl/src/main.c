@@ -11,6 +11,7 @@ enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4 };
 typedef struct viewer_options {
   int max_frames;
   const char *porthole_socket;
+  const char *session_id;
 } viewer_options;
 
 typedef struct stream_state {
@@ -44,6 +45,9 @@ static viewer_options parse_options(int argc, char **argv) {
     } else if (strcmp(argv[i], "--porthole-socket") == 0) {
       options.porthole_socket = argv[i + 1];
       i++;
+    } else if (strcmp(argv[i], "--session-id") == 0) {
+      options.session_id = argv[i + 1];
+      i++;
     }
   }
   return options;
@@ -72,13 +76,17 @@ int main(int argc, char **argv) {
 
   ft_synthetic_session synthetic_session = {0};
   if (stream.daemon_mode) {
-    if (require_ok(ft_create_synthetic_session(options.porthole_socket, &synthetic_session),
-                   "ft_create_synthetic_session")) {
-      return 1;
+    const char *session_id = options.session_id;
+    if (session_id == NULL) {
+      if (require_ok(ft_create_synthetic_session(options.porthole_socket, &synthetic_session),
+                     "ft_create_synthetic_session")) {
+        return 1;
+      }
+      session_id = synthetic_session.session_id;
     }
     ft_session_descriptor descriptor = {
         .control_socket_path = options.porthole_socket,
-        .session_id = synthetic_session.session_id,
+        .session_id = session_id,
     };
     if (require_ok(ft_consumer_connect_session(&descriptor, &stream.consumer),
                    "ft_consumer_connect_session")) {

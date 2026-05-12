@@ -9,11 +9,13 @@ The viewer has two modes:
 - `--porthole-socket`: asks `portholed` to create a synthetic capture session,
   connects back through a session descriptor, then receives frames through the
   fd-passing transport.
+- `--porthole-socket` plus `--session-id`: attaches to an existing daemon
+  capture session without creating one.
 
 Build:
 
 ```sh
-cargo build -p capture-transfer -p portholed --locked
+cargo build -p capture-transfer -p porthole -p portholed --locked
 cmake -S tools/capture-viewer-sdl -B target/capture-viewer-sdl \
   -DCAPTURE_TRANSFER_LIB="$PWD/target/debug/libcapture_transfer.dylib"
 cmake --build target/capture-viewer-sdl
@@ -45,6 +47,30 @@ done
 
 SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl \
   --porthole-socket "$runtime_dir/porthole.sock" \
+  --frames 3
+
+kill "$portholed_pid"
+rm -rf "$runtime_dir"
+```
+
+Attach-only daemon smoke test:
+
+```sh
+runtime_dir="$(mktemp -d)"
+PORTHOLE_RUNTIME_DIR="$runtime_dir" target/debug/portholed >"$runtime_dir/portholed.log" 2>&1 &
+portholed_pid=$!
+
+for _ in $(seq 1 50); do
+  [ -S "$runtime_dir/porthole.sock" ] && break
+  sleep 0.1
+done
+
+descriptor="$(PORTHOLE_RUNTIME_DIR="$runtime_dir" target/debug/porthole capture-session synthetic)"
+session_id="$(printf '%s\n' "$descriptor" | awk '/^session_id:/ { print $2 }')"
+
+SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl \
+  --porthole-socket "$runtime_dir/porthole.sock" \
+  --session-id "$session_id" \
   --frames 3
 
 kill "$portholed_pid"

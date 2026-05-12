@@ -128,6 +128,7 @@ impl Drop for SharedMemorySegment {
 }
 
 fn unique_path() -> PathBuf {
+    // Uniqueness only; no ordering with other memory is required.
     let id = NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("capture-transfer-{}-{id}.shm", std::process::id()))
 }

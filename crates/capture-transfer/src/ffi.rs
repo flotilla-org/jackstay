@@ -540,7 +540,7 @@ pub unsafe extern "C" fn ft_consumer_acquire_latest_video_frame(
 /// `ft_consumer_acquire_latest_video_frame`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsumer, frame: *mut FtVideoFrame) {
-    let Some(_consumer) = consumer_as_mut(consumer) else {
+    let Some(consumer) = consumer_as_mut(consumer) else {
         return;
     };
     if frame.is_null() {
@@ -555,6 +555,13 @@ pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsum
 
     // SAFETY: handle was produced by ft_consumer_acquire_latest_video_frame and is consumed once here.
     let acquired = unsafe { *Box::from_raw(frame.handle) };
+    debug_assert!(
+        matches!(
+            (&consumer.kind, &acquired),
+            (FtConsumerKind::InProcess { .. }, FtFrameHandle::InProcess { .. }) | (FtConsumerKind::Daemon { .. }, FtFrameHandle::Daemon(_))
+        ),
+        "ft_consumer_release_video_frame called with a frame from a different consumer kind"
+    );
     match acquired {
         FtFrameHandle::InProcess { inner, frame } => {
             inner.borrow_mut().video.release(frame);

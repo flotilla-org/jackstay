@@ -80,6 +80,7 @@ struct SessionInfoWire {
 #[derive(Debug, Deserialize)]
 struct LatestFrameWire {
     sequence: u64,
+    timestamp_ns: u64,
     width: u32,
     height: u32,
     stride: u32,
@@ -163,7 +164,7 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
     Ok(DaemonFrame {
         desc: VideoFrameDesc {
             sequence: frame.sequence,
-            timestamp_ns: 0,
+            timestamp_ns: frame.timestamp_ns,
             width: frame.width,
             height: frame.height,
             stride: frame.stride,
@@ -222,7 +223,8 @@ fn parse_http_response(response: &str) -> Result<String> {
             message: "missing status line".to_string(),
         });
     };
-    if !status_line.contains(" 200 ") {
+    let ok_status = status_line.split_whitespace().nth(1).map(|status| status == "200").unwrap_or(false);
+    if !ok_status {
         return Err(CaptureTransferError::DaemonTransport {
             operation: "http-status",
             message: status_line.to_string(),
@@ -257,5 +259,11 @@ mod tests {
     fn parses_http_body() {
         let body = parse_http_response("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").unwrap();
         assert_eq!(body, "{}");
+    }
+
+    #[test]
+    fn rejects_non_200_status_without_substring_match() {
+        let error = parse_http_response("HTTP/1.1 1200 Weird\r\ncontent-length: 2\r\n\r\n{}").unwrap_err();
+        assert!(error.to_string().contains("1200 Weird"));
     }
 }

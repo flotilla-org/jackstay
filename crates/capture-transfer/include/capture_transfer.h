@@ -37,6 +37,13 @@ typedef uint64_t ft_track_id;
 typedef struct ft_producer ft_producer;
 typedef struct ft_consumer ft_consumer;
 
+/*
+ * Threading: v1 handles are single-threaded. Do not call capture-transfer C ABI
+ * functions concurrently on the same ft_producer or ft_consumer. External
+ * synchronization is required if a host application moves handles across
+ * threads.
+ */
+
 typedef struct ft_producer_options {
   uint32_t reserved;
 } ft_producer_options;

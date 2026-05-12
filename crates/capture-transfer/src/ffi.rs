@@ -133,6 +133,7 @@ impl Default for FtVideoFrame {
 struct ProducerInner {
     state: SessionState,
     video: VideoSlotManager,
+    next_consumer_id: u64,
 }
 
 #[derive(Debug)]
@@ -179,6 +180,7 @@ pub unsafe extern "C" fn ft_producer_create(_options: *const FtProducerOptions, 
         inner: Rc::new(RefCell::new(ProducerInner {
             state: SessionState::new(),
             video: VideoSlotManager::new(3),
+            next_consumer_id: 0,
         })),
     });
 
@@ -322,11 +324,16 @@ pub unsafe extern "C" fn ft_consumer_connect(options: *const FtConsumerOptions, 
     let Some(producer) = producer_as_ref(producer) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
+    let consumer_id = {
+        let mut inner = producer.inner.borrow_mut();
+        inner.next_consumer_id = inner.next_consumer_id.saturating_add(1).max(1);
+        ConsumerId::new(inner.next_consumer_id)
+    };
 
     let consumer = Box::new(FtConsumer {
         kind: FtConsumerKind::InProcess {
             inner: Rc::clone(&producer.inner),
-            consumer_id: ConsumerId::new(1),
+            consumer_id,
             event_cursor: 0,
         },
     });
@@ -570,7 +577,7 @@ pub unsafe extern "C" fn ft_consumer_destroy(consumer: *mut FtConsumer) {
     }
 }
 
-fn producer_as_ref(producer: *mut FtProducer) -> Option<&'static FtProducer> {
+fn producer_as_ref<'a>(producer: *mut FtProducer) -> Option<&'a FtProducer> {
     if producer.is_null() {
         None
     } else {
@@ -579,7 +586,7 @@ fn producer_as_ref(producer: *mut FtProducer) -> Option<&'static FtProducer> {
     }
 }
 
-fn consumer_as_mut(consumer: *mut FtConsumer) -> Option<&'static mut FtConsumer> {
+fn consumer_as_mut<'a>(consumer: *mut FtConsumer) -> Option<&'a mut FtConsumer> {
     if consumer.is_null() {
         None
     } else {
@@ -588,7 +595,7 @@ fn consumer_as_mut(consumer: *mut FtConsumer) -> Option<&'static mut FtConsumer>
     }
 }
 
-unsafe fn c_string_to_str(value: *const c_char) -> Option<&'static str> {
+unsafe fn c_string_to_str<'a>(value: *const c_char) -> Option<&'a str> {
     // SAFETY: caller guarantees value points to a NUL-terminated C string.
     unsafe { CStr::from_ptr(value) }.to_str().ok()
 }

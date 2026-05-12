@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-crate-type = ["rlib", "staticlib", "cdylib"]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "0.2"

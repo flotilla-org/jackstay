@@ -6,6 +6,12 @@ pub type Result<T> = std::result::Result<T, CaptureTransferError>;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CaptureTransferError {
+    #[error("shared memory segment length must be greater than zero")]
+    InvalidSharedMemoryLength,
+
+    #[error("shared memory {operation} failed: {message}")]
+    SharedMemory { operation: &'static str, message: String },
+
     #[error("unknown source id {source_id:?}")]
     UnknownSource { source_id: SourceId },
 

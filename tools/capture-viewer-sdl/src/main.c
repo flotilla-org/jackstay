@@ -230,10 +230,34 @@ int main(int argc, char **argv) {
     }
 
     while (ft_consumer_poll_event(stream.consumer, &event) == FT_STATUS_OK) {
+      if (event.kind == FT_EVENT_TRACK_UPDATED && event.track_id == stream.track_id &&
+          event.track_type == FT_TRACK_TYPE_VIDEO) {
+        stream.width = event.width;
+        stream.height = event.height;
+        stream.stride = event.width * 4;
+      }
     }
 
     ft_video_frame frame = {0};
     if (ft_consumer_acquire_latest_video_frame(stream.consumer, stream.track_id, &frame) == FT_STATUS_OK) {
+      if (frame.desc.width != stream.width || frame.desc.height != stream.height) {
+        SDL_Texture *resized_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA32,
+                                                         SDL_TEXTUREACCESS_STREAMING,
+                                                         frame.desc.width, frame.desc.height);
+        if (resized_texture == NULL) {
+          fprintf(stderr, "SDL resize texture failed: %s\n", SDL_GetError());
+          ft_consumer_release_video_frame(stream.consumer, &frame);
+          running = 0;
+          break;
+        }
+        SDL_DestroyTexture(texture);
+        texture = resized_texture;
+        SDL_SetWindowSize(window, frame.desc.width < WIDTH ? WIDTH : (int)frame.desc.width,
+                          frame.desc.height < HEIGHT ? HEIGHT : (int)frame.desc.height);
+        stream.width = frame.desc.width;
+        stream.height = frame.desc.height;
+      }
+      stream.stride = frame.desc.stride;
       SDL_UpdateTexture(texture, NULL, frame.data, (int)frame.desc.stride);
       SDL_RenderClear(renderer);
       SDL_RenderCopy(renderer, texture, NULL, NULL);

@@ -162,7 +162,10 @@ enum FtConsumerKind {
 
 #[derive(Debug)]
 enum FtFrameHandle {
-    InProcess(AcquiredVideoFrame),
+    InProcess {
+        inner: Rc<RefCell<ProducerInner>>,
+        frame: AcquiredVideoFrame,
+    },
     Daemon(DaemonFrame),
 }
 
@@ -500,7 +503,10 @@ pub unsafe extern "C" fn ft_consumer_acquire_latest_video_frame(
                     let desc = video_frame_desc_to_ffi(&frame.desc);
                     let data = frame.bytes().as_ptr().cast::<c_void>();
                     let len = frame.bytes().len();
-                    let handle = Box::into_raw(Box::new(FtFrameHandle::InProcess(frame)));
+                    let handle = Box::into_raw(Box::new(FtFrameHandle::InProcess {
+                        inner: Rc::clone(inner),
+                        frame,
+                    }));
                     // SAFETY: out_frame was checked for null and points to caller-owned storage.
                     unsafe {
                         *out_frame = FtVideoFrame { desc, data, len, handle };
@@ -534,7 +540,7 @@ pub unsafe extern "C" fn ft_consumer_acquire_latest_video_frame(
 /// `ft_consumer_acquire_latest_video_frame`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsumer, frame: *mut FtVideoFrame) {
-    let Some(consumer) = consumer_as_mut(consumer) else {
+    let Some(_consumer) = consumer_as_mut(consumer) else {
         return;
     };
     if frame.is_null() {
@@ -550,10 +556,8 @@ pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsum
     // SAFETY: handle was produced by ft_consumer_acquire_latest_video_frame and is consumed once here.
     let acquired = unsafe { *Box::from_raw(frame.handle) };
     match acquired {
-        FtFrameHandle::InProcess(acquired_frame) => {
-            if let FtConsumerKind::InProcess { inner, .. } = &mut consumer.kind {
-                inner.borrow_mut().video.release(acquired_frame);
-            }
+        FtFrameHandle::InProcess { inner, frame } => {
+            inner.borrow_mut().video.release(frame);
         }
         FtFrameHandle::Daemon(_frame) => {}
     }

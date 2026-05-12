@@ -245,4 +245,24 @@ mod tests {
 
         assert_eq!(bytes, &[9, 8, 7]);
     }
+
+    #[test]
+    fn cloned_fd_survives_release_and_prune() {
+        use std::{fs::File, io::Read};
+
+        let mut slots = VideoSlotManager::new(1);
+        let track = TrackId::new(1);
+
+        slots.publish(track, frame_desc(1), &[9, 8, 7]).unwrap();
+        let frame = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
+        let mut file = File::from(frame.try_clone_fd().unwrap());
+        slots.release(frame);
+
+        slots.publish(track, frame_desc(2), &[1, 2, 3]).unwrap();
+        assert_eq!(slots.pinned_frame_count(), 0);
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, &[9, 8, 7]);
+    }
 }

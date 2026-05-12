@@ -116,6 +116,8 @@ pub fn get_session(control_socket_path: &str, session_id: &str) -> Result<Sessio
 }
 
 pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
+    // Prototype transport: one fd-socket connection per frame. Replace this
+    // with a streaming/subscription protocol before polling at display rate.
     let mut stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-fd-socket", error))?;
     writeln!(
         stream,

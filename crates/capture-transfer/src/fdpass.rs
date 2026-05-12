@@ -120,7 +120,7 @@ fn cmsg_len(data_len: usize) -> libc::socklen_t {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::{File, OpenOptions},
+        fs::File,
         io::{Read, Seek, SeekFrom, Write},
         os::{fd::AsRawFd, unix::net::UnixStream},
     };
@@ -147,18 +147,9 @@ mod tests {
     }
 
     fn tempfile_file_with_contents(contents: &[u8]) -> File {
-        let mut path = std::env::temp_dir();
-        path.push(format!("capture-transfer-fdpass-test-{}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
         file.write_all(contents).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
-        std::fs::remove_file(path).unwrap();
         file
     }
 }

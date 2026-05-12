@@ -6,6 +6,12 @@ pub type Result<T> = std::result::Result<T, CaptureTransferError>;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CaptureTransferError {
+    #[error("fd passing {operation} failed: {message}")]
+    FdPassing { operation: &'static str, message: String },
+
+    #[error("fd passing response did not include a file descriptor")]
+    MissingPassedFd,
+
     #[error("shared memory segment length must be greater than zero")]
     InvalidSharedMemoryLength,
 

@@ -76,3 +76,15 @@ SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl \
 kill "$portholed_pid"
 rm -rf "$runtime_dir"
 ```
+
+Real surface capture:
+
+```sh
+surface_id="$(porthole attach --containing-pid $$ --frontmost --json | jq -r .surface_id)"
+descriptor="$(porthole capture-session surface "$surface_id")"
+session_id="$(printf '%s\n' "$descriptor" | awk '/^session_id:/ { print $2 }')"
+
+target/capture-viewer-sdl/capture-viewer-sdl \
+  --porthole-socket "$PORTHOLE_RUNTIME_DIR/porthole.sock" \
+  --session-id "$session_id"
+```

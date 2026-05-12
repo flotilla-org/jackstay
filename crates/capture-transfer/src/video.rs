@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    rc::Rc,
+    os::fd::OwnedFd,
+    sync::Arc,
 };
 
 use crate::{
@@ -40,7 +41,7 @@ pub struct AcquiredVideoFrame {
     consumer_id: ConsumerId,
     track_id: TrackId,
     frame_key: u64,
-    segment: Rc<SharedMemorySegment>,
+    segment: Arc<SharedMemorySegment>,
 }
 
 impl AcquiredVideoFrame {
@@ -48,13 +49,17 @@ impl AcquiredVideoFrame {
     pub fn bytes(&self) -> &[u8] {
         self.segment.as_slice()
     }
+
+    pub fn try_clone_fd(&self) -> Result<OwnedFd> {
+        self.segment.try_clone_fd()
+    }
 }
 
 #[derive(Debug)]
 struct StoredFrame {
     key: u64,
     desc: VideoFrameDesc,
-    segment: Rc<SharedMemorySegment>,
+    segment: Arc<SharedMemorySegment>,
     pinned_by: BTreeSet<ConsumerId>,
 }
 
@@ -84,7 +89,7 @@ impl VideoSlotManager {
         frames.push(StoredFrame {
             key,
             desc,
-            segment: Rc::new(segment),
+            segment: Arc::new(segment),
             pinned_by: BTreeSet::new(),
         });
         Self::prune_unpinned(frames, self.capacity_per_track);
@@ -103,7 +108,7 @@ impl VideoSlotManager {
             consumer_id,
             track_id,
             frame_key: frame.key,
-            segment: Rc::clone(&frame.segment),
+            segment: Arc::clone(&frame.segment),
         })
     }
 
@@ -222,5 +227,22 @@ mod tests {
         slots.disconnect_consumer(consumer);
 
         assert_eq!(slots.pinned_frame_count(), 0);
+    }
+
+    #[test]
+    fn acquired_frame_can_clone_readable_fd() {
+        use std::{fs::File, io::Read};
+
+        let mut slots = VideoSlotManager::new(2);
+        let track = TrackId::new(1);
+
+        slots.publish(track, frame_desc(1), &[9, 8, 7]).unwrap();
+        let frame = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
+
+        let mut file = File::from(frame.try_clone_fd().unwrap());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+
+        assert_eq!(bytes, &[9, 8, 7]);
     }
 }

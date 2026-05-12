@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     ptr::NonNull,
     sync::atomic::{AtomicU64, Ordering},
@@ -20,6 +20,13 @@ pub struct SharedMemorySegment {
     path: PathBuf,
     _file: File,
 }
+
+// SAFETY: SharedMemorySegment owns a file-backed mmap. Immutable access can be
+// shared across threads, and mutable access requires `&mut self`; Drop unmaps
+// only when the final owner goes away.
+unsafe impl Send for SharedMemorySegment {}
+// SAFETY: See the Send impl. Shared references expose read-only slices.
+unsafe impl Sync for SharedMemorySegment {}
 
 impl SharedMemorySegment {
     pub fn new(len: usize) -> Result<Self> {
@@ -97,6 +104,16 @@ impl SharedMemorySegment {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: ptr points to a live mutable mapping of len bytes owned by self.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    pub fn try_clone_fd(&self) -> Result<OwnedFd> {
+        self._file
+            .try_clone()
+            .map(OwnedFd::from)
+            .map_err(|error| CaptureTransferError::SharedMemory {
+                operation: "clone-fd",
+                message: error.to_string(),
+            })
     }
 }
 

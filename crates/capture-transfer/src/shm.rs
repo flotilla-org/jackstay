@@ -115,6 +115,15 @@ impl SharedMemorySegment {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
     }
 
+    pub fn with_slice_at_mut<R>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        assert!(offset <= self.len);
+        assert!(len <= self.len - offset);
+        // SAFETY: offset and len were bounds-checked. The slot manager only
+        // hands this out for producer-owned slots that are not pinned.
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) };
+        f(slice)
+    }
+
     pub fn write_at(&self, offset: usize, bytes: &[u8]) {
         assert!(offset <= self.len);
         assert!(bytes.len() <= self.len - offset);
@@ -186,5 +195,14 @@ mod tests {
         segment.write_at(2, &[7, 8, 9]);
 
         assert_eq!(segment.slice_at(0, 6), &[0, 0, 7, 8, 9, 0]);
+    }
+
+    #[test]
+    fn with_slice_at_mut_updates_bounded_subrange() {
+        let segment = SharedMemorySegment::new(8).unwrap();
+
+        segment.with_slice_at_mut(3, 2, |slice| slice.copy_from_slice(&[5, 6]));
+
+        assert_eq!(segment.slice_at(0, 6), &[0, 0, 0, 5, 6, 0]);
     }
 }

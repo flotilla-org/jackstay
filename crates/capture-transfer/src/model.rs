@@ -115,8 +115,52 @@ pub enum PixelFormat {
     Rgba8Unorm,
 }
 
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorSpace {
-    Unknown,
-    Srgb,
+    Unknown = 0,
+    Srgb = 1,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockDomain {
+    Unknown = 0,
+    UnixTime = 1,
+    MediaTime = 2,
+    HostTime = 3,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSyncKind {
+    Unknown = 0,
+    CpuCopyComplete = 1,
+    SckSampleReady = 2,
+    NativeTimeline = 3,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageKind {
+    Unknown = 0,
+    FullFrame = 1,
+    None = 2,
+    InlineRects = 3,
+    SidecarRects = 4,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind};
+
+    #[test]
+    fn frame_metadata_defaults_are_explicit() {
+        assert_eq!(ClockDomain::Unknown as u32, 0);
+        assert_eq!(ClockDomain::UnixTime as u32, 1);
+        assert_eq!(ClockDomain::MediaTime as u32, 2);
+        assert_eq!(FrameSyncKind::CpuCopyComplete as u32, 1);
+        assert_eq!(DamageKind::FullFrame as u32, 1);
+        assert_eq!(ColorSpace::Unknown as u32, 0);
+    }
 }

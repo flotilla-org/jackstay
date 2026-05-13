@@ -21,11 +21,15 @@ pub struct SharedMemorySegment {
     _file: File,
 }
 
-// SAFETY: SharedMemorySegment owns a file-backed mmap. Immutable access can be
-// shared across threads, and mutable access requires `&mut self`; Drop unmaps
-// only when the final owner goes away.
+// SAFETY: SharedMemorySegment owns a file-backed mmap. Shared reads are safe;
+// producer writes use explicit offset/length APIs and are guarded by the slot
+// manager so pinned ranges are not overwritten. Drop unmaps only when the final
+// owner goes away.
 unsafe impl Send for SharedMemorySegment {}
-// SAFETY: See the Send impl. Shared references expose read-only slices.
+// SAFETY: Interior-mutable writes through with_slice_at_mut/write_at are safe
+// across threads only under the VideoSlotManager claim/commit discipline: claims
+// reserve exclusive slot ranges, and committed frames are not overwritten while
+// pinned by consumers.
 unsafe impl Sync for SharedMemorySegment {}
 
 impl SharedMemorySegment {
@@ -106,6 +110,33 @@ impl SharedMemorySegment {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
+    #[must_use]
+    pub fn slice_at(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(offset <= self.len);
+        assert!(len <= self.len - offset);
+        // SAFETY: offset and len were bounds-checked against the live mapping.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
+    }
+
+    pub fn with_slice_at_mut<R>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        assert!(offset <= self.len);
+        assert!(len <= self.len - offset);
+        // SAFETY: offset and len were bounds-checked. The slot manager only
+        // hands this out for producer-owned slots that are not pinned.
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) };
+        f(slice)
+    }
+
+    pub fn write_at(&self, offset: usize, bytes: &[u8]) {
+        assert!(offset <= self.len);
+        assert!(bytes.len() <= self.len - offset);
+        // SAFETY: offset and len were bounds-checked. Callers only write into a
+        // producer-owned slot that is not pinned by acquired frames.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(offset), bytes.len());
+        }
+    }
+
     pub fn try_clone_fd(&self) -> Result<OwnedFd> {
         self._file
             .try_clone()
@@ -150,5 +181,31 @@ mod tests {
     #[test]
     fn zero_length_segment_is_rejected() {
         assert!(SharedMemorySegment::new(0).is_err());
+    }
+
+    #[test]
+    fn slice_at_returns_bounded_subrange() {
+        let mut segment = SharedMemorySegment::new(8).unwrap();
+        segment.as_mut_slice().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
+
+        assert_eq!(segment.slice_at(2, 3), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn write_at_updates_bounded_subrange() {
+        let segment = SharedMemorySegment::new(8).unwrap();
+
+        segment.write_at(2, &[7, 8, 9]);
+
+        assert_eq!(segment.slice_at(0, 6), &[0, 0, 7, 8, 9, 0]);
+    }
+
+    #[test]
+    fn with_slice_at_mut_updates_bounded_subrange() {
+        let segment = SharedMemorySegment::new(8).unwrap();
+
+        segment.with_slice_at_mut(3, 2, |slice| slice.copy_from_slice(&[5, 6]));
+
+        assert_eq!(segment.slice_at(0, 6), &[0, 0, 0, 5, 6, 0]);
     }
 }

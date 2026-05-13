@@ -7,7 +7,10 @@ use std::{
 
 use crate::{
     daemon::{self, DaemonFrame, SessionInfo},
-    model::{PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId, VideoTrackDesc},
+    model::{
+        ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId,
+        VideoTrackDesc,
+    },
     state::{Event, EventKind, SessionState},
     video::{AcquiredVideoFrame, ConsumerId, VideoFrameDesc, VideoSlotManager},
 };
@@ -27,6 +30,25 @@ pub const FT_TRACK_TYPE_VIDEO: u32 = 1;
 
 pub const FT_PIXEL_FORMAT_BGRA8_UNORM: u32 = 1;
 pub const FT_PIXEL_FORMAT_RGBA8_UNORM: u32 = 2;
+
+pub const FT_CLOCK_DOMAIN_UNKNOWN: u32 = 0;
+pub const FT_CLOCK_DOMAIN_UNIX_TIME: u32 = 1;
+pub const FT_CLOCK_DOMAIN_MEDIA_TIME: u32 = 2;
+pub const FT_CLOCK_DOMAIN_HOST_TIME: u32 = 3;
+
+pub const FT_COLOR_SPACE_UNKNOWN: u32 = 0;
+pub const FT_COLOR_SPACE_SRGB: u32 = 1;
+
+pub const FT_FRAME_SYNC_UNKNOWN: u32 = 0;
+pub const FT_FRAME_SYNC_CPU_COPY_COMPLETE: u32 = 1;
+pub const FT_FRAME_SYNC_SCK_SAMPLE_READY: u32 = 2;
+pub const FT_FRAME_SYNC_NATIVE_TIMELINE: u32 = 3;
+
+pub const FT_DAMAGE_UNKNOWN: u32 = 0;
+pub const FT_DAMAGE_FULL_FRAME: u32 = 1;
+pub const FT_DAMAGE_NONE: u32 = 2;
+pub const FT_DAMAGE_INLINE_RECTS: u32 = 3;
+pub const FT_DAMAGE_SIDECAR_RECTS: u32 = 4;
 
 pub const FT_EVENT_PRODUCER_STARTED: u32 = 1;
 pub const FT_EVENT_SOURCE_REGISTERED: u32 = 2;
@@ -95,6 +117,21 @@ pub struct FtVideoFrameDesc {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: u32,
+    pub pool_id: u64,
+    pub slot_id: u64,
+    pub slot_generation: u64,
+    pub payload_offset: u64,
+    pub payload_len: u64,
+    pub payload_map_len: u64,
+    pub clock_domain: u32,
+    pub color_space: u32,
+    pub sync_kind: u32,
+    pub damage_kind: u32,
+    pub damage_base_sequence: u64,
+    pub dropped_before_publish: u64,
+    pub producer_drop_count: u64,
+    pub evicted_count: u64,
+    pub consumer_skipped_count: u64,
 }
 
 #[repr(C)]
@@ -182,7 +219,7 @@ pub unsafe extern "C" fn ft_producer_create(_options: *const FtProducerOptions, 
     let producer = Box::new(FtProducer {
         inner: Rc::new(RefCell::new(ProducerInner {
             state: SessionState::new(),
-            video: VideoSlotManager::new(3),
+            video: VideoSlotManager::new_reusable_pool(3),
             next_consumer_id: 0,
         })),
     });
@@ -648,6 +685,21 @@ fn video_frame_desc_from_ffi(desc: &FtVideoFrameDesc) -> Option<VideoFrameDesc> 
         height: desc.height,
         stride: desc.stride,
         pixel_format: pixel_format_from_ffi(desc.pixel_format)?,
+        pool_id: desc.pool_id,
+        slot_id: desc.slot_id,
+        slot_generation: desc.slot_generation,
+        payload_offset: desc.payload_offset,
+        payload_len: desc.payload_len,
+        payload_map_len: desc.payload_map_len,
+        clock_domain: clock_domain_from_ffi(desc.clock_domain)?,
+        color_space: color_space_from_ffi(desc.color_space)?,
+        sync_kind: sync_kind_from_ffi(desc.sync_kind)?,
+        damage_kind: damage_kind_from_ffi(desc.damage_kind)?,
+        damage_base_sequence: desc.damage_base_sequence,
+        dropped_before_publish: desc.dropped_before_publish,
+        producer_drop_count: desc.producer_drop_count,
+        evicted_count: desc.evicted_count,
+        consumer_skipped_count: desc.consumer_skipped_count,
     })
 }
 
@@ -659,6 +711,21 @@ fn video_frame_desc_to_ffi(desc: &VideoFrameDesc) -> FtVideoFrameDesc {
         height: desc.height,
         stride: desc.stride,
         pixel_format: pixel_format_to_ffi(desc.pixel_format),
+        pool_id: desc.pool_id,
+        slot_id: desc.slot_id,
+        slot_generation: desc.slot_generation,
+        payload_offset: desc.payload_offset,
+        payload_len: desc.payload_len,
+        payload_map_len: desc.payload_map_len,
+        clock_domain: clock_domain_to_ffi(desc.clock_domain),
+        color_space: color_space_to_ffi(desc.color_space),
+        sync_kind: sync_kind_to_ffi(desc.sync_kind),
+        damage_kind: damage_kind_to_ffi(desc.damage_kind),
+        damage_base_sequence: desc.damage_base_sequence,
+        dropped_before_publish: desc.dropped_before_publish,
+        producer_drop_count: desc.producer_drop_count,
+        evicted_count: desc.evicted_count,
+        consumer_skipped_count: desc.consumer_skipped_count,
     }
 }
 
@@ -707,16 +774,91 @@ fn pixel_format_to_ffi(format: PixelFormat) -> u32 {
     }
 }
 
+fn clock_domain_from_ffi(domain: u32) -> Option<ClockDomain> {
+    match domain {
+        FT_CLOCK_DOMAIN_UNKNOWN => Some(ClockDomain::Unknown),
+        FT_CLOCK_DOMAIN_UNIX_TIME => Some(ClockDomain::UnixTime),
+        FT_CLOCK_DOMAIN_MEDIA_TIME => Some(ClockDomain::MediaTime),
+        FT_CLOCK_DOMAIN_HOST_TIME => Some(ClockDomain::HostTime),
+        _ => None,
+    }
+}
+
+fn clock_domain_to_ffi(domain: ClockDomain) -> u32 {
+    match domain {
+        ClockDomain::Unknown => FT_CLOCK_DOMAIN_UNKNOWN,
+        ClockDomain::UnixTime => FT_CLOCK_DOMAIN_UNIX_TIME,
+        ClockDomain::MediaTime => FT_CLOCK_DOMAIN_MEDIA_TIME,
+        ClockDomain::HostTime => FT_CLOCK_DOMAIN_HOST_TIME,
+    }
+}
+
+fn color_space_from_ffi(color_space: u32) -> Option<ColorSpace> {
+    match color_space {
+        FT_COLOR_SPACE_UNKNOWN => Some(ColorSpace::Unknown),
+        FT_COLOR_SPACE_SRGB => Some(ColorSpace::Srgb),
+        _ => None,
+    }
+}
+
+fn color_space_to_ffi(color_space: ColorSpace) -> u32 {
+    match color_space {
+        ColorSpace::Unknown => FT_COLOR_SPACE_UNKNOWN,
+        ColorSpace::Srgb => FT_COLOR_SPACE_SRGB,
+    }
+}
+
+fn sync_kind_from_ffi(sync_kind: u32) -> Option<FrameSyncKind> {
+    match sync_kind {
+        FT_FRAME_SYNC_UNKNOWN => Some(FrameSyncKind::Unknown),
+        FT_FRAME_SYNC_CPU_COPY_COMPLETE => Some(FrameSyncKind::CpuCopyComplete),
+        FT_FRAME_SYNC_SCK_SAMPLE_READY => Some(FrameSyncKind::SckSampleReady),
+        FT_FRAME_SYNC_NATIVE_TIMELINE => Some(FrameSyncKind::NativeTimeline),
+        _ => None,
+    }
+}
+
+fn sync_kind_to_ffi(sync_kind: FrameSyncKind) -> u32 {
+    match sync_kind {
+        FrameSyncKind::Unknown => FT_FRAME_SYNC_UNKNOWN,
+        FrameSyncKind::CpuCopyComplete => FT_FRAME_SYNC_CPU_COPY_COMPLETE,
+        FrameSyncKind::SckSampleReady => FT_FRAME_SYNC_SCK_SAMPLE_READY,
+        FrameSyncKind::NativeTimeline => FT_FRAME_SYNC_NATIVE_TIMELINE,
+    }
+}
+
+fn damage_kind_from_ffi(damage_kind: u32) -> Option<DamageKind> {
+    match damage_kind {
+        FT_DAMAGE_UNKNOWN => Some(DamageKind::Unknown),
+        FT_DAMAGE_FULL_FRAME => Some(DamageKind::FullFrame),
+        FT_DAMAGE_NONE => Some(DamageKind::None),
+        FT_DAMAGE_INLINE_RECTS => Some(DamageKind::InlineRects),
+        FT_DAMAGE_SIDECAR_RECTS => Some(DamageKind::SidecarRects),
+        _ => None,
+    }
+}
+
+fn damage_kind_to_ffi(damage_kind: DamageKind) -> u32 {
+    match damage_kind {
+        DamageKind::Unknown => FT_DAMAGE_UNKNOWN,
+        DamageKind::FullFrame => FT_DAMAGE_FULL_FRAME,
+        DamageKind::None => FT_DAMAGE_NONE,
+        DamageKind::InlineRects => FT_DAMAGE_INLINE_RECTS,
+        DamageKind::SidecarRects => FT_DAMAGE_SIDECAR_RECTS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::CString, ptr};
 
     use crate::ffi::{
-        FT_EVENT_SOURCE_REGISTERED, FT_EVENT_TRACK_REGISTERED, FT_PIXEL_FORMAT_BGRA8_UNORM, FT_SOURCE_KIND_WINDOW, FT_STATUS_EMPTY,
-        FT_STATUS_OK, FT_TRACK_TYPE_VIDEO, FtConsumer, FtConsumerOptions, FtEvent, FtProducer, FtProducerOptions, FtSourceDesc,
-        FtTrackDesc, FtVideoFrame, FtVideoFrameDesc, FtVideoTrackDesc, ft_consumer_acquire_latest_video_frame, ft_consumer_connect,
-        ft_consumer_destroy, ft_consumer_poll_event, ft_consumer_release_video_frame, ft_producer_create, ft_producer_destroy,
-        ft_producer_publish_video_frame, ft_producer_register_source, ft_producer_register_track,
+        FT_CLOCK_DOMAIN_MEDIA_TIME, FT_COLOR_SPACE_UNKNOWN, FT_DAMAGE_FULL_FRAME, FT_EVENT_SOURCE_REGISTERED, FT_EVENT_TRACK_REGISTERED,
+        FT_FRAME_SYNC_CPU_COPY_COMPLETE, FT_PIXEL_FORMAT_BGRA8_UNORM, FT_SOURCE_KIND_WINDOW, FT_STATUS_EMPTY, FT_STATUS_OK,
+        FT_TRACK_TYPE_VIDEO, FtConsumer, FtConsumerOptions, FtEvent, FtProducer, FtProducerOptions, FtSourceDesc, FtTrackDesc,
+        FtVideoFrame, FtVideoFrameDesc, FtVideoTrackDesc, ft_consumer_acquire_latest_video_frame, ft_consumer_connect, ft_consumer_destroy,
+        ft_consumer_poll_event, ft_consumer_release_video_frame, ft_producer_create, ft_producer_destroy, ft_producer_publish_video_frame,
+        ft_producer_register_source, ft_producer_register_track,
     };
 
     #[test]
@@ -761,6 +903,21 @@ mod tests {
                 height: 1,
                 stride: 8,
                 pixel_format: FT_PIXEL_FORMAT_BGRA8_UNORM,
+                pool_id: 0,
+                slot_id: 0,
+                slot_generation: 0,
+                payload_offset: 0,
+                payload_len: 0,
+                payload_map_len: 0,
+                clock_domain: FT_CLOCK_DOMAIN_MEDIA_TIME,
+                color_space: FT_COLOR_SPACE_UNKNOWN,
+                sync_kind: FT_FRAME_SYNC_CPU_COPY_COMPLETE,
+                damage_kind: FT_DAMAGE_FULL_FRAME,
+                damage_base_sequence: 1,
+                dropped_before_publish: 0,
+                producer_drop_count: 0,
+                evicted_count: 0,
+                consumer_skipped_count: 0,
             };
             let pixels = [1_u8, 2, 3, 4];
 
@@ -789,6 +946,16 @@ mod tests {
             let mut frame = FtVideoFrame::default();
             assert_eq!(ft_consumer_acquire_latest_video_frame(consumer, track_id, &mut frame), FT_STATUS_OK);
             assert_eq!(frame.desc.sequence, 1);
+            assert_eq!(frame.desc.clock_domain, FT_CLOCK_DOMAIN_MEDIA_TIME);
+            assert_eq!(frame.desc.color_space, FT_COLOR_SPACE_UNKNOWN);
+            assert_eq!(frame.desc.sync_kind, FT_FRAME_SYNC_CPU_COPY_COMPLETE);
+            assert_eq!(frame.desc.damage_kind, FT_DAMAGE_FULL_FRAME);
+            assert_eq!(frame.desc.damage_base_sequence, 1);
+            assert_ne!(frame.desc.pool_id, 0);
+            assert_eq!(frame.desc.slot_id, 0);
+            assert_ne!(frame.desc.slot_generation, 0);
+            assert_eq!(frame.desc.payload_len as usize, pixels.len());
+            assert!(frame.desc.payload_offset + frame.desc.payload_len <= frame.desc.payload_map_len);
             assert_eq!(frame.len, pixels.len());
             assert!(!frame.data.is_null());
 

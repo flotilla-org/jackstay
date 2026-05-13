@@ -22,6 +22,25 @@ extern "C" {
 #define FT_PIXEL_FORMAT_BGRA8_UNORM 1
 #define FT_PIXEL_FORMAT_RGBA8_UNORM 2
 
+#define FT_CLOCK_DOMAIN_UNKNOWN 0
+#define FT_CLOCK_DOMAIN_UNIX_TIME 1
+#define FT_CLOCK_DOMAIN_MEDIA_TIME 2
+#define FT_CLOCK_DOMAIN_HOST_TIME 3
+
+#define FT_COLOR_SPACE_UNKNOWN 0
+#define FT_COLOR_SPACE_SRGB 1
+
+#define FT_FRAME_SYNC_UNKNOWN 0
+#define FT_FRAME_SYNC_CPU_COPY_COMPLETE 1
+#define FT_FRAME_SYNC_SCK_SAMPLE_READY 2
+#define FT_FRAME_SYNC_NATIVE_TIMELINE 3
+
+#define FT_DAMAGE_UNKNOWN 0
+#define FT_DAMAGE_FULL_FRAME 1
+#define FT_DAMAGE_NONE 2
+#define FT_DAMAGE_INLINE_RECTS 3
+#define FT_DAMAGE_SIDECAR_RECTS 4
+
 #define FT_EVENT_PRODUCER_STARTED 1
 #define FT_EVENT_SOURCE_REGISTERED 2
 #define FT_EVENT_SOURCE_UPDATED 3
@@ -87,6 +106,21 @@ typedef struct ft_video_frame_desc {
   uint32_t height;
   uint32_t stride;
   uint32_t pixel_format;
+  uint64_t pool_id;
+  uint64_t slot_id;
+  uint64_t slot_generation;
+  uint64_t payload_offset;
+  uint64_t payload_len;
+  uint64_t payload_map_len;
+  uint32_t clock_domain;
+  uint32_t color_space;
+  uint32_t sync_kind;
+  uint32_t damage_kind;
+  uint64_t damage_base_sequence;
+  uint64_t dropped_before_publish;
+  uint64_t producer_drop_count;
+  uint64_t evicted_count;
+  uint64_t consumer_skipped_count;
 } ft_video_frame_desc;
 
 typedef struct ft_event {

@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     ffi::{CStr, c_char, c_void},
-    ptr,
+    ptr::{self, NonNull},
     rc::Rc,
 };
 
@@ -205,9 +205,11 @@ pub unsafe extern "C" fn ft_producer_register_source(
     desc: *const FtSourceDesc,
     out_source_id: *mut u64,
 ) -> FtStatus {
-    let Some(producer) = producer_as_ref(producer) else {
+    let Some(producer) = ptr_as_non_null(producer) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
+    // SAFETY: producer was checked for null and must be live for this call.
+    let producer = unsafe { producer.as_ref() };
     if desc.is_null() || out_source_id.is_null() {
         return FT_STATUS_INVALID_ARGUMENT;
     }
@@ -241,9 +243,11 @@ pub unsafe extern "C" fn ft_producer_register_track(
     desc: *const FtTrackDesc,
     out_track_id: *mut u64,
 ) -> FtStatus {
-    let Some(producer) = producer_as_ref(producer) else {
+    let Some(producer) = ptr_as_non_null(producer) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
+    // SAFETY: producer was checked for null and must be live for this call.
+    let producer = unsafe { producer.as_ref() };
     if desc.is_null() || out_track_id.is_null() {
         return FT_STATUS_INVALID_ARGUMENT;
     }
@@ -278,9 +282,11 @@ pub unsafe extern "C" fn ft_producer_publish_video_frame(
     pixels: *const c_void,
     len: usize,
 ) -> FtStatus {
-    let Some(producer) = producer_as_ref(producer) else {
+    let Some(producer) = ptr_as_non_null(producer) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
+    // SAFETY: producer was checked for null and must be live for this call.
+    let producer = unsafe { producer.as_ref() };
     if desc.is_null() || pixels.is_null() || len == 0 {
         return FT_STATUS_INVALID_ARGUMENT;
     }
@@ -324,9 +330,11 @@ pub unsafe extern "C" fn ft_consumer_connect(options: *const FtConsumerOptions, 
 
     // SAFETY: options was checked for null and is only read during this call.
     let producer = unsafe { (*options).producer };
-    let Some(producer) = producer_as_ref(producer) else {
+    let Some(producer) = ptr_as_non_null(producer) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
+    // SAFETY: producer was checked for null and must be live for this call.
+    let producer = unsafe { producer.as_ref() };
     let consumer_id = {
         let mut inner = producer.inner.borrow_mut();
         inner.next_consumer_id = inner.next_consumer_id.saturating_add(1).max(1);
@@ -358,10 +366,10 @@ pub unsafe extern "C" fn ft_create_synthetic_session(control_socket_path: *const
         return FT_STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: control_socket_path was checked for null and must be NUL-terminated by caller.
-    let Some(control_socket_path) = (unsafe { c_string_to_str(control_socket_path) }) else {
+    let Some(control_socket_path) = (unsafe { c_string_to_string(control_socket_path) }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    let Ok(session) = daemon::create_synthetic_session(control_socket_path) else {
+    let Ok(session) = daemon::create_synthetic_session(&control_socket_path) else {
         return FT_STATUS_ERROR;
     };
     let mut ffi = FtSyntheticSession {
@@ -398,15 +406,15 @@ pub unsafe extern "C" fn ft_consumer_connect_session(descriptor: *const FtSessio
         return FT_STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: descriptor strings were checked for null and must be NUL-terminated by caller.
-    let Some(control_socket_path) = (unsafe { c_string_to_str(descriptor.control_socket_path) }) else {
+    let Some(control_socket_path) = (unsafe { c_string_to_string(descriptor.control_socket_path) }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
     // SAFETY: descriptor strings were checked for null and must be NUL-terminated by caller.
-    let Some(session_id) = (unsafe { c_string_to_str(descriptor.session_id) }) else {
+    let Some(session_id) = (unsafe { c_string_to_string(descriptor.session_id) }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
 
-    let Ok(info) = daemon::get_session(control_socket_path, session_id) else {
+    let Ok(info) = daemon::get_session(&control_socket_path, &session_id) else {
         return FT_STATUS_ERROR;
     };
     let events = vec![
@@ -445,9 +453,11 @@ pub unsafe extern "C" fn ft_consumer_connect_session(descriptor: *const FtSessio
 /// `out_event` must be a valid, non-null pointer to writable storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_consumer_poll_event(consumer: *mut FtConsumer, out_event: *mut FtEvent) -> FtStatus {
-    let Some(consumer) = consumer_as_mut(consumer) else {
+    let Some(mut consumer) = ptr_as_non_null(consumer) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
+    // SAFETY: consumer was checked for null and must be live and uniquely borrowed for this call.
+    let consumer = unsafe { consumer.as_mut() };
     if out_event.is_null() {
         return FT_STATUS_INVALID_ARGUMENT;
     }
@@ -489,9 +499,11 @@ pub unsafe extern "C" fn ft_consumer_acquire_latest_video_frame(
     track_id: u64,
     out_frame: *mut FtVideoFrame,
 ) -> FtStatus {
-    let Some(consumer) = consumer_as_mut(consumer) else {
+    let Some(mut consumer) = ptr_as_non_null(consumer) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
+    // SAFETY: consumer was checked for null and must be live and uniquely borrowed for this call.
+    let consumer = unsafe { consumer.as_mut() };
     if out_frame.is_null() {
         return FT_STATUS_INVALID_ARGUMENT;
     }
@@ -540,9 +552,11 @@ pub unsafe extern "C" fn ft_consumer_acquire_latest_video_frame(
 /// `ft_consumer_acquire_latest_video_frame`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsumer, frame: *mut FtVideoFrame) {
-    let Some(consumer) = consumer_as_mut(consumer) else {
+    let Some(mut consumer) = ptr_as_non_null(consumer) else {
         return;
     };
+    // SAFETY: consumer was checked for null and must be live and uniquely borrowed for this call.
+    let consumer = unsafe { consumer.as_mut() };
     if frame.is_null() {
         return;
     }
@@ -588,27 +602,16 @@ pub unsafe extern "C" fn ft_consumer_destroy(consumer: *mut FtConsumer) {
     }
 }
 
-fn producer_as_ref<'a>(producer: *mut FtProducer) -> Option<&'a FtProducer> {
-    if producer.is_null() {
-        None
-    } else {
-        // SAFETY: caller-provided pointer is assumed to come from ft_producer_create.
-        Some(unsafe { &*producer })
-    }
+fn ptr_as_non_null<T>(value: *mut T) -> Option<NonNull<T>> {
+    NonNull::new(value)
 }
 
-fn consumer_as_mut<'a>(consumer: *mut FtConsumer) -> Option<&'a mut FtConsumer> {
-    if consumer.is_null() {
-        None
-    } else {
-        // SAFETY: caller-provided pointer is assumed to come from ft_consumer_connect.
-        Some(unsafe { &mut *consumer })
+unsafe fn c_string_to_string(value: *const c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
     }
-}
-
-unsafe fn c_string_to_str<'a>(value: *const c_char) -> Option<&'a str> {
     // SAFETY: caller guarantees value points to a NUL-terminated C string.
-    unsafe { CStr::from_ptr(value) }.to_str().ok()
+    unsafe { CStr::from_ptr(value) }.to_str().ok().map(ToOwned::to_owned)
 }
 
 unsafe fn source_desc_from_ffi(desc: &FtSourceDesc) -> Option<SourceDesc> {

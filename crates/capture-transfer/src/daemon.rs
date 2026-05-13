@@ -40,6 +40,7 @@ pub struct DaemonFrame {
     map_len: usize,
     payload_offset: usize,
     ptr: *mut libc::c_void,
+    _lease: UnixStream,
 }
 
 impl DaemonFrame {
@@ -225,6 +226,7 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
         map_len: payload_map_len,
         payload_offset,
         ptr,
+        _lease: stream,
     })
 }
 

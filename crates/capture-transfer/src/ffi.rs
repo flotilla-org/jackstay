@@ -117,6 +117,9 @@ pub struct FtVideoFrameDesc {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: u32,
+    pub pool_id: u64,
+    pub slot_id: u64,
+    pub slot_generation: u64,
     pub payload_offset: u64,
     pub payload_len: u64,
     pub payload_map_len: u64,
@@ -682,6 +685,9 @@ fn video_frame_desc_from_ffi(desc: &FtVideoFrameDesc) -> Option<VideoFrameDesc> 
         height: desc.height,
         stride: desc.stride,
         pixel_format: pixel_format_from_ffi(desc.pixel_format)?,
+        pool_id: desc.pool_id,
+        slot_id: desc.slot_id,
+        slot_generation: desc.slot_generation,
         payload_offset: desc.payload_offset,
         payload_len: desc.payload_len,
         payload_map_len: desc.payload_map_len,
@@ -705,6 +711,9 @@ fn video_frame_desc_to_ffi(desc: &VideoFrameDesc) -> FtVideoFrameDesc {
         height: desc.height,
         stride: desc.stride,
         pixel_format: pixel_format_to_ffi(desc.pixel_format),
+        pool_id: desc.pool_id,
+        slot_id: desc.slot_id,
+        slot_generation: desc.slot_generation,
         payload_offset: desc.payload_offset,
         payload_len: desc.payload_len,
         payload_map_len: desc.payload_map_len,
@@ -894,6 +903,9 @@ mod tests {
                 height: 1,
                 stride: 8,
                 pixel_format: FT_PIXEL_FORMAT_BGRA8_UNORM,
+                pool_id: 0,
+                slot_id: 0,
+                slot_generation: 0,
                 payload_offset: 0,
                 payload_len: 0,
                 payload_map_len: 0,
@@ -939,6 +951,9 @@ mod tests {
             assert_eq!(frame.desc.sync_kind, FT_FRAME_SYNC_CPU_COPY_COMPLETE);
             assert_eq!(frame.desc.damage_kind, FT_DAMAGE_FULL_FRAME);
             assert_eq!(frame.desc.damage_base_sequence, 1);
+            assert_ne!(frame.desc.pool_id, 0);
+            assert_eq!(frame.desc.slot_id, 0);
+            assert_ne!(frame.desc.slot_generation, 0);
             assert_eq!(frame.desc.payload_len as usize, pixels.len());
             assert!(frame.desc.payload_offset + frame.desc.payload_len <= frame.desc.payload_map_len);
             assert_eq!(frame.len, pixels.len());

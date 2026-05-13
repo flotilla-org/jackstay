@@ -7,7 +7,10 @@ use std::{
 
 use crate::{
     daemon::{self, DaemonFrame, SessionInfo},
-    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId, VideoTrackDesc},
+    model::{
+        ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId,
+        VideoTrackDesc,
+    },
     state::{Event, EventKind, SessionState},
     video::{AcquiredVideoFrame, ConsumerId, VideoFrameDesc, VideoSlotManager},
 };
@@ -834,8 +837,8 @@ mod tests {
     use crate::ffi::{
         FT_CLOCK_DOMAIN_MEDIA_TIME, FT_COLOR_SPACE_UNKNOWN, FT_DAMAGE_FULL_FRAME, FT_EVENT_SOURCE_REGISTERED, FT_EVENT_TRACK_REGISTERED,
         FT_FRAME_SYNC_CPU_COPY_COMPLETE, FT_PIXEL_FORMAT_BGRA8_UNORM, FT_SOURCE_KIND_WINDOW, FT_STATUS_EMPTY, FT_STATUS_OK,
-        FT_TRACK_TYPE_VIDEO, FtConsumer, FtConsumerOptions, FtEvent, FtProducer, FtProducerOptions, FtSourceDesc, FtTrackDesc, FtVideoFrame,
-        FtVideoFrameDesc, FtVideoTrackDesc, ft_consumer_acquire_latest_video_frame, ft_consumer_connect, ft_consumer_destroy,
+        FT_TRACK_TYPE_VIDEO, FtConsumer, FtConsumerOptions, FtEvent, FtProducer, FtProducerOptions, FtSourceDesc, FtTrackDesc,
+        FtVideoFrame, FtVideoFrameDesc, FtVideoTrackDesc, ft_consumer_acquire_latest_video_frame, ft_consumer_connect, ft_consumer_destroy,
         ft_consumer_poll_event, ft_consumer_release_video_frame, ft_producer_create, ft_producer_destroy, ft_producer_publish_video_frame,
         ft_producer_register_source, ft_producer_register_track,
     };

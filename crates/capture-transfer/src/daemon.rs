@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::{
     error::{CaptureTransferError, Result},
     fdpass,
-    model::PixelFormat,
+    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat},
     video::VideoFrameDesc,
 };
 
@@ -171,6 +171,15 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
             height: frame.height,
             stride: frame.stride,
             pixel_format,
+            clock_domain: ClockDomain::Unknown,
+            color_space: ColorSpace::Unknown,
+            sync_kind: FrameSyncKind::CpuCopyComplete,
+            damage_kind: DamageKind::FullFrame,
+            damage_base_sequence: frame.sequence,
+            dropped_before_publish: 0,
+            producer_drop_count: 0,
+            evicted_count: 0,
+            consumer_skipped_count: 0,
         },
         len: frame.len,
         ptr,

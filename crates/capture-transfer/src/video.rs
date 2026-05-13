@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     error::{CaptureTransferError, Result},
-    model::{PixelFormat, TrackId},
+    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
     shm::SharedMemorySegment,
 };
 
@@ -33,6 +33,15 @@ pub struct VideoFrameDesc {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: PixelFormat,
+    pub clock_domain: ClockDomain,
+    pub color_space: ColorSpace,
+    pub sync_kind: FrameSyncKind,
+    pub damage_kind: DamageKind,
+    pub damage_base_sequence: u64,
+    pub dropped_before_publish: u64,
+    pub producer_drop_count: u64,
+    pub evicted_count: u64,
+    pub consumer_skipped_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +77,9 @@ pub struct VideoSlotManager {
     capacity_per_track: usize,
     next_frame_key: u64,
     frames_by_track: BTreeMap<TrackId, Vec<StoredFrame>>,
+    evicted_by_track: BTreeMap<TrackId, u64>,
+    last_acquired_by_consumer: BTreeMap<(ConsumerId, TrackId), u64>,
+    skipped_by_consumer: BTreeMap<(ConsumerId, TrackId), u64>,
 }
 
 impl VideoSlotManager {
@@ -77,6 +89,9 @@ impl VideoSlotManager {
             capacity_per_track: capacity_per_track.max(1),
             next_frame_key: 1,
             frames_by_track: BTreeMap::new(),
+            evicted_by_track: BTreeMap::new(),
+            last_acquired_by_consumer: BTreeMap::new(),
+            skipped_by_consumer: BTreeMap::new(),
         }
     }
 
@@ -92,7 +107,8 @@ impl VideoSlotManager {
             segment: Arc::new(segment),
             pinned_by: BTreeSet::new(),
         });
-        Self::prune_unpinned(frames, self.capacity_per_track);
+        let evicted = Self::prune_unpinned(frames, self.capacity_per_track);
+        *self.evicted_by_track.entry(track_id).or_default() += evicted;
         Ok(())
     }
 
@@ -103,8 +119,18 @@ impl VideoSlotManager {
             .and_then(|frames| frames.last_mut())
             .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
         frame.pinned_by.insert(consumer_id);
+        let consumer_key = (consumer_id, track_id);
+        let sequence = frame.desc.sequence;
+        if let Some(previous) = self.last_acquired_by_consumer.insert(consumer_key, sequence)
+            && sequence > previous.saturating_add(1)
+        {
+            *self.skipped_by_consumer.entry(consumer_key).or_default() += sequence - previous - 1;
+        }
+        let mut desc = frame.desc.clone();
+        desc.evicted_count = self.evicted_by_track.get(&track_id).copied().unwrap_or(0);
+        desc.consumer_skipped_count = self.skipped_by_consumer.get(&consumer_key).copied().unwrap_or(0);
         Ok(AcquiredVideoFrame {
-            desc: frame.desc.clone(),
+            desc,
             consumer_id,
             track_id,
             frame_key: frame.key,
@@ -117,17 +143,23 @@ impl VideoSlotManager {
             if let Some(stored) = frames.iter_mut().find(|stored| stored.key == frame.frame_key) {
                 stored.pinned_by.remove(&frame.consumer_id);
             }
-            Self::prune_unpinned(frames, self.capacity_per_track);
+            let evicted = Self::prune_unpinned(frames, self.capacity_per_track);
+            *self.evicted_by_track.entry(frame.track_id).or_default() += evicted;
         }
     }
 
     pub fn disconnect_consumer(&mut self, consumer_id: ConsumerId) {
-        for frames in self.frames_by_track.values_mut() {
+        for (track_id, frames) in &mut self.frames_by_track {
             for frame in frames.iter_mut() {
                 frame.pinned_by.remove(&consumer_id);
             }
-            Self::prune_unpinned(frames, self.capacity_per_track);
+            let evicted = Self::prune_unpinned(frames, self.capacity_per_track);
+            *self.evicted_by_track.entry(*track_id).or_default() += evicted;
         }
+        self.last_acquired_by_consumer
+            .retain(|(stored_consumer_id, _), _| *stored_consumer_id != consumer_id);
+        self.skipped_by_consumer
+            .retain(|(stored_consumer_id, _), _| *stored_consumer_id != consumer_id);
     }
 
     #[must_use]
@@ -139,21 +171,24 @@ impl VideoSlotManager {
             .count()
     }
 
-    fn prune_unpinned(frames: &mut Vec<StoredFrame>, capacity: usize) {
+    fn prune_unpinned(frames: &mut Vec<StoredFrame>, capacity: usize) -> u64 {
+        let mut evicted = 0;
         while frames.len() > capacity {
             if let Some(index) = frames.iter().position(|frame| frame.pinned_by.is_empty()) {
                 frames.remove(index);
+                evicted += 1;
             } else {
                 break;
             }
         }
+        evicted
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        model::{PixelFormat, TrackId},
+        model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
         video::{ConsumerId, VideoFrameDesc, VideoSlotManager},
     };
 
@@ -165,6 +200,15 @@ mod tests {
             height: 1,
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
+            clock_domain: ClockDomain::MediaTime,
+            color_space: ColorSpace::Unknown,
+            sync_kind: FrameSyncKind::CpuCopyComplete,
+            damage_kind: DamageKind::FullFrame,
+            damage_base_sequence: sequence,
+            dropped_before_publish: 0,
+            producer_drop_count: 0,
+            evicted_count: 0,
+            consumer_skipped_count: 0,
         }
     }
 
@@ -178,6 +222,20 @@ mod tests {
         let frame = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
         assert_eq!(frame.desc.sequence, 1);
         assert_eq!(frame.bytes(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn acquiring_latest_preserves_frame_metadata() {
+        let mut slots = VideoSlotManager::new(2);
+        let track = TrackId::new(1);
+        let mut desc = frame_desc(7);
+        desc.damage_base_sequence = 3;
+        desc.producer_drop_count = 2;
+
+        slots.publish(track, desc.clone(), &[1, 2, 3, 4]).unwrap();
+
+        let frame = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
+        assert_eq!(frame.desc, desc);
     }
 
     #[test]

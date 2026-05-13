@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     daemon::{self, DaemonFrame, SessionInfo},
-    model::{PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId, VideoTrackDesc},
+    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId, VideoTrackDesc},
     state::{Event, EventKind, SessionState},
     video::{AcquiredVideoFrame, ConsumerId, VideoFrameDesc, VideoSlotManager},
 };
@@ -648,6 +648,15 @@ fn video_frame_desc_from_ffi(desc: &FtVideoFrameDesc) -> Option<VideoFrameDesc> 
         height: desc.height,
         stride: desc.stride,
         pixel_format: pixel_format_from_ffi(desc.pixel_format)?,
+        clock_domain: ClockDomain::Unknown,
+        color_space: ColorSpace::Unknown,
+        sync_kind: FrameSyncKind::CpuCopyComplete,
+        damage_kind: DamageKind::FullFrame,
+        damage_base_sequence: desc.sequence,
+        dropped_before_publish: 0,
+        producer_drop_count: 0,
+        evicted_count: 0,
+        consumer_skipped_count: 0,
     })
 }
 

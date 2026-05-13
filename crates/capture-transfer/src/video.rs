@@ -307,6 +307,9 @@ impl VideoSlotManager {
     }
 
     fn commit_video_slot_with_key(&mut self, _key: u64, claim: ClaimedVideoSlot) -> Result<PublishedPayload> {
+        // The frame key is assigned by the caller and stored with the returned
+        // payload. It is accepted here to keep this helper paired with the
+        // publish path until ring headers carry their own key fields.
         if let Some(pending_claims) = self.pending_claims_by_track.get_mut(&claim.track_id) {
             pending_claims.remove(&(claim.pool_generation, claim.slot_index));
         }
@@ -476,6 +479,8 @@ impl VideoSlotManager {
                 next_slot: 0,
             },
         );
+        // Outstanding claims for the old generation still own their mmap Arc,
+        // but clearing the pending set makes later commits unpublishable no-ops.
         self.pending_claims_by_track.remove(&track_id);
         Ok(())
     }

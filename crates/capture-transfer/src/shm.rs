@@ -26,7 +26,10 @@ pub struct SharedMemorySegment {
 // manager so pinned ranges are not overwritten. Drop unmaps only when the final
 // owner goes away.
 unsafe impl Send for SharedMemorySegment {}
-// SAFETY: See the Send impl.
+// SAFETY: Interior-mutable writes through with_slice_at_mut/write_at are safe
+// across threads only under the VideoSlotManager claim/commit discipline: claims
+// reserve exclusive slot ranges, and committed frames are not overwritten while
+// pinned by consumers.
 unsafe impl Sync for SharedMemorySegment {}
 
 impl SharedMemorySegment {

@@ -106,6 +106,9 @@ typedef struct ft_video_frame_desc {
   uint32_t height;
   uint32_t stride;
   uint32_t pixel_format;
+  uint64_t payload_offset;
+  uint64_t payload_len;
+  uint64_t payload_map_len;
   uint32_t clock_domain;
   uint32_t color_space;
   uint32_t sync_kind;

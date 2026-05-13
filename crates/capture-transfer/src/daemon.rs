@@ -37,14 +37,17 @@ pub struct SessionInfo {
 pub struct DaemonFrame {
     pub desc: VideoFrameDesc,
     pub len: usize,
+    map_len: usize,
+    payload_offset: usize,
     ptr: *mut libc::c_void,
 }
 
 impl DaemonFrame {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        // SAFETY: ptr is a live read-only mapping of len bytes until Drop.
-        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+        // SAFETY: ptr is a live read-only mapping of map_len bytes until Drop,
+        // and payload_offset/len were validated against that mapping.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>().add(self.payload_offset), self.len) }
     }
 }
 
@@ -52,7 +55,7 @@ impl Drop for DaemonFrame {
     fn drop(&mut self) {
         // SAFETY: ptr/len describe the mapping created in latest_frame.
         unsafe {
-            libc::munmap(self.ptr, self.len);
+            libc::munmap(self.ptr, self.map_len);
         }
     }
 }
@@ -85,6 +88,9 @@ struct LatestFrameWire {
     height: u32,
     stride: u32,
     pixel_format: String,
+    payload_offset: u64,
+    payload_len: u64,
+    payload_map_len: u64,
     clock_domain: String,
     color_space: String,
     sync_kind: String,
@@ -151,18 +157,36 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
     let color_space = parse_color_space(&frame.color_space)?;
     let sync_kind = parse_sync_kind(&frame.sync_kind)?;
     let damage_kind = parse_damage_kind(&frame.damage_kind)?;
-    if frame.len == 0 {
+    let payload_offset = usize::try_from(frame.payload_offset).map_err(|_| CaptureTransferError::DaemonTransport {
+        operation: "mmap-frame",
+        message: "payload offset does not fit usize".to_string(),
+    })?;
+    let payload_len = usize::try_from(frame.payload_len).map_err(|_| CaptureTransferError::DaemonTransport {
+        operation: "mmap-frame",
+        message: "payload length does not fit usize".to_string(),
+    })?;
+    let payload_map_len = usize::try_from(frame.payload_map_len).map_err(|_| CaptureTransferError::DaemonTransport {
+        operation: "mmap-frame",
+        message: "payload map length does not fit usize".to_string(),
+    })?;
+    if payload_len == 0 || frame.len != payload_len {
         return Err(CaptureTransferError::DaemonTransport {
             operation: "mmap-frame",
             message: "frame length is zero".to_string(),
         });
     }
+    if payload_offset > payload_map_len || payload_len > payload_map_len - payload_offset {
+        return Err(CaptureTransferError::DaemonTransport {
+            operation: "mmap-frame",
+            message: "payload range exceeds mapped length".to_string(),
+        });
+    }
 
-    // SAFETY: fd is valid, len is supplied by daemon metadata, and mapping is read-only.
+    // SAFETY: fd is valid, map length is supplied by daemon metadata, and mapping is read-only.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            frame.len,
+            payload_map_len,
             libc::PROT_READ,
             libc::MAP_SHARED,
             fd.as_raw_fd(),
@@ -184,6 +208,9 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
             height: frame.height,
             stride: frame.stride,
             pixel_format,
+            payload_offset: frame.payload_offset,
+            payload_len: frame.payload_len,
+            payload_map_len: frame.payload_map_len,
             clock_domain,
             color_space,
             sync_kind,
@@ -194,7 +221,9 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
             evicted_count: frame.evicted_count,
             consumer_skipped_count: frame.consumer_skipped_count,
         },
-        len: frame.len,
+        len: payload_len,
+        map_len: payload_map_len,
+        payload_offset,
         ptr,
     })
 }

@@ -117,6 +117,9 @@ pub struct FtVideoFrameDesc {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: u32,
+    pub payload_offset: u64,
+    pub payload_len: u64,
+    pub payload_map_len: u64,
     pub clock_domain: u32,
     pub color_space: u32,
     pub sync_kind: u32,
@@ -213,7 +216,7 @@ pub unsafe extern "C" fn ft_producer_create(_options: *const FtProducerOptions, 
     let producer = Box::new(FtProducer {
         inner: Rc::new(RefCell::new(ProducerInner {
             state: SessionState::new(),
-            video: VideoSlotManager::new(3),
+            video: VideoSlotManager::new_reusable_pool(3),
             next_consumer_id: 0,
         })),
     });
@@ -679,6 +682,9 @@ fn video_frame_desc_from_ffi(desc: &FtVideoFrameDesc) -> Option<VideoFrameDesc> 
         height: desc.height,
         stride: desc.stride,
         pixel_format: pixel_format_from_ffi(desc.pixel_format)?,
+        payload_offset: desc.payload_offset,
+        payload_len: desc.payload_len,
+        payload_map_len: desc.payload_map_len,
         clock_domain: clock_domain_from_ffi(desc.clock_domain)?,
         color_space: color_space_from_ffi(desc.color_space)?,
         sync_kind: sync_kind_from_ffi(desc.sync_kind)?,
@@ -699,6 +705,9 @@ fn video_frame_desc_to_ffi(desc: &VideoFrameDesc) -> FtVideoFrameDesc {
         height: desc.height,
         stride: desc.stride,
         pixel_format: pixel_format_to_ffi(desc.pixel_format),
+        payload_offset: desc.payload_offset,
+        payload_len: desc.payload_len,
+        payload_map_len: desc.payload_map_len,
         clock_domain: clock_domain_to_ffi(desc.clock_domain),
         color_space: color_space_to_ffi(desc.color_space),
         sync_kind: sync_kind_to_ffi(desc.sync_kind),
@@ -885,6 +894,9 @@ mod tests {
                 height: 1,
                 stride: 8,
                 pixel_format: FT_PIXEL_FORMAT_BGRA8_UNORM,
+                payload_offset: 0,
+                payload_len: 0,
+                payload_map_len: 0,
                 clock_domain: FT_CLOCK_DOMAIN_MEDIA_TIME,
                 color_space: FT_COLOR_SPACE_UNKNOWN,
                 sync_kind: FT_FRAME_SYNC_CPU_COPY_COMPLETE,
@@ -927,6 +939,8 @@ mod tests {
             assert_eq!(frame.desc.sync_kind, FT_FRAME_SYNC_CPU_COPY_COMPLETE);
             assert_eq!(frame.desc.damage_kind, FT_DAMAGE_FULL_FRAME);
             assert_eq!(frame.desc.damage_base_sequence, 1);
+            assert_eq!(frame.desc.payload_len as usize, pixels.len());
+            assert!(frame.desc.payload_offset + frame.desc.payload_len <= frame.desc.payload_map_len);
             assert_eq!(frame.len, pixels.len());
             assert!(!frame.data.is_null());
 

@@ -85,6 +85,15 @@ struct LatestFrameWire {
     height: u32,
     stride: u32,
     pixel_format: String,
+    clock_domain: String,
+    color_space: String,
+    sync_kind: String,
+    damage_kind: String,
+    damage_base_sequence: u64,
+    dropped_before_publish: u64,
+    producer_drop_count: u64,
+    evicted_count: u64,
+    consumer_skipped_count: u64,
     len: usize,
 }
 
@@ -138,6 +147,10 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
         .map_err(|error| daemon_error("read-latest-response", error))?;
     let frame: LatestFrameWire = serde_json::from_str(line.trim_end()).map_err(|error| daemon_error("parse-latest-frame", error))?;
     let pixel_format = parse_pixel_format(&frame.pixel_format)?;
+    let clock_domain = parse_clock_domain(&frame.clock_domain)?;
+    let color_space = parse_color_space(&frame.color_space)?;
+    let sync_kind = parse_sync_kind(&frame.sync_kind)?;
+    let damage_kind = parse_damage_kind(&frame.damage_kind)?;
     if frame.len == 0 {
         return Err(CaptureTransferError::DaemonTransport {
             operation: "mmap-frame",
@@ -171,15 +184,15 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
             height: frame.height,
             stride: frame.stride,
             pixel_format,
-            clock_domain: ClockDomain::Unknown,
-            color_space: ColorSpace::Unknown,
-            sync_kind: FrameSyncKind::CpuCopyComplete,
-            damage_kind: DamageKind::FullFrame,
-            damage_base_sequence: frame.sequence,
-            dropped_before_publish: 0,
-            producer_drop_count: 0,
-            evicted_count: 0,
-            consumer_skipped_count: 0,
+            clock_domain,
+            color_space,
+            sync_kind,
+            damage_kind,
+            damage_base_sequence: frame.damage_base_sequence,
+            dropped_before_publish: frame.dropped_before_publish,
+            producer_drop_count: frame.producer_drop_count,
+            evicted_count: frame.evicted_count,
+            consumer_skipped_count: frame.consumer_skipped_count,
         },
         len: frame.len,
         ptr,
@@ -250,6 +263,57 @@ fn parse_pixel_format(value: &str) -> Result<PixelFormat> {
         "rgba8_unorm" => Ok(PixelFormat::Rgba8Unorm),
         other => Err(CaptureTransferError::DaemonTransport {
             operation: "parse-pixel-format",
+            message: other.to_string(),
+        }),
+    }
+}
+
+fn parse_clock_domain(value: &str) -> Result<ClockDomain> {
+    match value {
+        "unknown" => Ok(ClockDomain::Unknown),
+        "unix_time" => Ok(ClockDomain::UnixTime),
+        "media_time" => Ok(ClockDomain::MediaTime),
+        "host_time" => Ok(ClockDomain::HostTime),
+        other => Err(CaptureTransferError::DaemonTransport {
+            operation: "parse-clock-domain",
+            message: other.to_string(),
+        }),
+    }
+}
+
+fn parse_color_space(value: &str) -> Result<ColorSpace> {
+    match value {
+        "unknown" => Ok(ColorSpace::Unknown),
+        "srgb" => Ok(ColorSpace::Srgb),
+        other => Err(CaptureTransferError::DaemonTransport {
+            operation: "parse-color-space",
+            message: other.to_string(),
+        }),
+    }
+}
+
+fn parse_sync_kind(value: &str) -> Result<FrameSyncKind> {
+    match value {
+        "unknown" => Ok(FrameSyncKind::Unknown),
+        "cpu_copy_complete" => Ok(FrameSyncKind::CpuCopyComplete),
+        "sck_sample_ready" => Ok(FrameSyncKind::SckSampleReady),
+        "native_timeline" => Ok(FrameSyncKind::NativeTimeline),
+        other => Err(CaptureTransferError::DaemonTransport {
+            operation: "parse-sync-kind",
+            message: other.to_string(),
+        }),
+    }
+}
+
+fn parse_damage_kind(value: &str) -> Result<DamageKind> {
+    match value {
+        "unknown" => Ok(DamageKind::Unknown),
+        "full_frame" => Ok(DamageKind::FullFrame),
+        "none" => Ok(DamageKind::None),
+        "inline_rects" => Ok(DamageKind::InlineRects),
+        "sidecar_rects" => Ok(DamageKind::SidecarRects),
+        other => Err(CaptureTransferError::DaemonTransport {
+            operation: "parse-damage-kind",
             message: other.to_string(),
         }),
     }

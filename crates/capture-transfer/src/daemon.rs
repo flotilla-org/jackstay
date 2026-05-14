@@ -37,10 +37,10 @@ pub struct SessionInfo {
 pub struct DaemonFrame {
     pub desc: VideoFrameDesc,
     pub len: usize,
+    lease_id: u64,
     map_len: usize,
     payload_offset: usize,
     ptr: *mut libc::c_void,
-    _lease: UnixStream,
 }
 
 impl DaemonFrame {
@@ -54,11 +54,18 @@ impl DaemonFrame {
 
 impl Drop for DaemonFrame {
     fn drop(&mut self) {
-        // SAFETY: ptr/len describe the mapping created in latest_frame.
+        // SAFETY: ptr/len describe the mapping created in DaemonConsumer::latest_frame.
         unsafe {
             libc::munmap(self.ptr, self.map_len);
         }
     }
+}
+
+#[derive(Debug)]
+pub struct DaemonConsumer {
+    info: SessionInfo,
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +91,7 @@ struct SessionInfoWire {
 #[derive(Debug, Deserialize)]
 struct LatestFrameWire {
     sequence: u64,
+    lease_id: u64,
     timestamp_ns: u64,
     width: u32,
     height: u32,
@@ -105,6 +113,62 @@ struct LatestFrameWire {
     evicted_count: u64,
     consumer_skipped_count: u64,
     len: usize,
+}
+
+impl DaemonConsumer {
+    pub fn connect(info: SessionInfo) -> Result<Self> {
+        let stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-fd-socket", error))?;
+        let reader_stream = stream.try_clone().map_err(|error| daemon_error("clone-fd-stream", error))?;
+        Ok(Self {
+            info,
+            stream,
+            reader: BufReader::new(reader_stream),
+        })
+    }
+
+    pub fn latest_frame(&mut self, track_id: u64) -> Result<DaemonFrame> {
+        writeln!(
+            self.stream,
+            "{}",
+            serde_json::json!({
+                "op": "latest_video_frame",
+                "session_id": self.info.session_id,
+                "track_id": track_id
+            })
+        )
+        .map_err(|error| daemon_error("write-latest-request", error))?;
+        self.stream.flush().map_err(|error| daemon_error("flush-latest-request", error))?;
+
+        let fd = fdpass::recv_fd(&self.stream)?;
+        let mut line = String::new();
+        let bytes_read = self
+            .reader
+            .read_line(&mut line)
+            .map_err(|error| daemon_error("read-latest-response", error))?;
+        if bytes_read == 0 {
+            return Err(CaptureTransferError::DaemonTransport {
+                operation: "read-latest-response",
+                message: "daemon closed fd socket".to_string(),
+            });
+        }
+        let frame: LatestFrameWire = serde_json::from_str(line.trim_end()).map_err(|error| daemon_error("parse-latest-frame", error))?;
+        daemon_frame_from_wire(fd, frame)
+    }
+
+    pub fn release_frame(&mut self, frame: DaemonFrame) -> Result<()> {
+        let lease_id = frame.lease_id;
+        drop(frame);
+        writeln!(
+            self.stream,
+            "{}",
+            serde_json::json!({
+                "op": "release_video_frame",
+                "lease_id": lease_id
+            })
+        )
+        .map_err(|error| daemon_error("write-release-request", error))?;
+        self.stream.flush().map_err(|error| daemon_error("flush-release-request", error))
+    }
 }
 
 pub fn create_synthetic_session(control_socket_path: &str) -> Result<SyntheticSession> {
@@ -134,28 +198,7 @@ pub fn get_session(control_socket_path: &str, session_id: &str) -> Result<Sessio
     })
 }
 
-pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
-    // Prototype transport: one fd-socket connection per frame. Replace this
-    // with a streaming/subscription protocol before polling at display rate.
-    let mut stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-fd-socket", error))?;
-    writeln!(
-        stream,
-        "{}",
-        serde_json::json!({
-            "session_id": info.session_id,
-            "track_id": track_id
-        })
-    )
-    .map_err(|error| daemon_error("write-latest-request", error))?;
-    let fd = fdpass::recv_fd(&stream)?;
-
-    let reader_stream = stream.try_clone().map_err(|error| daemon_error("clone-fd-stream", error))?;
-    let mut reader = BufReader::new(reader_stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|error| daemon_error("read-latest-response", error))?;
-    let frame: LatestFrameWire = serde_json::from_str(line.trim_end()).map_err(|error| daemon_error("parse-latest-frame", error))?;
+fn daemon_frame_from_wire(fd: std::os::fd::OwnedFd, frame: LatestFrameWire) -> Result<DaemonFrame> {
     let pixel_format = parse_pixel_format(&frame.pixel_format)?;
     let clock_domain = parse_clock_domain(&frame.clock_domain)?;
     let color_space = parse_color_space(&frame.color_space)?;
@@ -229,10 +272,10 @@ pub fn latest_frame(info: &SessionInfo, track_id: u64) -> Result<DaemonFrame> {
             consumer_skipped_count: frame.consumer_skipped_count,
         },
         len: payload_len,
+        lease_id: frame.lease_id,
         map_len: payload_map_len,
         payload_offset,
         ptr,
-        _lease: stream,
     })
 }
 
@@ -365,7 +408,15 @@ fn daemon_error(operation: &'static str, error: impl std::fmt::Display) -> Captu
 
 #[cfg(test)]
 mod tests {
-    use super::parse_http_response;
+    use std::{
+        fs::File,
+        io::{BufRead, BufReader, Seek, SeekFrom, Write},
+        os::{fd::AsRawFd, unix::net::UnixListener},
+        thread,
+    };
+
+    use super::{DaemonConsumer, SessionInfo, parse_http_response};
+    use crate::{fdpass, model::PixelFormat};
 
     #[test]
     fn parses_http_body() {
@@ -377,5 +428,107 @@ mod tests {
     fn rejects_non_200_status_without_substring_match() {
         let error = parse_http_response("HTTP/1.1 1200 Weird\r\ncontent-length: 2\r\n\r\n{}").unwrap_err();
         assert!(error.to_string().contains("1200 Weird"));
+    }
+
+    #[test]
+    fn daemon_consumer_reuses_connection_and_releases_by_lease_id() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let first_file = tempfile_file_with_contents(b"abcd");
+            fdpass::send_fd(&stream, first_file.as_raw_fd()).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json(11, 1, 4)).unwrap();
+
+            assert_release_request(&mut reader, 11);
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let second_file = tempfile_file_with_contents(b"wxyz");
+            fdpass::send_fd(&stream, second_file.as_raw_fd()).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json(12, 2, 4)).unwrap();
+
+            assert_release_request(&mut reader, 12);
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let first = consumer.latest_frame(7).unwrap();
+        assert_eq!(first.desc.sequence, 1);
+        assert_eq!(first.bytes(), b"abcd");
+        consumer.release_frame(first).unwrap();
+
+        let second = consumer.latest_frame(7).unwrap();
+        assert_eq!(second.desc.sequence, 2);
+        assert_eq!(second.bytes(), b"wxyz");
+        consumer.release_frame(second).unwrap();
+
+        server.join().unwrap();
+    }
+
+    fn assert_latest_request(reader: &mut BufReader<std::os::unix::net::UnixStream>, session_id: &str, track_id: u64) {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(request["op"], "latest_video_frame");
+        assert_eq!(request["session_id"], session_id);
+        assert_eq!(request["track_id"], track_id);
+    }
+
+    fn assert_release_request(reader: &mut BufReader<std::os::unix::net::UnixStream>, lease_id: u64) {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(request["op"], "release_video_frame");
+        assert_eq!(request["lease_id"], lease_id);
+    }
+
+    fn latest_frame_json(lease_id: u64, sequence: u64, payload_len: u64) -> serde_json::Value {
+        serde_json::json!({
+            "sequence": sequence,
+            "lease_id": lease_id,
+            "timestamp_ns": 100,
+            "width": 2,
+            "height": 1,
+            "stride": 8,
+            "pixel_format": "bgra8_unorm",
+            "pool_id": 1,
+            "slot_id": 0,
+            "slot_generation": sequence,
+            "payload_offset": 0,
+            "payload_len": payload_len,
+            "payload_map_len": payload_len,
+            "clock_domain": "media_time",
+            "color_space": "srgb",
+            "sync_kind": "cpu_copy_complete",
+            "damage_kind": "full_frame",
+            "damage_base_sequence": sequence,
+            "dropped_before_publish": 0,
+            "producer_drop_count": 0,
+            "evicted_count": 0,
+            "consumer_skipped_count": 0,
+            "len": payload_len
+        })
+    }
+
+    fn tempfile_file_with_contents(contents: &[u8]) -> File {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(contents).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file
     }
 }

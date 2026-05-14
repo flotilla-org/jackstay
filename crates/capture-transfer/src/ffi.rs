@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    daemon::{self, DaemonFrame, SessionInfo},
+    daemon::{self, DaemonConsumer, DaemonFrame},
     model::{
         ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId,
         VideoTrackDesc,
@@ -191,7 +191,7 @@ enum FtConsumerKind {
         event_cursor: usize,
     },
     Daemon {
-        info: SessionInfo,
+        consumer: DaemonConsumer,
         events: Vec<FtEvent>,
         event_cursor: usize,
     },
@@ -470,9 +470,12 @@ pub unsafe extern "C" fn ft_consumer_connect_session(descriptor: *const FtSessio
             pixel_format: pixel_format_to_ffi(info.pixel_format),
         },
     ];
+    let Ok(daemon_consumer) = DaemonConsumer::connect(info) else {
+        return FT_STATUS_ERROR;
+    };
     let consumer = Box::new(FtConsumer {
         kind: FtConsumerKind::Daemon {
-            info,
+            consumer: daemon_consumer,
             events,
             event_cursor: 0,
         },
@@ -565,7 +568,7 @@ pub unsafe extern "C" fn ft_consumer_acquire_latest_video_frame(
                 Err(_) => FT_STATUS_ERROR,
             }
         }
-        FtConsumerKind::Daemon { info, .. } => match daemon::latest_frame(info, track_id) {
+        FtConsumerKind::Daemon { consumer, .. } => match consumer.latest_frame(track_id) {
             Ok(frame) => {
                 let desc = video_frame_desc_to_ffi(&frame.desc);
                 let data = frame.bytes().as_ptr().cast::<c_void>();
@@ -617,7 +620,11 @@ pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsum
         FtFrameHandle::InProcess { inner, frame } => {
             inner.borrow_mut().video.release(frame);
         }
-        FtFrameHandle::Daemon(_frame) => {}
+        FtFrameHandle::Daemon(frame) => {
+            if let FtConsumerKind::Daemon { consumer, .. } = &mut consumer.kind {
+                let _ = consumer.release_frame(frame);
+            }
+        }
     }
     frame.handle = ptr::null_mut();
     frame.data = ptr::null();

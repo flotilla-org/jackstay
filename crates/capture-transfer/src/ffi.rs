@@ -622,6 +622,8 @@ pub unsafe extern "C" fn ft_consumer_release_video_frame(consumer: *mut FtConsum
         }
         FtFrameHandle::Daemon(frame) => {
             if let FtConsumerKind::Daemon { consumer, .. } = &mut consumer.kind {
+                // Best effort: the C ABI release hook cannot report I/O errors.
+                // If this write fails, connection close releases remaining leases.
                 let _ = consumer.release_frame(frame);
             }
         }

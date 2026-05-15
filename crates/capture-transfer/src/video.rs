@@ -66,6 +66,7 @@ pub struct AcquiredVideoFrame {
     consumer_id: ConsumerId,
     track_id: TrackId,
     frame_key: u64,
+    producer_cursor: u64,
     segment: Arc<SharedMemorySegment>,
     pool_registration: Option<CpuPoolRegistration>,
 }
@@ -134,6 +135,7 @@ struct StoredFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameRingEntry {
+    pub producer_cursor: u64,
     pub sequence: u64,
     pub frame_key: u64,
     pub pool_id: u64,
@@ -143,14 +145,25 @@ pub struct FrameRingEntry {
     pub payload_len: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingFrameRingEntry {
+    sequence: u64,
+    frame_key: u64,
+    pool_id: u64,
+    slot_id: u64,
+    slot_generation: u64,
+    payload_offset: u64,
+    payload_len: u64,
+}
+
 #[derive(Debug)]
-struct TrackFrameRing {
+struct MetadataRing {
     entries: Vec<Option<FrameRingEntry>>,
     next_index: usize,
     len: usize,
 }
 
-impl TrackFrameRing {
+impl MetadataRing {
     fn new(capacity: usize) -> Self {
         Self {
             entries: vec![None; capacity.max(1)],
@@ -186,6 +199,114 @@ impl TrackFrameRing {
             })
             .collect()
     }
+
+    fn capacity(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Debug)]
+struct TrackRingControl {
+    ring: MetadataRing,
+    producer_cursor: u64,
+    latest_sequence: Option<u64>,
+}
+
+impl TrackRingControl {
+    fn new(capacity: usize) -> Self {
+        Self {
+            ring: MetadataRing::new(capacity),
+            producer_cursor: 0,
+            latest_sequence: None,
+        }
+    }
+
+    fn push(&mut self, entry: PendingFrameRingEntry) {
+        self.producer_cursor = self.producer_cursor.saturating_add(1);
+        self.latest_sequence = Some(entry.sequence);
+        self.ring.push(FrameRingEntry {
+            producer_cursor: self.producer_cursor,
+            sequence: entry.sequence,
+            frame_key: entry.frame_key,
+            pool_id: entry.pool_id,
+            slot_id: entry.slot_id,
+            slot_generation: entry.slot_generation,
+            payload_offset: entry.payload_offset,
+            payload_len: entry.payload_len,
+        });
+    }
+
+    fn latest(&self) -> Option<&FrameRingEntry> {
+        self.ring.latest()
+    }
+
+    fn ring_snapshot(&self) -> Vec<FrameRingEntry> {
+        self.ring.snapshot()
+    }
+
+    fn snapshot(&self) -> TrackRingControlSnapshot {
+        TrackRingControlSnapshot {
+            capacity: self.ring.capacity(),
+            producer_cursor: self.producer_cursor,
+            latest_sequence: self.latest_sequence,
+            entries: self.ring_snapshot(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConsumerRingCursor {
+    last_acquired_cursor: Option<u64>,
+    last_acquired_sequence: Option<u64>,
+    // Tracked for the future shared control page; frame pinning still gates
+    // actual slot reuse in this in-process prototype.
+    release_cursor: u64,
+    skipped_count: u64,
+    acquired_count: u64,
+}
+
+impl ConsumerRingCursor {
+    fn acquire(&mut self, entry: &FrameRingEntry) {
+        if let Some(previous) = self.last_acquired_cursor
+            && entry.producer_cursor > previous.saturating_add(1)
+        {
+            self.skipped_count = self.skipped_count.saturating_add(entry.producer_cursor - previous - 1);
+        }
+        self.last_acquired_cursor = Some(entry.producer_cursor);
+        self.last_acquired_sequence = Some(entry.sequence);
+        self.acquired_count = self.acquired_count.saturating_add(1);
+    }
+
+    fn release(&mut self, producer_cursor: u64) {
+        self.release_cursor = self.release_cursor.max(producer_cursor);
+    }
+
+    fn snapshot(&self) -> ConsumerRingCursorSnapshot {
+        ConsumerRingCursorSnapshot {
+            last_acquired_cursor: self.last_acquired_cursor,
+            last_acquired_sequence: self.last_acquired_sequence,
+            release_cursor: self.release_cursor,
+            skipped_count: self.skipped_count,
+            acquired_count: self.acquired_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackRingControlSnapshot {
+    pub capacity: usize,
+    pub producer_cursor: u64,
+    pub latest_sequence: Option<u64>,
+    pub entries: Vec<FrameRingEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerRingCursorSnapshot {
+    pub last_acquired_cursor: Option<u64>,
+    pub last_acquired_sequence: Option<u64>,
+    pub release_cursor: u64,
+    pub skipped_count: u64,
+    pub acquired_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,12 +342,11 @@ pub struct VideoSlotManager {
     next_pool_id: u64,
     next_pool_generation: u64,
     frames_by_track: BTreeMap<TrackId, Vec<StoredFrame>>,
-    rings_by_track: BTreeMap<TrackId, TrackFrameRing>,
+    controls_by_track: BTreeMap<TrackId, TrackRingControl>,
     pools_by_track: BTreeMap<TrackId, TrackPool>,
     pending_claims_by_track: BTreeMap<TrackId, BTreeSet<(u64, usize)>>,
     evicted_by_track: BTreeMap<TrackId, u64>,
-    last_acquired_by_consumer: BTreeMap<(ConsumerId, TrackId), u64>,
-    skipped_by_consumer: BTreeMap<(ConsumerId, TrackId), u64>,
+    consumer_cursors: BTreeMap<(ConsumerId, TrackId), ConsumerRingCursor>,
 }
 
 impl VideoSlotManager {
@@ -239,12 +359,11 @@ impl VideoSlotManager {
             next_pool_id: 1,
             next_pool_generation: 1,
             frames_by_track: BTreeMap::new(),
-            rings_by_track: BTreeMap::new(),
+            controls_by_track: BTreeMap::new(),
             pools_by_track: BTreeMap::new(),
             pending_claims_by_track: BTreeMap::new(),
             evicted_by_track: BTreeMap::new(),
-            last_acquired_by_consumer: BTreeMap::new(),
-            skipped_by_consumer: BTreeMap::new(),
+            consumer_cursors: BTreeMap::new(),
         }
     }
 
@@ -360,7 +479,7 @@ impl VideoSlotManager {
     }
 
     fn store_published_payload(&mut self, track_id: TrackId, key: u64, payload: PublishedPayload) {
-        let ring_entry = FrameRingEntry {
+        let ring_entry = PendingFrameRingEntry {
             sequence: payload.desc.sequence,
             frame_key: key,
             pool_id: payload.desc.pool_id,
@@ -379,48 +498,48 @@ impl VideoSlotManager {
             pool_registration: payload.pool_registration,
             pinned_by: BTreeSet::new(),
         });
-        self.rings_by_track
+        self.controls_by_track
             .entry(track_id)
-            .or_insert_with(|| TrackFrameRing::new(self.capacity_per_track))
+            .or_insert_with(|| TrackRingControl::new(self.capacity_per_track))
             .push(ring_entry);
         let evicted = Self::prune_unpinned(frames, self.capacity_per_track);
         *self.evicted_by_track.entry(track_id).or_default() += evicted;
     }
 
     pub fn acquire_latest(&mut self, consumer_id: ConsumerId, track_id: TrackId) -> Result<AcquiredVideoFrame> {
-        let frame_key = self
-            .rings_by_track
+        let entry = self
+            .controls_by_track
             .get(&track_id)
-            .and_then(TrackFrameRing::latest)
-            .map(|entry| entry.frame_key)
+            .and_then(TrackRingControl::latest)
+            .cloned()
             .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
         let frame = self
             .frames_by_track
             .get_mut(&track_id)
-            .and_then(|frames| frames.iter_mut().find(|frame| frame.key == frame_key))
+            .and_then(|frames| frames.iter_mut().find(|frame| frame.key == entry.frame_key))
             .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
         frame.pinned_by.insert(consumer_id);
         let consumer_key = (consumer_id, track_id);
-        let sequence = frame.desc.sequence;
-        if let Some(previous) = self.last_acquired_by_consumer.insert(consumer_key, sequence)
-            && sequence > previous.saturating_add(1)
-        {
-            *self.skipped_by_consumer.entry(consumer_key).or_default() += sequence - previous - 1;
-        }
+        let cursor = self.consumer_cursors.entry(consumer_key).or_default();
+        cursor.acquire(&entry);
         let mut desc = frame.desc.clone();
         desc.evicted_count = self.evicted_by_track.get(&track_id).copied().unwrap_or(0);
-        desc.consumer_skipped_count = self.skipped_by_consumer.get(&consumer_key).copied().unwrap_or(0);
+        desc.consumer_skipped_count = cursor.skipped_count;
         Ok(AcquiredVideoFrame {
             desc,
             consumer_id,
             track_id,
             frame_key: frame.key,
+            producer_cursor: entry.producer_cursor,
             segment: Arc::clone(&frame.segment),
             pool_registration: frame.pool_registration.clone(),
         })
     }
 
     pub fn release(&mut self, frame: AcquiredVideoFrame) {
+        if let Some(cursor) = self.consumer_cursors.get_mut(&(frame.consumer_id, frame.track_id)) {
+            cursor.release(frame.producer_cursor);
+        }
         if let Some(frames) = self.frames_by_track.get_mut(&frame.track_id) {
             if let Some(stored) = frames.iter_mut().find(|stored| stored.key == frame.frame_key) {
                 stored.pinned_by.remove(&frame.consumer_id);
@@ -438,9 +557,7 @@ impl VideoSlotManager {
             let evicted = Self::prune_unpinned(frames, self.capacity_per_track);
             *self.evicted_by_track.entry(*track_id).or_default() += evicted;
         }
-        self.last_acquired_by_consumer
-            .retain(|(stored_consumer_id, _), _| *stored_consumer_id != consumer_id);
-        self.skipped_by_consumer
+        self.consumer_cursors
             .retain(|(stored_consumer_id, _), _| *stored_consumer_id != consumer_id);
     }
 
@@ -455,7 +572,21 @@ impl VideoSlotManager {
 
     #[must_use]
     pub fn debug_ring_snapshot(&self, track_id: TrackId) -> Vec<FrameRingEntry> {
-        self.rings_by_track.get(&track_id).map_or_else(Vec::new, TrackFrameRing::snapshot)
+        self.controls_by_track
+            .get(&track_id)
+            .map_or_else(Vec::new, TrackRingControl::ring_snapshot)
+    }
+
+    #[must_use]
+    pub fn debug_control_snapshot(&self, track_id: TrackId) -> Option<TrackRingControlSnapshot> {
+        self.controls_by_track.get(&track_id).map(TrackRingControl::snapshot)
+    }
+
+    #[must_use]
+    pub fn debug_consumer_cursor_snapshot(&self, consumer_id: ConsumerId, track_id: TrackId) -> Option<ConsumerRingCursorSnapshot> {
+        self.consumer_cursors
+            .get(&(consumer_id, track_id))
+            .map(ConsumerRingCursor::snapshot)
     }
 
     fn prune_unpinned(frames: &mut Vec<StoredFrame>, capacity: usize) -> u64 {
@@ -795,6 +926,115 @@ mod tests {
         let latest = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
         assert_eq!(latest.desc.sequence, 3);
         assert_eq!(latest.bytes(), &[3]);
+    }
+
+    #[test]
+    fn ring_control_snapshot_tracks_producer_cursor_and_latest_sequence() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+
+        let control = slots.debug_control_snapshot(track).unwrap();
+        assert_eq!(control.capacity, 2);
+        assert_eq!(control.producer_cursor, 3);
+        assert_eq!(control.latest_sequence, Some(3));
+        assert_eq!(
+            control
+                .entries
+                .iter()
+                .map(|entry| (entry.producer_cursor, entry.sequence))
+                .collect::<Vec<_>>(),
+            vec![(2, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn slow_consumer_skip_count_uses_ring_cursor_after_wraparound() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        let first = slots.acquire_latest(consumer, track).unwrap();
+        assert_eq!(first.desc.consumer_skipped_count, 0);
+        slots.release(first);
+
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+        slots.publish(track, frame_desc(4), &[4]).unwrap();
+
+        let latest = slots.acquire_latest(consumer, track).unwrap();
+        assert_eq!(latest.desc.sequence, 4);
+        assert_eq!(latest.desc.consumer_skipped_count, 2);
+
+        let cursor = slots.debug_consumer_cursor_snapshot(consumer, track).unwrap();
+        assert_eq!(cursor.last_acquired_cursor, Some(4));
+        assert_eq!(cursor.skipped_count, 2);
+        assert_eq!(cursor.acquired_count, 2);
+    }
+
+    #[test]
+    fn releasing_frame_advances_consumer_release_cursor() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        let frame = slots.acquire_latest(consumer, track).unwrap();
+
+        let cursor = slots.debug_consumer_cursor_snapshot(consumer, track).unwrap();
+        assert_eq!(cursor.last_acquired_cursor, Some(1));
+        assert_eq!(cursor.release_cursor, 0);
+
+        slots.release(frame);
+
+        let cursor = slots.debug_consumer_cursor_snapshot(consumer, track).unwrap();
+        assert_eq!(cursor.last_acquired_cursor, Some(1));
+        assert_eq!(cursor.release_cursor, 1);
+    }
+
+    #[test]
+    fn consumers_track_independent_ring_cursors_on_same_track() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+        let fast = ConsumerId::new(7);
+        let slow = ConsumerId::new(8);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        let fast_first = slots.acquire_latest(fast, track).unwrap();
+        let slow_first = slots.acquire_latest(slow, track).unwrap();
+        slots.release(fast_first);
+
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        let fast_second = slots.acquire_latest(fast, track).unwrap();
+        slots.release(fast_second);
+
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+        slots.publish(track, frame_desc(4), &[4]).unwrap();
+
+        let fast_latest = slots.acquire_latest(fast, track).unwrap();
+        let slow_latest = slots.acquire_latest(slow, track).unwrap();
+
+        assert_eq!(fast_latest.desc.consumer_skipped_count, 1);
+        assert_eq!(slow_latest.desc.consumer_skipped_count, 2);
+
+        slots.release(fast_latest);
+        slots.release(slow_first);
+
+        let fast_cursor = slots.debug_consumer_cursor_snapshot(fast, track).unwrap();
+        assert_eq!(fast_cursor.last_acquired_cursor, Some(4));
+        assert_eq!(fast_cursor.release_cursor, 4);
+        assert_eq!(fast_cursor.skipped_count, 1);
+        assert_eq!(fast_cursor.acquired_count, 3);
+
+        let slow_cursor = slots.debug_consumer_cursor_snapshot(slow, track).unwrap();
+        assert_eq!(slow_cursor.last_acquired_cursor, Some(4));
+        assert_eq!(slow_cursor.release_cursor, 1);
+        assert_eq!(slow_cursor.skipped_count, 2);
+        assert_eq!(slow_cursor.acquired_count, 2);
     }
 
     #[test]

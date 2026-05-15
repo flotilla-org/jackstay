@@ -46,7 +46,7 @@ pub struct DaemonFrame {
     map_len: usize,
     payload_offset: usize,
     ptr: *mut libc::c_void,
-    _pool: Option<Rc<RegisteredPoolMapping>>,
+    pool: Option<Rc<RegisteredPoolMapping>>,
 }
 
 impl DaemonFrame {
@@ -60,7 +60,7 @@ impl DaemonFrame {
 
 impl Drop for DaemonFrame {
     fn drop(&mut self) {
-        if self._pool.is_none() {
+        if self.pool.is_none() {
             // SAFETY: ptr/len describe the mapping created for this immutable frame.
             unsafe {
                 libc::munmap(self.ptr, self.map_len);
@@ -96,6 +96,7 @@ pub struct DaemonConsumer {
     info: SessionInfo,
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    // TODO: evict retired pool generations once the side channel grows pool-retirement messages.
     pools: BTreeMap<PoolKey, Rc<RegisteredPoolMapping>>,
 }
 
@@ -268,6 +269,9 @@ impl DaemonConsumer {
             let fd = fdpass::recv_fd(&self.stream)?;
             daemon_frame_from_immutable_fd(fd, frame)
         } else {
+            // The current wire shape reuses slot_generation as the pool generation
+            // for reusable CPU pools. Slot-level generation is implicit in the
+            // frame sequence until the ring protocol grows explicit slot cursors.
             let key = PoolKey {
                 track_id: frame.track_id,
                 pool_id: frame.pool_id,
@@ -313,20 +317,38 @@ pub fn get_session(control_socket_path: &str, session_id: &str) -> Result<Sessio
 }
 
 fn daemon_frame_from_immutable_fd(fd: OwnedFd, frame: LatestFrameWire) -> Result<DaemonFrame> {
-    let (_, payload_offset, payload_len, payload_map_len) = parse_frame_metadata(&frame)?;
+    let (desc, payload_offset, payload_len, payload_map_len) = parse_frame_metadata(&frame)?;
+    let lease_id = frame.lease_id;
     let ptr = mmap_fd(fd.as_raw_fd(), payload_map_len, "mmap-frame")?;
-    daemon_frame_from_mapping(frame, ptr, payload_offset, payload_len, payload_map_len, None)
+    Ok(daemon_frame_from_mapping(
+        desc,
+        lease_id,
+        ptr,
+        payload_offset,
+        payload_len,
+        payload_map_len,
+        None,
+    ))
 }
 
 fn daemon_frame_from_registered_pool(pool: Rc<RegisteredPoolMapping>, frame: LatestFrameWire) -> Result<DaemonFrame> {
-    let (_, payload_offset, payload_len, payload_map_len) = parse_frame_metadata(&frame)?;
+    let (desc, payload_offset, payload_len, payload_map_len) = parse_frame_metadata(&frame)?;
+    let lease_id = frame.lease_id;
     if payload_map_len != pool.map_len {
         return Err(CaptureTransferError::DaemonTransport {
             operation: "resolve-frame-pool",
             message: "frame map length does not match registered pool".to_string(),
         });
     }
-    daemon_frame_from_mapping(frame, pool.ptr, payload_offset, payload_len, payload_map_len, Some(pool))
+    Ok(daemon_frame_from_mapping(
+        desc,
+        lease_id,
+        pool.ptr,
+        payload_offset,
+        payload_len,
+        payload_map_len,
+        Some(pool),
+    ))
 }
 
 fn parse_frame_metadata(frame: &LatestFrameWire) -> Result<(VideoFrameDesc, usize, usize, usize)> {
@@ -390,27 +412,28 @@ fn parse_frame_metadata(frame: &LatestFrameWire) -> Result<(VideoFrameDesc, usiz
 }
 
 fn daemon_frame_from_mapping(
-    frame: LatestFrameWire,
+    desc: VideoFrameDesc,
+    lease_id: u64,
     ptr: *mut libc::c_void,
     payload_offset: usize,
     payload_len: usize,
     payload_map_len: usize,
     pool: Option<Rc<RegisteredPoolMapping>>,
-) -> Result<DaemonFrame> {
-    let (desc, _, _, _) = parse_frame_metadata(&frame)?;
-    Ok(DaemonFrame {
+) -> DaemonFrame {
+    DaemonFrame {
         desc,
         len: payload_len,
-        lease_id: frame.lease_id,
+        lease_id,
         map_len: payload_map_len,
         payload_offset,
         ptr,
-        _pool: pool,
-    })
+        pool,
+    }
 }
 
 fn mmap_fd(fd: std::os::fd::RawFd, map_len: usize, operation: &'static str) -> Result<*mut libc::c_void> {
     // SAFETY: fd is valid, map length is supplied by daemon metadata, and mapping is read-only.
+    // A successful mmap is independent of fd lifetime, so callers may close the fd afterwards.
     let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
     if ptr == libc::MAP_FAILED {
         return Err(CaptureTransferError::DaemonTransport {

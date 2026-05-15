@@ -6,7 +6,7 @@ use std::{
         fd::{AsRawFd, OwnedFd},
         unix::net::UnixStream,
     },
-    sync::Arc,
+    rc::Rc,
 };
 
 use serde::Deserialize;
@@ -46,7 +46,7 @@ pub struct DaemonFrame {
     map_len: usize,
     payload_offset: usize,
     ptr: *mut libc::c_void,
-    _pool: Option<Arc<RegisteredPoolMapping>>,
+    _pool: Option<Rc<RegisteredPoolMapping>>,
 }
 
 impl DaemonFrame {
@@ -96,7 +96,7 @@ pub struct DaemonConsumer {
     info: SessionInfo,
     stream: UnixStream,
     reader: BufReader<UnixStream>,
-    pools: BTreeMap<PoolKey, Arc<RegisteredPoolMapping>>,
+    pools: BTreeMap<PoolKey, Rc<RegisteredPoolMapping>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,7 +258,7 @@ impl DaemonConsumer {
                 pool_id: pool.pool_id,
                 pool_generation: pool.pool_generation,
             },
-            Arc::new(RegisteredPoolMapping { ptr, map_len }),
+            Rc::new(RegisteredPoolMapping { ptr, map_len }),
         );
         Ok(())
     }
@@ -318,7 +318,7 @@ fn daemon_frame_from_immutable_fd(fd: OwnedFd, frame: LatestFrameWire) -> Result
     daemon_frame_from_mapping(frame, ptr, payload_offset, payload_len, payload_map_len, None)
 }
 
-fn daemon_frame_from_registered_pool(pool: Arc<RegisteredPoolMapping>, frame: LatestFrameWire) -> Result<DaemonFrame> {
+fn daemon_frame_from_registered_pool(pool: Rc<RegisteredPoolMapping>, frame: LatestFrameWire) -> Result<DaemonFrame> {
     let (_, payload_offset, payload_len, payload_map_len) = parse_frame_metadata(&frame)?;
     if payload_map_len != pool.map_len {
         return Err(CaptureTransferError::DaemonTransport {
@@ -395,7 +395,7 @@ fn daemon_frame_from_mapping(
     payload_offset: usize,
     payload_len: usize,
     payload_map_len: usize,
-    pool: Option<Arc<RegisteredPoolMapping>>,
+    pool: Option<Rc<RegisteredPoolMapping>>,
 ) -> Result<DaemonFrame> {
     let (desc, _, _, _) = parse_frame_metadata(&frame)?;
     Ok(DaemonFrame {
@@ -411,16 +411,7 @@ fn daemon_frame_from_mapping(
 
 fn mmap_fd(fd: std::os::fd::RawFd, map_len: usize, operation: &'static str) -> Result<*mut libc::c_void> {
     // SAFETY: fd is valid, map length is supplied by daemon metadata, and mapping is read-only.
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        )
-    };
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
     if ptr == libc::MAP_FAILED {
         return Err(CaptureTransferError::DaemonTransport {
             operation,
@@ -645,12 +636,22 @@ mod tests {
             let pool_file = tempfile_file_with_contents(b"abcdwxyz");
             writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 8, 4, 2)).unwrap();
             fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
-            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 8)).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 8)
+            )
+            .unwrap();
 
             assert_release_request(&mut reader, 11);
 
             assert_latest_request(&mut reader, "session-1", 7);
-            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(12, 2, 1, 1, 4, 4, 8)).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(12, 2, 1, 1, 4, 4, 8)
+            )
+            .unwrap();
 
             assert_release_request(&mut reader, 12);
         });

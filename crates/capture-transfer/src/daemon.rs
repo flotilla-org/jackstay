@@ -1,7 +1,12 @@
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     io::{BufRead, BufReader, Read, Write},
-    os::{fd::AsRawFd, unix::net::UnixStream},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
+    rc::Rc,
 };
 
 use serde::Deserialize;
@@ -41,6 +46,7 @@ pub struct DaemonFrame {
     map_len: usize,
     payload_offset: usize,
     ptr: *mut libc::c_void,
+    pool: Option<Rc<RegisteredPoolMapping>>,
 }
 
 impl DaemonFrame {
@@ -54,11 +60,35 @@ impl DaemonFrame {
 
 impl Drop for DaemonFrame {
     fn drop(&mut self) {
-        // SAFETY: ptr/len describe the mapping created in DaemonConsumer::latest_frame.
+        if self.pool.is_none() {
+            // SAFETY: ptr/len describe the mapping created for this immutable frame.
+            unsafe {
+                libc::munmap(self.ptr, self.map_len);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RegisteredPoolMapping {
+    ptr: *mut libc::c_void,
+    map_len: usize,
+}
+
+impl Drop for RegisteredPoolMapping {
+    fn drop(&mut self) {
+        // SAFETY: ptr/len describe the mapping created for this registered pool.
         unsafe {
             libc::munmap(self.ptr, self.map_len);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PoolKey {
+    track_id: u64,
+    pool_id: u64,
+    pool_generation: u64,
 }
 
 #[derive(Debug)]
@@ -66,6 +96,8 @@ pub struct DaemonConsumer {
     info: SessionInfo,
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    // TODO: evict retired pool generations once the side channel grows pool-retirement messages.
+    pools: BTreeMap<PoolKey, Rc<RegisteredPoolMapping>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +122,7 @@ struct SessionInfoWire {
 
 #[derive(Debug, Deserialize)]
 struct LatestFrameWire {
+    track_id: u64,
     sequence: u64,
     lease_id: u64,
     timestamp_ns: u64,
@@ -115,6 +148,14 @@ struct LatestFrameWire {
     len: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct RegisteredCpuPoolWire {
+    track_id: u64,
+    pool_id: u64,
+    pool_generation: u64,
+    payload_map_len: u64,
+}
+
 impl DaemonConsumer {
     pub fn connect(info: SessionInfo) -> Result<Self> {
         let stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-fd-socket", error))?;
@@ -123,6 +164,7 @@ impl DaemonConsumer {
             info,
             stream,
             reader: BufReader::new(reader_stream),
+            pools: BTreeMap::new(),
         })
     }
 
@@ -139,20 +181,34 @@ impl DaemonConsumer {
         .map_err(|error| daemon_error("write-latest-request", error))?;
         self.stream.flush().map_err(|error| daemon_error("flush-latest-request", error))?;
 
-        let fd = fdpass::recv_fd(&self.stream)?;
-        let mut line = String::new();
-        let bytes_read = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|error| daemon_error("read-latest-response", error))?;
-        if bytes_read == 0 {
-            return Err(CaptureTransferError::DaemonTransport {
-                operation: "read-latest-response",
-                message: "daemon closed fd socket".to_string(),
-            });
+        loop {
+            let value = self.read_side_channel_message()?;
+            match value.get("op").and_then(serde_json::Value::as_str) {
+                Some("register_cpu_pool") => {
+                    let pool: RegisteredCpuPoolWire =
+                        serde_json::from_value(value).map_err(|error| daemon_error("parse-register-cpu-pool", error))?;
+                    let fd = fdpass::recv_fd(&self.stream)?;
+                    self.register_cpu_pool(pool, fd)?;
+                }
+                Some("video_frame") => {
+                    let frame: LatestFrameWire =
+                        serde_json::from_value(value).map_err(|error| daemon_error("parse-latest-frame", error))?;
+                    return self.daemon_frame_from_wire(frame);
+                }
+                Some(other) => {
+                    return Err(CaptureTransferError::DaemonTransport {
+                        operation: "read-side-channel",
+                        message: format!("unexpected message op {other}"),
+                    });
+                }
+                None => {
+                    return Err(CaptureTransferError::DaemonTransport {
+                        operation: "read-side-channel",
+                        message: "missing message op".to_string(),
+                    });
+                }
+            }
         }
-        let frame: LatestFrameWire = serde_json::from_str(line.trim_end()).map_err(|error| daemon_error("parse-latest-frame", error))?;
-        daemon_frame_from_wire(fd, frame)
     }
 
     pub fn release_frame(&mut self, frame: DaemonFrame) -> Result<()> {
@@ -168,6 +224,68 @@ impl DaemonConsumer {
         )
         .map_err(|error| daemon_error("write-release-request", error))?;
         self.stream.flush().map_err(|error| daemon_error("flush-release-request", error))
+    }
+
+    fn read_side_channel_message(&mut self) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        let bytes_read = self
+            .reader
+            .read_line(&mut line)
+            .map_err(|error| daemon_error("read-side-channel", error))?;
+        if bytes_read == 0 {
+            return Err(CaptureTransferError::DaemonTransport {
+                operation: "read-side-channel",
+                message: "daemon closed fd socket".to_string(),
+            });
+        }
+        serde_json::from_str(line.trim_end()).map_err(|error| daemon_error("parse-side-channel", error))
+    }
+
+    fn register_cpu_pool(&mut self, pool: RegisteredCpuPoolWire, fd: OwnedFd) -> Result<()> {
+        let map_len = usize::try_from(pool.payload_map_len).map_err(|_| CaptureTransferError::DaemonTransport {
+            operation: "mmap-pool",
+            message: "pool map length does not fit usize".to_string(),
+        })?;
+        if map_len == 0 {
+            return Err(CaptureTransferError::DaemonTransport {
+                operation: "mmap-pool",
+                message: "pool map length is zero".to_string(),
+            });
+        }
+        let ptr = mmap_fd(fd.as_raw_fd(), map_len, "mmap-pool")?;
+        self.pools.insert(
+            PoolKey {
+                track_id: pool.track_id,
+                pool_id: pool.pool_id,
+                pool_generation: pool.pool_generation,
+            },
+            Rc::new(RegisteredPoolMapping { ptr, map_len }),
+        );
+        Ok(())
+    }
+
+    fn daemon_frame_from_wire(&mut self, frame: LatestFrameWire) -> Result<DaemonFrame> {
+        if frame.pool_id == 0 {
+            let fd = fdpass::recv_fd(&self.stream)?;
+            daemon_frame_from_immutable_fd(fd, frame)
+        } else {
+            // The current wire shape reuses slot_generation as the pool generation
+            // for reusable CPU pools. Slot-level generation is implicit in the
+            // frame sequence until the ring protocol grows explicit slot cursors.
+            let key = PoolKey {
+                track_id: frame.track_id,
+                pool_id: frame.pool_id,
+                pool_generation: frame.slot_generation,
+            };
+            let pool = self.pools.get(&key).cloned().ok_or_else(|| CaptureTransferError::DaemonTransport {
+                operation: "resolve-frame-pool",
+                message: format!(
+                    "frame references unregistered pool track={} pool={} generation={}",
+                    key.track_id, key.pool_id, key.pool_generation
+                ),
+            })?;
+            daemon_frame_from_registered_pool(pool, frame)
+        }
     }
 }
 
@@ -198,7 +316,42 @@ pub fn get_session(control_socket_path: &str, session_id: &str) -> Result<Sessio
     })
 }
 
-fn daemon_frame_from_wire(fd: std::os::fd::OwnedFd, frame: LatestFrameWire) -> Result<DaemonFrame> {
+fn daemon_frame_from_immutable_fd(fd: OwnedFd, frame: LatestFrameWire) -> Result<DaemonFrame> {
+    let (desc, payload_offset, payload_len, payload_map_len) = parse_frame_metadata(&frame)?;
+    let lease_id = frame.lease_id;
+    let ptr = mmap_fd(fd.as_raw_fd(), payload_map_len, "mmap-frame")?;
+    Ok(daemon_frame_from_mapping(
+        desc,
+        lease_id,
+        ptr,
+        payload_offset,
+        payload_len,
+        payload_map_len,
+        None,
+    ))
+}
+
+fn daemon_frame_from_registered_pool(pool: Rc<RegisteredPoolMapping>, frame: LatestFrameWire) -> Result<DaemonFrame> {
+    let (desc, payload_offset, payload_len, payload_map_len) = parse_frame_metadata(&frame)?;
+    let lease_id = frame.lease_id;
+    if payload_map_len != pool.map_len {
+        return Err(CaptureTransferError::DaemonTransport {
+            operation: "resolve-frame-pool",
+            message: "frame map length does not match registered pool".to_string(),
+        });
+    }
+    Ok(daemon_frame_from_mapping(
+        desc,
+        lease_id,
+        pool.ptr,
+        payload_offset,
+        payload_len,
+        payload_map_len,
+        Some(pool),
+    ))
+}
+
+fn parse_frame_metadata(frame: &LatestFrameWire) -> Result<(VideoFrameDesc, usize, usize, usize)> {
     let pixel_format = parse_pixel_format(&frame.pixel_format)?;
     let clock_domain = parse_clock_domain(&frame.clock_domain)?;
     let color_space = parse_color_space(&frame.color_space)?;
@@ -228,27 +381,8 @@ fn daemon_frame_from_wire(fd: std::os::fd::OwnedFd, frame: LatestFrameWire) -> R
             message: "payload range exceeds mapped length".to_string(),
         });
     }
-
-    // SAFETY: fd is valid, map length is supplied by daemon metadata, and mapping is read-only.
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            payload_map_len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        return Err(CaptureTransferError::DaemonTransport {
-            operation: "mmap-frame",
-            message: std::io::Error::last_os_error().to_string(),
-        });
-    }
-
-    Ok(DaemonFrame {
-        desc: VideoFrameDesc {
+    Ok((
+        VideoFrameDesc {
             sequence: frame.sequence,
             timestamp_ns: frame.timestamp_ns,
             width: frame.width,
@@ -271,12 +405,43 @@ fn daemon_frame_from_wire(fd: std::os::fd::OwnedFd, frame: LatestFrameWire) -> R
             evicted_count: frame.evicted_count,
             consumer_skipped_count: frame.consumer_skipped_count,
         },
+        payload_offset,
+        payload_len,
+        payload_map_len,
+    ))
+}
+
+fn daemon_frame_from_mapping(
+    desc: VideoFrameDesc,
+    lease_id: u64,
+    ptr: *mut libc::c_void,
+    payload_offset: usize,
+    payload_len: usize,
+    payload_map_len: usize,
+    pool: Option<Rc<RegisteredPoolMapping>>,
+) -> DaemonFrame {
+    DaemonFrame {
+        desc,
         len: payload_len,
-        lease_id: frame.lease_id,
+        lease_id,
         map_len: payload_map_len,
         payload_offset,
         ptr,
-    })
+        pool,
+    }
+}
+
+fn mmap_fd(fd: std::os::fd::RawFd, map_len: usize, operation: &'static str) -> Result<*mut libc::c_void> {
+    // SAFETY: fd is valid, map length is supplied by daemon metadata, and mapping is read-only.
+    // A successful mmap is independent of fd lifetime, so callers may close the fd afterwards.
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+    if ptr == libc::MAP_FAILED {
+        return Err(CaptureTransferError::DaemonTransport {
+            operation,
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(ptr)
 }
 
 /// # Safety
@@ -442,15 +607,74 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let first_file = tempfile_file_with_contents(b"abcd");
-            fdpass::send_fd(&stream, first_file.as_raw_fd()).unwrap();
             writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json(11, 1, 4)).unwrap();
+            fdpass::send_fd(&stream, first_file.as_raw_fd()).unwrap();
 
             assert_release_request(&mut reader, 11);
 
             assert_latest_request(&mut reader, "session-1", 7);
             let second_file = tempfile_file_with_contents(b"wxyz");
-            fdpass::send_fd(&stream, second_file.as_raw_fd()).unwrap();
             writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json(12, 2, 4)).unwrap();
+            fdpass::send_fd(&stream, second_file.as_raw_fd()).unwrap();
+
+            assert_release_request(&mut reader, 12);
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let first = consumer.latest_frame(7).unwrap();
+        assert_eq!(first.desc.sequence, 1);
+        assert_eq!(first.bytes(), b"abcd");
+        consumer.release_frame(first).unwrap();
+
+        let second = consumer.latest_frame(7).unwrap();
+        assert_eq!(second.desc.sequence, 2);
+        assert_eq!(second.bytes(), b"wxyz");
+        consumer.release_frame(second).unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_consumer_caches_registered_cpu_pool_frames() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let pool_file = tempfile_file_with_contents(b"abcdwxyz");
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 8, 4, 2)).unwrap();
+            fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 8)
+            )
+            .unwrap();
+
+            assert_release_request(&mut reader, 11);
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(12, 2, 1, 1, 4, 4, 8)
+            )
+            .unwrap();
 
             assert_release_request(&mut reader, 12);
         });
@@ -498,7 +722,22 @@ mod tests {
     }
 
     fn latest_frame_json(lease_id: u64, sequence: u64, payload_len: u64) -> serde_json::Value {
+        latest_frame_json_with_offset(lease_id, sequence, 0, 0, 0, payload_len, payload_len)
+    }
+
+    fn latest_frame_json_with_offset(
+        lease_id: u64,
+        sequence: u64,
+        pool_id: u64,
+        slot_generation: u64,
+        payload_offset: u64,
+        payload_len: u64,
+        payload_map_len: u64,
+    ) -> serde_json::Value {
         serde_json::json!({
+            "op": "video_frame",
+            "session_id": "session-1",
+            "track_id": 7,
             "sequence": sequence,
             "lease_id": lease_id,
             "timestamp_ns": 100,
@@ -506,12 +745,12 @@ mod tests {
             "height": 1,
             "stride": 8,
             "pixel_format": "bgra8_unorm",
-            "pool_id": 1,
+            "pool_id": pool_id,
             "slot_id": 0,
-            "slot_generation": sequence,
-            "payload_offset": 0,
+            "slot_generation": slot_generation,
+            "payload_offset": payload_offset,
             "payload_len": payload_len,
-            "payload_map_len": payload_len,
+            "payload_map_len": payload_map_len,
             "clock_domain": "media_time",
             "color_space": "srgb",
             "sync_kind": "cpu_copy_complete",
@@ -522,6 +761,26 @@ mod tests {
             "evicted_count": 0,
             "consumer_skipped_count": 0,
             "len": payload_len
+        })
+    }
+
+    fn register_pool_json(
+        track_id: u64,
+        pool_id: u64,
+        pool_generation: u64,
+        payload_map_len: u64,
+        slot_stride: u64,
+        slot_count: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "op": "register_cpu_pool",
+            "session_id": "session-1",
+            "track_id": track_id,
+            "pool_id": pool_id,
+            "pool_generation": pool_generation,
+            "payload_map_len": payload_map_len,
+            "slot_stride": slot_stride,
+            "slot_count": slot_count
         })
     }
 

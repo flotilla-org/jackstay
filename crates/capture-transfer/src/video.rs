@@ -50,6 +50,16 @@ pub struct VideoFrameDesc {
     pub consumer_skipped_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuPoolRegistration {
+    pub track_id: TrackId,
+    pub pool_id: u64,
+    pub pool_generation: u64,
+    pub payload_map_len: u64,
+    pub slot_stride: u64,
+    pub slot_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AcquiredVideoFrame {
     pub desc: VideoFrameDesc,
@@ -57,6 +67,7 @@ pub struct AcquiredVideoFrame {
     track_id: TrackId,
     frame_key: u64,
     segment: Arc<SharedMemorySegment>,
+    pool_registration: Option<CpuPoolRegistration>,
 }
 
 #[derive(Debug)]
@@ -66,6 +77,8 @@ pub struct ClaimedVideoSlot {
     segment: Arc<SharedMemorySegment>,
     pool_generation: u64,
     slot_index: usize,
+    slot_stride: usize,
+    slot_count: usize,
 }
 
 impl ClaimedVideoSlot {
@@ -101,6 +114,11 @@ impl AcquiredVideoFrame {
     pub fn try_clone_fd(&self) -> Result<OwnedFd> {
         self.segment.try_clone_fd()
     }
+
+    #[must_use]
+    pub fn cpu_pool_registration(&self) -> Option<CpuPoolRegistration> {
+        self.pool_registration.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -110,6 +128,7 @@ struct StoredFrame {
     segment: Arc<SharedMemorySegment>,
     pool_generation: Option<u64>,
     slot_index: Option<usize>,
+    pool_registration: Option<CpuPoolRegistration>,
     pinned_by: BTreeSet<ConsumerId>,
 }
 
@@ -191,6 +210,7 @@ struct PublishedPayload {
     segment: Arc<SharedMemorySegment>,
     pool_generation: Option<u64>,
     slot_index: Option<usize>,
+    pool_registration: Option<CpuPoolRegistration>,
 }
 
 #[derive(Debug)]
@@ -294,6 +314,8 @@ impl VideoSlotManager {
             segment: Arc::clone(&pool.segment),
             pool_generation: pool.generation,
             slot_index,
+            slot_stride: pool.slot_stride,
+            slot_count: pool.slot_count,
         })
     }
 
@@ -320,8 +342,17 @@ impl VideoSlotManager {
                     || !frame.pinned_by.is_empty()
             });
         }
+        let pool_registration = CpuPoolRegistration {
+            track_id: claim.track_id,
+            pool_id: claim.desc.pool_id,
+            pool_generation: claim.pool_generation,
+            payload_map_len: claim.desc.payload_map_len,
+            slot_stride: claim.slot_stride as u64,
+            slot_count: claim.slot_count as u64,
+        };
         Ok(PublishedPayload {
             desc: claim.desc,
+            pool_registration: Some(pool_registration),
             segment: claim.segment,
             pool_generation: Some(claim.pool_generation),
             slot_index: Some(claim.slot_index),
@@ -345,6 +376,7 @@ impl VideoSlotManager {
             segment: payload.segment,
             pool_generation: payload.pool_generation,
             slot_index: payload.slot_index,
+            pool_registration: payload.pool_registration,
             pinned_by: BTreeSet::new(),
         });
         self.rings_by_track
@@ -384,6 +416,7 @@ impl VideoSlotManager {
             track_id,
             frame_key: frame.key,
             segment: Arc::clone(&frame.segment),
+            pool_registration: frame.pool_registration.clone(),
         })
     }
 
@@ -453,6 +486,7 @@ impl VideoSlotManager {
             segment: Arc::new(segment),
             pool_generation: None,
             slot_index: None,
+            pool_registration: None,
         })
     }
 
@@ -665,6 +699,43 @@ mod tests {
         assert_ne!(second.desc.pool_id, 0);
         assert_eq!(second.desc.slot_id, 1);
         assert_ne!(second.desc.slot_generation, 0);
+    }
+
+    #[test]
+    fn reusable_pool_acquired_frames_expose_pool_registration_metadata() {
+        let mut slots = VideoSlotManager::new_reusable_pool(3);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1, 2, 3, 4]).unwrap();
+        let first = slots.acquire_latest(consumer, track).unwrap();
+        let first_pool = first.cpu_pool_registration().unwrap();
+        assert_eq!(first_pool.track_id, track);
+        assert_eq!(first_pool.pool_id, first.desc.pool_id);
+        assert_eq!(first_pool.pool_generation, first.desc.slot_generation);
+        assert_eq!(first_pool.payload_map_len, first.desc.payload_map_len);
+        assert_eq!(first_pool.slot_stride, 64);
+        assert_eq!(first_pool.slot_count, 3);
+        slots.release(first);
+
+        slots.publish(track, frame_desc(2), &[5, 6, 7, 8]).unwrap();
+        let second = slots.acquire_latest(consumer, track).unwrap();
+        let second_pool = second.cpu_pool_registration().unwrap();
+        assert_eq!(second_pool, first_pool);
+        assert_ne!(second.desc.payload_offset, 0);
+        assert_eq!(second.desc.payload_offset, first_pool.slot_stride);
+    }
+
+    #[test]
+    fn immutable_acquired_frames_do_not_expose_pool_registration_metadata() {
+        let mut slots = VideoSlotManager::new(3);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1, 2, 3, 4]).unwrap();
+        let frame = slots.acquire_latest(consumer, track).unwrap();
+
+        assert_eq!(frame.cpu_pool_registration(), None);
     }
 
     #[test]

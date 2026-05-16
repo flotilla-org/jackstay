@@ -1,3 +1,4 @@
+pub mod control_page;
 pub mod daemon;
 pub mod error;
 pub mod fdpass;

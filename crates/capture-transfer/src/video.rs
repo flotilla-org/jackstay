@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    control_page::{PendingVideoRingEntry, VideoRingEntry, VideoTrackControlPage, VideoTrackControlSnapshot},
     error::{CaptureTransferError, Result},
     model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
     shm::SharedMemorySegment,
@@ -138,124 +139,42 @@ struct StoredFrame {
     pinned_by: BTreeSet<ConsumerId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameRingEntry {
-    pub producer_cursor: u64,
-    pub sequence: u64,
-    pub frame_key: u64,
-    pub pool_id: u64,
-    pub slot_id: u64,
-    pub slot_generation: u64,
-    pub payload_offset: u64,
-    pub payload_len: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingFrameRingEntry {
-    sequence: u64,
-    frame_key: u64,
-    pool_id: u64,
-    slot_id: u64,
-    slot_generation: u64,
-    payload_offset: u64,
-    payload_len: u64,
-}
-
-#[derive(Debug)]
-struct MetadataRing {
-    entries: Vec<Option<FrameRingEntry>>,
-    next_index: usize,
-    len: usize,
-}
-
-impl MetadataRing {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: vec![None; capacity.max(1)],
-            next_index: 0,
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, entry: FrameRingEntry) {
-        self.entries[self.next_index] = Some(entry);
-        self.next_index = (self.next_index + 1) % self.entries.len();
-        self.len = (self.len + 1).min(self.entries.len());
-    }
-
-    fn latest(&self) -> Option<&FrameRingEntry> {
-        if self.len == 0 {
-            return None;
-        }
-        let index = if self.next_index == 0 {
-            self.entries.len() - 1
-        } else {
-            self.next_index - 1
-        };
-        self.entries[index].as_ref()
-    }
-
-    fn snapshot(&self) -> Vec<FrameRingEntry> {
-        let start = if self.len == self.entries.len() { self.next_index } else { 0 };
-        (0..self.len)
-            .filter_map(|offset| {
-                let index = (start + offset) % self.entries.len();
-                self.entries[index].clone()
-            })
-            .collect()
-    }
-
-    fn capacity(&self) -> usize {
-        self.entries.len()
-    }
-}
-
 #[derive(Debug)]
 struct TrackRingControl {
-    ring: MetadataRing,
-    producer_cursor: u64,
-    latest_sequence: Option<u64>,
+    page: VideoTrackControlPage,
 }
 
 impl TrackRingControl {
     fn new(capacity: usize) -> Self {
         Self {
-            ring: MetadataRing::new(capacity),
-            producer_cursor: 0,
-            latest_sequence: None,
+            page: VideoTrackControlPage::new(capacity),
         }
     }
 
-    fn push(&mut self, entry: PendingFrameRingEntry) {
-        self.producer_cursor = self.producer_cursor.saturating_add(1);
-        self.latest_sequence = Some(entry.sequence);
-        self.ring.push(FrameRingEntry {
-            producer_cursor: self.producer_cursor,
-            sequence: entry.sequence,
-            frame_key: entry.frame_key,
-            pool_id: entry.pool_id,
-            slot_id: entry.slot_id,
-            slot_generation: entry.slot_generation,
-            payload_offset: entry.payload_offset,
-            payload_len: entry.payload_len,
-        });
+    fn push(&mut self, entry: PendingVideoRingEntry) {
+        self.page.push(entry);
     }
 
-    fn latest(&self) -> Option<&FrameRingEntry> {
-        self.ring.latest()
+    fn latest(&self) -> Option<&VideoRingEntry> {
+        self.page.latest()
     }
 
-    fn ring_snapshot(&self) -> Vec<FrameRingEntry> {
-        self.ring.snapshot()
+    fn ring_snapshot(&self) -> Vec<VideoRingEntry> {
+        self.page.ring_snapshot()
     }
 
     fn snapshot(&self) -> TrackRingControlSnapshot {
+        let page = self.page.snapshot();
         TrackRingControlSnapshot {
-            capacity: self.ring.capacity(),
-            producer_cursor: self.producer_cursor,
-            latest_sequence: self.latest_sequence,
-            entries: self.ring_snapshot(),
+            capacity: page.header.capacity as usize,
+            producer_cursor: page.header.producer_cursor,
+            latest_sequence: (page.header.len > 0).then_some(page.header.latest_sequence),
+            entries: page.entries,
         }
+    }
+
+    fn control_page_snapshot(&self) -> VideoTrackControlSnapshot {
+        self.page.snapshot()
     }
 }
 
@@ -271,7 +190,7 @@ struct ConsumerRingCursor {
 }
 
 impl ConsumerRingCursor {
-    fn acquire(&mut self, entry: &FrameRingEntry) {
+    fn acquire(&mut self, entry: &VideoRingEntry) {
         if let Some(previous) = self.last_acquired_cursor
             && entry.producer_cursor > previous.saturating_add(1)
         {
@@ -302,7 +221,7 @@ pub struct TrackRingControlSnapshot {
     pub capacity: usize,
     pub producer_cursor: u64,
     pub latest_sequence: Option<u64>,
-    pub entries: Vec<FrameRingEntry>,
+    pub entries: Vec<VideoRingEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,7 +403,7 @@ impl VideoSlotManager {
     }
 
     fn store_published_payload(&mut self, track_id: TrackId, key: u64, payload: PublishedPayload) {
-        let ring_entry = PendingFrameRingEntry {
+        let ring_entry = PendingVideoRingEntry {
             sequence: payload.desc.sequence,
             frame_key: key,
             pool_id: payload.desc.pool_id,
@@ -576,7 +495,7 @@ impl VideoSlotManager {
     }
 
     #[must_use]
-    pub fn debug_ring_snapshot(&self, track_id: TrackId) -> Vec<FrameRingEntry> {
+    pub fn debug_ring_snapshot(&self, track_id: TrackId) -> Vec<VideoRingEntry> {
         self.controls_by_track
             .get(&track_id)
             .map_or_else(Vec::new, TrackRingControl::ring_snapshot)
@@ -585,6 +504,11 @@ impl VideoSlotManager {
     #[must_use]
     pub fn debug_control_snapshot(&self, track_id: TrackId) -> Option<TrackRingControlSnapshot> {
         self.controls_by_track.get(&track_id).map(TrackRingControl::snapshot)
+    }
+
+    #[must_use]
+    pub fn debug_control_page_snapshot(&self, track_id: TrackId) -> Option<VideoTrackControlSnapshot> {
+        self.controls_by_track.get(&track_id).map(TrackRingControl::control_page_snapshot)
     }
 
     #[must_use]
@@ -949,6 +873,30 @@ mod tests {
         assert_eq!(
             control
                 .entries
+                .iter()
+                .map(|entry| (entry.producer_cursor, entry.sequence))
+                .collect::<Vec<_>>(),
+            vec![(2, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn control_page_snapshot_tracks_ring_header_after_wraparound() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+
+        let page = slots.debug_control_page_snapshot(track).unwrap();
+        assert_eq!(page.header.capacity, 2);
+        assert_eq!(page.header.producer_cursor, 3);
+        assert_eq!(page.header.latest_sequence, 3);
+        assert_eq!(page.header.latest_index, 0);
+        assert_eq!(page.header.len, 2);
+        assert_eq!(
+            page.entries
                 .iter()
                 .map(|entry| (entry.producer_cursor, entry.sequence))
                 .collect::<Vec<_>>(),

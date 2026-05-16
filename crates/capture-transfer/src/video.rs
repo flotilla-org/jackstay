@@ -112,6 +112,11 @@ impl AcquiredVideoFrame {
             .slice_at(self.desc.payload_offset as usize, self.desc.payload_len as usize)
     }
 
+    #[must_use]
+    pub const fn producer_cursor(&self) -> u64 {
+        self.producer_cursor
+    }
+
     pub fn try_clone_fd(&self) -> Result<OwnedFd> {
         self.segment.try_clone_fd()
     }

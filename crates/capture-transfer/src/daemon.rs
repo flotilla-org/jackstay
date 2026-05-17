@@ -45,6 +45,7 @@ pub struct DaemonFrame {
     pub desc: VideoFrameDesc,
     pub producer_cursor: u64,
     pub len: usize,
+    track_id: u64,
     lease_id: u64,
     map_len: usize,
     payload_offset: usize,
@@ -102,6 +103,7 @@ pub struct DaemonConsumer {
     // TODO: evict retired pool generations once the capture transfer channel grows pool-retirement messages.
     pools: BTreeMap<PoolKey, Rc<RegisteredPoolMapping>>,
     control_pages: BTreeMap<u64, VideoTrackControlPage>,
+    consumer_slots: BTreeMap<u64, usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +168,7 @@ struct FrameMapping {
     desc: VideoFrameDesc,
     lease_id: u64,
     producer_cursor: u64,
+    track_id: u64,
     payload_offset: usize,
     payload_len: usize,
     payload_map_len: usize,
@@ -181,6 +184,7 @@ impl DaemonConsumer {
             reader: BufReader::new(reader_stream),
             pools: BTreeMap::new(),
             control_pages: BTreeMap::new(),
+            consumer_slots: BTreeMap::new(),
         })
     }
 
@@ -198,14 +202,40 @@ impl DaemonConsumer {
                     session_id: _,
                     track_id,
                     map_len,
+                    consumer_id,
+                    consumer_slot,
                 } => {
+                    if consumer_id == 0 {
+                        return Err(CaptureTransferError::DaemonTransport {
+                            operation: "mmap-control-page",
+                            message: "consumer id must be non-zero".to_string(),
+                        });
+                    }
                     let map_len = usize::try_from(map_len).map_err(|_| CaptureTransferError::DaemonTransport {
                         operation: "mmap-control-page",
                         message: "control page map length does not fit usize".to_string(),
                     })?;
                     let fd = fdpass::recv_fd(&self.stream)?;
-                    let page = VideoTrackControlPage::map_read_only(fd, map_len)?;
+                    // This maps the full page writable because POSIX fd passing gives us
+                    // whole-object access. Socket leases remain authoritative; a future
+                    // transport should narrow writable access to only this consumer slot.
+                    let page = VideoTrackControlPage::map_read_write(fd, map_len)?;
+                    let header = page.validate_header()?;
+                    if consumer_slot >= header.consumer_capacity {
+                        return Err(CaptureTransferError::DaemonTransport {
+                            operation: "mmap-control-page",
+                            message: format!(
+                                "consumer slot {consumer_slot} exceeds control page capacity {}",
+                                header.consumer_capacity
+                            ),
+                        });
+                    }
+                    let consumer_slot = usize::try_from(consumer_slot).map_err(|_| CaptureTransferError::DaemonTransport {
+                        operation: "mmap-control-page",
+                        message: "consumer slot does not fit usize".to_string(),
+                    })?;
                     self.control_pages.insert(track_id, page);
+                    self.consumer_slots.insert(track_id, consumer_slot);
                 }
                 CaptureTransferMessage::RegisterCpuPool {
                     session_id: _,
@@ -302,6 +332,11 @@ impl DaemonConsumer {
     }
 
     pub fn release_frame(&mut self, frame: DaemonFrame) -> Result<()> {
+        if let Some(consumer_slot) = self.consumer_slots.get(&frame.track_id).copied()
+            && let Some(page) = self.control_pages.get(&frame.track_id)
+        {
+            page.store_consumer_release_cursor(consumer_slot, frame.producer_cursor);
+        }
         let lease_id = frame.lease_id;
         drop(frame);
         self.write_capture_transfer_request(&CaptureTransferRequest::ReleaseVideoFrame { lease_id })?;
@@ -520,6 +555,7 @@ fn parse_frame_metadata(frame: &LatestFrameWire) -> Result<FrameMapping> {
         },
         lease_id: frame.lease_id,
         producer_cursor: frame.producer_cursor,
+        track_id: frame.track_id,
         payload_offset,
         payload_len,
         payload_map_len,
@@ -531,6 +567,7 @@ fn daemon_frame_from_mapping(mapping: FrameMapping, ptr: *mut libc::c_void, pool
         desc: mapping.desc,
         producer_cursor: mapping.producer_cursor,
         len: mapping.payload_len,
+        track_id: mapping.track_id,
         lease_id: mapping.lease_id,
         map_len: mapping.payload_map_len,
         payload_offset: mapping.payload_offset,
@@ -879,6 +916,114 @@ mod tests {
     }
 
     #[test]
+    fn daemon_consumer_writes_release_cursor_before_socket_release() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let mut control_page = VideoTrackControlPage::new(2);
+            let consumer_slot = control_page.register_consumer_cursor(1).unwrap();
+            control_page.push(pending_control_entry(1, 1, 1, 1, 0, 4, 4));
+            let control_fd = control_page.try_clone_fd().unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                register_control_page_json(7, control_page.mapped_len() as u64)
+            )
+            .unwrap();
+            fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
+
+            let pool_file = tempfile_file_with_contents(b"abcd");
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 4)
+            )
+            .unwrap();
+
+            assert_release_request(&mut reader, 11);
+            assert_eq!(control_page.consumer_cursor_entry(consumer_slot).release_cursor, 1);
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let frame = consumer.latest_frame(7).unwrap();
+        consumer.release_frame(frame).unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_consumer_rejects_invalid_consumer_cursor_slot() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let control_page = VideoTrackControlPage::new(2);
+            let control_fd = control_page.try_clone_fd().unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                serde_json::json!({
+                    "op": "register_video_control_page",
+                    "session_id": "session-1",
+                    "track_id": 7,
+                    "map_len": control_page.mapped_len(),
+                    "consumer_id": 1,
+                    "consumer_slot": 2
+                })
+            )
+            .unwrap();
+            fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let error = consumer.latest_frame(7).unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureTransferError::DaemonTransport {
+                operation: "mmap-control-page",
+                ref message,
+            } if message.contains("consumer slot 2 exceeds control page capacity 2")
+        ));
+
+        server.join().unwrap();
+    }
+
+    #[test]
     fn daemon_consumer_requests_control_page_latest_cursor_after_registration() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("capture-fd.sock");
@@ -1141,7 +1286,9 @@ mod tests {
             "op": "register_video_control_page",
             "session_id": "session-1",
             "track_id": track_id,
-            "map_len": map_len
+            "map_len": map_len,
+            "consumer_id": 1,
+            "consumer_slot": 0
         })
     }
 

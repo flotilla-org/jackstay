@@ -27,6 +27,8 @@ pub enum CaptureTransferMessage {
         session_id: String,
         track_id: u64,
         map_len: u64,
+        consumer_id: u64,
+        consumer_slot: u64,
     },
     RegisterCpuPool {
         session_id: String,
@@ -108,10 +110,14 @@ mod tests {
             session_id: "session-1".to_string(),
             track_id: 7,
             map_len: 4096,
+            consumer_id: 12,
+            consumer_slot: 1,
         };
         let control_json = serde_json::to_value(&control).unwrap();
         assert_eq!(control_json["op"], "register_video_control_page");
         assert_eq!(control_json["map_len"], 4096);
+        assert_eq!(control_json["consumer_id"], 12);
+        assert_eq!(control_json["consumer_slot"], 1);
         assert_eq!(serde_json::from_value::<CaptureTransferMessage>(control_json).unwrap(), control);
 
         let register = CaptureTransferMessage::RegisterCpuPool {

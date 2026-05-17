@@ -192,7 +192,7 @@ enum FtConsumerKind {
         event_cursor: usize,
     },
     Daemon {
-        consumer: DaemonConsumer,
+        consumer: Box<DaemonConsumer>,
         events: Vec<FtEvent>,
         event_cursor: usize,
     },
@@ -476,7 +476,7 @@ pub unsafe extern "C" fn ft_consumer_connect_session(descriptor: *const FtSessio
     };
     let consumer = Box::new(FtConsumer {
         kind: FtConsumerKind::Daemon {
-            consumer: daemon_consumer,
+            consumer: Box::new(daemon_consumer),
             events,
             event_cursor: 0,
         },

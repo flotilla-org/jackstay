@@ -13,7 +13,7 @@ use crate::{
 pub const CONTROL_PAGE_ALIGNMENT: usize = 128;
 pub const EMPTY_LATEST_INDEX: u64 = u64::MAX;
 pub const VIDEO_TRACK_CONTROL_MAGIC: u64 = u64::from_le_bytes(*b"JSVTRK01");
-pub const VIDEO_TRACK_CONTROL_VERSION: u64 = 1;
+pub const VIDEO_TRACK_CONTROL_VERSION: u64 = 2;
 const VIDEO_RING_PUBLICATION_SEQUENCE_LEN: usize = std::mem::size_of::<u64>();
 const _: () = assert!(std::mem::offset_of!(VideoRingEntry, publication_sequence) == 0);
 
@@ -25,6 +25,9 @@ pub struct VideoTrackControlHeader {
     pub header_len: u64,
     pub entry_len: u64,
     pub capacity: u64,
+    pub consumer_entries_offset: u64,
+    pub consumer_entry_len: u64,
+    pub consumer_capacity: u64,
     pub index_mask: u64,
     pub producer_cursor: u64,
     pub latest_sequence: u64,
@@ -91,6 +94,19 @@ pub struct PendingVideoRingEntry {
     pub producer_drop_count: u64,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoConsumerCursorEntry {
+    pub consumer_id: u64,
+    pub slot_generation: u64,
+    pub last_acquired_cursor: u64,
+    pub last_acquired_sequence: u64,
+    pub release_cursor: u64,
+    pub skipped_count: u64,
+    pub acquired_count: u64,
+    pub reserved0: u64,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum VideoRingReadError {
     #[error("video ring is empty")]
@@ -119,6 +135,9 @@ pub struct VideoTrackControlLayout {
     pub entries_offset: usize,
     pub entry_len: usize,
     pub capacity: usize,
+    pub consumer_entries_offset: usize,
+    pub consumer_entry_len: usize,
+    pub consumer_capacity: usize,
     pub byte_len: usize,
 }
 
@@ -130,14 +149,26 @@ impl VideoTrackControlLayout {
         let entries_len = capacity
             .checked_mul(entry_len)
             .expect("video control page entry byte length overflow");
-        let byte_len = entries_offset
+        let entries_end = entries_offset
             .checked_add(entries_len)
+            .expect("video control page entry byte length overflow");
+        let consumer_entries_offset = align_up(entries_end, CONTROL_PAGE_ALIGNMENT);
+        let consumer_entry_len = std::mem::size_of::<VideoConsumerCursorEntry>();
+        let consumer_capacity = capacity;
+        let consumer_entries_len = consumer_capacity
+            .checked_mul(consumer_entry_len)
+            .expect("video control page consumer cursor byte length overflow");
+        let byte_len = consumer_entries_offset
+            .checked_add(consumer_entries_len)
             .expect("video control page byte length overflow");
         Self {
             header_offset: 0,
             entries_offset,
             entry_len,
             capacity,
+            consumer_entries_offset,
+            consumer_entry_len,
+            consumer_capacity,
             byte_len,
         }
     }
@@ -147,6 +178,7 @@ impl VideoTrackControlLayout {
 pub struct VideoTrackControlSnapshot {
     pub header: VideoTrackControlHeader,
     pub entries: Vec<VideoRingEntry>,
+    pub consumer_entries: Vec<VideoConsumerCursorEntry>,
 }
 
 #[derive(Debug)]
@@ -168,6 +200,9 @@ impl VideoTrackControlPage {
             header_len: std::mem::size_of::<VideoTrackControlHeader>() as u64,
             entry_len: std::mem::size_of::<VideoRingEntry>() as u64,
             capacity: capacity as u64,
+            consumer_entries_offset: layout.consumer_entries_offset as u64,
+            consumer_entry_len: std::mem::size_of::<VideoConsumerCursorEntry>() as u64,
+            consumer_capacity: layout.consumer_capacity as u64,
             index_mask: (capacity - 1) as u64,
             producer_cursor: 0,
             latest_sequence: 0,
@@ -193,6 +228,21 @@ impl VideoTrackControlPage {
 
     pub fn map_read_only(fd: OwnedFd, map_len: usize) -> CaptureResult<Self> {
         let storage = SharedMemorySegment::map_read_only(fd, map_len)?;
+        let mut page = Self {
+            layout: VideoTrackControlLayout::for_capacity(1),
+            storage,
+        };
+        let initial_header: VideoTrackControlHeader = page.read_at(0);
+        let capacity = validate_control_header(&initial_header, map_len)?;
+        page.layout = VideoTrackControlLayout::for_capacity(capacity);
+        // Re-read after choosing the final layout so a racing or corrupt header
+        // is caught against the mapping shape callers will use.
+        page.validate_header()?;
+        Ok(page)
+    }
+
+    pub fn map_read_write(fd: OwnedFd, map_len: usize) -> CaptureResult<Self> {
+        let storage = SharedMemorySegment::map_read_write(fd, map_len)?;
         let mut page = Self {
             layout: VideoTrackControlLayout::for_capacity(1),
             storage,
@@ -270,6 +320,9 @@ impl VideoTrackControlPage {
             header_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, header_len)),
             entry_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, entry_len)),
             capacity: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, capacity)),
+            consumer_entries_offset: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, consumer_entries_offset)),
+            consumer_entry_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, consumer_entry_len)),
+            consumer_capacity: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, consumer_capacity)),
             index_mask: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, index_mask)),
             producer_cursor: self.load_header_producer_cursor(Ordering::Acquire),
             latest_sequence: self.load_header_latest_sequence(Ordering::Acquire),
@@ -415,6 +468,31 @@ impl VideoTrackControlPage {
         self.layout.entries_offset + index * self.layout.entry_len
     }
 
+    fn consumer_cursor_offset(&self, index: usize) -> usize {
+        assert!(index < self.layout.consumer_capacity);
+        self.layout.consumer_entries_offset + index * self.layout.consumer_entry_len
+    }
+
+    fn consumer_release_cursor_offset(&self, index: usize) -> usize {
+        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, release_cursor)
+    }
+
+    fn consumer_last_acquired_cursor_offset(&self, index: usize) -> usize {
+        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_cursor)
+    }
+
+    fn consumer_last_acquired_sequence_offset(&self, index: usize) -> usize {
+        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_sequence)
+    }
+
+    fn consumer_skipped_count_offset(&self, index: usize) -> usize {
+        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, skipped_count)
+    }
+
+    fn consumer_acquired_count_offset(&self, index: usize) -> usize {
+        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, acquired_count)
+    }
+
     fn load_u64_atomic(&self, offset: usize, ordering: Ordering) -> u64 {
         assert_eq!(offset % std::mem::align_of::<AtomicU64>(), 0);
         let bytes = self.storage.slice_at(offset, std::mem::size_of::<AtomicU64>());
@@ -538,6 +616,91 @@ impl VideoTrackControlPage {
         self.read_entry_for_cursor(cursor).map(Some)
     }
 
+    pub fn register_consumer_cursor(&self, consumer_id: u64) -> CaptureResult<usize> {
+        // This is a producer-side slot allocator called through VideoSlotManager's
+        // mutable track state. It is not a cross-process concurrent allocator; mapped
+        // consumers are only allowed to write their assigned release cursor.
+        if consumer_id == 0 {
+            return Err(invalid_control_page("consumer id must be non-zero"));
+        }
+        for index in 0..self.layout.consumer_capacity {
+            if self.consumer_cursor_entry(index).consumer_id == consumer_id {
+                return Ok(index);
+            }
+        }
+        for index in 0..self.layout.consumer_capacity {
+            let entry = self.consumer_cursor_entry(index);
+            if entry.consumer_id == 0 {
+                self.write_at(
+                    self.consumer_cursor_offset(index),
+                    VideoConsumerCursorEntry {
+                        consumer_id,
+                        slot_generation: entry.slot_generation.saturating_add(1).max(1),
+                        ..VideoConsumerCursorEntry::default()
+                    },
+                );
+                return Ok(index);
+            }
+        }
+        Err(invalid_control_page("consumer cursor table is full"))
+    }
+
+    pub fn unregister_consumer_cursor(&self, consumer_id: u64) {
+        for index in 0..self.layout.consumer_capacity {
+            let entry = self.consumer_cursor_entry(index);
+            if entry.consumer_id == consumer_id {
+                self.write_at(
+                    self.consumer_cursor_offset(index),
+                    VideoConsumerCursorEntry {
+                        slot_generation: entry.slot_generation,
+                        ..VideoConsumerCursorEntry::default()
+                    },
+                );
+                return;
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn consumer_cursor_entry(&self, index: usize) -> VideoConsumerCursorEntry {
+        self.read_at(self.consumer_cursor_offset(index))
+    }
+
+    pub fn store_consumer_release_cursor(&self, index: usize, release_cursor: u64) {
+        self.store_u64_atomic(self.consumer_release_cursor_offset(index), release_cursor, Ordering::Release);
+    }
+
+    pub fn store_consumer_acquire_cursor(
+        &self,
+        index: usize,
+        consumer_id: u64,
+        last_acquired_cursor: u64,
+        last_acquired_sequence: u64,
+        skipped_count: u64,
+        acquired_count: u64,
+    ) -> CaptureResult<()> {
+        let entry = self.consumer_cursor_entry(index);
+        if entry.consumer_id != consumer_id {
+            return Err(invalid_control_page("consumer cursor slot does not match consumer id"));
+        }
+        // These fields are observational in this slice. They are stored independently
+        // so acquire updates cannot clobber the consumer-owned release cursor; readers
+        // must not treat the four acquire fields as one atomic snapshot.
+        self.store_u64_atomic(
+            self.consumer_last_acquired_cursor_offset(index),
+            last_acquired_cursor,
+            Ordering::Release,
+        );
+        self.store_u64_atomic(
+            self.consumer_last_acquired_sequence_offset(index),
+            last_acquired_sequence,
+            Ordering::Release,
+        );
+        self.store_u64_atomic(self.consumer_skipped_count_offset(index), skipped_count, Ordering::Release);
+        self.store_u64_atomic(self.consumer_acquired_count_offset(index), acquired_count, Ordering::Release);
+        Ok(())
+    }
+
     #[must_use]
     pub fn latest_cursor(&self) -> Option<u64> {
         let producer_cursor = self.load_header_producer_cursor(Ordering::Acquire);
@@ -578,10 +741,18 @@ impl VideoTrackControlPage {
     }
 
     #[must_use]
+    pub fn consumer_cursor_snapshot(&self) -> Vec<VideoConsumerCursorEntry> {
+        (0..self.layout.consumer_capacity)
+            .map(|index| self.consumer_cursor_entry(index))
+            .collect()
+    }
+
+    #[must_use]
     pub fn snapshot(&self) -> VideoTrackControlSnapshot {
         VideoTrackControlSnapshot {
             header: self.header(),
             entries: self.ring_snapshot(),
+            consumer_entries: self.consumer_cursor_snapshot(),
         }
     }
 }
@@ -603,14 +774,25 @@ fn validate_control_header(header: &VideoTrackControlHeader, map_len: usize) -> 
     if header.entry_len != std::mem::size_of::<VideoRingEntry>() as u64 {
         return Err(invalid_control_page("invalid entry length"));
     }
+    if header.consumer_entry_len != std::mem::size_of::<VideoConsumerCursorEntry>() as u64 {
+        return Err(invalid_control_page("invalid consumer cursor entry length"));
+    }
     let capacity = usize::try_from(header.capacity).map_err(|_| invalid_control_page("capacity does not fit usize"))?;
     if capacity == 0 || !capacity.is_power_of_two() {
         return Err(invalid_control_page("capacity must be a non-zero power of two"));
+    }
+    let consumer_capacity =
+        usize::try_from(header.consumer_capacity).map_err(|_| invalid_control_page("consumer capacity does not fit usize"))?;
+    if consumer_capacity != capacity {
+        return Err(invalid_control_page("consumer capacity must match ring capacity"));
     }
     if header.index_mask != header.capacity - 1 {
         return Err(invalid_control_page("index mask does not match capacity"));
     }
     let layout = VideoTrackControlLayout::for_capacity(capacity);
+    if header.consumer_entries_offset != layout.consumer_entries_offset as u64 {
+        return Err(invalid_control_page("invalid consumer cursor entries offset"));
+    }
     if layout.byte_len > map_len {
         return Err(invalid_control_page("mapped length is smaller than declared layout"));
     }
@@ -699,8 +881,28 @@ mod tests {
         assert!(layout.entries_offset >= std::mem::size_of::<VideoTrackControlHeader>());
         assert_eq!(layout.entry_len, std::mem::size_of::<VideoRingEntry>());
         assert_eq!(layout.capacity, 4);
-        assert_eq!(layout.byte_len, layout.entries_offset + layout.capacity * layout.entry_len);
+        assert!(layout.byte_len >= layout.entries_offset + layout.capacity * layout.entry_len);
         assert_eq!(page.mapped_len(), layout.byte_len);
+    }
+
+    #[test]
+    fn control_page_layout_includes_consumer_cursor_region() {
+        let page = VideoTrackControlPage::new(3);
+
+        let layout = page.layout();
+        assert_eq!(layout.consumer_entry_len, std::mem::size_of::<super::VideoConsumerCursorEntry>());
+        assert_eq!(layout.consumer_capacity, layout.capacity);
+        assert_eq!(layout.consumer_entries_offset % CONTROL_PAGE_ALIGNMENT, 0);
+        assert!(layout.consumer_entries_offset >= layout.entries_offset + layout.capacity * layout.entry_len);
+        assert_eq!(
+            layout.byte_len,
+            layout.consumer_entries_offset + layout.consumer_capacity * layout.consumer_entry_len
+        );
+
+        let header = page.snapshot().header;
+        assert_eq!(header.consumer_entries_offset, layout.consumer_entries_offset as u64);
+        assert_eq!(header.consumer_entry_len, layout.consumer_entry_len as u64);
+        assert_eq!(header.consumer_capacity, layout.consumer_capacity as u64);
     }
 
     #[test]
@@ -759,6 +961,85 @@ mod tests {
 
         assert_eq!(page.load_entry_publication_sequence_for_test(0, Ordering::Acquire), 23);
         assert_eq!(page.raw_entry_for_test(0).publication_sequence, 23);
+    }
+
+    #[test]
+    fn consumer_cursor_slot_registers_and_roundtrips_release_cursor() {
+        let page = VideoTrackControlPage::new(2);
+
+        let slot = page.register_consumer_cursor(7).unwrap();
+        page.store_consumer_release_cursor(slot, 3);
+
+        let entry = page.consumer_cursor_entry(slot);
+        assert_eq!(slot, 0);
+        assert_eq!(entry.consumer_id, 7);
+        assert_eq!(entry.slot_generation, 1);
+        assert_eq!(entry.release_cursor, 3);
+    }
+
+    #[test]
+    fn consumer_cursor_slot_reuses_existing_consumer_slot() {
+        let page = VideoTrackControlPage::new(2);
+
+        let first = page.register_consumer_cursor(7).unwrap();
+        let second = page.register_consumer_cursor(7).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(page.consumer_cursor_entry(first).consumer_id, 7);
+    }
+
+    #[test]
+    fn consumer_cursor_slot_unregisters_consumer() {
+        let page = VideoTrackControlPage::new(2);
+        let slot = page.register_consumer_cursor(7).unwrap();
+        page.store_consumer_release_cursor(slot, 3);
+
+        page.unregister_consumer_cursor(7);
+
+        let entry = page.consumer_cursor_entry(slot);
+        assert_eq!(entry.consumer_id, 0);
+        assert_eq!(entry.slot_generation, 1);
+        assert_eq!(entry.release_cursor, 0);
+    }
+
+    #[test]
+    fn consumer_cursor_slot_generation_advances_when_slot_is_reused() {
+        let page = VideoTrackControlPage::new(2);
+        let first = page.register_consumer_cursor(7).unwrap();
+
+        page.unregister_consumer_cursor(7);
+        let second = page.register_consumer_cursor(8).unwrap();
+
+        let entry = page.consumer_cursor_entry(second);
+        assert_eq!(first, second);
+        assert_eq!(entry.consumer_id, 8);
+        assert_eq!(entry.slot_generation, 2);
+    }
+
+    #[test]
+    fn consumer_acquire_update_rejects_slot_consumer_mismatch() {
+        let page = VideoTrackControlPage::new(2);
+        let slot = page.register_consumer_cursor(7).unwrap();
+
+        let error = page.store_consumer_acquire_cursor(slot, 8, 1, 1, 0, 1).unwrap_err();
+
+        assert!(error.to_string().contains("consumer cursor slot does not match consumer id"));
+    }
+
+    #[test]
+    fn consumer_acquire_update_preserves_release_cursor() {
+        let page = VideoTrackControlPage::new(2);
+        let slot = page.register_consumer_cursor(7).unwrap();
+        page.store_consumer_release_cursor(slot, 9);
+
+        page.store_consumer_acquire_cursor(slot, 7, 10, 20, 1, 2).unwrap();
+
+        let entry = page.consumer_cursor_entry(slot);
+        assert_eq!(entry.last_acquired_cursor, 10);
+        assert_eq!(entry.last_acquired_sequence, 20);
+        assert_eq!(entry.skipped_count, 1);
+        assert_eq!(entry.acquired_count, 2);
+        assert_eq!(entry.release_cursor, 9);
     }
 
     #[test]

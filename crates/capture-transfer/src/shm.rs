@@ -121,6 +121,49 @@ impl SharedMemorySegment {
         })
     }
 
+    pub fn map_read_write(fd: OwnedFd, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(CaptureTransferError::InvalidSharedMemoryLength);
+        }
+        let file = File::from(fd);
+        let backing_len = file.metadata().map_err(|error| CaptureTransferError::SharedMemory {
+            operation: "stat-read-write",
+            message: error.to_string(),
+        })?;
+        if len as u64 > backing_len.len() {
+            return Err(CaptureTransferError::SharedMemory {
+                operation: "mmap-read-write",
+                message: format!("requested map length {len} exceeds backing file length {}", backing_len.len()),
+            });
+        }
+        // SAFETY: mmap is called with a valid fd, non-zero length, and
+        // read/write shared permissions. The mapping is released in Drop.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(CaptureTransferError::SharedMemory {
+                operation: "mmap-read-write",
+                message: std::io::Error::last_os_error().to_string(),
+            });
+        }
+        Ok(Self {
+            ptr: NonNull::new(raw.cast::<u8>()).expect("mmap returned null without MAP_FAILED"),
+            len,
+            path: None,
+            writable: true,
+            unlink_on_drop: false,
+            _file: file,
+        })
+    }
+
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len

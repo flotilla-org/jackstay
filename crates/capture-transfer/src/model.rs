@@ -112,6 +112,7 @@ pub enum PayloadKind {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
+    Unknown = 0,
     Bgra8Unorm = 1,
     Rgba8Unorm = 2,
 }
@@ -157,6 +158,7 @@ mod tests {
 
     #[test]
     fn frame_metadata_defaults_are_explicit() {
+        assert_eq!(PixelFormat::Unknown as u32, 0);
         assert_eq!(PixelFormat::Bgra8Unorm as u32, 1);
         assert_eq!(PixelFormat::Rgba8Unorm as u32, 2);
         assert_eq!(ClockDomain::Unknown as u32, 0);

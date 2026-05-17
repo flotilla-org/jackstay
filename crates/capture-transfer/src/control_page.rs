@@ -637,6 +637,7 @@ mod tests {
         CONTROL_PAGE_ALIGNMENT, EMPTY_LATEST_INDEX, PendingVideoRingEntry, VideoRingEntry, VideoRingReadError, VideoTrackControlHeader,
         VideoTrackControlPage,
     };
+    use crate::model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat};
 
     fn pending(sequence: u64, frame_key: u64) -> PendingVideoRingEntry {
         PendingVideoRingEntry {
@@ -671,18 +672,18 @@ mod tests {
             width: 1920,
             height: 1080,
             stride: 7680,
-            pixel_format: 2,
+            pixel_format: PixelFormat::Rgba8Unorm as u32,
             pool_id: 7,
             slot_id: sequence,
             slot_generation: 3,
             payload_offset: sequence * 64,
             payload_len: 4,
             payload_map_len: 8192,
-            clock_domain: 2,
-            color_space: 1,
-            sync_kind: 1,
-            damage_kind: 3,
-            damage_base_sequence: sequence - 1,
+            clock_domain: ClockDomain::MediaTime as u32,
+            color_space: ColorSpace::Srgb as u32,
+            sync_kind: FrameSyncKind::CpuCopyComplete as u32,
+            damage_kind: DamageKind::InlineRects as u32,
+            damage_base_sequence: sequence.saturating_sub(1),
             dropped_before_publish: 5,
             producer_drop_count: 8,
         }

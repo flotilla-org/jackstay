@@ -28,6 +28,7 @@ pub const FT_SOURCE_KIND_SURFACE: u32 = 3;
 
 pub const FT_TRACK_TYPE_VIDEO: u32 = 1;
 
+pub const FT_PIXEL_FORMAT_UNKNOWN: u32 = 0;
 pub const FT_PIXEL_FORMAT_BGRA8_UNORM: u32 = 1;
 pub const FT_PIXEL_FORMAT_RGBA8_UNORM: u32 = 2;
 
@@ -770,6 +771,7 @@ fn event_kind_to_ffi(kind: EventKind) -> u32 {
 
 fn pixel_format_from_ffi(format: u32) -> Option<PixelFormat> {
     match format {
+        FT_PIXEL_FORMAT_UNKNOWN => Some(PixelFormat::Unknown),
         FT_PIXEL_FORMAT_BGRA8_UNORM => Some(PixelFormat::Bgra8Unorm),
         FT_PIXEL_FORMAT_RGBA8_UNORM => Some(PixelFormat::Rgba8Unorm),
         _ => None,
@@ -778,6 +780,7 @@ fn pixel_format_from_ffi(format: u32) -> Option<PixelFormat> {
 
 fn pixel_format_to_ffi(format: PixelFormat) -> u32 {
     match format {
+        PixelFormat::Unknown => FT_PIXEL_FORMAT_UNKNOWN,
         PixelFormat::Bgra8Unorm => FT_PIXEL_FORMAT_BGRA8_UNORM,
         PixelFormat::Rgba8Unorm => FT_PIXEL_FORMAT_RGBA8_UNORM,
     }

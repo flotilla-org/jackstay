@@ -612,6 +612,7 @@ fn parse_http_response(response: &str) -> Result<String> {
 
 fn parse_pixel_format(value: &str) -> Result<PixelFormat> {
     match value {
+        "unknown" => Ok(PixelFormat::Unknown),
         "bgra8_unorm" => Ok(PixelFormat::Bgra8Unorm),
         "rgba8_unorm" => Ok(PixelFormat::Rgba8Unorm),
         other => Err(CaptureTransferError::DaemonTransport {

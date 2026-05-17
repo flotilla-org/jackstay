@@ -166,6 +166,10 @@ impl TrackRingControl {
         self.page.read_latest_lossy_entry()
     }
 
+    fn entry_for_cursor(&self, cursor: u64) -> std::result::Result<VideoRingEntry, VideoRingReadError> {
+        self.page.read_entry_for_cursor(cursor)
+    }
+
     fn ring_snapshot(&self) -> Vec<VideoRingEntry> {
         self.page.ring_snapshot()
     }
@@ -454,6 +458,21 @@ impl VideoSlotManager {
             .latest()
             .map_err(|source| CaptureTransferError::VideoControlRingRead { track_id, source })?
             .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
+        self.acquire_ring_entry(consumer_id, track_id, entry)
+    }
+
+    pub fn acquire_cursor(&mut self, consumer_id: ConsumerId, track_id: TrackId, producer_cursor: u64) -> Result<AcquiredVideoFrame> {
+        let control = self
+            .controls_by_track
+            .get(&track_id)
+            .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
+        let entry = control
+            .entry_for_cursor(producer_cursor)
+            .map_err(|source| CaptureTransferError::VideoControlRingRead { track_id, source })?;
+        self.acquire_ring_entry(consumer_id, track_id, entry)
+    }
+
+    fn acquire_ring_entry(&mut self, consumer_id: ConsumerId, track_id: TrackId, entry: VideoRingEntry) -> Result<AcquiredVideoFrame> {
         let frame = self
             .frames_by_track
             .get_mut(&track_id)
@@ -632,6 +651,8 @@ fn aligned_slot_stride(len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use crate::{
+        CaptureTransferError,
+        control_page::VideoRingReadError,
         model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
         video::{ConsumerId, VideoFrameDesc, VideoSlotManager},
     };
@@ -704,6 +725,45 @@ mod tests {
         let frame = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
         assert_eq!(frame.desc.sequence, 3);
         assert_eq!(frame.bytes(), &[3]);
+    }
+
+    #[test]
+    fn acquire_cursor_returns_requested_live_frame() {
+        let mut slots = VideoSlotManager::new(3);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+
+        let frame = slots.acquire_cursor(consumer, track, 2).unwrap();
+        assert_eq!(frame.desc.sequence, 2);
+        assert_eq!(frame.producer_cursor(), 2);
+        assert_eq!(frame.bytes(), &[2]);
+        assert_eq!(slots.pinned_frame_count(), 1);
+        let cursor = slots.debug_consumer_cursor_snapshot(consumer, track).unwrap();
+        assert_eq!(cursor.last_acquired_cursor, Some(2));
+        assert_eq!(cursor.last_acquired_sequence, Some(2));
+    }
+
+    #[test]
+    fn acquire_cursor_reports_lapped_cursor_after_wraparound() {
+        let mut slots = VideoSlotManager::new(2);
+        let track = TrackId::new(1);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+
+        let error = slots.acquire_cursor(ConsumerId::new(7), track, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureTransferError::VideoControlRingRead {
+                source: VideoRingReadError::Lapped { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

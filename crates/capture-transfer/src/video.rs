@@ -425,11 +425,24 @@ impl VideoSlotManager {
         let ring_entry = PendingVideoRingEntry {
             sequence: payload.desc.sequence,
             frame_key: key,
+            timestamp_ns: payload.desc.timestamp_ns,
+            width: payload.desc.width,
+            height: payload.desc.height,
+            stride: payload.desc.stride,
+            pixel_format: payload.desc.pixel_format as u32,
             pool_id: payload.desc.pool_id,
             slot_id: payload.desc.slot_id,
             slot_generation: payload.desc.slot_generation,
             payload_offset: payload.desc.payload_offset,
             payload_len: payload.desc.payload_len,
+            payload_map_len: payload.desc.payload_map_len,
+            clock_domain: payload.desc.clock_domain as u32,
+            color_space: payload.desc.color_space as u32,
+            sync_kind: payload.desc.sync_kind as u32,
+            damage_kind: payload.desc.damage_kind as u32,
+            damage_base_sequence: payload.desc.damage_base_sequence,
+            dropped_before_publish: payload.desc.dropped_before_publish,
+            producer_drop_count: payload.desc.producer_drop_count,
         };
         let frames = self.frames_by_track.entry(track_id).or_default();
         frames.push(StoredFrame {
@@ -986,6 +999,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(2, 2), (3, 3)]
         );
+    }
+
+    #[test]
+    fn publishing_frame_writes_full_descriptor_to_control_page() {
+        let mut slots = VideoSlotManager::new(2);
+        let track = TrackId::new(1);
+        let mut desc = frame_desc(9);
+        desc.timestamp_ns = 987_654_321;
+        desc.width = 640;
+        desc.height = 480;
+        desc.stride = 2_560;
+        desc.pixel_format = PixelFormat::Rgba8Unorm;
+        desc.clock_domain = ClockDomain::HostTime;
+        desc.color_space = ColorSpace::Srgb;
+        desc.sync_kind = FrameSyncKind::SckSampleReady;
+        desc.damage_kind = DamageKind::InlineRects;
+        desc.damage_base_sequence = 7;
+        desc.dropped_before_publish = 3;
+        desc.producer_drop_count = 4;
+
+        slots.publish(track, desc, &[1, 2, 3, 4]).unwrap();
+
+        let page = slots.debug_control_page_snapshot(track).unwrap();
+        let entry = page.entries.last().unwrap();
+        assert_eq!(entry.sequence, 9);
+        assert_eq!(entry.timestamp_ns, 987_654_321);
+        assert_eq!(entry.width, 640);
+        assert_eq!(entry.height, 480);
+        assert_eq!(entry.stride, 2_560);
+        assert_eq!(entry.pixel_format, PixelFormat::Rgba8Unorm as u32);
+        assert_eq!(entry.payload_map_len, 4);
+        assert_eq!(entry.clock_domain, ClockDomain::HostTime as u32);
+        assert_eq!(entry.color_space, ColorSpace::Srgb as u32);
+        assert_eq!(entry.sync_kind, FrameSyncKind::SckSampleReady as u32);
+        assert_eq!(entry.damage_kind, DamageKind::InlineRects as u32);
+        assert_eq!(entry.damage_base_sequence, 7);
+        assert_eq!(entry.dropped_before_publish, 3);
+        assert_eq!(entry.producer_drop_count, 4);
     }
 
     #[test]

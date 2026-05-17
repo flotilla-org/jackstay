@@ -368,6 +368,8 @@ impl DaemonConsumer {
             return Ok(());
         };
         let entry = page.shadow_read_entry_for_cursor(frame.producer_cursor)?;
+        // frame_key is intentionally absent here: it is not carried by the
+        // socket frame wire shape, which remains authoritative for leases.
         if entry.producer_cursor != frame.producer_cursor
             || entry.sequence != frame.sequence
             || entry.pool_id != frame.pool_id
@@ -658,6 +660,7 @@ mod tests {
 
     use super::{DaemonConsumer, SessionInfo, parse_http_response};
     use crate::{
+        CaptureTransferError,
         control_page::{PendingVideoRingEntry, VideoTrackControlPage},
         fdpass,
         model::PixelFormat,
@@ -848,6 +851,71 @@ mod tests {
         assert_eq!(frame.producer_cursor, 1);
         assert_eq!(frame.bytes(), b"abcd");
         consumer.release_frame(frame).unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_consumer_rejects_control_page_shadow_mismatch() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let mut control_page = VideoTrackControlPage::new(2);
+            control_page.push(PendingVideoRingEntry {
+                sequence: 1,
+                frame_key: 1,
+                pool_id: 1,
+                slot_id: 0,
+                slot_generation: 1,
+                payload_offset: 0,
+                payload_len: 3,
+            });
+            let control_fd = control_page.try_clone_fd().unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                register_control_page_json(7, control_page.mapped_len() as u64)
+            )
+            .unwrap();
+            fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
+
+            let pool_file = tempfile_file_with_contents(b"abcd");
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 4)
+            )
+            .unwrap();
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let error = consumer.latest_frame(7).unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureTransferError::DaemonTransport {
+                operation: "control-page-shadow",
+                ..
+            }
+        ));
 
         server.join().unwrap();
     }

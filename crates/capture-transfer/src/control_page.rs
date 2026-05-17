@@ -174,6 +174,8 @@ impl VideoTrackControlPage {
         let initial_header: VideoTrackControlHeader = page.read_at(0);
         let capacity = validate_control_header(&initial_header, map_len)?;
         page.layout = VideoTrackControlLayout::for_capacity(capacity);
+        // Re-read after choosing the final layout so a racing or corrupt header
+        // is caught against the mapping shape callers will use.
         page.validate_header()?;
         Ok(page)
     }
@@ -185,6 +187,8 @@ impl VideoTrackControlPage {
     }
 
     pub fn shadow_read_entry_for_cursor(&self, cursor: u64) -> CaptureResult<VideoRingEntry> {
+        // This shadow path is diagnostic while socket metadata remains
+        // authoritative, so validate on each read and fail closed.
         self.validate_header()?;
         self.read_entry_for_cursor(cursor)
             .map_err(|source| CaptureTransferError::SharedMemory {

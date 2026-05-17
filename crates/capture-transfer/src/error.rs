@@ -1,6 +1,9 @@
 use thiserror::Error;
 
-use crate::model::{SourceId, TrackId};
+use crate::{
+    control_page::VideoRingReadError,
+    model::{SourceId, TrackId},
+};
 
 pub type Result<T> = std::result::Result<T, CaptureTransferError>;
 
@@ -26,4 +29,7 @@ pub enum CaptureTransferError {
 
     #[error("unknown track id {track_id:?}")]
     UnknownTrack { track_id: TrackId },
+
+    #[error("video control ring read failed for track id {track_id:?}: {source}")]
+    VideoControlRingRead { track_id: TrackId, source: VideoRingReadError },
 }

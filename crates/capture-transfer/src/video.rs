@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    control_page::{PendingVideoRingEntry, VideoRingEntry, VideoTrackControlPage, VideoTrackControlSnapshot},
+    control_page::{PendingVideoRingEntry, VideoRingEntry, VideoRingReadError, VideoTrackControlPage, VideoTrackControlSnapshot},
     error::{CaptureTransferError, Result},
     model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
     shm::SharedMemorySegment,
@@ -155,8 +155,8 @@ impl TrackRingControl {
         self.page.push(entry);
     }
 
-    fn latest(&self) -> Option<&VideoRingEntry> {
-        self.page.latest()
+    fn latest(&self) -> std::result::Result<Option<VideoRingEntry>, VideoRingReadError> {
+        self.page.read_latest_lossy_entry()
     }
 
     fn ring_snapshot(&self) -> Vec<VideoRingEntry> {
@@ -431,11 +431,13 @@ impl VideoSlotManager {
     }
 
     pub fn acquire_latest(&mut self, consumer_id: ConsumerId, track_id: TrackId) -> Result<AcquiredVideoFrame> {
-        let entry = self
+        let control = self
             .controls_by_track
             .get(&track_id)
-            .and_then(TrackRingControl::latest)
-            .cloned()
+            .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
+        let entry = control
+            .latest()
+            .map_err(|source| CaptureTransferError::VideoControlRingRead { track_id, source })?
             .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
         let frame = self
             .frames_by_track

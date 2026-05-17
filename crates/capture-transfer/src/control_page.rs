@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use thiserror::Error;
 
 use crate::shm::SharedMemorySegment;
@@ -6,6 +8,8 @@ pub const CONTROL_PAGE_ALIGNMENT: usize = 128;
 pub const EMPTY_LATEST_INDEX: u64 = u64::MAX;
 pub const VIDEO_TRACK_CONTROL_MAGIC: u64 = u64::from_le_bytes(*b"JSVTRK01");
 pub const VIDEO_TRACK_CONTROL_VERSION: u64 = 1;
+const VIDEO_RING_PUBLICATION_SEQUENCE_LEN: usize = std::mem::size_of::<u64>();
+const _: () = assert!(std::mem::offset_of!(VideoRingEntry, publication_sequence) == 0);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +24,14 @@ pub struct VideoTrackControlHeader {
     pub latest_sequence: u64,
     pub latest_index: u64,
     pub len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoTrackControlHeaderField {
+    ProducerCursor,
+    LatestSequence,
+    LatestIndex,
+    Len,
 }
 
 #[repr(C)]
@@ -118,7 +130,7 @@ impl VideoTrackControlPage {
         let layout = VideoTrackControlLayout::for_capacity(capacity);
         let storage = SharedMemorySegment::new(layout.byte_len).expect("control page mapped storage allocation failed");
         let page = Self { layout, storage };
-        page.store_header(VideoTrackControlHeader {
+        page.store_initial_header(VideoTrackControlHeader {
             magic: VIDEO_TRACK_CONTROL_MAGIC,
             version: VIDEO_TRACK_CONTROL_VERSION,
             header_len: std::mem::size_of::<VideoTrackControlHeader>() as u64,
@@ -150,41 +162,210 @@ impl VideoTrackControlPage {
 
     #[cfg(test)]
     fn set_entry_publication_sequence_for_test(&self, index: usize, publication_sequence: u64) {
-        self.store_entry_publication_sequence(index, publication_sequence);
+        self.store_entry_publication_sequence(index, publication_sequence, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn header_field_offset_for_test(&self, field: VideoTrackControlHeaderField) -> usize {
+        self.header_field_offset(field)
+    }
+
+    #[cfg(test)]
+    fn entry_publication_sequence_offset_for_test(&self, index: usize) -> usize {
+        self.entry_publication_sequence_offset(index)
+    }
+
+    #[cfg(test)]
+    fn load_header_producer_cursor_for_test(&self, ordering: Ordering) -> u64 {
+        self.load_header_producer_cursor(ordering)
+    }
+
+    #[cfg(test)]
+    fn store_header_producer_cursor_for_test(&self, value: u64, ordering: Ordering) {
+        self.store_header_producer_cursor(value, ordering);
+    }
+
+    #[cfg(test)]
+    fn load_entry_publication_sequence_for_test(&self, index: usize, ordering: Ordering) -> u64 {
+        self.load_entry_publication_sequence(index, ordering)
+    }
+
+    #[cfg(test)]
+    fn store_entry_publication_sequence_for_test(&self, index: usize, value: u64, ordering: Ordering) {
+        self.store_entry_publication_sequence(index, value, ordering);
     }
 
     fn header(&self) -> VideoTrackControlHeader {
-        self.read_at(self.layout.header_offset)
+        VideoTrackControlHeader {
+            magic: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, magic)),
+            version: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, version)),
+            header_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, header_len)),
+            entry_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, entry_len)),
+            capacity: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, capacity)),
+            index_mask: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, index_mask)),
+            producer_cursor: self.load_header_producer_cursor(Ordering::Acquire),
+            latest_sequence: self.load_header_latest_sequence(Ordering::Acquire),
+            latest_index: self.load_header_latest_index(Ordering::Acquire),
+            len: self.load_header_len(Ordering::Acquire),
+        }
     }
 
-    fn store_header(&self, header: VideoTrackControlHeader) {
+    fn store_initial_header(&self, header: VideoTrackControlHeader) {
+        debug_assert_eq!(header.producer_cursor, 0);
+        debug_assert_eq!(header.latest_sequence, 0);
+        debug_assert_eq!(header.latest_index, EMPTY_LATEST_INDEX);
+        debug_assert_eq!(header.len, 0);
+        // This is the one whole-header write, performed before the page can be
+        // shared with any reader. After init, hot fields use atomic helpers.
         self.write_at(self.layout.header_offset, header);
     }
 
     fn entry(&self, index: usize) -> VideoRingEntry {
         assert!(index < self.layout.capacity);
-        self.read_at(self.entry_offset(index))
+        // Snapshot/test reads are lossy observations. Authoritative cursor reads
+        // use `read_entry_for_cursor`, which performs the second sequence load.
+        // TODO(cross-process): do not use this as an authoritative reader after
+        // fd passing; it does not re-load the sequence after descriptor copy.
+        let publication_sequence = self.load_entry_publication_sequence(index, Ordering::Acquire);
+        self.read_entry_descriptor(index, publication_sequence)
     }
 
-    fn store_entry(&self, index: usize, entry: VideoRingEntry) {
+    fn read_entry_descriptor(&self, index: usize, publication_sequence: u64) -> VideoRingEntry {
         assert!(index < self.layout.capacity);
-        self.write_at(self.entry_offset(index), entry);
+        let mut entry = VideoRingEntry {
+            publication_sequence,
+            ..VideoRingEntry::default()
+        };
+        let descriptor_offset = self.entry_offset(index) + VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
+        let descriptor_len = self.layout.entry_len - VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
+        let bytes = self.storage.slice_at(descriptor_offset, descriptor_len);
+        // SAFETY: `publication_sequence` is field 0. This copies the rest of
+        // the repr(C) descriptor into a local value without reading the atomic
+        // sequence as plain bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                std::ptr::addr_of_mut!(entry).cast::<u8>().add(VIDEO_RING_PUBLICATION_SEQUENCE_LEN),
+                bytes.len(),
+            );
+        }
+        entry
+    }
+
+    fn store_entry_descriptor(&self, index: usize, entry: VideoRingEntry) {
+        assert!(index < self.layout.capacity);
+        let descriptor_offset = self.entry_offset(index) + VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
+        let descriptor_len = self.layout.entry_len - VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
+        self.storage.with_slice_at_mut(descriptor_offset, descriptor_len, |bytes| {
+            // SAFETY: `publication_sequence` is field 0. This copies the rest
+            // of the repr(C) descriptor without touching the atomic sequence.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    std::ptr::addr_of!(entry).cast::<u8>().add(VIDEO_RING_PUBLICATION_SEQUENCE_LEN),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+            }
+        });
     }
 
     fn entry_publication_sequence(&self, index: usize) -> u64 {
-        assert!(index < self.layout.capacity);
-        // `publication_sequence` is field 0 of the repr(C) entry. Keep this
-        // offset explicit because future atomics will load this field directly.
-        self.read_at(self.entry_offset(index))
+        self.load_entry_publication_sequence(index, Ordering::Acquire)
     }
 
-    fn store_entry_publication_sequence(&self, index: usize, publication_sequence: u64) {
+    fn load_entry_publication_sequence(&self, index: usize, ordering: Ordering) -> u64 {
         assert!(index < self.layout.capacity);
-        self.write_at(self.entry_offset(index), publication_sequence);
+        self.load_u64_atomic(self.entry_publication_sequence_offset(index), ordering)
+    }
+
+    fn store_entry_publication_sequence(&self, index: usize, publication_sequence: u64, ordering: Ordering) {
+        assert!(index < self.layout.capacity);
+        self.store_u64_atomic(self.entry_publication_sequence_offset(index), publication_sequence, ordering);
+    }
+
+    fn entry_publication_sequence_offset(&self, index: usize) -> usize {
+        // `publication_sequence` is field 0 of the repr(C) entry. Keep this
+        // offset explicit because future atomics will load this field directly.
+        self.entry_offset(index)
+    }
+
+    fn load_header_producer_cursor(&self, ordering: Ordering) -> u64 {
+        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::ProducerCursor), ordering)
+    }
+
+    fn store_header_producer_cursor(&self, value: u64, ordering: Ordering) {
+        self.store_u64_atomic(
+            self.header_field_offset(VideoTrackControlHeaderField::ProducerCursor),
+            value,
+            ordering,
+        );
+    }
+
+    fn load_header_latest_sequence(&self, ordering: Ordering) -> u64 {
+        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::LatestSequence), ordering)
+    }
+
+    fn store_header_latest_sequence(&self, value: u64, ordering: Ordering) {
+        self.store_u64_atomic(
+            self.header_field_offset(VideoTrackControlHeaderField::LatestSequence),
+            value,
+            ordering,
+        );
+    }
+
+    fn load_header_latest_index(&self, ordering: Ordering) -> u64 {
+        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::LatestIndex), ordering)
+    }
+
+    fn store_header_latest_index(&self, value: u64, ordering: Ordering) {
+        self.store_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::LatestIndex), value, ordering);
+    }
+
+    fn load_header_len(&self, ordering: Ordering) -> u64 {
+        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::Len), ordering)
+    }
+
+    fn store_header_len(&self, value: u64, ordering: Ordering) {
+        self.store_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::Len), value, ordering);
+    }
+
+    fn header_field_offset(&self, field: VideoTrackControlHeaderField) -> usize {
+        let field_offset = match field {
+            VideoTrackControlHeaderField::ProducerCursor => std::mem::offset_of!(VideoTrackControlHeader, producer_cursor),
+            VideoTrackControlHeaderField::LatestSequence => std::mem::offset_of!(VideoTrackControlHeader, latest_sequence),
+            VideoTrackControlHeaderField::LatestIndex => std::mem::offset_of!(VideoTrackControlHeader, latest_index),
+            VideoTrackControlHeaderField::Len => std::mem::offset_of!(VideoTrackControlHeader, len),
+        };
+        self.layout.header_offset + field_offset
+    }
+
+    fn read_header_u64(&self, field_offset: usize) -> u64 {
+        self.read_at(self.layout.header_offset + field_offset)
     }
 
     fn entry_offset(&self, index: usize) -> usize {
         self.layout.entries_offset + index * self.layout.entry_len
+    }
+
+    fn load_u64_atomic(&self, offset: usize, ordering: Ordering) -> u64 {
+        assert_eq!(offset % std::mem::align_of::<AtomicU64>(), 0);
+        let bytes = self.storage.slice_at(offset, std::mem::size_of::<AtomicU64>());
+        // SAFETY: callers supply an AtomicU64-aligned offset inside the live
+        // mapping. The storage is a plain mapped page whose hot u64 fields are
+        // exclusively accessed through these atomic helpers after init.
+        unsafe { (&*bytes.as_ptr().cast::<AtomicU64>()).load(ordering) }
+    }
+
+    fn store_u64_atomic(&self, offset: usize, value: u64, ordering: Ordering) {
+        assert_eq!(offset % std::mem::align_of::<AtomicU64>(), 0);
+        self.storage.with_slice_at_mut(offset, std::mem::size_of::<AtomicU64>(), |bytes| {
+            // SAFETY: callers supply an AtomicU64-aligned offset inside the live
+            // mapping. The storage is a plain mapped page whose hot u64 fields
+            // are exclusively accessed through these atomic helpers after init.
+            unsafe {
+                (&*bytes.as_mut_ptr().cast::<AtomicU64>()).store(value, ordering);
+            }
+        });
     }
 
     fn read_at<T: Copy>(&self, offset: usize) -> T {
@@ -222,14 +403,17 @@ impl VideoTrackControlPage {
             payload_offset: entry.payload_offset,
             payload_len: entry.payload_len,
         };
-        // TODO: before any cross-process reader uses this mapping, replace
-        // these plain writes with the atomic release/acquire publication pair.
-        self.store_entry(index, ring_entry);
-        self.store_entry_publication_sequence(index, header.producer_cursor);
-        header.latest_sequence = entry.sequence;
-        header.latest_index = index as u64;
-        header.len = (header.len + 1).min(header.capacity);
-        self.store_header(header);
+        // Descriptor fields are still plain copied values. The surrounding
+        // publication sequence stores are the release/acquire boundary that a
+        // future cross-process reader must preserve.
+        self.store_entry_publication_sequence(index, 0, Ordering::Relaxed);
+        self.store_entry_descriptor(index, ring_entry);
+        self.store_entry_publication_sequence(index, header.producer_cursor, Ordering::Release);
+        let len = (header.len + 1).min(header.capacity);
+        self.store_header_latest_sequence(entry.sequence, Ordering::Relaxed);
+        self.store_header_latest_index(index as u64, Ordering::Relaxed);
+        self.store_header_len(len, Ordering::Release);
+        self.store_header_producer_cursor(header.producer_cursor, Ordering::Release);
     }
 
     pub fn read_entry_for_cursor(&self, cursor: u64) -> Result<VideoRingEntry, VideoRingReadError> {
@@ -254,7 +438,7 @@ impl VideoTrackControlPage {
         let header = self.header();
         let index = ((cursor - 1) & header.index_mask) as usize;
         let first_sequence = self.entry_publication_sequence(index);
-        let entry = self.entry(index);
+        let entry = self.read_entry_descriptor(index, first_sequence);
         let second_sequence = self.entry_publication_sequence(index);
         if first_sequence != cursor || second_sequence != cursor {
             return Err(VideoRingReadError::SlotSequenceMismatch {
@@ -275,18 +459,19 @@ impl VideoTrackControlPage {
 
     #[must_use]
     pub fn latest_cursor(&self) -> Option<u64> {
-        let header = self.header();
-        (header.len > 0).then_some(header.producer_cursor)
+        let producer_cursor = self.load_header_producer_cursor(Ordering::Acquire);
+        (producer_cursor > 0).then_some(producer_cursor)
     }
 
     #[must_use]
     pub fn oldest_live_cursor(&self) -> Option<u64> {
-        let header = self.header();
-        if header.len == 0 {
+        let producer_cursor = self.load_header_producer_cursor(Ordering::Acquire);
+        let len = self.load_header_len(Ordering::Acquire);
+        if producer_cursor == 0 || len == 0 {
             return None;
         }
-        debug_assert!(header.producer_cursor >= header.len);
-        Some(header.producer_cursor - header.len + 1)
+        debug_assert!(producer_cursor >= len);
+        Some(producer_cursor - len + 1)
     }
 
     #[must_use]
@@ -305,7 +490,7 @@ impl VideoTrackControlPage {
         };
         (0..len)
             .map(|offset| {
-                let index = (start + offset) & header.index_mask as usize;
+                let index = (start + offset) & (header.index_mask as usize);
                 self.entry(index)
             })
             .collect()
@@ -331,6 +516,8 @@ const fn align_up(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::{
         CONTROL_PAGE_ALIGNMENT, EMPTY_LATEST_INDEX, PendingVideoRingEntry, VideoRingEntry, VideoRingReadError, VideoTrackControlHeader,
         VideoTrackControlPage,
@@ -371,11 +558,68 @@ mod tests {
     }
 
     #[test]
+    fn hot_control_fields_are_aligned_for_atomic_u64_access() {
+        let page = VideoTrackControlPage::new(2);
+
+        assert_eq!(
+            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::ProducerCursor)
+                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
+            0
+        );
+        assert_eq!(
+            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::LatestSequence)
+                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
+            0
+        );
+        assert_eq!(
+            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::LatestIndex)
+                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
+            0
+        );
+        assert_eq!(
+            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::Len)
+                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
+            0
+        );
+        assert_eq!(
+            page.entry_publication_sequence_offset_for_test(0) % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
+            0
+        );
+    }
+
+    #[test]
+    fn atomic_header_producer_cursor_roundtrips_through_mapped_page() {
+        let page = VideoTrackControlPage::new(2);
+
+        page.store_header_producer_cursor_for_test(17, Ordering::Release);
+
+        assert_eq!(page.load_header_producer_cursor_for_test(Ordering::Acquire), 17);
+        assert_eq!(page.snapshot().header.producer_cursor, 17);
+    }
+
+    #[test]
+    fn atomic_entry_publication_sequence_roundtrips_through_mapped_page() {
+        let page = VideoTrackControlPage::new(2);
+
+        page.store_entry_publication_sequence_for_test(0, 23, Ordering::Release);
+
+        assert_eq!(page.load_entry_publication_sequence_for_test(0, Ordering::Acquire), 23);
+        assert_eq!(page.raw_entry_for_test(0).publication_sequence, 23);
+    }
+
+    #[test]
     fn control_page_mapped_entries_start_zeroed() {
         let page = VideoTrackControlPage::new(2);
 
         assert_eq!(page.raw_entry_for_test(0), VideoRingEntry::default());
         assert_eq!(page.raw_entry_for_test(1), VideoRingEntry::default());
+    }
+
+    #[test]
+    fn latest_cursor_returns_none_on_empty_page() {
+        let page = VideoTrackControlPage::new(2);
+
+        assert_eq!(page.latest_cursor(), None);
     }
 
     #[test]

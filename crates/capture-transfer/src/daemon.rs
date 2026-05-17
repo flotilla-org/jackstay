@@ -382,13 +382,31 @@ impl DaemonConsumer {
         let entry = page.shadow_read_entry_for_cursor(frame.producer_cursor)?;
         // frame_key is intentionally absent here: it is not carried by the
         // socket frame wire shape, which remains authoritative for leases.
+        let pixel_format = parse_pixel_format(&frame.pixel_format)? as u32;
+        let clock_domain = parse_clock_domain(&frame.clock_domain)? as u32;
+        let color_space = parse_color_space(&frame.color_space)? as u32;
+        let sync_kind = parse_sync_kind(&frame.sync_kind)? as u32;
+        let damage_kind = parse_damage_kind(&frame.damage_kind)? as u32;
         if entry.producer_cursor != frame.producer_cursor
             || entry.sequence != frame.sequence
+            || entry.timestamp_ns != frame.timestamp_ns
+            || entry.width != frame.width
+            || entry.height != frame.height
+            || entry.stride != frame.stride
+            || entry.pixel_format != pixel_format
             || entry.pool_id != frame.pool_id
             || entry.slot_id != frame.slot_id
             || entry.slot_generation != frame.slot_generation
             || entry.payload_offset != frame.payload_offset
             || entry.payload_len != frame.payload_len
+            || entry.payload_map_len != frame.payload_map_len
+            || entry.clock_domain != clock_domain
+            || entry.color_space != color_space
+            || entry.sync_kind != sync_kind
+            || entry.damage_kind != damage_kind
+            || entry.damage_base_sequence != frame.damage_base_sequence
+            || entry.dropped_before_publish != frame.dropped_before_publish
+            || entry.producer_drop_count != frame.producer_drop_count
         {
             return Err(CaptureTransferError::DaemonTransport {
                 operation: "control-page-shadow",
@@ -675,7 +693,7 @@ mod tests {
         CaptureTransferError,
         control_page::{PendingVideoRingEntry, VideoTrackControlPage},
         fdpass,
-        model::PixelFormat,
+        model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat},
     };
 
     #[test]
@@ -815,15 +833,7 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let mut control_page = VideoTrackControlPage::new(2);
-            control_page.push(PendingVideoRingEntry {
-                sequence: 1,
-                frame_key: 1,
-                pool_id: 1,
-                slot_id: 0,
-                slot_generation: 1,
-                payload_offset: 0,
-                payload_len: 4,
-            });
+            control_page.push(pending_control_entry(1, 1, 1, 1, 0, 4, 4));
             let control_fd = control_page.try_clone_fd().unwrap();
             writeln!(
                 stream.try_clone().unwrap(),
@@ -879,15 +889,7 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let mut control_page = VideoTrackControlPage::new(2);
-            control_page.push(PendingVideoRingEntry {
-                sequence: 1,
-                frame_key: 1,
-                pool_id: 1,
-                slot_id: 0,
-                slot_generation: 1,
-                payload_offset: 0,
-                payload_len: 4,
-            });
+            control_page.push(pending_control_entry(1, 1, 1, 1, 0, 4, 8));
             let control_fd = control_page.try_clone_fd().unwrap();
             writeln!(
                 stream.try_clone().unwrap(),
@@ -906,15 +908,7 @@ mod tests {
                 latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 8)
             )
             .unwrap();
-            control_page.push(PendingVideoRingEntry {
-                sequence: 2,
-                frame_key: 2,
-                pool_id: 1,
-                slot_id: 0,
-                slot_generation: 1,
-                payload_offset: 4,
-                payload_len: 4,
-            });
+            control_page.push(pending_control_entry(2, 2, 1, 1, 4, 4, 8));
             assert_release_request(&mut reader, 11);
 
             assert_acquire_request(&mut reader, "session-1", 7, 2);
@@ -965,15 +959,9 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let mut control_page = VideoTrackControlPage::new(2);
-            control_page.push(PendingVideoRingEntry {
-                sequence: 1,
-                frame_key: 1,
-                pool_id: 1,
-                slot_id: 0,
-                slot_generation: 1,
-                payload_offset: 0,
-                payload_len: 3,
-            });
+            let mut entry = pending_control_entry(1, 1, 1, 1, 0, 4, 4);
+            entry.timestamp_ns = 99;
+            control_page.push(entry);
             let control_fd = control_page.try_clone_fd().unwrap();
             writeln!(
                 stream.try_clone().unwrap(),
@@ -1092,6 +1080,39 @@ mod tests {
             "consumer_skipped_count": 0,
             "len": payload_len
         })
+    }
+
+    fn pending_control_entry(
+        sequence: u64,
+        frame_key: u64,
+        pool_id: u64,
+        slot_generation: u64,
+        payload_offset: u64,
+        payload_len: u64,
+        payload_map_len: u64,
+    ) -> PendingVideoRingEntry {
+        PendingVideoRingEntry {
+            sequence,
+            frame_key,
+            timestamp_ns: 100,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm as u32,
+            pool_id,
+            slot_id: 0,
+            slot_generation,
+            payload_offset,
+            payload_len,
+            payload_map_len,
+            clock_domain: ClockDomain::MediaTime as u32,
+            color_space: ColorSpace::Srgb as u32,
+            sync_kind: FrameSyncKind::CpuCopyComplete as u32,
+            damage_kind: DamageKind::FullFrame as u32,
+            damage_base_sequence: sequence,
+            dropped_before_publish: 0,
+            producer_drop_count: 0,
+        }
     }
 
     fn register_pool_json(

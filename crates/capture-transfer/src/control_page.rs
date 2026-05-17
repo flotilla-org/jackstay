@@ -47,22 +47,48 @@ pub struct VideoRingEntry {
     pub producer_cursor: u64,
     pub sequence: u64,
     pub frame_key: u64,
+    pub timestamp_ns: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
     pub pool_id: u64,
     pub slot_id: u64,
     pub slot_generation: u64,
     pub payload_offset: u64,
     pub payload_len: u64,
+    pub payload_map_len: u64,
+    pub clock_domain: u32,
+    pub color_space: u32,
+    pub sync_kind: u32,
+    pub damage_kind: u32,
+    pub damage_base_sequence: u64,
+    pub dropped_before_publish: u64,
+    pub producer_drop_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingVideoRingEntry {
     pub sequence: u64,
     pub frame_key: u64,
+    pub timestamp_ns: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
     pub pool_id: u64,
     pub slot_id: u64,
     pub slot_generation: u64,
     pub payload_offset: u64,
     pub payload_len: u64,
+    pub payload_map_len: u64,
+    pub clock_domain: u32,
+    pub color_space: u32,
+    pub sync_kind: u32,
+    pub damage_kind: u32,
+    pub damage_base_sequence: u64,
+    pub dropped_before_publish: u64,
+    pub producer_drop_count: u64,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -439,11 +465,24 @@ impl VideoTrackControlPage {
             producer_cursor: header.producer_cursor,
             sequence: entry.sequence,
             frame_key: entry.frame_key,
+            timestamp_ns: entry.timestamp_ns,
+            width: entry.width,
+            height: entry.height,
+            stride: entry.stride,
+            pixel_format: entry.pixel_format,
             pool_id: entry.pool_id,
             slot_id: entry.slot_id,
             slot_generation: entry.slot_generation,
             payload_offset: entry.payload_offset,
             payload_len: entry.payload_len,
+            payload_map_len: entry.payload_map_len,
+            clock_domain: entry.clock_domain,
+            color_space: entry.color_space,
+            sync_kind: entry.sync_kind,
+            damage_kind: entry.damage_kind,
+            damage_base_sequence: entry.damage_base_sequence,
+            dropped_before_publish: entry.dropped_before_publish,
+            producer_drop_count: entry.producer_drop_count,
         };
         // Descriptor fields are still plain copied values. The surrounding
         // publication sequence stores are the release/acquire boundary that a
@@ -603,11 +642,49 @@ mod tests {
         PendingVideoRingEntry {
             sequence,
             frame_key,
+            timestamp_ns: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: 0,
             pool_id: 7,
             slot_id: sequence,
             slot_generation: 3,
             payload_offset: sequence * 64,
             payload_len: 4,
+            payload_map_len: 4,
+            clock_domain: 0,
+            color_space: 0,
+            sync_kind: 0,
+            damage_kind: 0,
+            damage_base_sequence: 0,
+            dropped_before_publish: 0,
+            producer_drop_count: 0,
+        }
+    }
+
+    fn full_pending(sequence: u64, frame_key: u64) -> PendingVideoRingEntry {
+        PendingVideoRingEntry {
+            sequence,
+            frame_key,
+            timestamp_ns: 123_456_789,
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            pixel_format: 2,
+            pool_id: 7,
+            slot_id: sequence,
+            slot_generation: 3,
+            payload_offset: sequence * 64,
+            payload_len: 4,
+            payload_map_len: 8192,
+            clock_domain: 2,
+            color_space: 1,
+            sync_kind: 1,
+            damage_kind: 3,
+            damage_base_sequence: sequence - 1,
+            dropped_before_publish: 5,
+            producer_drop_count: 8,
         }
     }
 
@@ -712,6 +789,44 @@ mod tests {
         assert_eq!(entry.slot_id, 10);
         assert_eq!(entry.payload_offset, 640);
         assert_eq!(entry.payload_len, 4);
+    }
+
+    #[test]
+    fn read_only_control_page_shadow_reads_full_descriptor_from_fd() {
+        let mut page = VideoTrackControlPage::new(2);
+        let pending = full_pending(10, 100);
+        page.push(pending.clone());
+
+        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
+        let entry = mapped.shadow_read_entry_for_cursor(1).unwrap();
+
+        assert_eq!(
+            entry,
+            VideoRingEntry {
+                publication_sequence: 1,
+                producer_cursor: 1,
+                sequence: pending.sequence,
+                frame_key: pending.frame_key,
+                timestamp_ns: pending.timestamp_ns,
+                width: pending.width,
+                height: pending.height,
+                stride: pending.stride,
+                pixel_format: pending.pixel_format,
+                pool_id: pending.pool_id,
+                slot_id: pending.slot_id,
+                slot_generation: pending.slot_generation,
+                payload_offset: pending.payload_offset,
+                payload_len: pending.payload_len,
+                payload_map_len: pending.payload_map_len,
+                clock_domain: pending.clock_domain,
+                color_space: pending.color_space,
+                sync_kind: pending.sync_kind,
+                damage_kind: pending.damage_kind,
+                damage_base_sequence: pending.damage_base_sequence,
+                dropped_before_publish: pending.dropped_before_publish,
+                producer_drop_count: pending.producer_drop_count,
+            }
+        );
     }
 
     #[test]

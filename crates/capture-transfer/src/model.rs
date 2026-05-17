@@ -109,10 +109,11 @@ pub enum PayloadKind {
     D3dSharedResource,
 }
 
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
-    Bgra8Unorm,
-    Rgba8Unorm,
+    Bgra8Unorm = 1,
+    Rgba8Unorm = 2,
 }
 
 #[repr(u32)]
@@ -152,10 +153,12 @@ pub enum DamageKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind};
+    use super::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat};
 
     #[test]
     fn frame_metadata_defaults_are_explicit() {
+        assert_eq!(PixelFormat::Bgra8Unorm as u32, 1);
+        assert_eq!(PixelFormat::Rgba8Unorm as u32, 2);
         assert_eq!(ClockDomain::Unknown as u32, 0);
         assert_eq!(ClockDomain::UnixTime as u32, 1);
         assert_eq!(ClockDomain::MediaTime as u32, 2);

@@ -1,8 +1,14 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    os::fd::OwnedFd,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use thiserror::Error;
 
-use crate::shm::SharedMemorySegment;
+use crate::{
+    error::{CaptureTransferError, Result as CaptureResult},
+    shm::SharedMemorySegment,
+};
 
 pub const CONTROL_PAGE_ALIGNMENT: usize = 128;
 pub const EMPTY_LATEST_INDEX: u64 = u64::MAX;
@@ -153,6 +159,38 @@ impl VideoTrackControlPage {
     #[must_use]
     pub fn mapped_len(&self) -> usize {
         self.storage.len()
+    }
+
+    pub fn try_clone_fd(&self) -> CaptureResult<OwnedFd> {
+        self.storage.try_clone_fd()
+    }
+
+    pub fn map_read_only(fd: OwnedFd, map_len: usize) -> CaptureResult<Self> {
+        let storage = SharedMemorySegment::map_read_only(fd, map_len)?;
+        let mut page = Self {
+            layout: VideoTrackControlLayout::for_capacity(1),
+            storage,
+        };
+        let initial_header: VideoTrackControlHeader = page.read_at(0);
+        let capacity = validate_control_header(&initial_header, map_len)?;
+        page.layout = VideoTrackControlLayout::for_capacity(capacity);
+        page.validate_header()?;
+        Ok(page)
+    }
+
+    pub fn validate_header(&self) -> CaptureResult<VideoTrackControlHeader> {
+        let header = self.header();
+        validate_control_header(&header, self.storage.len())?;
+        Ok(header)
+    }
+
+    pub fn shadow_read_entry_for_cursor(&self, cursor: u64) -> CaptureResult<VideoRingEntry> {
+        self.validate_header()?;
+        self.read_entry_for_cursor(cursor)
+            .map_err(|source| CaptureTransferError::SharedMemory {
+                operation: "read-control-page",
+                message: source.to_string(),
+            })
     }
 
     #[cfg(test)]
@@ -509,6 +547,40 @@ fn ring_capacity_for(requested: usize) -> usize {
     requested.max(1).next_power_of_two()
 }
 
+fn validate_control_header(header: &VideoTrackControlHeader, map_len: usize) -> CaptureResult<usize> {
+    if header.magic != VIDEO_TRACK_CONTROL_MAGIC {
+        return Err(invalid_control_page("invalid magic"));
+    }
+    if header.version != VIDEO_TRACK_CONTROL_VERSION {
+        return Err(invalid_control_page("invalid version"));
+    }
+    if header.header_len != std::mem::size_of::<VideoTrackControlHeader>() as u64 {
+        return Err(invalid_control_page("invalid header length"));
+    }
+    if header.entry_len != std::mem::size_of::<VideoRingEntry>() as u64 {
+        return Err(invalid_control_page("invalid entry length"));
+    }
+    let capacity = usize::try_from(header.capacity).map_err(|_| invalid_control_page("capacity does not fit usize"))?;
+    if capacity == 0 || !capacity.is_power_of_two() {
+        return Err(invalid_control_page("capacity must be a non-zero power of two"));
+    }
+    if header.index_mask != header.capacity - 1 {
+        return Err(invalid_control_page("index mask does not match capacity"));
+    }
+    let layout = VideoTrackControlLayout::for_capacity(capacity);
+    if layout.byte_len > map_len {
+        return Err(invalid_control_page("mapped length is smaller than declared layout"));
+    }
+    Ok(capacity)
+}
+
+fn invalid_control_page(message: impl Into<String>) -> CaptureTransferError {
+    CaptureTransferError::SharedMemory {
+        operation: "validate-control-page",
+        message: message.into(),
+    }
+}
+
 const fn align_up(value: usize, alignment: usize) -> usize {
     debug_assert!(alignment.is_power_of_two());
     (value + alignment - 1) & !(alignment - 1)
@@ -605,6 +677,37 @@ mod tests {
 
         assert_eq!(page.load_entry_publication_sequence_for_test(0, Ordering::Acquire), 23);
         assert_eq!(page.raw_entry_for_test(0).publication_sequence, 23);
+    }
+
+    #[test]
+    fn read_only_control_page_mapping_validates_header_from_fd() {
+        let page = VideoTrackControlPage::new(3);
+
+        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
+
+        let header = mapped.validate_header().unwrap();
+        assert_eq!(header.magic, super::VIDEO_TRACK_CONTROL_MAGIC);
+        assert_eq!(header.version, super::VIDEO_TRACK_CONTROL_VERSION);
+        assert_eq!(header.capacity, 4);
+        assert_eq!(mapped.mapped_len(), page.mapped_len());
+    }
+
+    #[test]
+    fn read_only_control_page_shadow_reads_published_entry_from_fd() {
+        let mut page = VideoTrackControlPage::new(2);
+        page.push(pending(10, 100));
+
+        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
+        let entry = mapped.shadow_read_entry_for_cursor(1).unwrap();
+
+        assert_eq!(entry.publication_sequence, 1);
+        assert_eq!(entry.producer_cursor, 1);
+        assert_eq!(entry.sequence, 10);
+        assert_eq!(entry.frame_key, 100);
+        assert_eq!(entry.pool_id, 7);
+        assert_eq!(entry.slot_id, 10);
+        assert_eq!(entry.payload_offset, 640);
+        assert_eq!(entry.payload_len, 4);
     }
 
     #[test]

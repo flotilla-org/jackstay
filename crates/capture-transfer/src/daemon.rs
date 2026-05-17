@@ -12,6 +12,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
+    control_page::VideoTrackControlPage,
     error::{CaptureTransferError, Result},
     fdpass,
     model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat},
@@ -100,6 +101,7 @@ pub struct DaemonConsumer {
     reader: BufReader<UnixStream>,
     // TODO: evict retired pool generations once the capture transfer channel grows pool-retirement messages.
     pools: BTreeMap<PoolKey, Rc<RegisteredPoolMapping>>,
+    control_pages: BTreeMap<u64, VideoTrackControlPage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +180,7 @@ impl DaemonConsumer {
             stream,
             reader: BufReader::new(reader_stream),
             pools: BTreeMap::new(),
+            control_pages: BTreeMap::new(),
         })
     }
 
@@ -194,6 +197,20 @@ impl DaemonConsumer {
             // The connection is already scoped to self.info.session_id; session_id
             // remains on the wire for diagnostics and future multiplexing.
             match message {
+                CaptureTransferMessage::RegisterVideoControlPage {
+                    session_id: _,
+                    track_id,
+                    map_len,
+                } => {
+                    let map_len = usize::try_from(map_len).map_err(|_| CaptureTransferError::DaemonTransport {
+                        operation: "mmap-control-page",
+                        message: "control page map length does not fit usize".to_string(),
+                    })?;
+                    let fd = fdpass::recv_fd(&self.stream)?;
+                    let page = VideoTrackControlPage::map_read_only(fd, map_len)?;
+                    page.validate_header()?;
+                    self.control_pages.insert(track_id, page);
+                }
                 CaptureTransferMessage::RegisterCpuPool {
                     session_id: _,
                     track_id,
@@ -266,6 +283,7 @@ impl DaemonConsumer {
                         consumer_skipped_count,
                         len,
                     };
+                    self.compare_control_page_shadow(&frame)?;
                     return self.daemon_frame_from_wire(frame);
                 }
             }
@@ -344,6 +362,30 @@ impl DaemonConsumer {
             })?;
             daemon_frame_from_registered_pool(pool, frame)
         }
+    }
+
+    fn compare_control_page_shadow(&self, frame: &LatestFrameWire) -> Result<()> {
+        let Some(page) = self.control_pages.get(&frame.track_id) else {
+            return Ok(());
+        };
+        let entry = page.shadow_read_entry_for_cursor(frame.producer_cursor)?;
+        if entry.producer_cursor != frame.producer_cursor
+            || entry.sequence != frame.sequence
+            || entry.pool_id != frame.pool_id
+            || entry.slot_id != frame.slot_id
+            || entry.slot_generation != frame.slot_generation
+            || entry.payload_offset != frame.payload_offset
+            || entry.payload_len != frame.payload_len
+        {
+            return Err(CaptureTransferError::DaemonTransport {
+                operation: "control-page-shadow",
+                message: format!(
+                    "control page entry does not match frame metadata for track={} cursor={}",
+                    frame.track_id, frame.producer_cursor
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -616,7 +658,11 @@ mod tests {
     };
 
     use super::{DaemonConsumer, SessionInfo, parse_http_response};
-    use crate::{fdpass, model::PixelFormat};
+    use crate::{
+        control_page::{PendingVideoRingEntry, VideoTrackControlPage},
+        fdpass,
+        model::PixelFormat,
+    };
 
     #[test]
     fn parses_http_body() {
@@ -743,6 +789,70 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn daemon_consumer_maps_control_page_shadow() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let mut control_page = VideoTrackControlPage::new(2);
+            control_page.push(PendingVideoRingEntry {
+                sequence: 1,
+                frame_key: 1,
+                pool_id: 1,
+                slot_id: 0,
+                slot_generation: 1,
+                payload_offset: 0,
+                payload_len: 4,
+            });
+            let control_fd = control_page.try_clone_fd().unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                register_control_page_json(7, control_page.mapped_len() as u64)
+            )
+            .unwrap();
+            fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
+
+            let pool_file = tempfile_file_with_contents(b"abcd");
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 4)
+            )
+            .unwrap();
+
+            assert_release_request(&mut reader, 11);
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let frame = consumer.latest_frame(7).unwrap();
+        assert_eq!(frame.desc.sequence, 1);
+        assert_eq!(frame.producer_cursor, 1);
+        assert_eq!(frame.bytes(), b"abcd");
+        consumer.release_frame(frame).unwrap();
+
+        server.join().unwrap();
+    }
+
     fn assert_latest_request(reader: &mut BufReader<std::os::unix::net::UnixStream>, session_id: &str, track_id: u64) {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -821,6 +931,15 @@ mod tests {
             "payload_map_len": payload_map_len,
             "slot_stride": slot_stride,
             "slot_count": slot_count
+        })
+    }
+
+    fn register_control_page_json(track_id: u64, map_len: u64) -> serde_json::Value {
+        serde_json::json!({
+            "op": "register_video_control_page",
+            "session_id": "session-1",
+            "track_id": track_id,
+            "map_len": map_len
         })
     }
 

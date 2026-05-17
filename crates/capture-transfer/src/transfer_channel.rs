@@ -13,6 +13,11 @@ pub enum CaptureTransferRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CaptureTransferMessage {
+    RegisterVideoControlPage {
+        session_id: String,
+        track_id: u64,
+        map_len: u64,
+    },
     RegisterCpuPool {
         session_id: String,
         track_id: u64,
@@ -77,6 +82,16 @@ mod tests {
 
     #[test]
     fn server_messages_roundtrip_with_producer_cursor() {
+        let control = CaptureTransferMessage::RegisterVideoControlPage {
+            session_id: "session-1".to_string(),
+            track_id: 7,
+            map_len: 4096,
+        };
+        let control_json = serde_json::to_value(&control).unwrap();
+        assert_eq!(control_json["op"], "register_video_control_page");
+        assert_eq!(control_json["map_len"], 4096);
+        assert_eq!(serde_json::from_value::<CaptureTransferMessage>(control_json).unwrap(), control);
+
         let register = CaptureTransferMessage::RegisterCpuPool {
             session_id: "session-1".to_string(),
             track_id: 7,

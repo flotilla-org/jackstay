@@ -61,6 +61,13 @@ pub struct CpuPoolRegistration {
     pub slot_count: u64,
 }
 
+#[derive(Debug)]
+pub struct VideoControlPageRegistration {
+    pub track_id: TrackId,
+    pub map_len: u64,
+    pub fd: OwnedFd,
+}
+
 #[derive(Debug, Clone)]
 pub struct AcquiredVideoFrame {
     pub desc: VideoFrameDesc,
@@ -175,6 +182,14 @@ impl TrackRingControl {
 
     fn control_page_snapshot(&self) -> VideoTrackControlSnapshot {
         self.page.snapshot()
+    }
+
+    fn control_page_registration(&self, track_id: TrackId) -> Result<VideoControlPageRegistration> {
+        Ok(VideoControlPageRegistration {
+            track_id,
+            map_len: self.page.mapped_len() as u64,
+            fd: self.page.try_clone_fd()?,
+        })
     }
 }
 
@@ -511,6 +526,13 @@ impl VideoSlotManager {
     #[must_use]
     pub fn debug_control_page_snapshot(&self, track_id: TrackId) -> Option<VideoTrackControlSnapshot> {
         self.controls_by_track.get(&track_id).map(TrackRingControl::control_page_snapshot)
+    }
+
+    pub fn control_page_registration(&self, track_id: TrackId) -> Result<VideoControlPageRegistration> {
+        self.controls_by_track
+            .get(&track_id)
+            .ok_or(CaptureTransferError::UnknownTrack { track_id })?
+            .control_page_registration(track_id)
     }
 
     #[must_use]

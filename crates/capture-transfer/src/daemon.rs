@@ -185,10 +185,7 @@ impl DaemonConsumer {
     }
 
     pub fn latest_frame(&mut self, track_id: u64) -> Result<DaemonFrame> {
-        let request = CaptureTransferRequest::LatestVideoFrame {
-            session_id: self.info.session_id.clone(),
-            track_id,
-        };
+        let request = self.latest_frame_request(track_id);
         self.write_capture_transfer_request(&request)?;
         self.stream.flush().map_err(|error| daemon_error("flush-latest-request", error))?;
 
@@ -285,6 +282,21 @@ impl DaemonConsumer {
                     self.compare_control_page_shadow(&frame)?;
                     return self.daemon_frame_from_wire(frame);
                 }
+            }
+        }
+    }
+
+    fn latest_frame_request(&self, track_id: u64) -> CaptureTransferRequest {
+        if let Some(producer_cursor) = self.control_pages.get(&track_id).and_then(VideoTrackControlPage::latest_cursor) {
+            CaptureTransferRequest::AcquireVideoFrameByCursor {
+                session_id: self.info.session_id.clone(),
+                track_id,
+                producer_cursor,
+            }
+        } else {
+            CaptureTransferRequest::LatestVideoFrame {
+                session_id: self.info.session_id.clone(),
+                track_id,
             }
         }
     }
@@ -856,6 +868,92 @@ mod tests {
     }
 
     #[test]
+    fn daemon_consumer_requests_control_page_latest_cursor_after_registration() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_latest_request(&mut reader, "session-1", 7);
+            let mut control_page = VideoTrackControlPage::new(2);
+            control_page.push(PendingVideoRingEntry {
+                sequence: 1,
+                frame_key: 1,
+                pool_id: 1,
+                slot_id: 0,
+                slot_generation: 1,
+                payload_offset: 0,
+                payload_len: 4,
+            });
+            let control_fd = control_page.try_clone_fd().unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                register_control_page_json(7, control_page.mapped_len() as u64)
+            )
+            .unwrap();
+            fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
+
+            let pool_file = tempfile_file_with_contents(b"abcdwxyz");
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 8, 4, 2)).unwrap();
+            fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 8)
+            )
+            .unwrap();
+            control_page.push(PendingVideoRingEntry {
+                sequence: 2,
+                frame_key: 2,
+                pool_id: 1,
+                slot_id: 0,
+                slot_generation: 1,
+                payload_offset: 4,
+                payload_len: 4,
+            });
+            assert_release_request(&mut reader, 11);
+
+            assert_acquire_request(&mut reader, "session-1", 7, 2);
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(12, 2, 1, 1, 4, 4, 8)
+            )
+            .unwrap();
+            assert_release_request(&mut reader, 12);
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let first = consumer.latest_frame(7).unwrap();
+        assert_eq!(first.desc.sequence, 1);
+        assert_eq!(first.bytes(), b"abcd");
+        consumer.release_frame(first).unwrap();
+
+        let second = consumer.latest_frame(7).unwrap();
+        assert_eq!(second.desc.sequence, 2);
+        assert_eq!(second.producer_cursor, 2);
+        assert_eq!(second.bytes(), b"wxyz");
+        consumer.release_frame(second).unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
     fn daemon_consumer_rejects_control_page_shadow_mismatch() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("capture-fd.sock");
@@ -927,6 +1025,21 @@ mod tests {
         assert_eq!(request["op"], "latest_video_frame");
         assert_eq!(request["session_id"], session_id);
         assert_eq!(request["track_id"], track_id);
+    }
+
+    fn assert_acquire_request(
+        reader: &mut BufReader<std::os::unix::net::UnixStream>,
+        session_id: &str,
+        track_id: u64,
+        producer_cursor: u64,
+    ) {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(request["op"], "acquire_video_frame_by_cursor");
+        assert_eq!(request["session_id"], session_id);
+        assert_eq!(request["track_id"], track_id);
+        assert_eq!(request["producer_cursor"], producer_cursor);
     }
 
     fn assert_release_request(reader: &mut BufReader<std::os::unix::net::UnixStream>, lease_id: u64) {

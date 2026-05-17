@@ -3,8 +3,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CaptureTransferRequest {
-    LatestVideoFrame { session_id: String, track_id: u64 },
-    ReleaseVideoFrame { lease_id: u64 },
+    LatestVideoFrame {
+        session_id: String,
+        track_id: u64,
+    },
+    AcquireVideoFrameByCursor {
+        session_id: String,
+        track_id: u64,
+        producer_cursor: u64,
+    },
+    ReleaseVideoFrame {
+        lease_id: u64,
+    },
 }
 
 // Keep the enum variants flat so serde produces the channel JSON directly
@@ -72,6 +82,18 @@ mod tests {
         assert_eq!(latest_json["session_id"], "session-1");
         assert_eq!(latest_json["track_id"], 7);
         assert_eq!(serde_json::from_value::<CaptureTransferRequest>(latest_json).unwrap(), latest);
+
+        let acquire = CaptureTransferRequest::AcquireVideoFrameByCursor {
+            session_id: "session-1".to_string(),
+            track_id: 7,
+            producer_cursor: 99,
+        };
+        let acquire_json = serde_json::to_value(&acquire).unwrap();
+        assert_eq!(acquire_json["op"], "acquire_video_frame_by_cursor");
+        assert_eq!(acquire_json["session_id"], "session-1");
+        assert_eq!(acquire_json["track_id"], 7);
+        assert_eq!(acquire_json["producer_cursor"], 99);
+        assert_eq!(serde_json::from_value::<CaptureTransferRequest>(acquire_json).unwrap(), acquire);
 
         let release = CaptureTransferRequest::ReleaseVideoFrame { lease_id: 42 };
         let release_json = serde_json::to_value(&release).unwrap();

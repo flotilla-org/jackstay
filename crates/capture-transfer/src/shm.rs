@@ -92,6 +92,16 @@ impl SharedMemorySegment {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
         }
         let file = File::from(fd);
+        let backing_len = file.metadata().map_err(|error| CaptureTransferError::SharedMemory {
+            operation: "stat-read-only",
+            message: error.to_string(),
+        })?;
+        if len as u64 > backing_len.len() {
+            return Err(CaptureTransferError::SharedMemory {
+                operation: "mmap-read-only",
+                message: format!("requested map length {len} exceeds backing file length {}", backing_len.len()),
+            });
+        }
         // SAFETY: mmap is called with a valid fd, non-zero length, and read-only
         // shared permissions. The mapping is released in Drop.
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
@@ -201,7 +211,7 @@ fn unique_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use crate::shm::SharedMemorySegment;
+    use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
     #[test]
     fn mapped_segment_roundtrips_bytes() {
@@ -216,6 +226,15 @@ mod tests {
     #[test]
     fn zero_length_segment_is_rejected() {
         assert!(SharedMemorySegment::new(0).is_err());
+    }
+
+    #[test]
+    fn zero_length_read_only_mapping_is_rejected() {
+        let segment = SharedMemorySegment::new(4).unwrap();
+
+        let error = SharedMemorySegment::map_read_only(segment.try_clone_fd().unwrap(), 0).unwrap_err();
+
+        assert_eq!(error, CaptureTransferError::InvalidSharedMemoryLength);
     }
 
     #[test]
@@ -251,5 +270,20 @@ mod tests {
         let clone = SharedMemorySegment::map_read_only(segment.try_clone_fd().unwrap(), 4).unwrap();
 
         assert_eq!(clone.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn read_only_mapping_rejects_len_larger_than_backing_file() {
+        let segment = SharedMemorySegment::new(4).unwrap();
+
+        let error = SharedMemorySegment::map_read_only(segment.try_clone_fd().unwrap(), 8).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureTransferError::SharedMemory {
+                operation: "mmap-read-only",
+                ..
+            }
+        ));
     }
 }

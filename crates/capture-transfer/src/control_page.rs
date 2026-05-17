@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+use crate::shm::SharedMemorySegment;
+
+pub const CONTROL_PAGE_ALIGNMENT: usize = 128;
 pub const EMPTY_LATEST_INDEX: u64 = u64::MAX;
 pub const VIDEO_TRACK_CONTROL_MAGIC: u64 = u64::from_le_bytes(*b"JSVTRK01");
 pub const VIDEO_TRACK_CONTROL_VERSION: u64 = 1;
@@ -20,7 +23,7 @@ pub struct VideoTrackControlHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VideoRingEntry {
     pub publication_sequence: u64,
     pub producer_cursor: u64,
@@ -66,6 +69,36 @@ pub enum VideoRingReadError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoTrackControlLayout {
+    pub header_offset: usize,
+    pub entries_offset: usize,
+    pub entry_len: usize,
+    pub capacity: usize,
+    pub byte_len: usize,
+}
+
+impl VideoTrackControlLayout {
+    #[must_use]
+    pub fn for_capacity(capacity: usize) -> Self {
+        let entries_offset = align_up(std::mem::size_of::<VideoTrackControlHeader>(), CONTROL_PAGE_ALIGNMENT);
+        let entry_len = std::mem::size_of::<VideoRingEntry>();
+        let entries_len = capacity
+            .checked_mul(entry_len)
+            .expect("video control page entry byte length overflow");
+        let byte_len = entries_offset
+            .checked_add(entries_len)
+            .expect("video control page byte length overflow");
+        Self {
+            header_offset: 0,
+            entries_offset,
+            entry_len,
+            capacity,
+            byte_len,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoTrackControlSnapshot {
     pub header: VideoTrackControlHeader,
@@ -74,40 +107,113 @@ pub struct VideoTrackControlSnapshot {
 
 #[derive(Debug)]
 pub struct VideoTrackControlPage {
-    header: VideoTrackControlHeader,
-    entries: Vec<VideoRingEntry>,
+    layout: VideoTrackControlLayout,
+    storage: SharedMemorySegment,
 }
 
 impl VideoTrackControlPage {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let capacity = ring_capacity_for(capacity);
-        Self {
-            header: VideoTrackControlHeader {
-                magic: VIDEO_TRACK_CONTROL_MAGIC,
-                version: VIDEO_TRACK_CONTROL_VERSION,
-                header_len: std::mem::size_of::<VideoTrackControlHeader>() as u64,
-                entry_len: std::mem::size_of::<VideoRingEntry>() as u64,
-                capacity: capacity as u64,
-                index_mask: (capacity - 1) as u64,
-                producer_cursor: 0,
-                latest_sequence: 0,
-                latest_index: EMPTY_LATEST_INDEX,
-                len: 0,
-            },
-            entries: vec![VideoRingEntry::default(); capacity],
-        }
+        let layout = VideoTrackControlLayout::for_capacity(capacity);
+        let storage = SharedMemorySegment::new(layout.byte_len).expect("control page mapped storage allocation failed");
+        let page = Self { layout, storage };
+        page.store_header(VideoTrackControlHeader {
+            magic: VIDEO_TRACK_CONTROL_MAGIC,
+            version: VIDEO_TRACK_CONTROL_VERSION,
+            header_len: std::mem::size_of::<VideoTrackControlHeader>() as u64,
+            entry_len: std::mem::size_of::<VideoRingEntry>() as u64,
+            capacity: capacity as u64,
+            index_mask: (capacity - 1) as u64,
+            producer_cursor: 0,
+            latest_sequence: 0,
+            latest_index: EMPTY_LATEST_INDEX,
+            len: 0,
+        });
+        page
+    }
+
+    #[must_use]
+    pub fn layout(&self) -> VideoTrackControlLayout {
+        self.layout
+    }
+
+    #[must_use]
+    pub fn mapped_len(&self) -> usize {
+        self.storage.len()
+    }
+
+    #[cfg(test)]
+    fn raw_entry_for_test(&self, index: usize) -> VideoRingEntry {
+        self.entry(index)
+    }
+
+    #[cfg(test)]
+    fn set_entry_publication_sequence_for_test(&self, index: usize, publication_sequence: u64) {
+        self.store_entry_publication_sequence(index, publication_sequence);
+    }
+
+    fn header(&self) -> VideoTrackControlHeader {
+        self.read_at(self.layout.header_offset)
+    }
+
+    fn store_header(&self, header: VideoTrackControlHeader) {
+        self.write_at(self.layout.header_offset, header);
+    }
+
+    fn entry(&self, index: usize) -> VideoRingEntry {
+        assert!(index < self.layout.capacity);
+        self.read_at(self.entry_offset(index))
+    }
+
+    fn store_entry(&self, index: usize, entry: VideoRingEntry) {
+        assert!(index < self.layout.capacity);
+        self.write_at(self.entry_offset(index), entry);
+    }
+
+    fn entry_publication_sequence(&self, index: usize) -> u64 {
+        assert!(index < self.layout.capacity);
+        // `publication_sequence` is field 0 of the repr(C) entry. Keep this
+        // offset explicit because future atomics will load this field directly.
+        self.read_at(self.entry_offset(index))
+    }
+
+    fn store_entry_publication_sequence(&self, index: usize, publication_sequence: u64) {
+        assert!(index < self.layout.capacity);
+        self.write_at(self.entry_offset(index), publication_sequence);
+    }
+
+    fn entry_offset(&self, index: usize) -> usize {
+        self.layout.entries_offset + index * self.layout.entry_len
+    }
+
+    fn read_at<T: Copy>(&self, offset: usize) -> T {
+        let bytes = self.storage.slice_at(offset, std::mem::size_of::<T>());
+        // SAFETY: the page layout writes only plain repr(C) integer structs at
+        // these offsets, and the slice length was checked against T's size.
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
+    }
+
+    fn write_at<T: Copy>(&self, offset: usize, value: T) {
+        self.storage.with_slice_at_mut(offset, std::mem::size_of::<T>(), |bytes| {
+            // SAFETY: the destination slice is exactly T-sized and lives inside
+            // the mapped page. T is Copy and contains no references or drop glue.
+            unsafe {
+                std::ptr::copy_nonoverlapping(std::ptr::addr_of!(value).cast::<u8>(), bytes.as_mut_ptr(), bytes.len());
+            }
+        });
     }
 
     pub fn push(&mut self, entry: PendingVideoRingEntry) {
+        let mut header = self.header();
         // A u64 producer cursor is effectively inexhaustible for display-rate
         // capture, but saturation would make ring-slot selection ambiguous.
-        debug_assert!(self.header.producer_cursor < u64::MAX);
-        self.header.producer_cursor = self.header.producer_cursor.saturating_add(1);
-        let index = ((self.header.producer_cursor - 1) & self.header.index_mask) as usize;
-        self.entries[index] = VideoRingEntry {
+        debug_assert!(header.producer_cursor < u64::MAX);
+        header.producer_cursor = header.producer_cursor.saturating_add(1);
+        let index = ((header.producer_cursor - 1) & header.index_mask) as usize;
+        let ring_entry = VideoRingEntry {
             publication_sequence: 0,
-            producer_cursor: self.header.producer_cursor,
+            producer_cursor: header.producer_cursor,
             sequence: entry.sequence,
             frame_key: entry.frame_key,
             pool_id: entry.pool_id,
@@ -116,10 +222,14 @@ impl VideoTrackControlPage {
             payload_offset: entry.payload_offset,
             payload_len: entry.payload_len,
         };
-        self.entries[index].publication_sequence = self.header.producer_cursor;
-        self.header.latest_sequence = entry.sequence;
-        self.header.latest_index = index as u64;
-        self.header.len = (self.header.len + 1).min(self.header.capacity);
+        // TODO: before any cross-process reader uses this mapping, replace
+        // these plain writes with the atomic release/acquire publication pair.
+        self.store_entry(index, ring_entry);
+        self.store_entry_publication_sequence(index, header.producer_cursor);
+        header.latest_sequence = entry.sequence;
+        header.latest_index = index as u64;
+        header.len = (header.len + 1).min(header.capacity);
+        self.store_header(header);
     }
 
     pub fn read_entry_for_cursor(&self, cursor: u64) -> Result<VideoRingEntry, VideoRingReadError> {
@@ -141,10 +251,11 @@ impl VideoTrackControlPage {
             });
         }
 
-        let index = ((cursor - 1) & self.header.index_mask) as usize;
-        let first_sequence = self.entries[index].publication_sequence;
-        let entry = self.entries[index].clone();
-        let second_sequence = self.entries[index].publication_sequence;
+        let header = self.header();
+        let index = ((cursor - 1) & header.index_mask) as usize;
+        let first_sequence = self.entry_publication_sequence(index);
+        let entry = self.entry(index);
+        let second_sequence = self.entry_publication_sequence(index);
         if first_sequence != cursor || second_sequence != cursor {
             return Err(VideoRingReadError::SlotSequenceMismatch {
                 requested_cursor: cursor,
@@ -164,16 +275,18 @@ impl VideoTrackControlPage {
 
     #[must_use]
     pub fn latest_cursor(&self) -> Option<u64> {
-        (self.header.len > 0).then_some(self.header.producer_cursor)
+        let header = self.header();
+        (header.len > 0).then_some(header.producer_cursor)
     }
 
     #[must_use]
     pub fn oldest_live_cursor(&self) -> Option<u64> {
-        if self.header.len == 0 {
+        let header = self.header();
+        if header.len == 0 {
             return None;
         }
-        debug_assert!(self.header.producer_cursor >= self.header.len);
-        Some(self.header.producer_cursor - self.header.len + 1)
+        debug_assert!(header.producer_cursor >= header.len);
+        Some(header.producer_cursor - header.len + 1)
     }
 
     #[must_use]
@@ -183,16 +296,17 @@ impl VideoTrackControlPage {
 
     #[must_use]
     pub fn ring_snapshot(&self) -> Vec<VideoRingEntry> {
-        let len = self.header.len as usize;
-        let start = if len == self.entries.len() {
-            (self.header.producer_cursor & self.header.index_mask) as usize
+        let header = self.header();
+        let len = header.len as usize;
+        let start = if len == self.layout.capacity {
+            (header.producer_cursor & header.index_mask) as usize
         } else {
             0
         };
         (0..len)
             .map(|offset| {
-                let index = (start + offset) & self.header.index_mask as usize;
-                self.entries[index].clone()
+                let index = (start + offset) & header.index_mask as usize;
+                self.entry(index)
             })
             .collect()
     }
@@ -200,7 +314,7 @@ impl VideoTrackControlPage {
     #[must_use]
     pub fn snapshot(&self) -> VideoTrackControlSnapshot {
         VideoTrackControlSnapshot {
-            header: self.header,
+            header: self.header(),
             entries: self.ring_snapshot(),
         }
     }
@@ -210,9 +324,17 @@ fn ring_capacity_for(requested: usize) -> usize {
     requested.max(1).next_power_of_two()
 }
 
+const fn align_up(value: usize, alignment: usize) -> usize {
+    debug_assert!(alignment.is_power_of_two());
+    (value + alignment - 1) & !(alignment - 1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EMPTY_LATEST_INDEX, PendingVideoRingEntry, VideoRingReadError, VideoTrackControlPage};
+    use super::{
+        CONTROL_PAGE_ALIGNMENT, EMPTY_LATEST_INDEX, PendingVideoRingEntry, VideoRingEntry, VideoRingReadError, VideoTrackControlHeader,
+        VideoTrackControlPage,
+    };
 
     fn pending(sequence: u64, frame_key: u64) -> PendingVideoRingEntry {
         PendingVideoRingEntry {
@@ -224,6 +346,36 @@ mod tests {
             payload_offset: sequence * 64,
             payload_len: 4,
         }
+    }
+
+    #[test]
+    fn control_page_layout_aligns_entries_after_header() {
+        let page = VideoTrackControlPage::new(3);
+
+        let layout = page.layout();
+        assert_eq!(layout.header_offset, 0);
+        assert_eq!(layout.entries_offset % CONTROL_PAGE_ALIGNMENT, 0);
+        assert!(layout.entries_offset >= std::mem::size_of::<VideoTrackControlHeader>());
+        assert_eq!(layout.entry_len, std::mem::size_of::<VideoRingEntry>());
+        assert_eq!(layout.capacity, 4);
+        assert_eq!(layout.byte_len, layout.entries_offset + layout.capacity * layout.entry_len);
+        assert_eq!(page.mapped_len(), layout.byte_len);
+    }
+
+    #[test]
+    fn control_page_layout_is_deterministic_for_capacity() {
+        assert_eq!(
+            super::VideoTrackControlLayout::for_capacity(4),
+            super::VideoTrackControlLayout::for_capacity(4)
+        );
+    }
+
+    #[test]
+    fn control_page_mapped_entries_start_zeroed() {
+        let page = VideoTrackControlPage::new(2);
+
+        assert_eq!(page.raw_entry_for_test(0), VideoRingEntry::default());
+        assert_eq!(page.raw_entry_for_test(1), VideoRingEntry::default());
     }
 
     #[test]
@@ -377,7 +529,7 @@ mod tests {
         let mut page = VideoTrackControlPage::new(2);
 
         page.push(pending(10, 100));
-        page.entries[0].publication_sequence = 99;
+        page.set_entry_publication_sequence_for_test(0, 99);
 
         assert_eq!(
             page.read_entry_for_cursor(1),
@@ -411,7 +563,7 @@ mod tests {
         let mut page = VideoTrackControlPage::new(2);
 
         page.push(pending(10, 100));
-        page.entries[0].publication_sequence = 0;
+        page.set_entry_publication_sequence_for_test(0, 0);
 
         assert_eq!(
             page.read_latest_lossy_entry(),

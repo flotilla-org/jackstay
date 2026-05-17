@@ -208,7 +208,6 @@ impl DaemonConsumer {
                     })?;
                     let fd = fdpass::recv_fd(&self.stream)?;
                     let page = VideoTrackControlPage::map_read_only(fd, map_len)?;
-                    page.validate_header()?;
                     self.control_pages.insert(track_id, page);
                 }
                 CaptureTransferMessage::RegisterCpuPool {

@@ -12,6 +12,11 @@ pub enum CaptureTransferRequest {
         track_id: u64,
         producer_cursor: u64,
     },
+    AcquireNextVideoFrame {
+        session_id: String,
+        track_id: u64,
+        after_producer_cursor: u64,
+    },
     ReleaseVideoFrame {
         lease_id: u64,
     },
@@ -67,6 +72,15 @@ pub enum CaptureTransferMessage {
         consumer_skipped_count: u64,
         len: u64,
     },
+    VideoFrameUnavailable {
+        session_id: String,
+        track_id: u64,
+        after_producer_cursor: u64,
+        oldest_available_cursor: u64,
+        latest_available_cursor: u64,
+        skipped_count: u64,
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -96,6 +110,18 @@ mod tests {
         assert_eq!(acquire_json["track_id"], 7);
         assert_eq!(acquire_json["producer_cursor"], 99);
         assert_eq!(serde_json::from_value::<CaptureTransferRequest>(acquire_json).unwrap(), acquire);
+
+        let next = CaptureTransferRequest::AcquireNextVideoFrame {
+            session_id: "session-1".to_string(),
+            track_id: 7,
+            after_producer_cursor: 42,
+        };
+        let next_json = serde_json::to_value(&next).unwrap();
+        assert_eq!(next_json["op"], "acquire_next_video_frame");
+        assert_eq!(next_json["session_id"], "session-1");
+        assert_eq!(next_json["track_id"], 7);
+        assert_eq!(next_json["after_producer_cursor"], 42);
+        assert_eq!(serde_json::from_value::<CaptureTransferRequest>(next_json).unwrap(), next);
 
         let release = CaptureTransferRequest::ReleaseVideoFrame { lease_id: 42 };
         let release_json = serde_json::to_value(&release).unwrap();
@@ -166,5 +192,25 @@ mod tests {
         assert_eq!(frame_json["op"], "video_frame");
         assert_eq!(frame_json["producer_cursor"], 99);
         assert_eq!(serde_json::from_value::<CaptureTransferMessage>(frame_json).unwrap(), frame);
+
+        let unavailable = CaptureTransferMessage::VideoFrameUnavailable {
+            session_id: "session-1".to_string(),
+            track_id: 7,
+            after_producer_cursor: 42,
+            oldest_available_cursor: 48,
+            latest_available_cursor: 57,
+            skipped_count: 5,
+            reason: "lapped".to_string(),
+        };
+        let unavailable_json = serde_json::to_value(&unavailable).unwrap();
+        assert_eq!(unavailable_json["op"], "video_frame_unavailable");
+        assert_eq!(unavailable_json["after_producer_cursor"], 42);
+        assert_eq!(unavailable_json["oldest_available_cursor"], 48);
+        assert_eq!(unavailable_json["latest_available_cursor"], 57);
+        assert_eq!(unavailable_json["skipped_count"], 5);
+        assert_eq!(
+            serde_json::from_value::<CaptureTransferMessage>(unavailable_json).unwrap(),
+            unavailable
+        );
     }
 }

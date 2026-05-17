@@ -53,6 +53,22 @@ pub struct DaemonFrame {
     pool: Option<Rc<RegisteredPoolMapping>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonFrameUnavailable {
+    pub track_id: u64,
+    pub after_producer_cursor: u64,
+    pub oldest_available_cursor: u64,
+    pub latest_available_cursor: u64,
+    pub skipped_count: u64,
+    pub reason: String,
+}
+
+#[derive(Debug)]
+pub enum DaemonFrameAcquire {
+    Frame(DaemonFrame),
+    Unavailable(DaemonFrameUnavailable),
+}
+
 impl DaemonFrame {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -193,6 +209,31 @@ impl DaemonConsumer {
         self.write_capture_transfer_request(&request)?;
         self.stream.flush().map_err(|error| daemon_error("flush-latest-request", error))?;
 
+        match self.receive_frame_acquire("latest-frame")? {
+            DaemonFrameAcquire::Frame(frame) => Ok(frame),
+            // `video_frame_unavailable` is reserved for ordered acquisition.
+            // Treat it as a daemon protocol error if it appears on the latest path.
+            DaemonFrameAcquire::Unavailable(unavailable) => Err(CaptureTransferError::DaemonTransport {
+                operation: "latest-frame",
+                message: format!("video frame unavailable: {}", unavailable.reason),
+            }),
+        }
+    }
+
+    pub fn next_frame_after(&mut self, track_id: u64, after_producer_cursor: u64) -> Result<DaemonFrameAcquire> {
+        let request = CaptureTransferRequest::AcquireNextVideoFrame {
+            session_id: self.info.session_id.clone(),
+            track_id,
+            after_producer_cursor,
+        };
+        self.write_capture_transfer_request(&request)?;
+        self.stream
+            .flush()
+            .map_err(|error| daemon_error("flush-next-frame-request", error))?;
+        self.receive_frame_acquire("next-frame")
+    }
+
+    fn receive_frame_acquire(&mut self, unavailable_operation: &'static str) -> Result<DaemonFrameAcquire> {
         loop {
             let message = self.read_capture_transfer_message()?;
             // The connection is already scoped to self.info.session_id; session_id
@@ -310,7 +351,31 @@ impl DaemonConsumer {
                         len,
                     };
                     self.compare_control_page_shadow(&frame)?;
-                    return self.daemon_frame_from_wire(frame);
+                    return self.daemon_frame_from_wire(frame).map(DaemonFrameAcquire::Frame);
+                }
+                CaptureTransferMessage::VideoFrameUnavailable {
+                    track_id,
+                    after_producer_cursor,
+                    oldest_available_cursor,
+                    latest_available_cursor,
+                    skipped_count,
+                    reason,
+                    ..
+                } => {
+                    if reason.is_empty() {
+                        return Err(CaptureTransferError::DaemonTransport {
+                            operation: unavailable_operation,
+                            message: "video frame unavailable without reason".to_string(),
+                        });
+                    }
+                    return Ok(DaemonFrameAcquire::Unavailable(DaemonFrameUnavailable {
+                        track_id,
+                        after_producer_cursor,
+                        oldest_available_cursor,
+                        latest_available_cursor,
+                        skipped_count,
+                        reason,
+                    }));
                 }
             }
         }
@@ -726,7 +791,7 @@ mod tests {
         thread,
     };
 
-    use super::{DaemonConsumer, SessionInfo, parse_http_response};
+    use super::{DaemonConsumer, DaemonFrameAcquire, SessionInfo, parse_http_response};
     use crate::{
         CaptureTransferError,
         control_page::{PendingVideoRingEntry, VideoTrackControlPage},
@@ -1094,6 +1159,108 @@ mod tests {
     }
 
     #[test]
+    fn daemon_consumer_requests_next_frame_after_cursor() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_next_request(&mut reader, "session-1", 7, 42);
+
+            let pool_file = tempfile_file_with_contents(b"abcd");
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                latest_frame_json_with_offset(11, 43, 1, 1, 0, 4, 4)
+            )
+            .unwrap();
+            assert_release_request(&mut reader, 11);
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let frame = match consumer.next_frame_after(7, 42).unwrap() {
+            DaemonFrameAcquire::Frame(frame) => frame,
+            other => panic!("expected frame, got {other:?}"),
+        };
+        assert_eq!(frame.desc.sequence, 43);
+        assert_eq!(frame.producer_cursor, 43);
+        assert_eq!(frame.bytes(), b"abcd");
+        consumer.release_frame(frame).unwrap();
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn daemon_consumer_parses_video_frame_unavailable() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("capture-fd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            assert_next_request(&mut reader, "session-1", 7, 42);
+            writeln!(
+                stream.try_clone().unwrap(),
+                "{}",
+                serde_json::json!({
+                    "op": "video_frame_unavailable",
+                    "session_id": "session-1",
+                    "track_id": 7,
+                    "after_producer_cursor": 42,
+                    "oldest_available_cursor": 48,
+                    "latest_available_cursor": 57,
+                    "skipped_count": 5,
+                    "reason": "lapped"
+                })
+            )
+            .unwrap();
+        });
+
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: socket_path.to_string_lossy().into_owned(),
+        };
+        let mut consumer = DaemonConsumer::connect(info).unwrap();
+
+        let unavailable = match consumer.next_frame_after(7, 42).unwrap() {
+            DaemonFrameAcquire::Unavailable(unavailable) => unavailable,
+            other => panic!("expected unavailable, got {other:?}"),
+        };
+        assert_eq!(unavailable.track_id, 7);
+        assert_eq!(unavailable.after_producer_cursor, 42);
+        assert_eq!(unavailable.oldest_available_cursor, 48);
+        assert_eq!(unavailable.latest_available_cursor, 57);
+        assert_eq!(unavailable.skipped_count, 5);
+        assert_eq!(unavailable.reason, "lapped");
+
+        server.join().unwrap();
+    }
+
+    #[test]
     fn daemon_consumer_rejects_control_page_shadow_mismatch() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("capture-fd.sock");
@@ -1174,6 +1341,21 @@ mod tests {
         assert_eq!(request["session_id"], session_id);
         assert_eq!(request["track_id"], track_id);
         assert_eq!(request["producer_cursor"], producer_cursor);
+    }
+
+    fn assert_next_request(
+        reader: &mut BufReader<std::os::unix::net::UnixStream>,
+        session_id: &str,
+        track_id: u64,
+        after_producer_cursor: u64,
+    ) {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(request["op"], "acquire_next_video_frame");
+        assert_eq!(request["session_id"], session_id);
+        assert_eq!(request["track_id"], track_id);
+        assert_eq!(request["after_producer_cursor"], after_producer_cursor);
     }
 
     fn assert_release_request(reader: &mut BufReader<std::os::unix::net::UnixStream>, lease_id: u64) {

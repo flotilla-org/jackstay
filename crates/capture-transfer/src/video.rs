@@ -178,6 +178,13 @@ impl TrackRingControl {
         self.page.ring_snapshot()
     }
 
+    fn retained_cursor_bounds(&self) -> Option<(u64, u64)> {
+        let entries = self.ring_snapshot();
+        let oldest = entries.first()?.producer_cursor;
+        let latest = entries.last()?.producer_cursor;
+        Some((oldest, latest))
+    }
+
     fn snapshot(&self) -> TrackRingControlSnapshot {
         let page = self.page.snapshot();
         TrackRingControlSnapshot {
@@ -298,6 +305,18 @@ pub struct ConsumerRingCursorSnapshot {
 pub enum VideoStorageMode {
     ImmutablePerFrame,
     ReusablePool,
+}
+
+#[derive(Debug)]
+pub enum OrderedVideoAcquire {
+    Frame(AcquiredVideoFrame),
+    Lapped {
+        after_producer_cursor: u64,
+        oldest_available_cursor: u64,
+        latest_available_cursor: u64,
+        skipped_count: u64,
+    },
+    Empty,
 }
 
 #[derive(Debug)]
@@ -527,6 +546,44 @@ impl VideoSlotManager {
         self.acquire_ring_entry(consumer_id, track_id, entry)
     }
 
+    pub fn acquire_next_after(
+        &mut self,
+        consumer_id: ConsumerId,
+        track_id: TrackId,
+        after_producer_cursor: u64,
+    ) -> Result<OrderedVideoAcquire> {
+        let control = self
+            .controls_by_track
+            .get(&track_id)
+            .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
+        let Some((oldest_available_cursor, latest_available_cursor)) = control.retained_cursor_bounds() else {
+            return Ok(OrderedVideoAcquire::Empty);
+        };
+        let target_cursor = if after_producer_cursor == 0 {
+            oldest_available_cursor
+        } else {
+            after_producer_cursor.saturating_add(1)
+        };
+
+        if target_cursor < oldest_available_cursor {
+            return Ok(OrderedVideoAcquire::Lapped {
+                after_producer_cursor,
+                oldest_available_cursor,
+                latest_available_cursor,
+                skipped_count: oldest_available_cursor.saturating_sub(target_cursor),
+            });
+        }
+        if target_cursor > latest_available_cursor {
+            return Ok(OrderedVideoAcquire::Empty);
+        }
+
+        let entry = control
+            .entry_for_cursor(target_cursor)
+            .map_err(|source| CaptureTransferError::VideoControlRingRead { track_id, source })?;
+        self.acquire_ring_entry(consumer_id, track_id, entry)
+            .map(OrderedVideoAcquire::Frame)
+    }
+
     fn acquire_ring_entry(&mut self, consumer_id: ConsumerId, track_id: TrackId, entry: VideoRingEntry) -> Result<AcquiredVideoFrame> {
         let consumer_slot = self
             .controls_by_track
@@ -743,7 +800,7 @@ mod tests {
         CaptureTransferError,
         control_page::VideoRingReadError,
         model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
-        video::{ConsumerId, VideoFrameDesc, VideoSlotManager},
+        video::{ConsumerId, OrderedVideoAcquire, VideoFrameDesc, VideoSlotManager},
     };
 
     fn frame_desc(sequence: u64) -> VideoFrameDesc {
@@ -853,6 +910,116 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn acquire_next_after_zero_returns_oldest_retained_frame() {
+        let mut slots = VideoSlotManager::new_reusable_pool(3);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+
+        let frame = match slots.acquire_next_after(consumer, track, 0).unwrap() {
+            OrderedVideoAcquire::Frame(frame) => frame,
+            other => panic!("expected frame, got {other:?}"),
+        };
+
+        assert_eq!(frame.producer_cursor(), 1);
+        assert_eq!(frame.desc.sequence, 1);
+        assert_eq!(frame.bytes(), &[1]);
+        slots.release(frame);
+    }
+
+    #[test]
+    fn acquire_next_after_retained_cursor_returns_next_frame() {
+        let mut slots = VideoSlotManager::new_reusable_pool(3);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+
+        let frame = match slots.acquire_next_after(consumer, track, 1).unwrap() {
+            OrderedVideoAcquire::Frame(frame) => frame,
+            other => panic!("expected frame, got {other:?}"),
+        };
+
+        assert_eq!(frame.producer_cursor(), 2);
+        assert_eq!(frame.desc.sequence, 2);
+        assert_eq!(frame.bytes(), &[2]);
+        slots.release(frame);
+    }
+
+    #[test]
+    fn acquire_next_after_latest_cursor_returns_empty() {
+        let mut slots = VideoSlotManager::new_reusable_pool(3);
+        let track = TrackId::new(1);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+
+        let result = slots.acquire_next_after(ConsumerId::new(7), track, 1).unwrap();
+
+        assert!(matches!(result, OrderedVideoAcquire::Empty));
+    }
+
+    #[test]
+    fn acquire_next_after_reports_lapped_cursor() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+        slots.publish(track, frame_desc(3), &[3]).unwrap();
+        slots.publish(track, frame_desc(4), &[4]).unwrap();
+
+        let result = slots.acquire_next_after(ConsumerId::new(7), track, 1).unwrap();
+
+        assert!(matches!(
+            result,
+            OrderedVideoAcquire::Lapped {
+                after_producer_cursor: 1,
+                oldest_available_cursor: 3,
+                latest_available_cursor: 4,
+                skipped_count: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn acquire_next_after_does_not_change_latest_semantics() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+        slots.publish(track, frame_desc(2), &[2]).unwrap();
+
+        let latest = slots.acquire_latest(consumer, track).unwrap();
+
+        assert_eq!(latest.producer_cursor(), 2);
+        assert_eq!(latest.desc.sequence, 2);
+        slots.release(latest);
+    }
+
+    #[test]
+    fn acquire_next_after_release_updates_consumer_release_cursor() {
+        let mut slots = VideoSlotManager::new_reusable_pool(2);
+        let track = TrackId::new(1);
+        let consumer = ConsumerId::new(7);
+
+        slots.publish(track, frame_desc(1), &[1]).unwrap();
+
+        let frame = match slots.acquire_next_after(consumer, track, 0).unwrap() {
+            OrderedVideoAcquire::Frame(frame) => frame,
+            other => panic!("expected frame, got {other:?}"),
+        };
+        slots.release(frame);
+
+        let cursor = slots.debug_consumer_cursor_snapshot(consumer, track).unwrap();
+        assert_eq!(cursor.release_cursor, 1);
     }
 
     #[test]

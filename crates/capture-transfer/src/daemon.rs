@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::CString,
+    fmt,
     io::{BufRead, BufReader, Read, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
@@ -28,7 +29,7 @@ pub struct SyntheticSession {
     pub fd_socket_path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionInfo {
     pub session_id: String,
     pub source_id: u64,
@@ -38,6 +39,25 @@ pub struct SessionInfo {
     pub stride: u32,
     pub pixel_format: PixelFormat,
     pub fd_socket_path: String,
+    /// Caller-supplied agent token for protected sessions. `None` keeps the
+    /// legacy unauthenticated fd flow used by synthetic sessions.
+    pub bearer_token: Option<String>,
+}
+
+impl fmt::Debug for SessionInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionInfo")
+            .field("session_id", &self.session_id)
+            .field("source_id", &self.source_id)
+            .field("track_id", &self.track_id)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("stride", &self.stride)
+            .field("pixel_format", &self.pixel_format)
+            .field("fd_socket_path", &self.fd_socket_path)
+            .field("bearer_token", &self.bearer_token.as_deref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -192,7 +212,16 @@ struct FrameMapping {
 
 impl DaemonConsumer {
     pub fn connect(info: SessionInfo) -> Result<Self> {
-        let stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-fd-socket", error))?;
+        let mut stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-fd-socket", error))?;
+        if let Some(bearer_token) = info.bearer_token.as_ref() {
+            let request = CaptureTransferRequest::Authorize {
+                session_id: info.session_id.clone(),
+                bearer_token: bearer_token.clone(),
+            };
+            let line = serde_json::to_string(&request).map_err(|error| daemon_error("encode-authorize-request", error))?;
+            writeln!(stream, "{line}").map_err(|error| daemon_error("write-authorize-request", error))?;
+            stream.flush().map_err(|error| daemon_error("flush-authorize-request", error))?;
+        }
         let reader_stream = stream.try_clone().map_err(|error| daemon_error("clone-fd-stream", error))?;
         Ok(Self {
             info,
@@ -544,6 +573,7 @@ pub fn get_session(control_socket_path: &str, session_id: &str) -> Result<Sessio
         stride: wire.stride,
         pixel_format: parse_pixel_format(&wire.pixel_format)?,
         fd_socket_path: wire.fd_socket_path,
+        bearer_token: None,
     })
 }
 
@@ -812,6 +842,25 @@ mod tests {
     }
 
     #[test]
+    fn session_info_debug_redacts_bearer_token() {
+        let info = SessionInfo {
+            session_id: "session-1".to_string(),
+            source_id: 1,
+            track_id: 7,
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            fd_socket_path: "/tmp/capture-fd.sock".to_string(),
+            bearer_token: Some("pta_agent.secret".to_string()),
+        };
+
+        let output = format!("{info:?}");
+        assert!(output.contains("<redacted>"));
+        assert!(!output.contains("pta_agent.secret"));
+    }
+
+    #[test]
     fn daemon_consumer_reuses_connection_and_releases_by_lease_id() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("capture-fd.sock");
@@ -821,6 +870,7 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
 
+            assert_authorize_request(&mut reader, "session-1", "pta_agent.secret");
             assert_latest_request(&mut reader, "session-1", 7);
             let first_file = tempfile_file_with_contents(b"abcd");
             writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json(11, 1, 4)).unwrap();
@@ -845,6 +895,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: Some("pta_agent.secret".to_string()),
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -906,6 +957,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -968,6 +1020,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -1026,6 +1079,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -1073,6 +1127,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -1141,6 +1196,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -1191,6 +1247,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -1243,6 +1300,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -1304,6 +1362,7 @@ mod tests {
             stride: 8,
             pixel_format: PixelFormat::Bgra8Unorm,
             fd_socket_path: socket_path.to_string_lossy().into_owned(),
+            bearer_token: None,
         };
         let mut consumer = DaemonConsumer::connect(info).unwrap();
 
@@ -1326,6 +1385,15 @@ mod tests {
         assert_eq!(request["op"], "latest_video_frame");
         assert_eq!(request["session_id"], session_id);
         assert_eq!(request["track_id"], track_id);
+    }
+
+    fn assert_authorize_request(reader: &mut BufReader<std::os::unix::net::UnixStream>, session_id: &str, bearer_token: &str) {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(request["op"], "authorize");
+        assert_eq!(request["session_id"], session_id);
+        assert_eq!(request["bearer_token"], bearer_token);
     }
 
     fn assert_acquire_request(

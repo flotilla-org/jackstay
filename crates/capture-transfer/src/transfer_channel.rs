@@ -1,8 +1,14 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CaptureTransferRequest {
+    Authorize {
+        session_id: String,
+        bearer_token: String,
+    },
     LatestVideoFrame {
         session_id: String,
         track_id: u64,
@@ -20,6 +26,44 @@ pub enum CaptureTransferRequest {
     ReleaseVideoFrame {
         lease_id: u64,
     },
+}
+
+impl fmt::Debug for CaptureTransferRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authorize { session_id, .. } => f
+                .debug_struct("Authorize")
+                .field("session_id", session_id)
+                .field("bearer_token", &"<redacted>")
+                .finish(),
+            Self::LatestVideoFrame { session_id, track_id } => f
+                .debug_struct("LatestVideoFrame")
+                .field("session_id", session_id)
+                .field("track_id", track_id)
+                .finish(),
+            Self::AcquireVideoFrameByCursor {
+                session_id,
+                track_id,
+                producer_cursor,
+            } => f
+                .debug_struct("AcquireVideoFrameByCursor")
+                .field("session_id", session_id)
+                .field("track_id", track_id)
+                .field("producer_cursor", producer_cursor)
+                .finish(),
+            Self::AcquireNextVideoFrame {
+                session_id,
+                track_id,
+                after_producer_cursor,
+            } => f
+                .debug_struct("AcquireNextVideoFrame")
+                .field("session_id", session_id)
+                .field("track_id", track_id)
+                .field("after_producer_cursor", after_producer_cursor)
+                .finish(),
+            Self::ReleaseVideoFrame { lease_id } => f.debug_struct("ReleaseVideoFrame").field("lease_id", lease_id).finish(),
+        }
+    }
 }
 
 // Keep the enum variants flat so serde produces the channel JSON directly
@@ -89,6 +133,16 @@ mod tests {
 
     #[test]
     fn request_messages_roundtrip_with_snake_case_ops() {
+        let authorize = CaptureTransferRequest::Authorize {
+            session_id: "session-1".to_string(),
+            bearer_token: "pta_agent.secret".to_string(),
+        };
+        let authorize_json = serde_json::to_value(&authorize).unwrap();
+        assert_eq!(authorize_json["op"], "authorize");
+        assert_eq!(authorize_json["session_id"], "session-1");
+        assert_eq!(authorize_json["bearer_token"], "pta_agent.secret");
+        assert_eq!(serde_json::from_value::<CaptureTransferRequest>(authorize_json).unwrap(), authorize);
+
         let latest = CaptureTransferRequest::LatestVideoFrame {
             session_id: "session-1".to_string(),
             track_id: 7,
@@ -128,6 +182,18 @@ mod tests {
         assert_eq!(release_json["op"], "release_video_frame");
         assert_eq!(release_json["lease_id"], 42);
         assert_eq!(serde_json::from_value::<CaptureTransferRequest>(release_json).unwrap(), release);
+    }
+
+    #[test]
+    fn request_debug_redacts_bearer_token() {
+        let request = CaptureTransferRequest::Authorize {
+            session_id: "session-1".to_string(),
+            bearer_token: "pta_agent.secret".to_string(),
+        };
+
+        let output = format!("{request:?}");
+        assert!(output.contains("<redacted>"));
+        assert!(!output.contains("pta_agent.secret"));
     }
 
     #[test]

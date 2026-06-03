@@ -226,7 +226,10 @@ impl DaemonConsumer {
         Ok(Self {
             info,
             stream,
-            reader: BufReader::new(reader_stream),
+            // Messages that announce an fd are followed by a single ancillary
+            // data byte. Do not let buffered line reads consume that byte
+            // before fdpass::recv_fd can receive its control message.
+            reader: BufReader::with_capacity(1, reader_stream),
             pools: BTreeMap::new(),
             control_pages: BTreeMap::new(),
             consumer_slots: BTreeMap::new(),

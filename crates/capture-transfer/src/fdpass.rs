@@ -45,7 +45,7 @@ pub fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<()> {
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = cmsg_len(SCM_RIGHTS_FD_LEN);
+        (*cmsg).cmsg_len = cmsg_len(SCM_RIGHTS_FD_LEN) as _;
         let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
         std::ptr::copy_nonoverlapping(&fd, data, 1);
     }
@@ -93,7 +93,7 @@ pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
         if cmsg.is_null() || (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
             return Err(CaptureTransferError::MissingPassedFd);
         }
-        if (*cmsg).cmsg_len != cmsg_len(SCM_RIGHTS_FD_LEN) {
+        if (*cmsg).cmsg_len as usize != cmsg_len(SCM_RIGHTS_FD_LEN) {
             return Err(CaptureTransferError::MissingPassedFd);
         }
         let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
@@ -112,9 +112,9 @@ fn stream_fd(stream: &UnixStream) -> RawFd {
     borrowed.as_raw_fd()
 }
 
-fn cmsg_len(data_len: usize) -> libc::socklen_t {
+fn cmsg_len(data_len: usize) -> usize {
     // SAFETY: CMSG_LEN performs platform-specific header+payload sizing.
-    unsafe { libc::CMSG_LEN(data_len as _) as _ }
+    unsafe { libc::CMSG_LEN(data_len as _) as usize }
 }
 
 #[cfg(test)]

@@ -107,9 +107,9 @@ typedef struct ft_video_frame_desc {
   uint32_t height;
   uint32_t stride;
   uint32_t pixel_format;
+  /* Pool ids are unique forever (never reused); no generation needed. */
   uint64_t pool_id;
-  uint64_t slot_id;
-  uint64_t slot_generation;
+  uint32_t slot_id;
   uint64_t payload_offset;
   uint64_t payload_len;
   uint64_t payload_map_len;
@@ -118,11 +118,38 @@ typedef struct ft_video_frame_desc {
   uint32_t sync_kind;
   uint32_t damage_kind;
   uint64_t damage_base_sequence;
-  uint64_t dropped_before_publish;
+  uint32_t dropped_before_publish;
   uint64_t producer_drop_count;
   uint64_t evicted_count;
   uint64_t consumer_skipped_count;
+  /* Native-handle descriptor: payload_kind selects cpu-shm vs IOSurface/
+   * dmabuf/D3D; native frames carry no in-band payload and are sampled
+   * after waiting for fence_value on the stream's fence_id. */
+  uint32_t payload_kind;
+  uint64_t modifier;
+  uint64_t fence_id;
+  uint64_t fence_value;
+  uint32_t flags;
 } ft_video_frame_desc;
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+/*
+ * Pin the ABI of ft_video_frame_desc. The mirror lives in the Rust
+ * FtVideoFrameDesc (#[repr(C)]); these asserts and the matching
+ * const _: () block in src/ffi.rs must agree. Narrowing a field or
+ * appending to the tail without updating both sides is the trap this
+ * guards against.
+ */
+_Static_assert(sizeof(ft_video_frame_desc) == 168, "frame desc size");
+_Static_assert(offsetof(ft_video_frame_desc, pool_id) == 32, "frame desc packing");
+_Static_assert(offsetof(ft_video_frame_desc, slot_id) == 40, "slot_id narrowed to u32");
+_Static_assert(offsetof(ft_video_frame_desc, dropped_before_publish) == 96, "dropped_before_publish narrowed to u32");
+_Static_assert(offsetof(ft_video_frame_desc, payload_kind) == 128, "native-handle tail begins");
+_Static_assert(offsetof(ft_video_frame_desc, modifier) == 136, "native-handle tail packing");
+_Static_assert(offsetof(ft_video_frame_desc, fence_id) == 144, "native-handle tail packing");
+_Static_assert(offsetof(ft_video_frame_desc, fence_value) == 152, "native-handle tail packing");
+_Static_assert(offsetof(ft_video_frame_desc, flags) == 160, "native-handle tail packing");
+#endif
 
 typedef struct ft_event {
   uint32_t kind;

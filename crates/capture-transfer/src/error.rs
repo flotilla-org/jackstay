@@ -32,4 +32,7 @@ pub enum CaptureTransferError {
 
     #[error("video control ring read failed for track id {track_id:?}: {source}")]
     VideoControlRingRead { track_id: TrackId, source: VideoRingReadError },
+
+    #[error("native frame backend {operation} failed: {message}")]
+    NativeBackend { operation: &'static str, message: String },
 }

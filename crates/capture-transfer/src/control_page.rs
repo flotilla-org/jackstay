@@ -1,6 +1,6 @@
 use std::{
     os::fd::OwnedFd,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering, fence},
 };
 
 use thiserror::Error;
@@ -10,101 +10,307 @@ use crate::{
     shm::SharedMemorySegment,
 };
 
-pub const CONTROL_PAGE_ALIGNMENT: usize = 128;
-pub const EMPTY_LATEST_INDEX: u64 = u64::MAX;
-pub const VIDEO_TRACK_CONTROL_MAGIC: u64 = u64::from_le_bytes(*b"JSVTRK01");
-pub const VIDEO_TRACK_CONTROL_VERSION: u64 = 2;
-const VIDEO_RING_PUBLICATION_SEQUENCE_LEN: usize = std::mem::size_of::<u64>();
-const _: () = assert!(std::mem::offset_of!(VideoRingEntry, publication_sequence) == 0);
+// The wire layout implemented here is specified by include/jackstay_ring.h.
+// Every struct below mirrors that header exactly; the const block after the
+// struct definitions static-asserts each documented offset and size.
+//
+// Records are one 128-byte cacheline each (Apple silicon line size) so no two
+// records false-share; the header's hot cursors live alone on the second line.
 
+pub const CONTROL_PAGE_ALIGNMENT: usize = 128;
+pub const VIDEO_TRACK_CONTROL_MAGIC: u64 = u64::from_le_bytes(*b"JSFRING1");
+pub const VIDEO_TRACK_CONTROL_VERSION: u32 = 3;
+pub const CONFIG_RING_CAPACITY: usize = 4;
+// config_index_mask derives the ring mask as CONFIG_RING_CAPACITY - 1, which is
+// only a valid index mask when the capacity is a power of two.
+const _: () = assert!(CONFIG_RING_CAPACITY.is_power_of_two());
+const HEADER_LEN: usize = 256;
+const SEQLOCK_WORD_LEN: usize = std::mem::size_of::<u64>();
+
+/// jackstay_ring_header. Line 0 is written once at creation and read-only
+/// afterwards; line 1 holds the only mutable cross-process words.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoTrackControlHeader {
     pub magic: u64,
-    pub version: u64,
-    pub header_len: u64,
-    pub entry_len: u64,
-    pub capacity: u64,
-    pub consumer_entries_offset: u64,
-    pub consumer_entry_len: u64,
-    pub consumer_capacity: u64,
-    pub index_mask: u64,
+    pub layout_version: u32,
+    pub header_len: u32,
+    pub slot_len: u32,
+    pub slot_capacity: u32,
+    pub config_len: u32,
+    pub config_capacity: u32,
+    pub consumer_len: u32,
+    pub consumer_capacity: u32,
+    pub slots_offset: u32,
+    pub configs_offset: u32,
+    pub consumers_offset: u32,
+    pub reserved0: [u8; 76],
+    /// Count of published frames; 0 = empty. Ring occupancy derives from it:
+    /// len = min(cursor, slot_capacity), latest index = (cursor-1) & mask,
+    /// oldest live cursor = cursor - len + 1.
     pub producer_cursor: u64,
-    pub latest_sequence: u64,
-    pub latest_index: u64,
-    pub len: u64,
+    /// Latest stream config generation; 0 = none published yet.
+    pub config_cursor: u64,
+    pub reserved1: [u8; 112],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VideoTrackControlHeaderField {
-    ProducerCursor,
-    LatestSequence,
-    LatestIndex,
-    Len,
-}
-
+/// jackstay_frame_slot: one published frame. The payload is not here; cpu-shm
+/// payloads live in a pool segment attached via the setup channel, native
+/// payloads are the pool slot itself (an IOSurface/dmabuf registered via the
+/// setup channel) and payload_offset/len are zero.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct VideoRingEntry {
+pub struct FrameSlot {
+    /// Seqlock word: 0 while mid-write, else the producer cursor value at
+    /// publish, which makes it invalidation flag, version, and identity in
+    /// one compare. Must remain field 0: it is accessed atomically by offset
+    /// while the rest of the slot is copied as plain bytes.
     pub publication_sequence: u64,
-    pub producer_cursor: u64,
+    /// Producer frame count. Unlike the cursor it advances on dropped frames,
+    /// so capture gaps stay visible.
     pub sequence: u64,
-    pub frame_key: u64,
     pub timestamp_ns: u64,
+    /// Unique forever, never reused, so stale pools need no generation.
+    pub pool_id: u64,
+    pub payload_offset: u64,
+    pub payload_len: u64,
+    /// Timeline value to wait for on the config's fence before sampling a
+    /// native payload.
+    pub fence_value: u64,
+    pub damage_base_sequence: u64,
+    pub producer_drop_count: u64,
+    pub slot_id: u32,
+    /// Names a StreamConfig generation (truncated; generations are asserted
+    /// to stay within u32).
+    pub config_generation: u32,
+    pub payload_kind: u32,
+    pub damage_kind: u32,
+    pub dropped_before_publish: u32,
+    pub flags: u32,
+    pub reserved: [u8; 32],
+}
+
+/// jackstay_stream_config: per-stream values that change only on reconfigure.
+/// A resize is not a special frame; it is a new generation (and, when
+/// dimensions grow, a new pool) that subsequent frames reference. The ring
+/// holds the last CONFIG_RING_CAPACITY generations at index
+/// generation & (capacity-1).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamConfig {
+    /// Seqlock word: 0 while mid-write, else the generation. Field 0, same
+    /// discipline as FrameSlot::publication_sequence.
+    pub config_generation: u64,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
     pub pixel_format: u32,
-    pub pool_id: u64,
-    pub slot_id: u64,
-    pub slot_generation: u64,
-    pub payload_offset: u64,
-    pub payload_len: u64,
-    pub payload_map_len: u64,
-    pub clock_domain: u32,
     pub color_space: u32,
+    pub clock_domain: u32,
     pub sync_kind: u32,
-    pub damage_kind: u32,
-    pub damage_base_sequence: u64,
-    pub dropped_before_publish: u64,
-    pub producer_drop_count: u64,
+    pub reserved0: u32,
+    pub modifier: u64,
+    /// The stream's timeline fence, as registered via the setup channel.
+    pub fence_id: u64,
+    pub reserved1: [u8; 72],
 }
 
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            config_generation: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: 0,
+            color_space: 0,
+            clock_domain: 0,
+            sync_kind: 0,
+            reserved0: 0,
+            modifier: 0,
+            fence_id: 0,
+            reserved1: [0; 72],
+        }
+    }
+}
+
+/// jackstay_consumer_slot: one cacheline per consumer so consumers never
+/// share a line. The producer allocates and frees slots (consumer_id == 0
+/// means free); a registered consumer stores only into its own slot. Every
+/// field is observational: stores are individually atomic but the slot is
+/// never read as one consistent snapshot.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoConsumerCursorEntry {
+    pub consumer_id: u64,
+    /// Frames at or below this cursor are no longer being sampled.
+    pub release_cursor: u64,
+    pub last_acquired_cursor: u64,
+    pub last_acquired_sequence: u64,
+    pub acquired_count: u64,
+    pub skipped_count: u64,
+    pub reserved: [u8; 80],
+}
+
+impl Default for VideoConsumerCursorEntry {
+    fn default() -> Self {
+        Self {
+            consumer_id: 0,
+            release_cursor: 0,
+            last_acquired_cursor: 0,
+            last_acquired_sequence: 0,
+            acquired_count: 0,
+            skipped_count: 0,
+            reserved: [0; 80],
+        }
+    }
+}
+
+// Offsets and sizes are the contract from include/jackstay_ring.h.
+const _: () = {
+    assert!(std::mem::size_of::<VideoTrackControlHeader>() == 256);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, magic) == 0);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, layout_version) == 8);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, header_len) == 12);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, slot_len) == 16);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, slot_capacity) == 20);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, config_len) == 24);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, config_capacity) == 28);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, consumer_len) == 32);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, consumer_capacity) == 36);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, slots_offset) == 40);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, configs_offset) == 44);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, consumers_offset) == 48);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, producer_cursor) == 128);
+    assert!(std::mem::offset_of!(VideoTrackControlHeader, config_cursor) == 136);
+
+    assert!(std::mem::size_of::<FrameSlot>() == 128);
+    assert!(std::mem::offset_of!(FrameSlot, publication_sequence) == 0);
+    assert!(std::mem::offset_of!(FrameSlot, sequence) == 8);
+    assert!(std::mem::offset_of!(FrameSlot, timestamp_ns) == 16);
+    assert!(std::mem::offset_of!(FrameSlot, pool_id) == 24);
+    assert!(std::mem::offset_of!(FrameSlot, payload_offset) == 32);
+    assert!(std::mem::offset_of!(FrameSlot, payload_len) == 40);
+    assert!(std::mem::offset_of!(FrameSlot, fence_value) == 48);
+    assert!(std::mem::offset_of!(FrameSlot, damage_base_sequence) == 56);
+    assert!(std::mem::offset_of!(FrameSlot, producer_drop_count) == 64);
+    assert!(std::mem::offset_of!(FrameSlot, slot_id) == 72);
+    assert!(std::mem::offset_of!(FrameSlot, config_generation) == 76);
+    assert!(std::mem::offset_of!(FrameSlot, payload_kind) == 80);
+    assert!(std::mem::offset_of!(FrameSlot, damage_kind) == 84);
+    assert!(std::mem::offset_of!(FrameSlot, dropped_before_publish) == 88);
+    assert!(std::mem::offset_of!(FrameSlot, flags) == 92);
+    assert!(std::mem::offset_of!(FrameSlot, reserved) == 96);
+
+    assert!(std::mem::size_of::<StreamConfig>() == 128);
+    assert!(std::mem::offset_of!(StreamConfig, config_generation) == 0);
+    assert!(std::mem::offset_of!(StreamConfig, width) == 8);
+    assert!(std::mem::offset_of!(StreamConfig, height) == 12);
+    assert!(std::mem::offset_of!(StreamConfig, stride) == 16);
+    assert!(std::mem::offset_of!(StreamConfig, pixel_format) == 20);
+    assert!(std::mem::offset_of!(StreamConfig, color_space) == 24);
+    assert!(std::mem::offset_of!(StreamConfig, clock_domain) == 28);
+    assert!(std::mem::offset_of!(StreamConfig, sync_kind) == 32);
+    assert!(std::mem::offset_of!(StreamConfig, modifier) == 40);
+    assert!(std::mem::offset_of!(StreamConfig, fence_id) == 48);
+    assert!(std::mem::offset_of!(StreamConfig, reserved1) == 56);
+
+    assert!(std::mem::size_of::<VideoConsumerCursorEntry>() == 128);
+    assert!(std::mem::offset_of!(VideoConsumerCursorEntry, consumer_id) == 0);
+    assert!(std::mem::offset_of!(VideoConsumerCursorEntry, release_cursor) == 8);
+    assert!(std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_cursor) == 16);
+    assert!(std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_sequence) == 24);
+    assert!(std::mem::offset_of!(VideoConsumerCursorEntry, acquired_count) == 32);
+    assert!(std::mem::offset_of!(VideoConsumerCursorEntry, skipped_count) == 40);
+};
+
+/// A frame as a producer submits it: the per-frame slot values plus the
+/// stream-level values. The page splits them, deduplicating unchanged stream
+/// values into the current config generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingVideoRingEntry {
     pub sequence: u64,
-    pub frame_key: u64,
     pub timestamp_ns: u64,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
     pub pixel_format: u32,
     pub pool_id: u64,
-    pub slot_id: u64,
-    pub slot_generation: u64,
+    pub slot_id: u32,
     pub payload_offset: u64,
     pub payload_len: u64,
-    pub payload_map_len: u64,
     pub clock_domain: u32,
     pub color_space: u32,
     pub sync_kind: u32,
     pub damage_kind: u32,
     pub damage_base_sequence: u64,
-    pub dropped_before_publish: u64,
+    pub dropped_before_publish: u32,
     pub producer_drop_count: u64,
+    pub payload_kind: u32,
+    pub modifier: u64,
+    pub fence_id: u64,
+    pub fence_value: u64,
+    pub flags: u32,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct VideoConsumerCursorEntry {
-    pub consumer_id: u64,
-    pub slot_generation: u64,
-    pub last_acquired_cursor: u64,
-    pub last_acquired_sequence: u64,
-    pub release_cursor: u64,
-    pub skipped_count: u64,
-    pub acquired_count: u64,
-    pub reserved0: u64,
+/// A validated read: the frame slot merged with the stream config it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoRingEntry {
+    pub cursor: u64,
+    pub sequence: u64,
+    pub timestamp_ns: u64,
+    pub config_generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u32,
+    pub pool_id: u64,
+    pub slot_id: u32,
+    pub payload_offset: u64,
+    pub payload_len: u64,
+    pub clock_domain: u32,
+    pub color_space: u32,
+    pub sync_kind: u32,
+    pub damage_kind: u32,
+    pub damage_base_sequence: u64,
+    pub dropped_before_publish: u32,
+    pub producer_drop_count: u64,
+    pub payload_kind: u32,
+    pub modifier: u64,
+    pub fence_id: u64,
+    pub fence_value: u64,
+    pub flags: u32,
+}
+
+impl VideoRingEntry {
+    fn from_parts(cursor: u64, slot: &FrameSlot, config: &StreamConfig) -> Self {
+        Self {
+            cursor,
+            sequence: slot.sequence,
+            timestamp_ns: slot.timestamp_ns,
+            config_generation: config.config_generation,
+            width: config.width,
+            height: config.height,
+            stride: config.stride,
+            pixel_format: config.pixel_format,
+            pool_id: slot.pool_id,
+            slot_id: slot.slot_id,
+            payload_offset: slot.payload_offset,
+            payload_len: slot.payload_len,
+            clock_domain: config.clock_domain,
+            color_space: config.color_space,
+            sync_kind: config.sync_kind,
+            damage_kind: slot.damage_kind,
+            damage_base_sequence: slot.damage_base_sequence,
+            dropped_before_publish: slot.dropped_before_publish,
+            producer_drop_count: slot.producer_drop_count,
+            payload_kind: slot.payload_kind,
+            modifier: config.modifier,
+            fence_id: config.fence_id,
+            fence_value: slot.fence_value,
+            flags: slot.flags,
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -127,16 +333,28 @@ pub enum VideoRingReadError {
         first_sequence: u64,
         second_sequence: u64,
     },
+    #[error(
+        "video ring cursor {requested_cursor} names stream config generation {requested_generation} which is no longer live: first read {first_generation}, second read {second_generation}"
+    )]
+    ConfigOverwritten {
+        requested_cursor: u64,
+        requested_generation: u64,
+        first_generation: u64,
+        second_generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoTrackControlLayout {
     pub header_offset: usize,
-    pub entries_offset: usize,
-    pub entry_len: usize,
-    pub capacity: usize,
-    pub consumer_entries_offset: usize,
-    pub consumer_entry_len: usize,
+    pub slots_offset: usize,
+    pub slot_len: usize,
+    pub slot_capacity: usize,
+    pub configs_offset: usize,
+    pub config_len: usize,
+    pub config_capacity: usize,
+    pub consumers_offset: usize,
+    pub consumer_len: usize,
     pub consumer_capacity: usize,
     pub byte_len: usize,
 }
@@ -144,33 +362,49 @@ pub struct VideoTrackControlLayout {
 impl VideoTrackControlLayout {
     #[must_use]
     pub fn for_capacity(capacity: usize) -> Self {
-        let entries_offset = align_up(std::mem::size_of::<VideoTrackControlHeader>(), CONTROL_PAGE_ALIGNMENT);
-        let entry_len = std::mem::size_of::<VideoRingEntry>();
-        let entries_len = capacity
-            .checked_mul(entry_len)
-            .expect("video control page entry byte length overflow");
-        let entries_end = entries_offset
-            .checked_add(entries_len)
-            .expect("video control page entry byte length overflow");
-        let consumer_entries_offset = align_up(entries_end, CONTROL_PAGE_ALIGNMENT);
-        let consumer_entry_len = std::mem::size_of::<VideoConsumerCursorEntry>();
-        let consumer_capacity = capacity;
-        let consumer_entries_len = consumer_capacity
-            .checked_mul(consumer_entry_len)
-            .expect("video control page consumer cursor byte length overflow");
-        let byte_len = consumer_entries_offset
-            .checked_add(consumer_entries_len)
+        let slot_capacity = ring_capacity_for(capacity);
+        let slot_len = std::mem::size_of::<FrameSlot>();
+        let slots_offset = HEADER_LEN;
+        let slots_len = slot_capacity
+            .checked_mul(slot_len)
+            .expect("video control page slot byte length overflow");
+        let configs_offset = slots_offset
+            .checked_add(slots_len)
+            .expect("video control page slot byte length overflow");
+        let config_len = std::mem::size_of::<StreamConfig>();
+        let configs_len = CONFIG_RING_CAPACITY * config_len;
+        let consumers_offset = configs_offset
+            .checked_add(configs_len)
+            .expect("video control page config byte length overflow");
+        let consumer_len = std::mem::size_of::<VideoConsumerCursorEntry>();
+        let consumer_capacity = slot_capacity;
+        let consumers_len = consumer_capacity
+            .checked_mul(consumer_len)
+            .expect("video control page consumer byte length overflow");
+        let byte_len = consumers_offset
+            .checked_add(consumers_len)
             .expect("video control page byte length overflow");
         Self {
             header_offset: 0,
-            entries_offset,
-            entry_len,
-            capacity,
-            consumer_entries_offset,
-            consumer_entry_len,
+            slots_offset,
+            slot_len,
+            slot_capacity,
+            configs_offset,
+            config_len,
+            config_capacity: CONFIG_RING_CAPACITY,
+            consumers_offset,
+            consumer_len,
             consumer_capacity,
             byte_len,
         }
+    }
+
+    const fn slot_index_mask(&self) -> u64 {
+        (self.slot_capacity - 1) as u64
+    }
+
+    const fn config_index_mask(&self) -> u64 {
+        (self.config_capacity - 1) as u64
     }
 }
 
@@ -178,6 +412,7 @@ impl VideoTrackControlLayout {
 pub struct VideoTrackControlSnapshot {
     pub header: VideoTrackControlHeader,
     pub entries: Vec<VideoRingEntry>,
+    pub configs: Vec<StreamConfig>,
     pub consumer_entries: Vec<VideoConsumerCursorEntry>,
 }
 
@@ -185,30 +420,23 @@ pub struct VideoTrackControlSnapshot {
 pub struct VideoTrackControlPage {
     layout: VideoTrackControlLayout,
     storage: SharedMemorySegment,
+    /// Producer-side cache of the live config (stored with generation 0 so it
+    /// compares against candidate bodies directly). Only the creating
+    /// producer pushes, so a mapped page starts cold and republishes once.
+    producer_config: Option<(u64, StreamConfig)>,
 }
 
 impl VideoTrackControlPage {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        let capacity = ring_capacity_for(capacity);
         let layout = VideoTrackControlLayout::for_capacity(capacity);
         let storage = SharedMemorySegment::new(layout.byte_len).expect("control page mapped storage allocation failed");
-        let page = Self { layout, storage };
-        page.store_initial_header(VideoTrackControlHeader {
-            magic: VIDEO_TRACK_CONTROL_MAGIC,
-            version: VIDEO_TRACK_CONTROL_VERSION,
-            header_len: std::mem::size_of::<VideoTrackControlHeader>() as u64,
-            entry_len: std::mem::size_of::<VideoRingEntry>() as u64,
-            capacity: capacity as u64,
-            consumer_entries_offset: layout.consumer_entries_offset as u64,
-            consumer_entry_len: std::mem::size_of::<VideoConsumerCursorEntry>() as u64,
-            consumer_capacity: layout.consumer_capacity as u64,
-            index_mask: (capacity - 1) as u64,
-            producer_cursor: 0,
-            latest_sequence: 0,
-            latest_index: EMPTY_LATEST_INDEX,
-            len: 0,
-        });
+        let page = Self {
+            layout,
+            storage,
+            producer_config: None,
+        };
+        page.store_initial_header();
         page
     }
 
@@ -228,26 +456,24 @@ impl VideoTrackControlPage {
 
     pub fn map_read_only(fd: OwnedFd, map_len: usize) -> CaptureResult<Self> {
         let storage = SharedMemorySegment::map_read_only(fd, map_len)?;
-        let mut page = Self {
-            layout: VideoTrackControlLayout::for_capacity(1),
-            storage,
-        };
-        let initial_header: VideoTrackControlHeader = page.read_at(0);
-        let capacity = validate_control_header(&initial_header, map_len)?;
-        page.layout = VideoTrackControlLayout::for_capacity(capacity);
-        // Re-read after choosing the final layout so a racing or corrupt header
-        // is caught against the mapping shape callers will use.
-        page.validate_header()?;
-        Ok(page)
+        Self::from_mapped_storage(storage, map_len)
     }
 
     pub fn map_read_write(fd: OwnedFd, map_len: usize) -> CaptureResult<Self> {
         let storage = SharedMemorySegment::map_read_write(fd, map_len)?;
+        Self::from_mapped_storage(storage, map_len)
+    }
+
+    fn from_mapped_storage(storage: SharedMemorySegment, map_len: usize) -> CaptureResult<Self> {
+        if map_len < HEADER_LEN {
+            return Err(invalid_control_page("mapped length is smaller than the ring header"));
+        }
         let mut page = Self {
             layout: VideoTrackControlLayout::for_capacity(1),
             storage,
+            producer_config: None,
         };
-        let initial_header: VideoTrackControlHeader = page.read_at(0);
+        let initial_header = page.header();
         let capacity = validate_control_header(&initial_header, map_len)?;
         page.layout = VideoTrackControlLayout::for_capacity(capacity);
         // Re-read after choosing the final layout so a racing or corrupt header
@@ -273,116 +499,230 @@ impl VideoTrackControlPage {
             })
     }
 
-    #[cfg(test)]
-    fn raw_entry_for_test(&self, index: usize) -> VideoRingEntry {
-        self.entry(index)
-    }
-
-    #[cfg(test)]
-    fn set_entry_publication_sequence_for_test(&self, index: usize, publication_sequence: u64) {
-        self.store_entry_publication_sequence(index, publication_sequence, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    fn header_field_offset_for_test(&self, field: VideoTrackControlHeaderField) -> usize {
-        self.header_field_offset(field)
-    }
-
-    #[cfg(test)]
-    fn entry_publication_sequence_offset_for_test(&self, index: usize) -> usize {
-        self.entry_publication_sequence_offset(index)
-    }
-
-    #[cfg(test)]
-    fn load_header_producer_cursor_for_test(&self, ordering: Ordering) -> u64 {
-        self.load_header_producer_cursor(ordering)
-    }
-
-    #[cfg(test)]
-    fn store_header_producer_cursor_for_test(&self, value: u64, ordering: Ordering) {
-        self.store_header_producer_cursor(value, ordering);
-    }
-
-    #[cfg(test)]
-    fn load_entry_publication_sequence_for_test(&self, index: usize, ordering: Ordering) -> u64 {
-        self.load_entry_publication_sequence(index, ordering)
-    }
-
-    #[cfg(test)]
-    fn store_entry_publication_sequence_for_test(&self, index: usize, value: u64, ordering: Ordering) {
-        self.store_entry_publication_sequence(index, value, ordering);
-    }
-
     fn header(&self) -> VideoTrackControlHeader {
         VideoTrackControlHeader {
-            magic: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, magic)),
-            version: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, version)),
-            header_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, header_len)),
-            entry_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, entry_len)),
-            capacity: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, capacity)),
-            consumer_entries_offset: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, consumer_entries_offset)),
-            consumer_entry_len: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, consumer_entry_len)),
-            consumer_capacity: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, consumer_capacity)),
-            index_mask: self.read_header_u64(std::mem::offset_of!(VideoTrackControlHeader, index_mask)),
+            magic: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, magic)),
+            layout_version: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, layout_version)),
+            header_len: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, header_len)),
+            slot_len: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, slot_len)),
+            slot_capacity: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, slot_capacity)),
+            config_len: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, config_len)),
+            config_capacity: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, config_capacity)),
+            consumer_len: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, consumer_len)),
+            consumer_capacity: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, consumer_capacity)),
+            slots_offset: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, slots_offset)),
+            configs_offset: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, configs_offset)),
+            consumers_offset: self.read_at(std::mem::offset_of!(VideoTrackControlHeader, consumers_offset)),
+            reserved0: [0; 76],
             producer_cursor: self.load_header_producer_cursor(Ordering::Acquire),
-            latest_sequence: self.load_header_latest_sequence(Ordering::Acquire),
-            latest_index: self.load_header_latest_index(Ordering::Acquire),
-            len: self.load_header_len(Ordering::Acquire),
+            config_cursor: self.load_header_config_cursor(Ordering::Acquire),
+            reserved1: [0; 112],
         }
     }
 
-    fn store_initial_header(&self, header: VideoTrackControlHeader) {
-        debug_assert_eq!(header.producer_cursor, 0);
-        debug_assert_eq!(header.latest_sequence, 0);
-        debug_assert_eq!(header.latest_index, EMPTY_LATEST_INDEX);
-        debug_assert_eq!(header.len, 0);
+    fn store_initial_header(&self) {
+        let header = VideoTrackControlHeader {
+            magic: VIDEO_TRACK_CONTROL_MAGIC,
+            layout_version: VIDEO_TRACK_CONTROL_VERSION,
+            header_len: HEADER_LEN as u32,
+            slot_len: self.layout.slot_len as u32,
+            slot_capacity: self.layout.slot_capacity as u32,
+            config_len: self.layout.config_len as u32,
+            config_capacity: self.layout.config_capacity as u32,
+            consumer_len: self.layout.consumer_len as u32,
+            consumer_capacity: self.layout.consumer_capacity as u32,
+            slots_offset: self.layout.slots_offset as u32,
+            configs_offset: self.layout.configs_offset as u32,
+            consumers_offset: self.layout.consumers_offset as u32,
+            reserved0: [0; 76],
+            producer_cursor: 0,
+            config_cursor: 0,
+            reserved1: [0; 112],
+        };
         // This is the one whole-header write, performed before the page can be
         // shared with any reader. After init, hot fields use atomic helpers.
         self.write_at(self.layout.header_offset, header);
     }
 
-    fn entry(&self, index: usize) -> VideoRingEntry {
-        assert!(index < self.layout.capacity);
-        // Snapshot/test reads are lossy observations. Authoritative cursor reads
-        // use `read_entry_for_cursor`, which performs the second sequence load.
-        // TODO(cross-process): do not use this as an authoritative reader after
-        // fd passing; it does not re-load the sequence after descriptor copy.
-        let publication_sequence = self.load_entry_publication_sequence(index, Ordering::Acquire);
-        self.read_entry_descriptor(index, publication_sequence)
+    pub fn push(&mut self, entry: PendingVideoRingEntry) -> u64 {
+        let config_generation = self.ensure_stream_config(&entry);
+        // A u64 producer cursor is effectively inexhaustible for display-rate
+        // capture, but saturation would make ring-slot selection ambiguous.
+        let cursor = self.load_header_producer_cursor(Ordering::Relaxed).saturating_add(1);
+        debug_assert!(cursor < u64::MAX);
+        let index = ((cursor - 1) & self.layout.slot_index_mask()) as usize;
+        let slot = FrameSlot {
+            publication_sequence: 0,
+            sequence: entry.sequence,
+            timestamp_ns: entry.timestamp_ns,
+            pool_id: entry.pool_id,
+            payload_offset: entry.payload_offset,
+            payload_len: entry.payload_len,
+            fence_value: entry.fence_value,
+            damage_base_sequence: entry.damage_base_sequence,
+            producer_drop_count: entry.producer_drop_count,
+            slot_id: entry.slot_id,
+            config_generation: config_generation as u32,
+            payload_kind: entry.payload_kind,
+            damage_kind: entry.damage_kind,
+            dropped_before_publish: entry.dropped_before_publish,
+            flags: entry.flags,
+            reserved: [0; 32],
+        };
+        // Seqlock writer. The release fence keeps the invalidating zero ahead
+        // of the descriptor's plain stores; without it ARM may drain the new
+        // descriptor bytes first and a lagging reader of the old cursor would
+        // double-read clean over torn data.
+        self.store_slot_publication_sequence(index, 0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.store_slot_descriptor(index, slot);
+        self.store_slot_publication_sequence(index, cursor, Ordering::Release);
+        self.store_header_producer_cursor(cursor, Ordering::Release);
+        cursor
     }
 
-    fn read_entry_descriptor(&self, index: usize, publication_sequence: u64) -> VideoRingEntry {
-        assert!(index < self.layout.capacity);
-        let mut entry = VideoRingEntry {
-            publication_sequence,
-            ..VideoRingEntry::default()
+    fn ensure_stream_config(&mut self, entry: &PendingVideoRingEntry) -> u64 {
+        let body = StreamConfig {
+            config_generation: 0,
+            width: entry.width,
+            height: entry.height,
+            stride: entry.stride,
+            pixel_format: entry.pixel_format,
+            color_space: entry.color_space,
+            clock_domain: entry.clock_domain,
+            sync_kind: entry.sync_kind,
+            reserved0: 0,
+            modifier: entry.modifier,
+            fence_id: entry.fence_id,
+            reserved1: [0; 72],
         };
-        let descriptor_offset = self.entry_offset(index) + VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
-        let descriptor_len = self.layout.entry_len - VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
+        if let Some((generation, cached)) = &self.producer_config
+            && *cached == body
+        {
+            return *generation;
+        }
+        let generation = self.load_header_config_cursor(Ordering::Relaxed) + 1;
+        // The frame slot carries the generation truncated to u32; reconfigures
+        // are rare enough (a per-event resize storm would take years) that the
+        // truncation is asserted rather than handled.
+        debug_assert!(generation <= u64::from(u32::MAX));
+        let index = (generation & self.layout.config_index_mask()) as usize;
+        // Same seqlock writer shape as push().
+        self.store_config_generation(index, 0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.store_config_descriptor(index, body);
+        self.store_config_generation(index, generation, Ordering::Release);
+        self.store_header_config_cursor(generation, Ordering::Release);
+        self.producer_config = Some((generation, body));
+        generation
+    }
+
+    pub fn read_entry_for_cursor(&self, cursor: u64) -> Result<VideoRingEntry, VideoRingReadError> {
+        let Some(latest_cursor) = self.latest_cursor() else {
+            return Err(VideoRingReadError::Empty);
+        };
+        if cursor > latest_cursor {
+            return Err(VideoRingReadError::NotPublished {
+                requested_cursor: cursor,
+                latest_cursor,
+            });
+        }
+        let oldest_live_cursor = self.oldest_live_cursor().expect("latest cursor implies oldest cursor");
+        if cursor < oldest_live_cursor {
+            return Err(VideoRingReadError::Lapped {
+                requested_cursor: cursor,
+                oldest_live_cursor,
+                latest_cursor,
+            });
+        }
+
+        let index = ((cursor - 1) & self.layout.slot_index_mask()) as usize;
+        let slot = self.read_slot_seqlock(index, cursor)?;
+        let generation = u64::from(slot.config_generation);
+        let config = self
+            .read_config_seqlock(generation)
+            .map_err(|(first, second)| VideoRingReadError::ConfigOverwritten {
+                requested_cursor: cursor,
+                requested_generation: generation,
+                first_generation: first,
+                second_generation: second,
+            })?;
+        Ok(VideoRingEntry::from_parts(cursor, &slot, &config))
+    }
+
+    pub fn read_latest_lossy_entry(&self) -> Result<Option<VideoRingEntry>, VideoRingReadError> {
+        let Some(cursor) = self.latest_cursor() else {
+            return Ok(None);
+        };
+        self.read_entry_for_cursor(cursor).map(Some)
+    }
+
+    fn read_slot_seqlock(&self, index: usize, expected_cursor: u64) -> Result<FrameSlot, VideoRingReadError> {
+        let first_sequence = self.load_slot_publication_sequence(index, Ordering::Acquire);
+        let slot = self.read_slot_descriptor(index, first_sequence);
+        // Order the descriptor's plain loads before the validating re-read; an
+        // acquire load alone does not keep earlier loads from completing late.
+        fence(Ordering::Acquire);
+        let second_sequence = self.load_slot_publication_sequence(index, Ordering::Relaxed);
+        if first_sequence != expected_cursor || second_sequence != expected_cursor {
+            return Err(VideoRingReadError::SlotSequenceMismatch {
+                requested_cursor: expected_cursor,
+                first_sequence,
+                second_sequence,
+            });
+        }
+        Ok(slot)
+    }
+
+    fn read_config_seqlock(&self, generation: u64) -> Result<StreamConfig, (u64, u64)> {
+        if generation == 0 {
+            return Err((0, 0));
+        }
+        let index = (generation & self.layout.config_index_mask()) as usize;
+        let first = self.load_config_generation(index, Ordering::Acquire);
+        let mut config = self.read_config_descriptor(index);
+        // Same load-ordering fence as the frame slot reader.
+        fence(Ordering::Acquire);
+        let second = self.load_config_generation(index, Ordering::Relaxed);
+        if first != generation || second != generation {
+            return Err((first, second));
+        }
+        config.config_generation = generation;
+        Ok(config)
+    }
+
+    fn read_slot_descriptor(&self, index: usize, publication_sequence: u64) -> FrameSlot {
+        assert!(index < self.layout.slot_capacity);
+        let mut slot = FrameSlot {
+            publication_sequence,
+            ..FrameSlot::default()
+        };
+        let descriptor_offset = self.slot_offset(index) + SEQLOCK_WORD_LEN;
+        let descriptor_len = self.layout.slot_len - SEQLOCK_WORD_LEN;
         let bytes = self.storage.slice_at(descriptor_offset, descriptor_len);
         // SAFETY: `publication_sequence` is field 0. This copies the rest of
-        // the repr(C) descriptor into a local value without reading the atomic
+        // the repr(C) slot into a local value without reading the atomic
         // sequence as plain bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                std::ptr::addr_of_mut!(entry).cast::<u8>().add(VIDEO_RING_PUBLICATION_SEQUENCE_LEN),
+                std::ptr::addr_of_mut!(slot).cast::<u8>().add(SEQLOCK_WORD_LEN),
                 bytes.len(),
             );
         }
-        entry
+        slot
     }
 
-    fn store_entry_descriptor(&self, index: usize, entry: VideoRingEntry) {
-        assert!(index < self.layout.capacity);
-        let descriptor_offset = self.entry_offset(index) + VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
-        let descriptor_len = self.layout.entry_len - VIDEO_RING_PUBLICATION_SEQUENCE_LEN;
+    fn store_slot_descriptor(&self, index: usize, slot: FrameSlot) {
+        assert!(index < self.layout.slot_capacity);
+        let descriptor_offset = self.slot_offset(index) + SEQLOCK_WORD_LEN;
+        let descriptor_len = self.layout.slot_len - SEQLOCK_WORD_LEN;
         self.storage.with_slice_at_mut(descriptor_offset, descriptor_len, |bytes| {
             // SAFETY: `publication_sequence` is field 0. This copies the rest
-            // of the repr(C) descriptor without touching the atomic sequence.
+            // of the repr(C) slot without touching the atomic sequence.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    std::ptr::addr_of!(entry).cast::<u8>().add(VIDEO_RING_PUBLICATION_SEQUENCE_LEN),
+                    std::ptr::addr_of!(slot).cast::<u8>().add(SEQLOCK_WORD_LEN),
                     bytes.as_mut_ptr(),
                     bytes.len(),
                 );
@@ -390,107 +730,102 @@ impl VideoTrackControlPage {
         });
     }
 
-    fn entry_publication_sequence(&self, index: usize) -> u64 {
-        self.load_entry_publication_sequence(index, Ordering::Acquire)
+    fn read_config_descriptor(&self, index: usize) -> StreamConfig {
+        assert!(index < self.layout.config_capacity);
+        let mut config = StreamConfig::default();
+        let descriptor_offset = self.config_offset(index) + SEQLOCK_WORD_LEN;
+        let descriptor_len = self.layout.config_len - SEQLOCK_WORD_LEN;
+        let bytes = self.storage.slice_at(descriptor_offset, descriptor_len);
+        // SAFETY: `config_generation` is field 0. This copies the rest of the
+        // repr(C) config without reading the atomic generation as plain bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                std::ptr::addr_of_mut!(config).cast::<u8>().add(SEQLOCK_WORD_LEN),
+                bytes.len(),
+            );
+        }
+        config
     }
 
-    fn load_entry_publication_sequence(&self, index: usize, ordering: Ordering) -> u64 {
-        assert!(index < self.layout.capacity);
-        self.load_u64_atomic(self.entry_publication_sequence_offset(index), ordering)
+    fn store_config_descriptor(&self, index: usize, config: StreamConfig) {
+        assert!(index < self.layout.config_capacity);
+        let descriptor_offset = self.config_offset(index) + SEQLOCK_WORD_LEN;
+        let descriptor_len = self.layout.config_len - SEQLOCK_WORD_LEN;
+        self.storage.with_slice_at_mut(descriptor_offset, descriptor_len, |bytes| {
+            // SAFETY: `config_generation` is field 0. This copies the rest of
+            // the repr(C) config without touching the atomic generation.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    std::ptr::addr_of!(config).cast::<u8>().add(SEQLOCK_WORD_LEN),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+            }
+        });
     }
 
-    fn store_entry_publication_sequence(&self, index: usize, publication_sequence: u64, ordering: Ordering) {
-        assert!(index < self.layout.capacity);
-        self.store_u64_atomic(self.entry_publication_sequence_offset(index), publication_sequence, ordering);
+    fn load_slot_publication_sequence(&self, index: usize, ordering: Ordering) -> u64 {
+        assert!(index < self.layout.slot_capacity);
+        self.load_u64_atomic(self.slot_offset(index), ordering)
     }
 
-    fn entry_publication_sequence_offset(&self, index: usize) -> usize {
-        // `publication_sequence` is field 0 of the repr(C) entry. Keep this
-        // offset explicit because future atomics will load this field directly.
-        self.entry_offset(index)
+    fn store_slot_publication_sequence(&self, index: usize, publication_sequence: u64, ordering: Ordering) {
+        assert!(index < self.layout.slot_capacity);
+        self.store_u64_atomic(self.slot_offset(index), publication_sequence, ordering);
+    }
+
+    fn load_config_generation(&self, index: usize, ordering: Ordering) -> u64 {
+        assert!(index < self.layout.config_capacity);
+        self.load_u64_atomic(self.config_offset(index), ordering)
+    }
+
+    fn store_config_generation(&self, index: usize, generation: u64, ordering: Ordering) {
+        assert!(index < self.layout.config_capacity);
+        self.store_u64_atomic(self.config_offset(index), generation, ordering);
     }
 
     fn load_header_producer_cursor(&self, ordering: Ordering) -> u64 {
-        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::ProducerCursor), ordering)
+        self.load_u64_atomic(
+            self.layout.header_offset + std::mem::offset_of!(VideoTrackControlHeader, producer_cursor),
+            ordering,
+        )
     }
 
     fn store_header_producer_cursor(&self, value: u64, ordering: Ordering) {
         self.store_u64_atomic(
-            self.header_field_offset(VideoTrackControlHeaderField::ProducerCursor),
+            self.layout.header_offset + std::mem::offset_of!(VideoTrackControlHeader, producer_cursor),
             value,
             ordering,
         );
     }
 
-    fn load_header_latest_sequence(&self, ordering: Ordering) -> u64 {
-        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::LatestSequence), ordering)
+    fn load_header_config_cursor(&self, ordering: Ordering) -> u64 {
+        self.load_u64_atomic(
+            self.layout.header_offset + std::mem::offset_of!(VideoTrackControlHeader, config_cursor),
+            ordering,
+        )
     }
 
-    fn store_header_latest_sequence(&self, value: u64, ordering: Ordering) {
+    fn store_header_config_cursor(&self, value: u64, ordering: Ordering) {
         self.store_u64_atomic(
-            self.header_field_offset(VideoTrackControlHeaderField::LatestSequence),
+            self.layout.header_offset + std::mem::offset_of!(VideoTrackControlHeader, config_cursor),
             value,
             ordering,
         );
     }
 
-    fn load_header_latest_index(&self, ordering: Ordering) -> u64 {
-        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::LatestIndex), ordering)
+    fn slot_offset(&self, index: usize) -> usize {
+        self.layout.slots_offset + index * self.layout.slot_len
     }
 
-    fn store_header_latest_index(&self, value: u64, ordering: Ordering) {
-        self.store_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::LatestIndex), value, ordering);
+    fn config_offset(&self, index: usize) -> usize {
+        self.layout.configs_offset + index * self.layout.config_len
     }
 
-    fn load_header_len(&self, ordering: Ordering) -> u64 {
-        self.load_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::Len), ordering)
-    }
-
-    fn store_header_len(&self, value: u64, ordering: Ordering) {
-        self.store_u64_atomic(self.header_field_offset(VideoTrackControlHeaderField::Len), value, ordering);
-    }
-
-    fn header_field_offset(&self, field: VideoTrackControlHeaderField) -> usize {
-        let field_offset = match field {
-            VideoTrackControlHeaderField::ProducerCursor => std::mem::offset_of!(VideoTrackControlHeader, producer_cursor),
-            VideoTrackControlHeaderField::LatestSequence => std::mem::offset_of!(VideoTrackControlHeader, latest_sequence),
-            VideoTrackControlHeaderField::LatestIndex => std::mem::offset_of!(VideoTrackControlHeader, latest_index),
-            VideoTrackControlHeaderField::Len => std::mem::offset_of!(VideoTrackControlHeader, len),
-        };
-        self.layout.header_offset + field_offset
-    }
-
-    fn read_header_u64(&self, field_offset: usize) -> u64 {
-        self.read_at(self.layout.header_offset + field_offset)
-    }
-
-    fn entry_offset(&self, index: usize) -> usize {
-        self.layout.entries_offset + index * self.layout.entry_len
-    }
-
-    fn consumer_cursor_offset(&self, index: usize) -> usize {
+    fn consumer_offset(&self, index: usize) -> usize {
         assert!(index < self.layout.consumer_capacity);
-        self.layout.consumer_entries_offset + index * self.layout.consumer_entry_len
-    }
-
-    fn consumer_release_cursor_offset(&self, index: usize) -> usize {
-        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, release_cursor)
-    }
-
-    fn consumer_last_acquired_cursor_offset(&self, index: usize) -> usize {
-        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_cursor)
-    }
-
-    fn consumer_last_acquired_sequence_offset(&self, index: usize) -> usize {
-        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_sequence)
-    }
-
-    fn consumer_skipped_count_offset(&self, index: usize) -> usize {
-        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, skipped_count)
-    }
-
-    fn consumer_acquired_count_offset(&self, index: usize) -> usize {
-        self.consumer_cursor_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, acquired_count)
+        self.layout.consumers_offset + index * self.layout.consumer_len
     }
 
     fn load_u64_atomic(&self, offset: usize, ordering: Ordering) -> u64 {
@@ -531,95 +866,10 @@ impl VideoTrackControlPage {
         });
     }
 
-    pub fn push(&mut self, entry: PendingVideoRingEntry) {
-        let mut header = self.header();
-        // A u64 producer cursor is effectively inexhaustible for display-rate
-        // capture, but saturation would make ring-slot selection ambiguous.
-        debug_assert!(header.producer_cursor < u64::MAX);
-        header.producer_cursor = header.producer_cursor.saturating_add(1);
-        let index = ((header.producer_cursor - 1) & header.index_mask) as usize;
-        let ring_entry = VideoRingEntry {
-            publication_sequence: 0,
-            producer_cursor: header.producer_cursor,
-            sequence: entry.sequence,
-            frame_key: entry.frame_key,
-            timestamp_ns: entry.timestamp_ns,
-            width: entry.width,
-            height: entry.height,
-            stride: entry.stride,
-            pixel_format: entry.pixel_format,
-            pool_id: entry.pool_id,
-            slot_id: entry.slot_id,
-            slot_generation: entry.slot_generation,
-            payload_offset: entry.payload_offset,
-            payload_len: entry.payload_len,
-            payload_map_len: entry.payload_map_len,
-            clock_domain: entry.clock_domain,
-            color_space: entry.color_space,
-            sync_kind: entry.sync_kind,
-            damage_kind: entry.damage_kind,
-            damage_base_sequence: entry.damage_base_sequence,
-            dropped_before_publish: entry.dropped_before_publish,
-            producer_drop_count: entry.producer_drop_count,
-        };
-        // Descriptor fields are still plain copied values. The surrounding
-        // publication sequence stores are the release/acquire boundary that a
-        // future cross-process reader must preserve.
-        self.store_entry_publication_sequence(index, 0, Ordering::Relaxed);
-        self.store_entry_descriptor(index, ring_entry);
-        self.store_entry_publication_sequence(index, header.producer_cursor, Ordering::Release);
-        let len = (header.len + 1).min(header.capacity);
-        self.store_header_latest_sequence(entry.sequence, Ordering::Relaxed);
-        self.store_header_latest_index(index as u64, Ordering::Relaxed);
-        self.store_header_len(len, Ordering::Release);
-        self.store_header_producer_cursor(header.producer_cursor, Ordering::Release);
-    }
-
-    pub fn read_entry_for_cursor(&self, cursor: u64) -> Result<VideoRingEntry, VideoRingReadError> {
-        let Some(latest_cursor) = self.latest_cursor() else {
-            return Err(VideoRingReadError::Empty);
-        };
-        if cursor > latest_cursor {
-            return Err(VideoRingReadError::NotPublished {
-                requested_cursor: cursor,
-                latest_cursor,
-            });
-        }
-        let oldest_live_cursor = self.oldest_live_cursor().expect("latest cursor implies oldest cursor");
-        if cursor < oldest_live_cursor {
-            return Err(VideoRingReadError::Lapped {
-                requested_cursor: cursor,
-                oldest_live_cursor,
-                latest_cursor,
-            });
-        }
-
-        let header = self.header();
-        let index = ((cursor - 1) & header.index_mask) as usize;
-        let first_sequence = self.entry_publication_sequence(index);
-        let entry = self.read_entry_descriptor(index, first_sequence);
-        let second_sequence = self.entry_publication_sequence(index);
-        if first_sequence != cursor || second_sequence != cursor {
-            return Err(VideoRingReadError::SlotSequenceMismatch {
-                requested_cursor: cursor,
-                first_sequence,
-                second_sequence,
-            });
-        }
-        Ok(entry)
-    }
-
-    pub fn read_latest_lossy_entry(&self) -> Result<Option<VideoRingEntry>, VideoRingReadError> {
-        let Some(cursor) = self.latest_cursor() else {
-            return Ok(None);
-        };
-        self.read_entry_for_cursor(cursor).map(Some)
-    }
-
     pub fn register_consumer_cursor(&self, consumer_id: u64) -> CaptureResult<usize> {
         // This is a producer-side slot allocator called through VideoSlotManager's
         // mutable track state. It is not a cross-process concurrent allocator; mapped
-        // consumers are only allowed to write their assigned release cursor.
+        // consumers are only allowed to write into their assigned slot.
         if consumer_id == 0 {
             return Err(invalid_control_page("consumer id must be non-zero"));
         }
@@ -629,13 +879,11 @@ impl VideoTrackControlPage {
             }
         }
         for index in 0..self.layout.consumer_capacity {
-            let entry = self.consumer_cursor_entry(index);
-            if entry.consumer_id == 0 {
+            if self.consumer_cursor_entry(index).consumer_id == 0 {
                 self.write_at(
-                    self.consumer_cursor_offset(index),
+                    self.consumer_offset(index),
                     VideoConsumerCursorEntry {
                         consumer_id,
-                        slot_generation: entry.slot_generation.saturating_add(1).max(1),
                         ..VideoConsumerCursorEntry::default()
                     },
                 );
@@ -647,15 +895,8 @@ impl VideoTrackControlPage {
 
     pub fn unregister_consumer_cursor(&self, consumer_id: u64) {
         for index in 0..self.layout.consumer_capacity {
-            let entry = self.consumer_cursor_entry(index);
-            if entry.consumer_id == consumer_id {
-                self.write_at(
-                    self.consumer_cursor_offset(index),
-                    VideoConsumerCursorEntry {
-                        slot_generation: entry.slot_generation,
-                        ..VideoConsumerCursorEntry::default()
-                    },
-                );
+            if self.consumer_cursor_entry(index).consumer_id == consumer_id {
+                self.write_at(self.consumer_offset(index), VideoConsumerCursorEntry::default());
                 return;
             }
         }
@@ -663,11 +904,24 @@ impl VideoTrackControlPage {
 
     #[must_use]
     pub fn consumer_cursor_entry(&self, index: usize) -> VideoConsumerCursorEntry {
-        self.read_at(self.consumer_cursor_offset(index))
+        self.read_at(self.consumer_offset(index))
     }
 
-    pub fn store_consumer_release_cursor(&self, index: usize, release_cursor: u64) {
-        self.store_u64_atomic(self.consumer_release_cursor_offset(index), release_cursor, Ordering::Release);
+    pub fn store_consumer_release_cursor(&self, index: usize, consumer_id: u64, release_cursor: u64) -> CaptureResult<()> {
+        let entry = self.consumer_cursor_entry(index);
+        // The read-check-store sequence is not one atomic op, but only the
+        // producer reallocates a consumer slot (see register_consumer_cursor),
+        // and a single consumer never races itself, so no other writer can
+        // change ownership between the check and the store. No CAS is needed.
+        if entry.consumer_id != consumer_id {
+            return Err(invalid_control_page("consumer cursor slot does not match consumer id"));
+        }
+        self.store_u64_atomic(
+            self.consumer_offset(index) + std::mem::offset_of!(VideoConsumerCursorEntry, release_cursor),
+            release_cursor,
+            Ordering::Release,
+        );
+        Ok(())
     }
 
     pub fn store_consumer_acquire_cursor(
@@ -686,18 +940,27 @@ impl VideoTrackControlPage {
         // These fields are observational in this slice. They are stored independently
         // so acquire updates cannot clobber the consumer-owned release cursor; readers
         // must not treat the four acquire fields as one atomic snapshot.
+        let base = self.consumer_offset(index);
         self.store_u64_atomic(
-            self.consumer_last_acquired_cursor_offset(index),
+            base + std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_cursor),
             last_acquired_cursor,
             Ordering::Release,
         );
         self.store_u64_atomic(
-            self.consumer_last_acquired_sequence_offset(index),
+            base + std::mem::offset_of!(VideoConsumerCursorEntry, last_acquired_sequence),
             last_acquired_sequence,
             Ordering::Release,
         );
-        self.store_u64_atomic(self.consumer_skipped_count_offset(index), skipped_count, Ordering::Release);
-        self.store_u64_atomic(self.consumer_acquired_count_offset(index), acquired_count, Ordering::Release);
+        self.store_u64_atomic(
+            base + std::mem::offset_of!(VideoConsumerCursorEntry, skipped_count),
+            skipped_count,
+            Ordering::Release,
+        );
+        self.store_u64_atomic(
+            base + std::mem::offset_of!(VideoConsumerCursorEntry, acquired_count),
+            acquired_count,
+            Ordering::Release,
+        );
         Ok(())
     }
 
@@ -710,11 +973,10 @@ impl VideoTrackControlPage {
     #[must_use]
     pub fn oldest_live_cursor(&self) -> Option<u64> {
         let producer_cursor = self.load_header_producer_cursor(Ordering::Acquire);
-        let len = self.load_header_len(Ordering::Acquire);
-        if producer_cursor == 0 || len == 0 {
+        if producer_cursor == 0 {
             return None;
         }
-        debug_assert!(producer_cursor >= len);
+        let len = producer_cursor.min(self.layout.slot_capacity as u64);
         Some(producer_cursor - len + 1)
     }
 
@@ -725,18 +987,27 @@ impl VideoTrackControlPage {
 
     #[must_use]
     pub fn ring_snapshot(&self) -> Vec<VideoRingEntry> {
-        let header = self.header();
-        let len = header.len as usize;
-        let start = if len == self.layout.capacity {
-            (header.producer_cursor & header.index_mask) as usize
-        } else {
-            0
+        let (Some(oldest), Some(latest)) = (self.oldest_live_cursor(), self.latest_cursor()) else {
+            return Vec::new();
         };
-        (0..len)
-            .map(|offset| {
-                let index = (start + offset) & (header.index_mask as usize);
-                self.entry(index)
-            })
+        // Lossy by design: entries with overwritten configs or torn seqlock
+        // reads (ConfigOverwritten / SlotSequenceMismatch / Lapped) are omitted
+        // rather than failing the call. A diagnostic snapshot must not fault.
+        (oldest..=latest)
+            .filter_map(|cursor| self.read_entry_for_cursor(cursor).ok())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn config_snapshot(&self) -> Vec<StreamConfig> {
+        let latest = self.load_header_config_cursor(Ordering::Acquire);
+        if latest == 0 {
+            return Vec::new();
+        }
+        let live = latest.min(self.layout.config_capacity as u64);
+        let oldest = latest - live + 1;
+        (oldest..=latest)
+            .filter_map(|generation| self.read_config_seqlock(generation).ok())
             .collect()
     }
 
@@ -752,8 +1023,32 @@ impl VideoTrackControlPage {
         VideoTrackControlSnapshot {
             header: self.header(),
             entries: self.ring_snapshot(),
+            configs: self.config_snapshot(),
             consumer_entries: self.consumer_cursor_snapshot(),
         }
+    }
+
+    #[cfg(test)]
+    fn raw_slot_for_test(&self, index: usize) -> FrameSlot {
+        let publication_sequence = self.load_slot_publication_sequence(index, Ordering::Acquire);
+        self.read_slot_descriptor(index, publication_sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_slot_publication_sequence_for_test(&self, index: usize, publication_sequence: u64) {
+        self.store_slot_publication_sequence(index, publication_sequence, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn hot_field_offsets_for_test(&self) -> Vec<usize> {
+        let header = self.layout.header_offset;
+        vec![
+            header + std::mem::offset_of!(VideoTrackControlHeader, producer_cursor),
+            header + std::mem::offset_of!(VideoTrackControlHeader, config_cursor),
+            self.slot_offset(0),
+            self.config_offset(0),
+            self.consumer_offset(0),
+        ]
     }
 }
 
@@ -765,33 +1060,37 @@ fn validate_control_header(header: &VideoTrackControlHeader, map_len: usize) -> 
     if header.magic != VIDEO_TRACK_CONTROL_MAGIC {
         return Err(invalid_control_page("invalid magic"));
     }
-    if header.version != VIDEO_TRACK_CONTROL_VERSION {
-        return Err(invalid_control_page("invalid version"));
+    if header.layout_version != VIDEO_TRACK_CONTROL_VERSION {
+        return Err(invalid_control_page("invalid layout version"));
     }
-    if header.header_len != std::mem::size_of::<VideoTrackControlHeader>() as u64 {
+    if header.header_len != HEADER_LEN as u32 {
         return Err(invalid_control_page("invalid header length"));
     }
-    if header.entry_len != std::mem::size_of::<VideoRingEntry>() as u64 {
-        return Err(invalid_control_page("invalid entry length"));
+    if header.slot_len != std::mem::size_of::<FrameSlot>() as u32 {
+        return Err(invalid_control_page("invalid frame slot length"));
     }
-    if header.consumer_entry_len != std::mem::size_of::<VideoConsumerCursorEntry>() as u64 {
-        return Err(invalid_control_page("invalid consumer cursor entry length"));
+    if header.config_len != std::mem::size_of::<StreamConfig>() as u32 {
+        return Err(invalid_control_page("invalid stream config length"));
     }
-    let capacity = usize::try_from(header.capacity).map_err(|_| invalid_control_page("capacity does not fit usize"))?;
+    if header.consumer_len != std::mem::size_of::<VideoConsumerCursorEntry>() as u32 {
+        return Err(invalid_control_page("invalid consumer slot length"));
+    }
+    let capacity = header.slot_capacity as usize;
     if capacity == 0 || !capacity.is_power_of_two() {
-        return Err(invalid_control_page("capacity must be a non-zero power of two"));
+        return Err(invalid_control_page("slot capacity must be a non-zero power of two"));
     }
-    let consumer_capacity =
-        usize::try_from(header.consumer_capacity).map_err(|_| invalid_control_page("consumer capacity does not fit usize"))?;
-    if consumer_capacity != capacity {
+    if header.config_capacity as usize != CONFIG_RING_CAPACITY {
+        return Err(invalid_control_page("config capacity does not match layout"));
+    }
+    if header.consumer_capacity != header.slot_capacity {
         return Err(invalid_control_page("consumer capacity must match ring capacity"));
     }
-    if header.index_mask != header.capacity - 1 {
-        return Err(invalid_control_page("index mask does not match capacity"));
-    }
     let layout = VideoTrackControlLayout::for_capacity(capacity);
-    if header.consumer_entries_offset != layout.consumer_entries_offset as u64 {
-        return Err(invalid_control_page("invalid consumer cursor entries offset"));
+    if header.slots_offset as usize != layout.slots_offset
+        || header.configs_offset as usize != layout.configs_offset
+        || header.consumers_offset as usize != layout.consumers_offset
+    {
+        return Err(invalid_control_page("region offsets do not match layout"));
     }
     if layout.byte_len > map_len {
         return Err(invalid_control_page("mapped length is smaller than declared layout"));
@@ -806,36 +1105,25 @@ fn invalid_control_page(message: impl Into<String>) -> CaptureTransferError {
     }
 }
 
-const fn align_up(value: usize, alignment: usize) -> usize {
-    debug_assert!(alignment.is_power_of_two());
-    (value + alignment - 1) & !(alignment - 1)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use super::{
-        CONTROL_PAGE_ALIGNMENT, EMPTY_LATEST_INDEX, PendingVideoRingEntry, VideoRingEntry, VideoRingReadError, VideoTrackControlHeader,
-        VideoTrackControlPage,
+        CONFIG_RING_CAPACITY, CONTROL_PAGE_ALIGNMENT, FrameSlot, PendingVideoRingEntry, VideoRingReadError, VideoTrackControlPage,
     };
-    use crate::model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat};
+    use crate::model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat};
 
-    fn pending(sequence: u64, frame_key: u64) -> PendingVideoRingEntry {
+    fn pending(sequence: u64) -> PendingVideoRingEntry {
         PendingVideoRingEntry {
             sequence,
-            frame_key,
             timestamp_ns: 0,
             width: 0,
             height: 0,
             stride: 0,
             pixel_format: 0,
             pool_id: 7,
-            slot_id: sequence,
-            slot_generation: 3,
+            slot_id: sequence as u32,
             payload_offset: sequence * 64,
             payload_len: 4,
-            payload_map_len: 4,
             clock_domain: 0,
             color_space: 0,
             sync_kind: 0,
@@ -843,24 +1131,26 @@ mod tests {
             damage_base_sequence: 0,
             dropped_before_publish: 0,
             producer_drop_count: 0,
+            payload_kind: 0,
+            modifier: 0,
+            fence_id: 0,
+            fence_value: 0,
+            flags: 0,
         }
     }
 
-    fn full_pending(sequence: u64, frame_key: u64) -> PendingVideoRingEntry {
+    fn full_pending(sequence: u64) -> PendingVideoRingEntry {
         PendingVideoRingEntry {
             sequence,
-            frame_key,
             timestamp_ns: 123_456_789,
             width: 1920,
             height: 1080,
             stride: 7680,
             pixel_format: PixelFormat::Rgba8Unorm as u32,
             pool_id: 7,
-            slot_id: sequence,
-            slot_generation: 3,
+            slot_id: sequence as u32,
             payload_offset: sequence * 64,
             payload_len: 4,
-            payload_map_len: 8192,
             clock_domain: ClockDomain::MediaTime as u32,
             color_space: ColorSpace::Srgb as u32,
             sync_kind: FrameSyncKind::CpuCopyComplete as u32,
@@ -868,41 +1158,34 @@ mod tests {
             damage_base_sequence: sequence.saturating_sub(1),
             dropped_before_publish: 5,
             producer_drop_count: 8,
+            payload_kind: PayloadKind::IoSurface as u32,
+            modifier: 42,
+            fence_id: 9,
+            fence_value: 100,
+            flags: 1,
         }
     }
 
     #[test]
-    fn control_page_layout_aligns_entries_after_header() {
+    fn control_page_layout_packs_cacheline_records() {
         let page = VideoTrackControlPage::new(3);
 
         let layout = page.layout();
         assert_eq!(layout.header_offset, 0);
-        assert_eq!(layout.entries_offset % CONTROL_PAGE_ALIGNMENT, 0);
-        assert!(layout.entries_offset >= std::mem::size_of::<VideoTrackControlHeader>());
-        assert_eq!(layout.entry_len, std::mem::size_of::<VideoRingEntry>());
-        assert_eq!(layout.capacity, 4);
-        assert!(layout.byte_len >= layout.entries_offset + layout.capacity * layout.entry_len);
+        assert_eq!(layout.slots_offset, 256);
+        assert_eq!(layout.slot_len, 128);
+        assert_eq!(layout.slot_capacity, 4);
+        assert_eq!(layout.config_len, 128);
+        assert_eq!(layout.config_capacity, CONFIG_RING_CAPACITY);
+        assert_eq!(layout.consumer_len, 128);
+        assert_eq!(layout.consumer_capacity, 4);
+        assert_eq!(layout.slots_offset % CONTROL_PAGE_ALIGNMENT, 0);
+        assert_eq!(layout.configs_offset % CONTROL_PAGE_ALIGNMENT, 0);
+        assert_eq!(layout.consumers_offset % CONTROL_PAGE_ALIGNMENT, 0);
+        assert_eq!(layout.configs_offset, layout.slots_offset + 4 * 128);
+        assert_eq!(layout.consumers_offset, layout.configs_offset + CONFIG_RING_CAPACITY * 128);
+        assert_eq!(layout.byte_len, layout.consumers_offset + 4 * 128);
         assert_eq!(page.mapped_len(), layout.byte_len);
-    }
-
-    #[test]
-    fn control_page_layout_includes_consumer_cursor_region() {
-        let page = VideoTrackControlPage::new(3);
-
-        let layout = page.layout();
-        assert_eq!(layout.consumer_entry_len, std::mem::size_of::<super::VideoConsumerCursorEntry>());
-        assert_eq!(layout.consumer_capacity, layout.capacity);
-        assert_eq!(layout.consumer_entries_offset % CONTROL_PAGE_ALIGNMENT, 0);
-        assert!(layout.consumer_entries_offset >= layout.entries_offset + layout.capacity * layout.entry_len);
-        assert_eq!(
-            layout.byte_len,
-            layout.consumer_entries_offset + layout.consumer_capacity * layout.consumer_entry_len
-        );
-
-        let header = page.snapshot().header;
-        assert_eq!(header.consumer_entries_offset, layout.consumer_entries_offset as u64);
-        assert_eq!(header.consumer_entry_len, layout.consumer_entry_len as u64);
-        assert_eq!(header.consumer_capacity, layout.consumer_capacity as u64);
     }
 
     #[test]
@@ -914,209 +1197,33 @@ mod tests {
     }
 
     #[test]
-    fn hot_control_fields_are_aligned_for_atomic_u64_access() {
+    fn hot_words_never_share_a_cacheline_between_records() {
         let page = VideoTrackControlPage::new(2);
 
-        assert_eq!(
-            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::ProducerCursor)
-                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
-            0
-        );
-        assert_eq!(
-            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::LatestSequence)
-                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
-            0
-        );
-        assert_eq!(
-            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::LatestIndex)
-                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
-            0
-        );
-        assert_eq!(
-            page.header_field_offset_for_test(super::VideoTrackControlHeaderField::Len)
-                % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
-            0
-        );
-        assert_eq!(
-            page.entry_publication_sequence_offset_for_test(0) % std::mem::align_of::<std::sync::atomic::AtomicU64>(),
-            0
-        );
+        for offset in page.hot_field_offsets_for_test() {
+            assert_eq!(offset % std::mem::align_of::<std::sync::atomic::AtomicU64>(), 0);
+        }
+        // Seqlock words sit at the start of 128-byte records, so consecutive
+        // records' atomics are always a full line apart.
+        assert_eq!(page.layout().slot_len % CONTROL_PAGE_ALIGNMENT, 0);
+        assert_eq!(page.layout().consumer_len % CONTROL_PAGE_ALIGNMENT, 0);
     }
 
     #[test]
-    fn atomic_header_producer_cursor_roundtrips_through_mapped_page() {
-        let page = VideoTrackControlPage::new(2);
-
-        page.store_header_producer_cursor_for_test(17, Ordering::Release);
-
-        assert_eq!(page.load_header_producer_cursor_for_test(Ordering::Acquire), 17);
-        assert_eq!(page.snapshot().header.producer_cursor, 17);
-    }
-
-    #[test]
-    fn atomic_entry_publication_sequence_roundtrips_through_mapped_page() {
-        let page = VideoTrackControlPage::new(2);
-
-        page.store_entry_publication_sequence_for_test(0, 23, Ordering::Release);
-
-        assert_eq!(page.load_entry_publication_sequence_for_test(0, Ordering::Acquire), 23);
-        assert_eq!(page.raw_entry_for_test(0).publication_sequence, 23);
-    }
-
-    #[test]
-    fn consumer_cursor_slot_registers_and_roundtrips_release_cursor() {
-        let page = VideoTrackControlPage::new(2);
-
-        let slot = page.register_consumer_cursor(7).unwrap();
-        page.store_consumer_release_cursor(slot, 3);
-
-        let entry = page.consumer_cursor_entry(slot);
-        assert_eq!(slot, 0);
-        assert_eq!(entry.consumer_id, 7);
-        assert_eq!(entry.slot_generation, 1);
-        assert_eq!(entry.release_cursor, 3);
-    }
-
-    #[test]
-    fn consumer_cursor_slot_reuses_existing_consumer_slot() {
-        let page = VideoTrackControlPage::new(2);
-
-        let first = page.register_consumer_cursor(7).unwrap();
-        let second = page.register_consumer_cursor(7).unwrap();
-
-        assert_eq!(first, second);
-        assert_eq!(page.consumer_cursor_entry(first).consumer_id, 7);
-    }
-
-    #[test]
-    fn consumer_cursor_slot_unregisters_consumer() {
-        let page = VideoTrackControlPage::new(2);
-        let slot = page.register_consumer_cursor(7).unwrap();
-        page.store_consumer_release_cursor(slot, 3);
-
-        page.unregister_consumer_cursor(7);
-
-        let entry = page.consumer_cursor_entry(slot);
-        assert_eq!(entry.consumer_id, 0);
-        assert_eq!(entry.slot_generation, 1);
-        assert_eq!(entry.release_cursor, 0);
-    }
-
-    #[test]
-    fn consumer_cursor_slot_generation_advances_when_slot_is_reused() {
-        let page = VideoTrackControlPage::new(2);
-        let first = page.register_consumer_cursor(7).unwrap();
-
-        page.unregister_consumer_cursor(7);
-        let second = page.register_consumer_cursor(8).unwrap();
-
-        let entry = page.consumer_cursor_entry(second);
-        assert_eq!(first, second);
-        assert_eq!(entry.consumer_id, 8);
-        assert_eq!(entry.slot_generation, 2);
-    }
-
-    #[test]
-    fn consumer_acquire_update_rejects_slot_consumer_mismatch() {
-        let page = VideoTrackControlPage::new(2);
-        let slot = page.register_consumer_cursor(7).unwrap();
-
-        let error = page.store_consumer_acquire_cursor(slot, 8, 1, 1, 0, 1).unwrap_err();
-
-        assert!(error.to_string().contains("consumer cursor slot does not match consumer id"));
-    }
-
-    #[test]
-    fn consumer_acquire_update_preserves_release_cursor() {
-        let page = VideoTrackControlPage::new(2);
-        let slot = page.register_consumer_cursor(7).unwrap();
-        page.store_consumer_release_cursor(slot, 9);
-
-        page.store_consumer_acquire_cursor(slot, 7, 10, 20, 1, 2).unwrap();
-
-        let entry = page.consumer_cursor_entry(slot);
-        assert_eq!(entry.last_acquired_cursor, 10);
-        assert_eq!(entry.last_acquired_sequence, 20);
-        assert_eq!(entry.skipped_count, 1);
-        assert_eq!(entry.acquired_count, 2);
-        assert_eq!(entry.release_cursor, 9);
-    }
-
-    #[test]
-    fn read_only_control_page_mapping_validates_header_from_fd() {
-        let page = VideoTrackControlPage::new(3);
-
-        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
-
-        let header = mapped.validate_header().unwrap();
-        assert_eq!(header.magic, super::VIDEO_TRACK_CONTROL_MAGIC);
-        assert_eq!(header.version, super::VIDEO_TRACK_CONTROL_VERSION);
-        assert_eq!(header.capacity, 4);
-        assert_eq!(mapped.mapped_len(), page.mapped_len());
-    }
-
-    #[test]
-    fn read_only_control_page_shadow_reads_published_entry_from_fd() {
+    fn push_returns_monotonic_cursors() {
         let mut page = VideoTrackControlPage::new(2);
-        page.push(pending(10, 100));
 
-        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
-        let entry = mapped.shadow_read_entry_for_cursor(1).unwrap();
-
-        assert_eq!(entry.publication_sequence, 1);
-        assert_eq!(entry.producer_cursor, 1);
-        assert_eq!(entry.sequence, 10);
-        assert_eq!(entry.frame_key, 100);
-        assert_eq!(entry.pool_id, 7);
-        assert_eq!(entry.slot_id, 10);
-        assert_eq!(entry.payload_offset, 640);
-        assert_eq!(entry.payload_len, 4);
+        assert_eq!(page.push(pending(10)), 1);
+        assert_eq!(page.push(pending(11)), 2);
+        assert_eq!(page.push(pending(12)), 3);
     }
 
     #[test]
-    fn read_only_control_page_shadow_reads_full_descriptor_from_fd() {
-        let mut page = VideoTrackControlPage::new(2);
-        let pending = full_pending(10, 100);
-        page.push(pending.clone());
-
-        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
-        let entry = mapped.shadow_read_entry_for_cursor(1).unwrap();
-
-        assert_eq!(
-            entry,
-            VideoRingEntry {
-                publication_sequence: 1,
-                producer_cursor: 1,
-                sequence: pending.sequence,
-                frame_key: pending.frame_key,
-                timestamp_ns: pending.timestamp_ns,
-                width: pending.width,
-                height: pending.height,
-                stride: pending.stride,
-                pixel_format: pending.pixel_format,
-                pool_id: pending.pool_id,
-                slot_id: pending.slot_id,
-                slot_generation: pending.slot_generation,
-                payload_offset: pending.payload_offset,
-                payload_len: pending.payload_len,
-                payload_map_len: pending.payload_map_len,
-                clock_domain: pending.clock_domain,
-                color_space: pending.color_space,
-                sync_kind: pending.sync_kind,
-                damage_kind: pending.damage_kind,
-                damage_base_sequence: pending.damage_base_sequence,
-                dropped_before_publish: pending.dropped_before_publish,
-                producer_drop_count: pending.producer_drop_count,
-            }
-        );
-    }
-
-    #[test]
-    fn control_page_mapped_entries_start_zeroed() {
+    fn control_page_mapped_slots_start_zeroed() {
         let page = VideoTrackControlPage::new(2);
 
-        assert_eq!(page.raw_entry_for_test(0), VideoRingEntry::default());
-        assert_eq!(page.raw_entry_for_test(1), VideoRingEntry::default());
+        assert_eq!(page.raw_slot_for_test(0), FrameSlot::default());
+        assert_eq!(page.raw_slot_for_test(1), FrameSlot::default());
     }
 
     #[test]
@@ -1124,63 +1231,53 @@ mod tests {
         let page = VideoTrackControlPage::new(2);
 
         assert_eq!(page.latest_cursor(), None);
+        assert_eq!(page.read_latest_lossy_entry(), Ok(None));
     }
 
     #[test]
-    fn empty_track_control_page_uses_fixed_empty_sentinels() {
+    fn empty_track_control_page_writes_geometry_header() {
         let page = VideoTrackControlPage::new(0);
 
-        let snapshot = page.snapshot();
-        assert_ne!(snapshot.header.magic, 0);
-        assert_ne!(snapshot.header.version, 0);
-        assert_eq!(
-            snapshot.header.header_len,
-            std::mem::size_of::<super::VideoTrackControlHeader>() as u64
-        );
-        assert_eq!(snapshot.header.entry_len, std::mem::size_of::<super::VideoRingEntry>() as u64);
-        assert_eq!(snapshot.header.capacity, 1);
-        assert_eq!(snapshot.header.index_mask, 0);
-        assert_eq!(snapshot.header.producer_cursor, 0);
-        assert_eq!(snapshot.header.latest_sequence, 0);
-        assert_eq!(snapshot.header.latest_index, EMPTY_LATEST_INDEX);
-        assert_eq!(snapshot.header.len, 0);
-        assert_eq!(page.read_latest_lossy_entry(), Ok(None));
-        assert!(snapshot.entries.is_empty());
+        let header = page.snapshot().header;
+        assert_eq!(header.magic, super::VIDEO_TRACK_CONTROL_MAGIC);
+        assert_eq!(header.layout_version, super::VIDEO_TRACK_CONTROL_VERSION);
+        assert_eq!(header.header_len, 256);
+        assert_eq!(header.slot_len, 128);
+        assert_eq!(header.slot_capacity, 1);
+        assert_eq!(header.config_capacity, CONFIG_RING_CAPACITY as u32);
+        assert_eq!(header.consumer_capacity, 1);
+        assert_eq!(header.producer_cursor, 0);
+        assert_eq!(header.config_cursor, 0);
     }
 
     #[test]
     fn track_control_page_rounds_capacity_to_power_of_two() {
         let page = VideoTrackControlPage::new(3);
 
-        let snapshot = page.snapshot();
-        assert_eq!(snapshot.header.capacity, 4);
-        assert_eq!(snapshot.header.index_mask, 3);
+        assert_eq!(page.snapshot().header.slot_capacity, 4);
     }
 
     #[test]
     fn track_control_page_wraps_entries_in_oldest_to_newest_order() {
         let mut page = VideoTrackControlPage::new(2);
 
-        page.push(pending(10, 100));
-        page.push(pending(11, 101));
-        page.push(pending(12, 102));
+        page.push(pending(10));
+        page.push(pending(11));
+        page.push(pending(12));
 
         let snapshot = page.snapshot();
-        assert_eq!(snapshot.header.capacity, 2);
+        assert_eq!(snapshot.header.slot_capacity, 2);
         assert_eq!(snapshot.header.producer_cursor, 3);
-        assert_eq!(snapshot.header.latest_sequence, 12);
-        assert_eq!(snapshot.header.latest_index, 0);
-        assert_eq!(snapshot.header.len, 2);
         assert_eq!(
             snapshot
                 .entries
                 .iter()
-                .map(|entry| { (entry.publication_sequence, entry.producer_cursor, entry.sequence, entry.frame_key,) })
+                .map(|entry| (entry.cursor, entry.sequence))
                 .collect::<Vec<_>>(),
-            vec![(2, 2, 11, 101), (3, 3, 12, 102)]
+            vec![(2, 11), (3, 12)]
         );
         let latest = page.read_entry_for_cursor(3).unwrap();
-        assert_eq!((latest.producer_cursor, latest.sequence), (3, 12));
+        assert_eq!((latest.cursor, latest.sequence), (3, 12));
     }
 
     #[test]
@@ -1191,17 +1288,17 @@ mod tests {
         assert_eq!(page.latest_cursor(), None);
         assert!(!page.cursor_lapped(1));
 
-        page.push(pending(10, 100));
-        page.push(pending(11, 101));
+        page.push(pending(10));
+        page.push(pending(11));
 
         assert_eq!(page.oldest_live_cursor(), Some(1));
         assert_eq!(page.latest_cursor(), Some(2));
         assert!(!page.cursor_lapped(1));
         assert!(!page.cursor_lapped(2));
 
-        page.push(pending(12, 102));
-        page.push(pending(13, 103));
-        page.push(pending(14, 104));
+        page.push(pending(12));
+        page.push(pending(13));
+        page.push(pending(14));
 
         assert_eq!(page.oldest_live_cursor(), Some(2));
         assert_eq!(page.latest_cursor(), Some(5));
@@ -1216,7 +1313,7 @@ mod tests {
 
         assert_eq!(page.read_entry_for_cursor(1), Err(VideoRingReadError::Empty));
 
-        page.push(pending(10, 100));
+        page.push(pending(10));
 
         assert_eq!(
             page.read_entry_for_cursor(0),
@@ -1239,28 +1336,59 @@ mod tests {
     fn read_entry_for_cursor_returns_requested_entry() {
         let mut page = VideoTrackControlPage::new(4);
 
-        page.push(pending(10, 100));
-        page.push(pending(11, 101));
+        page.push(pending(10));
+        page.push(pending(11));
 
         let entry = page.read_entry_for_cursor(2).unwrap();
-        assert_eq!(entry.publication_sequence, 2);
-        assert_eq!(entry.producer_cursor, 2);
+        assert_eq!(entry.cursor, 2);
         assert_eq!(entry.sequence, 11);
-        assert_eq!(entry.frame_key, 101);
         assert_eq!(entry.pool_id, 7);
         assert_eq!(entry.slot_id, 11);
-        assert_eq!(entry.slot_generation, 3);
         assert_eq!(entry.payload_offset, 704);
         assert_eq!(entry.payload_len, 4);
+        assert_eq!(entry.config_generation, 1);
+    }
+
+    #[test]
+    fn read_entry_for_cursor_merges_full_descriptor_and_config() {
+        let mut page = VideoTrackControlPage::new(2);
+        let pending = full_pending(10);
+        page.push(pending.clone());
+
+        let entry = page.read_entry_for_cursor(1).unwrap();
+        assert_eq!(entry.cursor, 1);
+        assert_eq!(entry.config_generation, 1);
+        assert_eq!(entry.sequence, pending.sequence);
+        assert_eq!(entry.timestamp_ns, pending.timestamp_ns);
+        assert_eq!(entry.width, pending.width);
+        assert_eq!(entry.height, pending.height);
+        assert_eq!(entry.stride, pending.stride);
+        assert_eq!(entry.pixel_format, pending.pixel_format);
+        assert_eq!(entry.pool_id, pending.pool_id);
+        assert_eq!(entry.slot_id, pending.slot_id);
+        assert_eq!(entry.payload_offset, pending.payload_offset);
+        assert_eq!(entry.payload_len, pending.payload_len);
+        assert_eq!(entry.clock_domain, pending.clock_domain);
+        assert_eq!(entry.color_space, pending.color_space);
+        assert_eq!(entry.sync_kind, pending.sync_kind);
+        assert_eq!(entry.damage_kind, pending.damage_kind);
+        assert_eq!(entry.damage_base_sequence, pending.damage_base_sequence);
+        assert_eq!(entry.dropped_before_publish, pending.dropped_before_publish);
+        assert_eq!(entry.producer_drop_count, pending.producer_drop_count);
+        assert_eq!(entry.payload_kind, pending.payload_kind);
+        assert_eq!(entry.modifier, pending.modifier);
+        assert_eq!(entry.fence_id, pending.fence_id);
+        assert_eq!(entry.fence_value, pending.fence_value);
+        assert_eq!(entry.flags, pending.flags);
     }
 
     #[test]
     fn read_entry_for_cursor_reports_lapped_cursors_after_wraparound() {
         let mut page = VideoTrackControlPage::new(2);
 
-        page.push(pending(10, 100));
-        page.push(pending(11, 101));
-        page.push(pending(12, 102));
+        page.push(pending(10));
+        page.push(pending(11));
+        page.push(pending(12));
 
         assert_eq!(
             page.read_entry_for_cursor(1),
@@ -1276,8 +1404,8 @@ mod tests {
     fn read_entry_for_cursor_reports_slot_sequence_mismatch() {
         let mut page = VideoTrackControlPage::new(2);
 
-        page.push(pending(10, 100));
-        page.set_entry_publication_sequence_for_test(0, 99);
+        page.push(pending(10));
+        page.set_slot_publication_sequence_for_test(0, 99);
 
         assert_eq!(
             page.read_entry_for_cursor(1),
@@ -1295,31 +1423,198 @@ mod tests {
 
         assert_eq!(page.read_latest_lossy_entry(), Ok(None));
 
-        page.push(pending(10, 100));
-        page.push(pending(11, 101));
-        page.push(pending(12, 102));
+        page.push(pending(10));
+        page.push(pending(11));
+        page.push(pending(12));
 
         let latest = page.read_latest_lossy_entry().unwrap().unwrap();
-        assert_eq!(latest.publication_sequence, 3);
-        assert_eq!(latest.producer_cursor, 3);
+        assert_eq!(latest.cursor, 3);
         assert_eq!(latest.sequence, 12);
-        assert_eq!(latest.frame_key, 102);
     }
 
     #[test]
-    fn read_latest_lossy_entry_preserves_slot_sequence_mismatch() {
-        let mut page = VideoTrackControlPage::new(2);
+    fn unchanged_stream_values_reuse_one_config_generation() {
+        let mut page = VideoTrackControlPage::new(4);
 
-        page.push(pending(10, 100));
-        page.set_entry_publication_sequence_for_test(0, 0);
+        page.push(full_pending(10));
+        page.push(full_pending(11));
+        page.push(full_pending(12));
 
+        let snapshot = page.snapshot();
+        assert_eq!(snapshot.header.config_cursor, 1);
+        assert_eq!(snapshot.configs.len(), 1);
+        assert_eq!(snapshot.configs[0].config_generation, 1);
+        assert_eq!(snapshot.configs[0].width, 1920);
+        assert!(snapshot.entries.iter().all(|entry| entry.config_generation == 1));
+    }
+
+    #[test]
+    fn changed_stream_values_publish_new_config_generation() {
+        let mut page = VideoTrackControlPage::new(4);
+
+        page.push(full_pending(10));
+        let mut resized = full_pending(11);
+        resized.width = 2560;
+        resized.stride = 10240;
+        page.push(resized);
+
+        let first = page.read_entry_for_cursor(1).unwrap();
+        let second = page.read_entry_for_cursor(2).unwrap();
+        assert_eq!(first.config_generation, 1);
+        assert_eq!((first.width, first.stride), (1920, 7680));
+        assert_eq!(second.config_generation, 2);
+        assert_eq!((second.width, second.stride), (2560, 10240));
+        assert_eq!(page.snapshot().header.config_cursor, 2);
+    }
+
+    #[test]
+    fn frames_older_than_the_config_ring_report_config_overwritten() {
+        // Capacity 8 ring keeps old frames live while more than
+        // CONFIG_RING_CAPACITY reconfigures overwrite generation 1.
+        let mut page = VideoTrackControlPage::new(8);
+
+        page.push(full_pending(10));
+        for round in 0..CONFIG_RING_CAPACITY as u32 {
+            let mut resized = full_pending(11 + u64::from(round));
+            resized.width = 2560 + round;
+            page.push(resized);
+        }
+
+        let error = page.read_entry_for_cursor(1).unwrap_err();
         assert_eq!(
-            page.read_latest_lossy_entry(),
-            Err(VideoRingReadError::SlotSequenceMismatch {
+            error,
+            VideoRingReadError::ConfigOverwritten {
                 requested_cursor: 1,
-                first_sequence: 0,
-                second_sequence: 0,
-            })
+                requested_generation: 1,
+                first_generation: 5,
+                second_generation: 5,
+            }
         );
+        // The newest frame still reads cleanly.
+        let latest = page.read_latest_lossy_entry().unwrap().unwrap();
+        assert_eq!(latest.config_generation, 5);
+    }
+
+    #[test]
+    fn consumer_cursor_slot_registers_and_roundtrips_release_cursor() {
+        let page = VideoTrackControlPage::new(2);
+
+        let slot = page.register_consumer_cursor(7).unwrap();
+        page.store_consumer_release_cursor(slot, 7, 3).unwrap();
+
+        let entry = page.consumer_cursor_entry(slot);
+        assert_eq!(slot, 0);
+        assert_eq!(entry.consumer_id, 7);
+        assert_eq!(entry.release_cursor, 3);
+    }
+
+    #[test]
+    fn consumer_cursor_slot_reuses_existing_consumer_slot() {
+        let page = VideoTrackControlPage::new(2);
+
+        let first = page.register_consumer_cursor(7).unwrap();
+        let second = page.register_consumer_cursor(7).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(page.consumer_cursor_entry(first).consumer_id, 7);
+    }
+
+    #[test]
+    fn consumer_cursor_slot_unregisters_and_zeroes_consumer() {
+        let page = VideoTrackControlPage::new(2);
+        let slot = page.register_consumer_cursor(7).unwrap();
+        page.store_consumer_release_cursor(slot, 7, 3).unwrap();
+
+        page.unregister_consumer_cursor(7);
+
+        let entry = page.consumer_cursor_entry(slot);
+        assert_eq!(entry.consumer_id, 0);
+        assert_eq!(entry.release_cursor, 0);
+
+        let reused = page.register_consumer_cursor(8).unwrap();
+        assert_eq!(reused, slot);
+        assert_eq!(page.consumer_cursor_entry(reused).release_cursor, 0);
+    }
+
+    #[test]
+    fn consumer_release_update_rejects_slot_consumer_mismatch() {
+        let page = VideoTrackControlPage::new(2);
+        let slot = page.register_consumer_cursor(7).unwrap();
+
+        let error = page.store_consumer_release_cursor(slot, 8, 3).unwrap_err();
+
+        assert!(error.to_string().contains("consumer cursor slot does not match consumer id"));
+    }
+
+    #[test]
+    fn consumer_acquire_update_rejects_slot_consumer_mismatch() {
+        let page = VideoTrackControlPage::new(2);
+        let slot = page.register_consumer_cursor(7).unwrap();
+
+        let error = page.store_consumer_acquire_cursor(slot, 8, 1, 1, 0, 1).unwrap_err();
+
+        assert!(error.to_string().contains("consumer cursor slot does not match consumer id"));
+    }
+
+    #[test]
+    fn consumer_acquire_update_preserves_release_cursor() {
+        let page = VideoTrackControlPage::new(2);
+        let slot = page.register_consumer_cursor(7).unwrap();
+        page.store_consumer_release_cursor(slot, 7, 9).unwrap();
+
+        page.store_consumer_acquire_cursor(slot, 7, 10, 20, 1, 2).unwrap();
+
+        let entry = page.consumer_cursor_entry(slot);
+        assert_eq!(entry.last_acquired_cursor, 10);
+        assert_eq!(entry.last_acquired_sequence, 20);
+        assert_eq!(entry.skipped_count, 1);
+        assert_eq!(entry.acquired_count, 2);
+        assert_eq!(entry.release_cursor, 9);
+    }
+
+    #[test]
+    fn read_only_control_page_mapping_validates_header_from_fd() {
+        let page = VideoTrackControlPage::new(3);
+
+        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
+
+        let header = mapped.validate_header().unwrap();
+        assert_eq!(header.magic, super::VIDEO_TRACK_CONTROL_MAGIC);
+        assert_eq!(header.layout_version, super::VIDEO_TRACK_CONTROL_VERSION);
+        assert_eq!(header.slot_capacity, 4);
+        assert_eq!(mapped.mapped_len(), page.mapped_len());
+    }
+
+    #[test]
+    fn read_only_control_page_shadow_reads_published_entry_from_fd() {
+        let mut page = VideoTrackControlPage::new(2);
+        page.push(pending(10));
+
+        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
+        let entry = mapped.shadow_read_entry_for_cursor(1).unwrap();
+
+        assert_eq!(entry.cursor, 1);
+        assert_eq!(entry.sequence, 10);
+        assert_eq!(entry.pool_id, 7);
+        assert_eq!(entry.slot_id, 10);
+        assert_eq!(entry.payload_offset, 640);
+        assert_eq!(entry.payload_len, 4);
+    }
+
+    #[test]
+    fn read_only_control_page_shadow_reads_full_descriptor_from_fd() {
+        let mut page = VideoTrackControlPage::new(2);
+        let pending = full_pending(10);
+        page.push(pending.clone());
+
+        let mapped = VideoTrackControlPage::map_read_only(page.try_clone_fd().unwrap(), page.mapped_len()).unwrap();
+        let entry = mapped.shadow_read_entry_for_cursor(1).unwrap();
+        let direct = page.read_entry_for_cursor(1).unwrap();
+
+        assert_eq!(entry, direct);
+        assert_eq!(entry.width, pending.width);
+        assert_eq!(entry.modifier, pending.modifier);
+        assert_eq!(entry.fence_id, pending.fence_id);
+        assert_eq!(entry.fence_value, pending.fence_value);
     }
 }

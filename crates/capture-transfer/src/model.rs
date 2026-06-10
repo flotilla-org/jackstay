@@ -101,12 +101,47 @@ pub enum TrackType {
     InputCorrelation,
 }
 
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
-    CpuShm,
-    IoSurface,
-    DmaBuf,
-    D3dSharedResource,
+    CpuShm = 0,
+    IoSurface = 1,
+    DmaBuf = 2,
+    D3dSharedResource = 3,
+}
+
+// Wire discriminants, pinned against the JACKSTAY_PAYLOAD_* constants in
+// include/jackstay_ring.h. Reordering variants or inserting one above an
+// existing variant would silently break the wire protocol; this block turns
+// that into a compile error.
+const _: () = {
+    assert!(PayloadKind::CpuShm as u32 == 0);
+    assert!(PayloadKind::IoSurface as u32 == 1);
+    assert!(PayloadKind::DmaBuf as u32 == 2);
+    assert!(PayloadKind::D3dSharedResource as u32 == 3);
+};
+
+impl PayloadKind {
+    /// Decode a wire `u32` discriminant. Unknown values map to `CpuShm` — the
+    /// conservative default, since a reader that does not understand a payload
+    /// kind cannot present its handle and should not treat it as native.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Self {
+        match value {
+            1 => Self::IoSurface,
+            2 => Self::DmaBuf,
+            3 => Self::D3dSharedResource,
+            _ => Self::CpuShm,
+        }
+    }
+
+    /// True when the payload is an OS-native GPU handle rather than CPU shm
+    /// pixels — i.e. there is no in-band byte payload and the frame is
+    /// referenced by a surface-pool slot plus a fence.
+    #[must_use]
+    pub const fn is_native_handle(self) -> bool {
+        !matches!(self, Self::CpuShm)
+    }
 }
 
 #[repr(u32)]

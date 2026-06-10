@@ -16,7 +16,7 @@ use crate::{
     control_page::VideoTrackControlPage,
     error::{CaptureTransferError, Result},
     fdpass,
-    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat},
+    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
     transfer_channel::{CaptureTransferMessage, CaptureTransferRequest},
     video::VideoFrameDesc,
 };
@@ -127,8 +127,8 @@ impl Drop for RegisteredPoolMapping {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PoolKey {
     track_id: u64,
+    // Pool ids are unique forever, so the key needs no generation.
     pool_id: u64,
-    pool_generation: u64,
 }
 
 #[derive(Debug)]
@@ -136,10 +136,11 @@ pub struct DaemonConsumer {
     info: SessionInfo,
     stream: UnixStream,
     reader: BufReader<UnixStream>,
-    // TODO: evict retired pool generations once the capture transfer channel grows pool-retirement messages.
+    // TODO: evict retired pools once the capture transfer channel grows pool-retirement messages.
     pools: BTreeMap<PoolKey, Rc<RegisteredPoolMapping>>,
     control_pages: BTreeMap<u64, VideoTrackControlPage>,
-    consumer_slots: BTreeMap<u64, usize>,
+    /// Per track: the assigned consumer cursor slot and this session's consumer id.
+    consumer_slots: BTreeMap<u64, (usize, u64)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,8 +175,7 @@ struct LatestFrameWire {
     stride: u32,
     pixel_format: String,
     pool_id: u64,
-    slot_id: u64,
-    slot_generation: u64,
+    slot_id: u32,
     payload_offset: u64,
     payload_len: u64,
     payload_map_len: u64,
@@ -184,7 +184,7 @@ struct LatestFrameWire {
     sync_kind: String,
     damage_kind: String,
     damage_base_sequence: u64,
-    dropped_before_publish: u64,
+    dropped_before_publish: u32,
     producer_drop_count: u64,
     evicted_count: u64,
     consumer_skipped_count: u64,
@@ -195,7 +195,6 @@ struct LatestFrameWire {
 struct RegisteredCpuPoolWire {
     track_id: u64,
     pool_id: u64,
-    pool_generation: u64,
     payload_map_len: u64,
 }
 
@@ -294,7 +293,7 @@ impl DaemonConsumer {
                     // transport should narrow writable access to only this consumer slot.
                     let page = VideoTrackControlPage::map_read_write(fd, map_len)?;
                     let header = page.validate_header()?;
-                    if consumer_slot >= header.consumer_capacity {
+                    if consumer_slot >= u64::from(header.consumer_capacity) {
                         return Err(CaptureTransferError::DaemonTransport {
                             operation: "mmap-control-page",
                             message: format!(
@@ -308,20 +307,18 @@ impl DaemonConsumer {
                         message: "consumer slot does not fit usize".to_string(),
                     })?;
                     self.control_pages.insert(track_id, page);
-                    self.consumer_slots.insert(track_id, consumer_slot);
+                    self.consumer_slots.insert(track_id, (consumer_slot, consumer_id));
                 }
                 CaptureTransferMessage::RegisterCpuPool {
                     session_id: _,
                     track_id,
                     pool_id,
-                    pool_generation,
                     payload_map_len,
                     ..
                 } => {
                     let pool = RegisteredCpuPoolWire {
                         track_id,
                         pool_id,
-                        pool_generation,
                         payload_map_len,
                     };
                     let fd = fdpass::recv_fd(&self.stream)?;
@@ -340,7 +337,6 @@ impl DaemonConsumer {
                     pixel_format,
                     pool_id,
                     slot_id,
-                    slot_generation,
                     payload_offset,
                     payload_len,
                     payload_map_len,
@@ -367,7 +363,6 @@ impl DaemonConsumer {
                         pixel_format,
                         pool_id,
                         slot_id,
-                        slot_generation,
                         payload_offset,
                         payload_len,
                         payload_map_len,
@@ -429,10 +424,10 @@ impl DaemonConsumer {
     }
 
     pub fn release_frame(&mut self, frame: DaemonFrame) -> Result<()> {
-        if let Some(consumer_slot) = self.consumer_slots.get(&frame.track_id).copied()
+        if let Some((consumer_slot, consumer_id)) = self.consumer_slots.get(&frame.track_id).copied()
             && let Some(page) = self.control_pages.get(&frame.track_id)
         {
-            page.store_consumer_release_cursor(consumer_slot, frame.producer_cursor);
+            page.store_consumer_release_cursor(consumer_slot, consumer_id, frame.producer_cursor)?;
         }
         let lease_id = frame.lease_id;
         drop(frame);
@@ -476,7 +471,6 @@ impl DaemonConsumer {
             PoolKey {
                 track_id: pool.track_id,
                 pool_id: pool.pool_id,
-                pool_generation: pool.pool_generation,
             },
             Rc::new(RegisteredPoolMapping { ptr, map_len }),
         );
@@ -488,20 +482,13 @@ impl DaemonConsumer {
             let fd = fdpass::recv_fd(&self.stream)?;
             daemon_frame_from_immutable_fd(fd, frame)
         } else {
-            // The current wire shape reuses slot_generation as the pool generation
-            // for reusable CPU pools. Slot-level generation is implicit in the
-            // frame sequence until the ring protocol grows explicit slot cursors.
             let key = PoolKey {
                 track_id: frame.track_id,
                 pool_id: frame.pool_id,
-                pool_generation: frame.slot_generation,
             };
             let pool = self.pools.get(&key).cloned().ok_or_else(|| CaptureTransferError::DaemonTransport {
                 operation: "resolve-frame-pool",
-                message: format!(
-                    "frame references unregistered pool track={} pool={} generation={}",
-                    key.track_id, key.pool_id, key.pool_generation
-                ),
+                message: format!("frame references unregistered pool track={} pool={}", key.track_id, key.pool_id),
             })?;
             daemon_frame_from_registered_pool(pool, frame)
         }
@@ -512,14 +499,14 @@ impl DaemonConsumer {
             return Ok(());
         };
         let entry = page.shadow_read_entry_for_cursor(frame.producer_cursor)?;
-        // frame_key is intentionally absent here: it is not carried by the
-        // socket frame wire shape, which remains authoritative for leases.
+        // payload_map_len is intentionally absent here: it is a property of the
+        // registered pool, carried by the pool registration rather than the ring.
         let pixel_format = parse_pixel_format(&frame.pixel_format)? as u32;
         let clock_domain = parse_clock_domain(&frame.clock_domain)? as u32;
         let color_space = parse_color_space(&frame.color_space)? as u32;
         let sync_kind = parse_sync_kind(&frame.sync_kind)? as u32;
         let damage_kind = parse_damage_kind(&frame.damage_kind)? as u32;
-        if entry.producer_cursor != frame.producer_cursor
+        if entry.cursor != frame.producer_cursor
             || entry.sequence != frame.sequence
             || entry.timestamp_ns != frame.timestamp_ns
             || entry.width != frame.width
@@ -528,10 +515,8 @@ impl DaemonConsumer {
             || entry.pixel_format != pixel_format
             || entry.pool_id != frame.pool_id
             || entry.slot_id != frame.slot_id
-            || entry.slot_generation != frame.slot_generation
             || entry.payload_offset != frame.payload_offset
             || entry.payload_len != frame.payload_len
-            || entry.payload_map_len != frame.payload_map_len
             || entry.clock_domain != clock_domain
             || entry.color_space != color_space
             || entry.sync_kind != sync_kind
@@ -637,7 +622,6 @@ fn parse_frame_metadata(frame: &LatestFrameWire) -> Result<FrameMapping> {
             pixel_format,
             pool_id: frame.pool_id,
             slot_id: frame.slot_id,
-            slot_generation: frame.slot_generation,
             payload_offset: frame.payload_offset,
             payload_len: frame.payload_len,
             payload_map_len: frame.payload_map_len,
@@ -650,6 +634,13 @@ fn parse_frame_metadata(frame: &LatestFrameWire) -> Result<FrameMapping> {
             producer_drop_count: frame.producer_drop_count,
             evicted_count: frame.evicted_count,
             consumer_skipped_count: frame.consumer_skipped_count,
+            // The daemon transfer channel carries CPU-shm frames only today;
+            // native-handle frames over this transport are #84.
+            payload_kind: PayloadKind::CpuShm,
+            modifier: 0,
+            fence_id: 0,
+            fence_value: 0,
+            flags: 0,
         },
         lease_id: frame.lease_id,
         producer_cursor: frame.producer_cursor,
@@ -929,24 +920,14 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let pool_file = tempfile_file_with_contents(b"abcdwxyz");
-            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 8, 4, 2)).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 8, 4, 2)).unwrap();
             fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 8)
-            )
-            .unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(11, 1, 1, 0, 4, 8)).unwrap();
 
             assert_release_request(&mut reader, 11);
 
             assert_latest_request(&mut reader, "session-1", 7);
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(12, 2, 1, 1, 4, 4, 8)
-            )
-            .unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(12, 2, 1, 4, 4, 8)).unwrap();
 
             assert_release_request(&mut reader, 12);
         });
@@ -991,7 +972,10 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let mut control_page = VideoTrackControlPage::new(2);
-            control_page.push(pending_control_entry(1, 1, 1, 1, 0, 4, 4));
+            // The registry registers the consumer cursor before announcing the
+            // page; release stores validate the slot's consumer id.
+            control_page.register_consumer_cursor(1).unwrap();
+            control_page.push(pending_control_entry(1, 1, 0, 4));
             let control_fd = control_page.try_clone_fd().unwrap();
             writeln!(
                 stream.try_clone().unwrap(),
@@ -1002,14 +986,9 @@ mod tests {
             fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
 
             let pool_file = tempfile_file_with_contents(b"abcd");
-            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 4, 4, 1)).unwrap();
             fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 4)
-            )
-            .unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(11, 1, 1, 0, 4, 4)).unwrap();
 
             assert_release_request(&mut reader, 11);
         });
@@ -1049,7 +1028,7 @@ mod tests {
             assert_latest_request(&mut reader, "session-1", 7);
             let mut control_page = VideoTrackControlPage::new(2);
             let consumer_slot = control_page.register_consumer_cursor(1).unwrap();
-            control_page.push(pending_control_entry(1, 1, 1, 1, 0, 4, 4));
+            control_page.push(pending_control_entry(1, 1, 0, 4));
             let control_fd = control_page.try_clone_fd().unwrap();
             writeln!(
                 stream.try_clone().unwrap(),
@@ -1060,14 +1039,9 @@ mod tests {
             fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
 
             let pool_file = tempfile_file_with_contents(b"abcd");
-            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 4, 4, 1)).unwrap();
             fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 4)
-            )
-            .unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(11, 1, 1, 0, 4, 4)).unwrap();
 
             assert_release_request(&mut reader, 11);
             assert_eq!(control_page.consumer_cursor_entry(consumer_slot).release_cursor, 1);
@@ -1158,7 +1132,10 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let mut control_page = VideoTrackControlPage::new(2);
-            control_page.push(pending_control_entry(1, 1, 1, 1, 0, 4, 8));
+            // The registry registers the consumer cursor before announcing the
+            // page; release stores validate the slot's consumer id.
+            control_page.register_consumer_cursor(1).unwrap();
+            control_page.push(pending_control_entry(1, 1, 0, 4));
             let control_fd = control_page.try_clone_fd().unwrap();
             writeln!(
                 stream.try_clone().unwrap(),
@@ -1169,24 +1146,14 @@ mod tests {
             fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
 
             let pool_file = tempfile_file_with_contents(b"abcdwxyz");
-            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 8, 4, 2)).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 8, 4, 2)).unwrap();
             fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 8)
-            )
-            .unwrap();
-            control_page.push(pending_control_entry(2, 2, 1, 1, 4, 4, 8));
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(11, 1, 1, 0, 4, 8)).unwrap();
+            control_page.push(pending_control_entry(2, 1, 4, 4));
             assert_release_request(&mut reader, 11);
 
             assert_acquire_request(&mut reader, "session-1", 7, 2);
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(12, 2, 1, 1, 4, 4, 8)
-            )
-            .unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(12, 2, 1, 4, 4, 8)).unwrap();
             assert_release_request(&mut reader, 12);
         });
 
@@ -1230,14 +1197,9 @@ mod tests {
             assert_next_request(&mut reader, "session-1", 7, 42);
 
             let pool_file = tempfile_file_with_contents(b"abcd");
-            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 4, 4, 1)).unwrap();
             fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(11, 43, 1, 1, 0, 4, 4)
-            )
-            .unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(11, 43, 1, 0, 4, 4)).unwrap();
             assert_release_request(&mut reader, 11);
         });
 
@@ -1333,7 +1295,7 @@ mod tests {
 
             assert_latest_request(&mut reader, "session-1", 7);
             let mut control_page = VideoTrackControlPage::new(2);
-            let mut entry = pending_control_entry(1, 1, 1, 1, 0, 4, 4);
+            let mut entry = pending_control_entry(1, 1, 0, 4);
             entry.timestamp_ns = 99;
             control_page.push(entry);
             let control_fd = control_page.try_clone_fd().unwrap();
@@ -1346,14 +1308,9 @@ mod tests {
             fdpass::send_fd(&stream, control_fd.as_raw_fd()).unwrap();
 
             let pool_file = tempfile_file_with_contents(b"abcd");
-            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 1, 4, 4, 1)).unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", register_pool_json(7, 1, 4, 4, 1)).unwrap();
             fdpass::send_fd(&stream, pool_file.as_raw_fd()).unwrap();
-            writeln!(
-                stream.try_clone().unwrap(),
-                "{}",
-                latest_frame_json_with_offset(11, 1, 1, 1, 0, 4, 4)
-            )
-            .unwrap();
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json_with_offset(11, 1, 1, 0, 4, 4)).unwrap();
         });
 
         let info = SessionInfo {
@@ -1438,14 +1395,13 @@ mod tests {
     }
 
     fn latest_frame_json(lease_id: u64, sequence: u64, payload_len: u64) -> serde_json::Value {
-        latest_frame_json_with_offset(lease_id, sequence, 0, 0, 0, payload_len, payload_len)
+        latest_frame_json_with_offset(lease_id, sequence, 0, 0, payload_len, payload_len)
     }
 
     fn latest_frame_json_with_offset(
         lease_id: u64,
         sequence: u64,
         pool_id: u64,
-        slot_generation: u64,
         payload_offset: u64,
         payload_len: u64,
         payload_map_len: u64,
@@ -1464,7 +1420,6 @@ mod tests {
             "pixel_format": "bgra8_unorm",
             "pool_id": pool_id,
             "slot_id": 0,
-            "slot_generation": slot_generation,
             "payload_offset": payload_offset,
             "payload_len": payload_len,
             "payload_map_len": payload_map_len,
@@ -1481,18 +1436,9 @@ mod tests {
         })
     }
 
-    fn pending_control_entry(
-        sequence: u64,
-        frame_key: u64,
-        pool_id: u64,
-        slot_generation: u64,
-        payload_offset: u64,
-        payload_len: u64,
-        payload_map_len: u64,
-    ) -> PendingVideoRingEntry {
+    fn pending_control_entry(sequence: u64, pool_id: u64, payload_offset: u64, payload_len: u64) -> PendingVideoRingEntry {
         PendingVideoRingEntry {
             sequence,
-            frame_key,
             timestamp_ns: 100,
             width: 2,
             height: 1,
@@ -1500,10 +1446,8 @@ mod tests {
             pixel_format: PixelFormat::Bgra8Unorm as u32,
             pool_id,
             slot_id: 0,
-            slot_generation,
             payload_offset,
             payload_len,
-            payload_map_len,
             clock_domain: ClockDomain::MediaTime as u32,
             color_space: ColorSpace::Srgb as u32,
             sync_kind: FrameSyncKind::CpuCopyComplete as u32,
@@ -1511,23 +1455,20 @@ mod tests {
             damage_base_sequence: sequence,
             dropped_before_publish: 0,
             producer_drop_count: 0,
+            payload_kind: 0,
+            modifier: 0,
+            fence_id: 0,
+            fence_value: 0,
+            flags: 0,
         }
     }
 
-    fn register_pool_json(
-        track_id: u64,
-        pool_id: u64,
-        pool_generation: u64,
-        payload_map_len: u64,
-        slot_stride: u64,
-        slot_count: u64,
-    ) -> serde_json::Value {
+    fn register_pool_json(track_id: u64, pool_id: u64, payload_map_len: u64, slot_stride: u64, slot_count: u64) -> serde_json::Value {
         serde_json::json!({
             "op": "register_cpu_pool",
             "session_id": "session-1",
             "track_id": track_id,
             "pool_id": pool_id,
-            "pool_generation": pool_generation,
             "payload_map_len": payload_map_len,
             "slot_stride": slot_stride,
             "slot_count": slot_count

@@ -8,7 +8,7 @@ use std::{
 use crate::{
     daemon::{self, DaemonConsumer, DaemonFrame},
     model::{
-        ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId,
+        ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat, SourceDesc, SourceId, SourceKind, TrackDesc, TrackId,
         VideoTrackDesc,
     },
     state::{Event, EventKind, SessionState},
@@ -119,8 +119,7 @@ pub struct FtVideoFrameDesc {
     pub stride: u32,
     pub pixel_format: u32,
     pub pool_id: u64,
-    pub slot_id: u64,
-    pub slot_generation: u64,
+    pub slot_id: u32,
     pub payload_offset: u64,
     pub payload_len: u64,
     pub payload_map_len: u64,
@@ -129,11 +128,31 @@ pub struct FtVideoFrameDesc {
     pub sync_kind: u32,
     pub damage_kind: u32,
     pub damage_base_sequence: u64,
-    pub dropped_before_publish: u64,
+    pub dropped_before_publish: u32,
     pub producer_drop_count: u64,
     pub evicted_count: u64,
     pub consumer_skipped_count: u64,
+    pub payload_kind: u32,
+    pub modifier: u64,
+    pub fence_id: u64,
+    pub fence_value: u64,
+    pub flags: u32,
 }
+
+// ABI contract for FtVideoFrameDesc, mirrored in include/capture_transfer.h.
+// Both sides must agree; narrowing a field or appending to the tail without
+// updating both is the trap these asserts guard against.
+const _: () = {
+    assert!(std::mem::size_of::<FtVideoFrameDesc>() == 168);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, pool_id) == 32);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, slot_id) == 40);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, dropped_before_publish) == 96);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, payload_kind) == 128);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, modifier) == 136);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, fence_id) == 144);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, fence_value) == 152);
+    assert!(std::mem::offset_of!(FtVideoFrameDesc, flags) == 160);
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -697,7 +716,6 @@ fn video_frame_desc_from_ffi(desc: &FtVideoFrameDesc) -> Option<VideoFrameDesc> 
         pixel_format: pixel_format_from_ffi(desc.pixel_format)?,
         pool_id: desc.pool_id,
         slot_id: desc.slot_id,
-        slot_generation: desc.slot_generation,
         payload_offset: desc.payload_offset,
         payload_len: desc.payload_len,
         payload_map_len: desc.payload_map_len,
@@ -710,6 +728,11 @@ fn video_frame_desc_from_ffi(desc: &FtVideoFrameDesc) -> Option<VideoFrameDesc> 
         producer_drop_count: desc.producer_drop_count,
         evicted_count: desc.evicted_count,
         consumer_skipped_count: desc.consumer_skipped_count,
+        payload_kind: PayloadKind::from_u32(desc.payload_kind),
+        modifier: desc.modifier,
+        fence_id: desc.fence_id,
+        fence_value: desc.fence_value,
+        flags: desc.flags,
     })
 }
 
@@ -723,7 +746,6 @@ fn video_frame_desc_to_ffi(desc: &VideoFrameDesc) -> FtVideoFrameDesc {
         pixel_format: pixel_format_to_ffi(desc.pixel_format),
         pool_id: desc.pool_id,
         slot_id: desc.slot_id,
-        slot_generation: desc.slot_generation,
         payload_offset: desc.payload_offset,
         payload_len: desc.payload_len,
         payload_map_len: desc.payload_map_len,
@@ -736,6 +758,11 @@ fn video_frame_desc_to_ffi(desc: &VideoFrameDesc) -> FtVideoFrameDesc {
         producer_drop_count: desc.producer_drop_count,
         evicted_count: desc.evicted_count,
         consumer_skipped_count: desc.consumer_skipped_count,
+        payload_kind: desc.payload_kind as u32,
+        modifier: desc.modifier,
+        fence_id: desc.fence_id,
+        fence_value: desc.fence_value,
+        flags: desc.flags,
     }
 }
 
@@ -917,7 +944,6 @@ mod tests {
                 pixel_format: FT_PIXEL_FORMAT_BGRA8_UNORM,
                 pool_id: 0,
                 slot_id: 0,
-                slot_generation: 0,
                 payload_offset: 0,
                 payload_len: 0,
                 payload_map_len: 0,
@@ -930,6 +956,11 @@ mod tests {
                 producer_drop_count: 0,
                 evicted_count: 0,
                 consumer_skipped_count: 0,
+                payload_kind: 0,
+                modifier: 0,
+                fence_id: 0,
+                fence_value: 0,
+                flags: 0,
             };
             let pixels = [1_u8, 2, 3, 4];
 
@@ -965,7 +996,6 @@ mod tests {
             assert_eq!(frame.desc.damage_base_sequence, 1);
             assert_ne!(frame.desc.pool_id, 0);
             assert_eq!(frame.desc.slot_id, 0);
-            assert_ne!(frame.desc.slot_generation, 0);
             assert_eq!(frame.desc.payload_len as usize, pixels.len());
             assert!(frame.desc.payload_offset + frame.desc.payload_len <= frame.desc.payload_map_len);
             assert_eq!(frame.len, pixels.len());

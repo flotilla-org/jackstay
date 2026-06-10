@@ -83,7 +83,6 @@ pub enum CaptureTransferMessage {
         session_id: String,
         track_id: u64,
         pool_id: u64,
-        pool_generation: u64,
         payload_map_len: u64,
         slot_stride: u64,
         slot_count: u64,
@@ -100,8 +99,7 @@ pub enum CaptureTransferMessage {
         stride: u32,
         pixel_format: String,
         pool_id: u64,
-        slot_id: u64,
-        slot_generation: u64,
+        slot_id: u32,
         payload_offset: u64,
         payload_len: u64,
         payload_map_len: u64,
@@ -110,7 +108,7 @@ pub enum CaptureTransferMessage {
         sync_kind: String,
         damage_kind: String,
         damage_base_sequence: u64,
-        dropped_before_publish: u64,
+        dropped_before_publish: u32,
         producer_drop_count: u64,
         evicted_count: u64,
         consumer_skipped_count: u64,
@@ -216,14 +214,13 @@ mod tests {
             session_id: "session-1".to_string(),
             track_id: 7,
             pool_id: 3,
-            pool_generation: 5,
             payload_map_len: 4096,
             slot_stride: 1024,
             slot_count: 4,
         };
         let register_json = serde_json::to_value(&register).unwrap();
         assert_eq!(register_json["op"], "register_cpu_pool");
-        assert_eq!(register_json["pool_generation"], 5);
+        assert_eq!(register_json["pool_id"], 3);
         assert_eq!(serde_json::from_value::<CaptureTransferMessage>(register_json).unwrap(), register);
 
         let frame = CaptureTransferMessage::VideoFrame {
@@ -239,7 +236,6 @@ mod tests {
             pixel_format: "bgra8_unorm".to_string(),
             pool_id: 3,
             slot_id: 1,
-            slot_generation: 5,
             payload_offset: 1024,
             payload_len: 8,
             payload_map_len: 4096,

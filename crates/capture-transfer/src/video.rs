@@ -7,7 +7,7 @@ use std::{
 use crate::{
     control_page::{PendingVideoRingEntry, VideoRingEntry, VideoRingReadError, VideoTrackControlPage, VideoTrackControlSnapshot},
     error::{CaptureTransferError, Result},
-    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
+    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat, TrackId},
     shm::SharedMemorySegment,
 };
 
@@ -34,9 +34,10 @@ pub struct VideoFrameDesc {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: PixelFormat,
+    /// Pool ids are unique forever (never reused), so a pool reference needs
+    /// no generation to detect staleness.
     pub pool_id: u64,
-    pub slot_id: u64,
-    pub slot_generation: u64,
+    pub slot_id: u32,
     pub payload_offset: u64,
     pub payload_len: u64,
     pub payload_map_len: u64,
@@ -45,17 +46,28 @@ pub struct VideoFrameDesc {
     pub sync_kind: FrameSyncKind,
     pub damage_kind: DamageKind,
     pub damage_base_sequence: u64,
-    pub dropped_before_publish: u64,
+    pub dropped_before_publish: u32,
     pub producer_drop_count: u64,
     pub evicted_count: u64,
     pub consumer_skipped_count: u64,
+    /// Payload kind. `CpuShm` (default) keeps pixels in the shm slot; a native
+    /// kind means there is no in-band payload and the frame is the surface-pool
+    /// slot above plus the `(fence_id, fence_value)` fence below.
+    pub payload_kind: PayloadKind,
+    /// Format modifier (e.g. dmabuf modifier). 0 / linear for IOSurface.
+    pub modifier: u64,
+    /// Fence/timeline identity for native frames (the producer's shared event).
+    pub fence_id: u64,
+    /// Monotonic value the consumer must wait for on `fence_id` before sampling.
+    pub fence_value: u64,
+    /// Reserved descriptor flags; 0 today.
+    pub flags: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuPoolRegistration {
     pub track_id: TrackId,
     pub pool_id: u64,
-    pub pool_generation: u64,
     pub payload_map_len: u64,
     pub slot_stride: u64,
     pub slot_count: u64,
@@ -75,7 +87,6 @@ pub struct AcquiredVideoFrame {
     pub desc: VideoFrameDesc,
     consumer_id: ConsumerId,
     track_id: TrackId,
-    frame_key: u64,
     producer_cursor: u64,
     segment: Arc<SharedMemorySegment>,
     pool_registration: Option<CpuPoolRegistration>,
@@ -86,7 +97,6 @@ pub struct ClaimedVideoSlot {
     desc: VideoFrameDesc,
     track_id: TrackId,
     segment: Arc<SharedMemorySegment>,
-    pool_generation: u64,
     slot_index: usize,
     slot_stride: usize,
     slot_count: usize,
@@ -139,10 +149,12 @@ impl AcquiredVideoFrame {
 
 #[derive(Debug)]
 struct StoredFrame {
-    key: u64,
+    /// The publish cursor returned by the ring; doubles as the in-process
+    /// frame identity for pinning since cursors are never reused.
+    cursor: u64,
     desc: VideoFrameDesc,
     segment: Arc<SharedMemorySegment>,
-    pool_generation: Option<u64>,
+    pool_id: Option<u64>,
     slot_index: Option<usize>,
     pool_registration: Option<CpuPoolRegistration>,
     pinned_by: BTreeSet<ConsumerId>,
@@ -162,8 +174,8 @@ impl TrackRingControl {
         }
     }
 
-    fn push(&mut self, entry: PendingVideoRingEntry) {
-        self.page.push(entry);
+    fn push(&mut self, entry: PendingVideoRingEntry) -> u64 {
+        self.page.push(entry)
     }
 
     fn latest(&self) -> std::result::Result<Option<VideoRingEntry>, VideoRingReadError> {
@@ -180,17 +192,17 @@ impl TrackRingControl {
 
     fn retained_cursor_bounds(&self) -> Option<(u64, u64)> {
         let entries = self.ring_snapshot();
-        let oldest = entries.first()?.producer_cursor;
-        let latest = entries.last()?.producer_cursor;
+        let oldest = entries.first()?.cursor;
+        let latest = entries.last()?.cursor;
         Some((oldest, latest))
     }
 
     fn snapshot(&self) -> TrackRingControlSnapshot {
         let page = self.page.snapshot();
         TrackRingControlSnapshot {
-            capacity: page.header.capacity as usize,
+            capacity: page.header.slot_capacity as usize,
             producer_cursor: page.header.producer_cursor,
-            latest_sequence: (page.header.len > 0).then_some(page.header.latest_sequence),
+            latest_sequence: page.entries.last().map(|entry| entry.sequence),
             entries: page.entries,
         }
     }
@@ -236,8 +248,7 @@ impl TrackRingControl {
 
     fn store_consumer_release(&mut self, consumer_id: ConsumerId, release_cursor: u64) -> Result<()> {
         let slot = self.register_consumer(consumer_id)?;
-        self.page.store_consumer_release_cursor(slot, release_cursor);
-        Ok(())
+        self.page.store_consumer_release_cursor(slot, consumer_id.get(), release_cursor)
     }
 
     fn unregister_consumer(&mut self, consumer_id: ConsumerId) {
@@ -260,11 +271,11 @@ struct ConsumerRingCursor {
 impl ConsumerRingCursor {
     fn acquire(&mut self, entry: &VideoRingEntry) {
         if let Some(previous) = self.last_acquired_cursor
-            && entry.producer_cursor > previous.saturating_add(1)
+            && entry.cursor > previous.saturating_add(1)
         {
-            self.skipped_count = self.skipped_count.saturating_add(entry.producer_cursor - previous - 1);
+            self.skipped_count = self.skipped_count.saturating_add(entry.cursor - previous - 1);
         }
-        self.last_acquired_cursor = Some(entry.producer_cursor);
+        self.last_acquired_cursor = Some(entry.cursor);
         self.last_acquired_sequence = Some(entry.sequence);
         self.acquired_count = self.acquired_count.saturating_add(1);
     }
@@ -322,7 +333,6 @@ pub enum OrderedVideoAcquire {
 #[derive(Debug)]
 struct TrackPool {
     pool_id: u64,
-    generation: u64,
     segment: Arc<SharedMemorySegment>,
     slot_stride: usize,
     slot_count: usize,
@@ -333,7 +343,7 @@ struct TrackPool {
 struct PublishedPayload {
     desc: VideoFrameDesc,
     segment: Arc<SharedMemorySegment>,
-    pool_generation: Option<u64>,
+    pool_id: Option<u64>,
     slot_index: Option<usize>,
     pool_registration: Option<CpuPoolRegistration>,
 }
@@ -342,9 +352,7 @@ struct PublishedPayload {
 pub struct VideoSlotManager {
     capacity_per_track: usize,
     storage_mode: VideoStorageMode,
-    next_frame_key: u64,
     next_pool_id: u64,
-    next_pool_generation: u64,
     frames_by_track: BTreeMap<TrackId, Vec<StoredFrame>>,
     controls_by_track: BTreeMap<TrackId, TrackRingControl>,
     pools_by_track: BTreeMap<TrackId, TrackPool>,
@@ -359,9 +367,7 @@ impl VideoSlotManager {
         Self {
             capacity_per_track: capacity_per_track.max(1),
             storage_mode: VideoStorageMode::ImmutablePerFrame,
-            next_frame_key: 1,
             next_pool_id: 1,
-            next_pool_generation: 1,
             frames_by_track: BTreeMap::new(),
             controls_by_track: BTreeMap::new(),
             pools_by_track: BTreeMap::new(),
@@ -379,17 +385,15 @@ impl VideoSlotManager {
     }
 
     pub fn publish(&mut self, track_id: TrackId, desc: VideoFrameDesc, pixels: &[u8]) -> Result<()> {
-        let key = self.next_frame_key;
-        self.next_frame_key += 1;
         let payload = match self.storage_mode {
             VideoStorageMode::ImmutablePerFrame => self.publish_immutable_frame(desc, pixels)?,
             VideoStorageMode::ReusablePool => {
                 let mut claim = self.claim_video_slot(track_id, desc, pixels.len())?;
                 claim.copy_from_slice(pixels);
-                self.commit_video_slot_with_key(key, claim)?
+                self.commit_claimed_slot(claim)?
             }
         };
-        self.store_published_payload(track_id, key, payload);
+        self.store_published_payload(track_id, payload);
         Ok(())
     }
 
@@ -422,20 +426,18 @@ impl VideoSlotManager {
         self.pending_claims_by_track
             .entry(track_id)
             .or_default()
-            .insert((pool.generation, slot_index));
+            .insert((pool.pool_id, slot_index));
 
         desc.payload_offset = offset as u64;
         desc.payload_len = len as u64;
         desc.payload_map_len = pool.segment.len() as u64;
         desc.pool_id = pool.pool_id;
-        desc.slot_id = slot_index as u64;
-        desc.slot_generation = pool.generation;
+        desc.slot_id = slot_index as u32;
 
         Ok(ClaimedVideoSlot {
             desc,
             track_id,
             segment: Arc::clone(&pool.segment),
-            pool_generation: pool.generation,
             slot_index,
             slot_stride: pool.slot_stride,
             slot_count: pool.slot_count,
@@ -443,32 +445,25 @@ impl VideoSlotManager {
     }
 
     pub fn commit_video_slot(&mut self, claim: ClaimedVideoSlot) -> Result<()> {
-        let key = self.next_frame_key;
-        self.next_frame_key += 1;
         let track_id = claim.track_id;
-        let payload = self.commit_video_slot_with_key(key, claim)?;
-        self.store_published_payload(track_id, key, payload);
+        let payload = self.commit_claimed_slot(claim)?;
+        self.store_published_payload(track_id, payload);
         Ok(())
     }
 
-    fn commit_video_slot_with_key(&mut self, _key: u64, claim: ClaimedVideoSlot) -> Result<PublishedPayload> {
-        // The frame key is assigned by the caller and stored with the returned
-        // payload. It is accepted here to keep this helper paired with the
-        // publish path until ring headers carry their own key fields.
+    fn commit_claimed_slot(&mut self, claim: ClaimedVideoSlot) -> Result<PublishedPayload> {
+        let pool_id = claim.desc.pool_id;
         if let Some(pending_claims) = self.pending_claims_by_track.get_mut(&claim.track_id) {
-            pending_claims.remove(&(claim.pool_generation, claim.slot_index));
+            pending_claims.remove(&(pool_id, claim.slot_index));
         }
         if let Some(frames) = self.frames_by_track.get_mut(&claim.track_id) {
             frames.retain(|frame| {
-                frame.pool_generation != Some(claim.pool_generation)
-                    || frame.slot_index != Some(claim.slot_index)
-                    || !frame.pinned_by.is_empty()
+                frame.pool_id != Some(pool_id) || frame.slot_index != Some(claim.slot_index) || !frame.pinned_by.is_empty()
             });
         }
         let pool_registration = CpuPoolRegistration {
             track_id: claim.track_id,
-            pool_id: claim.desc.pool_id,
-            pool_generation: claim.pool_generation,
+            pool_id,
             payload_map_len: claim.desc.payload_map_len,
             slot_stride: claim.slot_stride as u64,
             slot_count: claim.slot_count as u64,
@@ -477,15 +472,14 @@ impl VideoSlotManager {
             desc: claim.desc,
             pool_registration: Some(pool_registration),
             segment: claim.segment,
-            pool_generation: Some(claim.pool_generation),
+            pool_id: Some(pool_id),
             slot_index: Some(claim.slot_index),
         })
     }
 
-    fn store_published_payload(&mut self, track_id: TrackId, key: u64, payload: PublishedPayload) {
+    fn store_published_payload(&mut self, track_id: TrackId, payload: PublishedPayload) {
         let ring_entry = PendingVideoRingEntry {
             sequence: payload.desc.sequence,
-            frame_key: key,
             timestamp_ns: payload.desc.timestamp_ns,
             width: payload.desc.width,
             height: payload.desc.height,
@@ -493,10 +487,8 @@ impl VideoSlotManager {
             pixel_format: payload.desc.pixel_format as u32,
             pool_id: payload.desc.pool_id,
             slot_id: payload.desc.slot_id,
-            slot_generation: payload.desc.slot_generation,
             payload_offset: payload.desc.payload_offset,
             payload_len: payload.desc.payload_len,
-            payload_map_len: payload.desc.payload_map_len,
             clock_domain: payload.desc.clock_domain as u32,
             color_space: payload.desc.color_space as u32,
             sync_kind: payload.desc.sync_kind as u32,
@@ -504,21 +496,27 @@ impl VideoSlotManager {
             damage_base_sequence: payload.desc.damage_base_sequence,
             dropped_before_publish: payload.desc.dropped_before_publish,
             producer_drop_count: payload.desc.producer_drop_count,
+            payload_kind: payload.desc.payload_kind as u32,
+            modifier: payload.desc.modifier,
+            fence_id: payload.desc.fence_id,
+            fence_value: payload.desc.fence_value,
+            flags: payload.desc.flags,
         };
+        let cursor = self
+            .controls_by_track
+            .entry(track_id)
+            .or_insert_with(|| TrackRingControl::new(self.capacity_per_track))
+            .push(ring_entry);
         let frames = self.frames_by_track.entry(track_id).or_default();
         frames.push(StoredFrame {
-            key,
+            cursor,
             desc: payload.desc,
             segment: payload.segment,
-            pool_generation: payload.pool_generation,
+            pool_id: payload.pool_id,
             slot_index: payload.slot_index,
             pool_registration: payload.pool_registration,
             pinned_by: BTreeSet::new(),
         });
-        self.controls_by_track
-            .entry(track_id)
-            .or_insert_with(|| TrackRingControl::new(self.capacity_per_track))
-            .push(ring_entry);
         let evicted = Self::prune_unpinned(frames, self.capacity_per_track);
         *self.evicted_by_track.entry(track_id).or_default() += evicted;
     }
@@ -590,19 +588,14 @@ impl VideoSlotManager {
             .get_mut(&track_id)
             .ok_or(CaptureTransferError::UnknownTrack { track_id })?
             .register_consumer(consumer_id)?;
-        let (frame_key, desc, segment, pool_registration) = {
+        let (desc, segment, pool_registration) = {
             let frame = self
                 .frames_by_track
                 .get_mut(&track_id)
-                .and_then(|frames| frames.iter_mut().find(|frame| frame.key == entry.frame_key))
+                .and_then(|frames| frames.iter_mut().find(|frame| frame.cursor == entry.cursor))
                 .ok_or(CaptureTransferError::UnknownTrack { track_id })?;
             frame.pinned_by.insert(consumer_id);
-            (
-                frame.key,
-                frame.desc.clone(),
-                Arc::clone(&frame.segment),
-                frame.pool_registration.clone(),
-            )
+            (frame.desc.clone(), Arc::clone(&frame.segment), frame.pool_registration.clone())
         };
         let consumer_key = (consumer_id, track_id);
         let cursor = self.consumer_cursors.entry(consumer_key).or_default();
@@ -611,7 +604,7 @@ impl VideoSlotManager {
         if let Some(control) = self.controls_by_track.get_mut(&track_id) {
             if let Err(error) = control.store_consumer_acquire(consumer_id, consumer_slot, &cursor_snapshot) {
                 if let Some(frames) = self.frames_by_track.get_mut(&track_id)
-                    && let Some(stored) = frames.iter_mut().find(|stored| stored.key == frame_key)
+                    && let Some(stored) = frames.iter_mut().find(|stored| stored.cursor == entry.cursor)
                 {
                     stored.pinned_by.remove(&consumer_id);
                 }
@@ -625,8 +618,7 @@ impl VideoSlotManager {
             desc,
             consumer_id,
             track_id,
-            frame_key,
-            producer_cursor: entry.producer_cursor,
+            producer_cursor: entry.cursor,
             segment,
             pool_registration,
         })
@@ -644,7 +636,7 @@ impl VideoSlotManager {
             let _ = control.store_consumer_release(frame.consumer_id, release_cursor);
         }
         if let Some(frames) = self.frames_by_track.get_mut(&frame.track_id) {
-            if let Some(stored) = frames.iter_mut().find(|stored| stored.key == frame.frame_key) {
+            if let Some(stored) = frames.iter_mut().find(|stored| stored.cursor == frame.producer_cursor) {
                 stored.pinned_by.remove(&frame.consumer_id);
             }
             let evicted = Self::prune_unpinned(frames, self.capacity_per_track);
@@ -726,14 +718,13 @@ impl VideoSlotManager {
         segment.as_mut_slice().copy_from_slice(pixels);
         desc.pool_id = 0;
         desc.slot_id = 0;
-        desc.slot_generation = 0;
         desc.payload_offset = 0;
         desc.payload_len = pixels.len() as u64;
         desc.payload_map_len = pixels.len() as u64;
         Ok(PublishedPayload {
             desc,
             segment: Arc::new(segment),
-            pool_generation: None,
+            pool_id: None,
             slot_index: None,
             pool_registration: None,
         })
@@ -742,8 +733,6 @@ impl VideoSlotManager {
     fn replace_pool(&mut self, track_id: TrackId, slot_stride: usize) -> Result<()> {
         let pool_id = self.next_pool_id;
         self.next_pool_id += 1;
-        let generation = self.next_pool_generation;
-        self.next_pool_generation += 1;
         let len = slot_stride
             .checked_mul(self.capacity_per_track)
             .ok_or_else(|| CaptureTransferError::SharedMemory {
@@ -755,15 +744,14 @@ impl VideoSlotManager {
             track_id,
             TrackPool {
                 pool_id,
-                generation,
                 segment: Arc::new(segment),
                 slot_stride,
                 slot_count: self.capacity_per_track,
                 next_slot: 0,
             },
         );
-        // Outstanding claims for the old generation still own their mmap Arc,
-        // but clearing the pending set makes later commits unpublishable no-ops.
+        // Outstanding claims for the old pool still own their mmap Arc, but
+        // clearing the pending set makes later commits unpublishable no-ops.
         self.pending_claims_by_track.remove(&track_id);
         Ok(())
     }
@@ -775,11 +763,11 @@ impl VideoSlotManager {
         for attempt in 0..pool.slot_count {
             let slot_index = (pool.next_slot + attempt) % pool.slot_count;
             let pinned = frames.is_some_and(|frames| {
-                frames.iter().any(|frame| {
-                    frame.pool_generation == Some(pool.generation) && frame.slot_index == Some(slot_index) && !frame.pinned_by.is_empty()
-                })
+                frames
+                    .iter()
+                    .any(|frame| frame.pool_id == Some(pool.pool_id) && frame.slot_index == Some(slot_index) && !frame.pinned_by.is_empty())
             });
-            let claimed = pending_claims.is_some_and(|claims| claims.contains(&(pool.generation, slot_index)));
+            let claimed = pending_claims.is_some_and(|claims| claims.contains(&(pool.pool_id, slot_index)));
             if !pinned && !claimed {
                 return Some(slot_index);
             }
@@ -799,7 +787,8 @@ mod tests {
     use crate::{
         CaptureTransferError,
         control_page::VideoRingReadError,
-        model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PixelFormat, TrackId},
+        model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat, TrackId},
+        shm::SharedMemorySegment,
         video::{ConsumerId, OrderedVideoAcquire, VideoFrameDesc, VideoSlotManager},
     };
 
@@ -813,7 +802,6 @@ mod tests {
             pixel_format: PixelFormat::Bgra8Unorm,
             pool_id: 0,
             slot_id: 0,
-            slot_generation: 0,
             payload_offset: 0,
             payload_len: 0,
             payload_map_len: 0,
@@ -826,6 +814,11 @@ mod tests {
             producer_drop_count: 0,
             evicted_count: 0,
             consumer_skipped_count: 0,
+            payload_kind: PayloadKind::CpuShm,
+            modifier: 0,
+            fence_id: 0,
+            fence_value: 0,
+            flags: 0,
         }
     }
 
@@ -1091,14 +1084,12 @@ mod tests {
         let first = slots.acquire_latest(consumer, track).unwrap();
         assert_ne!(first.desc.pool_id, 0);
         assert_eq!(first.desc.slot_id, 0);
-        assert_ne!(first.desc.slot_generation, 0);
         slots.release(first);
 
         slots.publish(track, frame_desc(2), &[5, 6, 7, 8]).unwrap();
         let second = slots.acquire_latest(consumer, track).unwrap();
         assert_ne!(second.desc.pool_id, 0);
         assert_eq!(second.desc.slot_id, 1);
-        assert_ne!(second.desc.slot_generation, 0);
     }
 
     #[test]
@@ -1112,7 +1103,6 @@ mod tests {
         let first_pool = first.cpu_pool_registration().unwrap();
         assert_eq!(first_pool.track_id, track);
         assert_eq!(first_pool.pool_id, first.desc.pool_id);
-        assert_eq!(first_pool.pool_generation, first.desc.slot_generation);
         assert_eq!(first_pool.payload_map_len, first.desc.payload_map_len);
         assert_eq!(first_pool.slot_stride, 64);
         assert_eq!(first_pool.slot_count, 3);
@@ -1214,7 +1204,7 @@ mod tests {
             control
                 .entries
                 .iter()
-                .map(|entry| (entry.producer_cursor, entry.sequence))
+                .map(|entry| (entry.cursor, entry.sequence))
                 .collect::<Vec<_>>(),
             vec![(2, 2), (3, 3)]
         );
@@ -1230,16 +1220,10 @@ mod tests {
         slots.publish(track, frame_desc(3), &[3]).unwrap();
 
         let page = slots.debug_control_page_snapshot(track).unwrap();
-        assert_eq!(page.header.capacity, 2);
+        assert_eq!(page.header.slot_capacity, 2);
         assert_eq!(page.header.producer_cursor, 3);
-        assert_eq!(page.header.latest_sequence, 3);
-        assert_eq!(page.header.latest_index, 0);
-        assert_eq!(page.header.len, 2);
         assert_eq!(
-            page.entries
-                .iter()
-                .map(|entry| (entry.producer_cursor, entry.sequence))
-                .collect::<Vec<_>>(),
+            page.entries.iter().map(|entry| (entry.cursor, entry.sequence)).collect::<Vec<_>>(),
             vec![(2, 2), (3, 3)]
         );
     }
@@ -1272,7 +1256,6 @@ mod tests {
         assert_eq!(entry.height, 480);
         assert_eq!(entry.stride, 2_560);
         assert_eq!(entry.pixel_format, PixelFormat::Rgba8Unorm as u32);
-        assert_eq!(entry.payload_map_len, 4);
         assert_eq!(entry.clock_domain, ClockDomain::HostTime as u32);
         assert_eq!(entry.color_space, ColorSpace::Srgb as u32);
         assert_eq!(entry.sync_kind, FrameSyncKind::SckSampleReady as u32);
@@ -1443,44 +1426,42 @@ mod tests {
         assert_eq!(slots.pinned_frame_count(), 0);
     }
 
-    #[test]
-    fn acquired_frame_can_clone_readable_fd() {
-        use std::{
-            fs::File,
-            io::{Read, Seek, SeekFrom},
-        };
+    // Anonymous shm objects are mmap-only on macOS (read()/seek() fail with
+    // ENXIO), so cloned fds are exercised the way consumers use them: mapped.
 
+    #[test]
+    fn acquired_frame_can_clone_mappable_fd() {
         let mut slots = VideoSlotManager::new(2);
         let track = TrackId::new(1);
 
         slots.publish(track, frame_desc(1), &[9, 8, 7]).unwrap();
         let frame = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
 
-        let mut file = File::from(frame.try_clone_fd().unwrap());
-        let mut bytes = Vec::new();
-        file.seek(SeekFrom::Start(frame.desc.payload_offset)).unwrap();
-        file.take(frame.desc.payload_len).read_to_end(&mut bytes).unwrap();
+        let mapping = SharedMemorySegment::map_read_only(frame.try_clone_fd().unwrap(), frame.desc.payload_map_len as usize).unwrap();
 
-        assert_eq!(bytes, &[9, 8, 7]);
+        assert_eq!(
+            mapping.slice_at(frame.desc.payload_offset as usize, frame.desc.payload_len as usize),
+            &[9, 8, 7]
+        );
     }
 
     #[test]
     fn cloned_fd_survives_release_and_prune() {
-        use std::{fs::File, io::Read};
-
         let mut slots = VideoSlotManager::new(1);
         let track = TrackId::new(1);
 
         slots.publish(track, frame_desc(1), &[9, 8, 7]).unwrap();
         let frame = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
-        let mut file = File::from(frame.try_clone_fd().unwrap());
+        let fd = frame.try_clone_fd().unwrap();
+        let map_len = frame.desc.payload_map_len as usize;
+        let payload_offset = frame.desc.payload_offset as usize;
+        let payload_len = frame.desc.payload_len as usize;
         slots.release(frame);
 
         slots.publish(track, frame_desc(2), &[1, 2, 3]).unwrap();
         assert_eq!(slots.pinned_frame_count(), 0);
 
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, &[9, 8, 7]);
+        let mapping = SharedMemorySegment::map_read_only(fd, map_len).unwrap();
+        assert_eq!(mapping.slice_at(payload_offset, payload_len), &[9, 8, 7]);
     }
 }

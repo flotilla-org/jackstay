@@ -1,9 +1,7 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::File,
     os::fd::{AsRawFd, OwnedFd},
-    path::PathBuf,
     ptr::NonNull,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::{
@@ -11,15 +9,11 @@ use crate::{
     model::PayloadKind,
 };
 
-static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
-
 #[derive(Debug)]
 pub struct SharedMemorySegment {
     ptr: NonNull<u8>,
     len: usize,
-    path: Option<PathBuf>,
     writable: bool,
-    unlink_on_drop: bool,
     _file: File,
 }
 
@@ -40,20 +34,7 @@ impl SharedMemorySegment {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
         }
 
-        let path = unique_path();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| CaptureTransferError::SharedMemory {
-                operation: "create",
-                message: error.to_string(),
-            })?;
-        file.set_len(len as u64).map_err(|error| CaptureTransferError::SharedMemory {
-            operation: "resize",
-            message: error.to_string(),
-        })?;
+        let file = create_anonymous_backing(len)?;
 
         // SAFETY: mmap is called with a valid file descriptor, non-zero length,
         // and read/write shared permissions. The mapping is released in Drop.
@@ -69,20 +50,16 @@ impl SharedMemorySegment {
         };
 
         if raw == libc::MAP_FAILED {
-            let error = std::io::Error::last_os_error();
-            let _ = fs::remove_file(&path);
             return Err(CaptureTransferError::SharedMemory {
                 operation: "mmap",
-                message: error.to_string(),
+                message: std::io::Error::last_os_error().to_string(),
             });
         }
 
         Ok(Self {
             ptr: NonNull::new(raw.cast::<u8>()).expect("mmap returned null without MAP_FAILED"),
             len,
-            path: Some(path),
             writable: true,
-            unlink_on_drop: true,
             _file: file,
         })
     }
@@ -114,9 +91,7 @@ impl SharedMemorySegment {
         Ok(Self {
             ptr: NonNull::new(raw.cast::<u8>()).expect("mmap returned null without MAP_FAILED"),
             len,
-            path: None,
             writable: false,
-            unlink_on_drop: false,
             _file: file,
         })
     }
@@ -157,9 +132,7 @@ impl SharedMemorySegment {
         Ok(Self {
             ptr: NonNull::new(raw.cast::<u8>()).expect("mmap returned null without MAP_FAILED"),
             len,
-            path: None,
             writable: true,
-            unlink_on_drop: false,
             _file: file,
         })
     }
@@ -234,23 +207,95 @@ impl SharedMemorySegment {
 
 impl Drop for SharedMemorySegment {
     fn drop(&mut self) {
-        // SAFETY: ptr/len describe the mapping created in new.
+        // SAFETY: ptr/len describe the mapping created in new. The kernel keeps
+        // the anonymous backing object alive while any other fd or mapping
+        // (including in other processes) still references it.
         unsafe {
             libc::munmap(self.ptr.as_ptr().cast(), self.len);
-        }
-        if self.unlink_on_drop
-            && let Some(path) = &self.path
-        {
-            let _ = fs::remove_file(path);
         }
     }
 }
 
-fn unique_path() -> PathBuf {
-    // Uniqueness only; no ordering with other memory is required.
-    let id = NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("capture-transfer-{}-{id}.shm", std::process::id()))
+/// Creates the anonymous memory object backing a segment.
+///
+/// The object must never appear in a filesystem namespace once this returns:
+/// the fd (and fds passed to consumers) is the only handle, so a killed
+/// process leaks nothing, and pages are swap-backed rather than written back
+/// to disk by the pager.
+#[cfg(target_os = "macos")]
+fn create_anonymous_backing(len: usize) -> Result<File> {
+    use std::{
+        ffi::CString,
+        os::fd::FromRawFd,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
+
+    for _ in 0..64 {
+        let id = NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed);
+        // POSIX shm names are capped at PSHMNAMLEN (31) bytes on macOS; hex
+        // pid + id stays within it. The name only exists between shm_open and
+        // shm_unlink below; uniqueness just avoids EEXIST against strays.
+        let name = CString::new(format!("/js.{:x}.{id:x}", std::process::id())).expect("shm name contains no NUL");
+        // SAFETY: name is a valid NUL-terminated string; mode is passed for O_CREAT.
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return Err(CaptureTransferError::SharedMemory {
+                operation: "shm-open",
+                message: error.to_string(),
+            });
+        }
+        // SAFETY: fd was just returned by shm_open and is owned by nothing else.
+        let file = unsafe { File::from_raw_fd(fd) };
+        // Drop the name immediately: the kernel refcounts the object (xnu holds
+        // a usecount reference per fd and mapping), so only handles keep it
+        // alive from here on.
+        // SAFETY: name is the valid NUL-terminated string opened above.
+        let _ = unsafe { libc::shm_unlink(name.as_ptr()) };
+        // ftruncate is only honoured once for a macOS shm object; segments are
+        // sized exactly once at creation and pools are replaced, never resized.
+        file.set_len(len as u64).map_err(|error| CaptureTransferError::SharedMemory {
+            operation: "resize",
+            message: error.to_string(),
+        })?;
+        return Ok(file);
+    }
+    Err(CaptureTransferError::SharedMemory {
+        operation: "shm-open",
+        message: "could not find an unused shm name".to_string(),
+    })
 }
+
+#[cfg(target_os = "linux")]
+fn create_anonymous_backing(len: usize) -> Result<File> {
+    use std::{ffi::CStr, os::fd::FromRawFd};
+
+    // The name is purely diagnostic (/proc/self/fd); memfds are anonymous.
+    let name = CStr::from_bytes_with_nul(b"jackstay-segment\0").expect("static name is NUL-terminated");
+    // SAFETY: name is a valid NUL-terminated string.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(CaptureTransferError::SharedMemory {
+            operation: "memfd-create",
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    // SAFETY: fd was just returned by memfd_create and is owned by nothing else.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(len as u64).map_err(|error| CaptureTransferError::SharedMemory {
+        operation: "resize",
+        message: error.to_string(),
+    })?;
+    Ok(file)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("anonymous shm backing is only implemented for macOS and Linux");
 
 #[cfg(test)]
 mod tests {
@@ -319,7 +364,9 @@ mod tests {
     fn read_only_mapping_rejects_len_larger_than_backing_file() {
         let segment = SharedMemorySegment::new(4).unwrap();
 
-        let error = SharedMemorySegment::map_read_only(segment.try_clone_fd().unwrap(), 8).unwrap_err();
+        // Anonymous shm objects are page-rounded by the kernel, so the guard
+        // is page-granular: overshoot by far more than any page size.
+        let error = SharedMemorySegment::map_read_only(segment.try_clone_fd().unwrap(), 1 << 21).unwrap_err();
 
         assert!(matches!(
             error,

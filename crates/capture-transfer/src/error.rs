@@ -35,4 +35,7 @@ pub enum CaptureTransferError {
 
     #[error("native frame backend {operation} failed: {message}")]
     NativeBackend { operation: &'static str, message: String },
+
+    #[error("surface pool exhausted: all {slot_count} surfaces are held by consumers or live in the ring")]
+    SurfacePoolExhausted { slot_count: u32 },
 }

@@ -34,6 +34,19 @@
  *     s2 = slot.publication_sequence         relaxed
  *     valid iff s1 == C && s2 == C
  *
+ *   reader holding a native payload (IOSurface / dmabuf) beyond the seqlock
+ *   read MUST take the hold in this order:
+ *     increment the surface's OS use count       (IOSurfaceIncrementUseCount)
+ *     re-read header.producer_cursor             acquire
+ *     still live iff producer_cursor - C < slot_capacity;
+ *       if not, release the hold and discard without sampling
+ *   The producer reuses a surface only when its last published cursor has
+ *   left the live window AND its use count is zero. Liveness of a given
+ *   cursor only expires, so this order makes reuse under a reader
+ *   impossible: either the hold was visible to the producer's use-count
+ *   check, or the reader's re-check observes the expired entry and the
+ *   reader discards. Holds taken count-first need no further validation.
+ *
  * Both fences are required on weakly-ordered machines (ARM); they compile to
  * nothing on x86. The publication sequence doubles as invalidation flag
  * (zero), version counter, and frame identity: a published slot holds the

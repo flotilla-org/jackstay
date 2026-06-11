@@ -8,13 +8,21 @@
 //! slots. [`NativeFrameBackend`] is the platform seam behind that contract;
 //! the macOS IOSurface/MTLSharedEvent implementation arrives in a later slice
 //! (#84), and [`fake`] provides an OS-free implementation for tests.
+//!
+//! Surface reuse is *prevented*, not detected: a surface is staged into only
+//! when no consumer holds it (the OS use count is the source of truth,
+//! checklist §7) and no live ring entry still names it. In-band consumer
+//! cursors are advisory.
+
+pub mod attach;
 
 use std::os::fd::OwnedFd;
 
 use crate::{
     control_page::{PendingVideoRingEntry, VideoTrackControlPage},
-    error::Result,
+    error::{CaptureTransferError, Result},
     model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
+    native::attach::AttachGrant,
 };
 
 /// Stream-level parameters for a native track. These land in the ring's
@@ -31,12 +39,54 @@ pub struct NativeStreamParams {
     pub modifier: u64,
 }
 
+/// What the producer does when no surface is eligible for staging: every
+/// slot is either held by a consumer or still named by a live ring entry.
+/// Never a silent overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PoolExhaustionPolicy {
+    /// Drop the frame and account for it: the producer's drop counters
+    /// advance and the next published frame carries the gap in
+    /// `dropped_before_publish`. The right default for latest-wins capture,
+    /// where blocking the producer is the worst outcome.
+    #[default]
+    DropFrame,
+    /// Fail the publish with [`CaptureTransferError::SurfacePoolExhausted`]
+    /// without consuming the frame's sequence number; the caller may retry
+    /// the same frame (its stall policy).
+    Fail,
+}
+
+/// The result of a [`NativeTrackProducer::publish`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Published {
+        cursor: u64,
+    },
+    /// The frame was dropped under [`PoolExhaustionPolicy::DropFrame`]; the
+    /// gap is carried by the next published frame's `dropped_before_publish`.
+    Dropped,
+}
+
+impl PublishOutcome {
+    #[must_use]
+    pub const fn cursor(self) -> Option<u64> {
+        match self {
+            Self::Published { cursor } => Some(cursor),
+            Self::Dropped => None,
+        }
+    }
+}
+
 /// Platform seam for the native handle path.
 ///
 /// Implementations own the process-local surface and fence objects; everything
 /// that crosses a process boundary is either a plain id carried in ring slots
 /// (`pool_id`, `slot_id`, `fence_value`) or an opaque blob carried by the
-/// setup channel (the serialized sync handle, surface pool registration).
+/// setup channel (the serialized surface and sync handles).
+///
+/// Slot *selection* is not the backend's job: the neutral core picks an
+/// eligible slot (use count zero, outside the ring's live window) and the
+/// backend stages into it.
 pub trait NativeFrameBackend {
     /// A frame as captured from the platform source (e.g. an SCK sample).
     type CapturedFrame;
@@ -55,11 +105,20 @@ pub trait NativeFrameBackend {
     /// The transferable id consumers use to attach this pool.
     fn pool_id(&self, pool: &Self::SurfacePool) -> u64;
 
-    /// Bind a captured frame to a pool surface and return the slot id that
-    /// now holds it. For wrap-free producers this is where surface contents
-    /// become the frame (zero-copy backends may adopt the captured surface
-    /// directly).
-    fn stage_frame(&mut self, pool: &mut Self::SurfacePool, frame: &Self::CapturedFrame) -> Result<u32>;
+    /// The OS-side use count for one pool surface. This is the source of
+    /// truth gating reuse (e.g. `IOSurfaceGetUseCount`); in-band consumer
+    /// cursors are hints only.
+    fn surface_use_count(&self, pool: &Self::SurfacePool, slot_id: u32) -> Result<u32>;
+
+    /// Bind a captured frame to the given pool surface. The slot was chosen
+    /// by the caller and is guaranteed unheld and outside the ring's live
+    /// window. Zero-copy backends may adopt the captured surface directly.
+    fn stage_frame(&mut self, pool: &mut Self::SurfacePool, slot_id: u32, frame: &Self::CapturedFrame) -> Result<()>;
+
+    /// Serialize each pool surface handle for setup-channel transfer (one
+    /// entry per slot; on macOS an XPC-encodable IOSurface reference, opaque
+    /// bytes at this layer).
+    fn serialize_surface_handles(&self, pool: &Self::SurfacePool) -> Result<Vec<Vec<u8>>>;
 
     /// Create the stream's timeline fence.
     fn create_fence(&mut self) -> Result<Self::Fence>;
@@ -79,51 +138,97 @@ pub trait NativeFrameBackend {
 }
 
 /// Publishes native frames from a [`NativeFrameBackend`] through a jackstay
-/// broadcast ring. This is the thin tracer spine: it owns the control page,
-/// one surface pool, and the stream fence; integration with track/session
-/// management arrives in later slices.
+/// broadcast ring, gating surface reuse on the OS use count and the ring's
+/// live window. Owns the control page, one surface pool, and the stream
+/// fence; integration with track/session management arrives in later slices.
 #[derive(Debug)]
 pub struct NativeTrackProducer<B: NativeFrameBackend> {
     backend: B,
     params: NativeStreamParams,
     page: VideoTrackControlPage,
     pool: B::SurfacePool,
+    pool_slot_count: u32,
     fence: B::Fence,
+    exhaustion_policy: PoolExhaustionPolicy,
+    /// Cursor each pool slot was last published at (0 = never published;
+    /// real cursors start at 1, so 0 is unambiguous); a slot is reachable
+    /// while its cursor is inside the ring's live window.
+    slot_cursors: Vec<u64>,
+    next_slot_hint: u32,
+    last_cursor: u64,
     sequence: u64,
     fence_value: u64,
+    pending_dropped: u32,
+    producer_drop_count: u64,
 }
 
 impl<B: NativeFrameBackend> NativeTrackProducer<B> {
-    pub fn new(mut backend: B, params: NativeStreamParams, slot_count: u32) -> Result<Self> {
-        let pool = backend.allocate_surface_pool(&params, slot_count)?;
+    /// `ring_capacity` is rounded up to a power of two by the control page;
+    /// `pool_slot_count` must exceed the *rounded* capacity so at least one
+    /// surface is always outside the ring's live window — otherwise live
+    /// entries alone could pin every surface and stall the stream with no
+    /// consumer involvement.
+    pub fn new(
+        mut backend: B,
+        params: NativeStreamParams,
+        ring_capacity: usize,
+        pool_slot_count: u32,
+        exhaustion_policy: PoolExhaustionPolicy,
+    ) -> Result<Self> {
+        let page = VideoTrackControlPage::new(ring_capacity);
+        let rounded_capacity = page.layout().slot_capacity;
+        if pool_slot_count as usize <= rounded_capacity {
+            return Err(CaptureTransferError::NativeBackend {
+                operation: "create-native-producer",
+                message: format!("surface pool ({pool_slot_count} slots) must exceed the rounded ring capacity ({rounded_capacity})"),
+            });
+        }
+        let pool = backend.allocate_surface_pool(&params, pool_slot_count)?;
         let fence = backend.create_fence()?;
-        // The ring rounds `slot_count` up to the next power of two, so its lap
-        // threshold can exceed the surface-pool size (e.g. slot_count = 3 gives
-        // a 4-entry ring over 3 surfaces). The seqlock identity is independent
-        // of slot indices, so this is correct for staleness detection. But a
-        // backend that lets consumers pin a surface by `slot_id` must assume a
-        // surface can be recycled after `slot_count` frames, not after a full
-        // ring lap. Real backends (#84) should either size the pool to the
-        // rounded-up ring capacity or honor the tighter recycle bound.
-        let page = VideoTrackControlPage::new(slot_count as usize);
         Ok(Self {
             backend,
             params,
             page,
             pool,
+            pool_slot_count,
             fence,
+            exhaustion_policy,
+            slot_cursors: vec![0; pool_slot_count as usize],
+            next_slot_hint: 0,
+            last_cursor: 0,
             sequence: 0,
             fence_value: 0,
+            pending_dropped: 0,
+            producer_drop_count: 0,
         })
     }
 
-    /// Stage `frame`, signal the fence, and publish the descriptor. Returns
-    /// the publish cursor.
-    pub fn publish(&mut self, frame: &B::CapturedFrame, timestamp_ns: u64) -> Result<u64> {
-        let slot_id = self.backend.stage_frame(&mut self.pool, frame)?;
-        // Saturating + debug_assert, matching the producer-cursor overflow guard
-        // in VideoTrackControlPage::push. u64 will not overflow at any real frame
-        // rate; the guard keeps the two hot paths consistent.
+    /// Stage `frame` into an eligible surface, signal the fence, and publish
+    /// the descriptor. When the pool is exhausted the configured
+    /// [`PoolExhaustionPolicy`] applies.
+    pub fn publish(&mut self, frame: &B::CapturedFrame, timestamp_ns: u64) -> Result<PublishOutcome> {
+        let Some(slot_id) = self.claim_slot()? else {
+            return match self.exhaustion_policy {
+                PoolExhaustionPolicy::DropFrame => {
+                    // The captured frame existed: its sequence number is
+                    // consumed so the gap stays visible to consumers.
+                    self.sequence = self.sequence.saturating_add(1);
+                    debug_assert!(self.sequence < u64::MAX);
+                    self.pending_dropped = self.pending_dropped.saturating_add(1);
+                    self.producer_drop_count = self.producer_drop_count.saturating_add(1);
+                    Ok(PublishOutcome::Dropped)
+                }
+                // Nothing is consumed: the caller may retry the same frame.
+                PoolExhaustionPolicy::Fail => Err(CaptureTransferError::SurfacePoolExhausted {
+                    slot_count: self.pool_slot_count,
+                }),
+            };
+        };
+
+        self.backend.stage_frame(&mut self.pool, slot_id, frame)?;
+        // Saturating + debug_assert, matching the producer-cursor overflow
+        // guard in VideoTrackControlPage::push. u64 will not overflow at any
+        // real frame rate; the guard keeps the hot paths consistent.
         self.sequence = self.sequence.saturating_add(1);
         debug_assert!(self.sequence < u64::MAX);
         self.fence_value = self.fence_value.saturating_add(1);
@@ -151,15 +256,70 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
             sync_kind: FrameSyncKind::NativeTimeline as u32,
             damage_kind: DamageKind::FullFrame as u32,
             damage_base_sequence: self.sequence,
-            dropped_before_publish: 0,
-            producer_drop_count: 0,
+            dropped_before_publish: self.pending_dropped,
+            producer_drop_count: self.producer_drop_count,
             payload_kind: self.backend.payload_kind() as u32,
             modifier: self.params.modifier,
             fence_id: self.backend.fence_id(&self.fence),
             fence_value: self.fence_value,
             flags: 0,
         });
-        Ok(cursor)
+        self.pending_dropped = 0;
+        self.last_cursor = cursor;
+        self.slot_cursors[slot_id as usize] = cursor;
+        self.next_slot_hint = (slot_id + 1) % self.pool_slot_count;
+        Ok(PublishOutcome::Published { cursor })
+    }
+
+    /// Pick the next eligible surface: not held by any consumer (OS use
+    /// count zero) and not named by any live ring entry. Returns `None` when
+    /// the pool is exhausted.
+    ///
+    /// The two checks and the subsequent staging are not one atomic step,
+    /// but the consumer hold protocol (jackstay_ring.h) closes the gap: a
+    /// consumer increments the surface's use count first and only then
+    /// re-checks that the entry's cursor is still inside the live window,
+    /// releasing the hold if it is not. Liveness of a given cursor only
+    /// expires (the cursor is monotonic), so either the consumer's hold was
+    /// in place before the use-count check here (we skip the slot), or the
+    /// consumer's re-check observes the expired entry and it discards the
+    /// hold without sampling. Reuse under a reader is prevented, not raced.
+    fn claim_slot(&mut self) -> Result<Option<u32>> {
+        let ring_capacity = self.page.layout().slot_capacity as u64;
+        let live_len = self.last_cursor.min(ring_capacity);
+        let oldest_live_cursor = self.last_cursor - live_len + 1;
+        for offset in 0..self.pool_slot_count {
+            let slot_id = (self.next_slot_hint + offset) % self.pool_slot_count;
+            let published_at = self.slot_cursors[slot_id as usize];
+            let reachable = published_at != 0 && published_at >= oldest_live_cursor;
+            if reachable {
+                continue;
+            }
+            if self.backend.surface_use_count(&self.pool, slot_id)? > 0 {
+                continue;
+            }
+            return Ok(Some(slot_id));
+        }
+        Ok(None)
+    }
+
+    /// Register `consumer_id` and assemble everything a consumer needs,
+    /// transferred exactly once at attach: the ring mapping, the pool's
+    /// surface handles, and the serialized sync handle. Steady state after
+    /// this is shared-memory only.
+    pub fn grant_attach(&mut self, consumer_id: u64) -> Result<AttachGrant> {
+        let consumer_slot = self.page.register_consumer_cursor(consumer_id)? as u64;
+        Ok(AttachGrant {
+            consumer_id,
+            consumer_slot,
+            ring_fd: self.page.try_clone_fd()?,
+            ring_map_len: self.page.mapped_len() as u64,
+            pool_id: self.backend.pool_id(&self.pool),
+            pool_slot_count: self.pool_slot_count,
+            surface_handles: self.backend.serialize_surface_handles(&self.pool)?,
+            fence_id: self.backend.fence_id(&self.fence),
+            sync_handle: self.backend.serialize_sync_handle(&self.fence)?,
+        })
     }
 
     /// The control page fd a consumer maps to read descriptors.
@@ -188,7 +348,8 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
 /// backend registers objects there, and a "remote" consumer resolves the ids
 /// it read from ring slots against the same registry, the way a real consumer
 /// resolves an IOSurface or waits a shared event after a setup-channel
-/// introduction.
+/// introduction. Consumer-side surface holds (`IOSurfaceIncrementUseCount`)
+/// are modelled by [`fake::FakeSurfaceRegistry::hold_surface`].
 pub mod fake {
     use std::{
         collections::BTreeMap,
@@ -205,10 +366,16 @@ pub mod fake {
     };
 
     #[derive(Debug, Default)]
+    struct FakePool {
+        slots: Vec<Vec<u8>>,
+        use_counts: Vec<u32>,
+    }
+
+    #[derive(Debug, Default)]
     struct RegistryInner {
         next_pool_id: u64,
         next_fence_id: u64,
-        pools: BTreeMap<u64, Arc<Mutex<Vec<Vec<u8>>>>>,
+        pools: BTreeMap<u64, Arc<Mutex<FakePool>>>,
         fences: BTreeMap<u64, Arc<AtomicU64>>,
     }
 
@@ -219,14 +386,33 @@ pub mod fake {
     }
 
     impl FakeSurfaceRegistry {
+        fn pool(&self, pool_id: u64) -> Option<Arc<Mutex<FakePool>>> {
+            let inner = self.inner.lock().expect("fake surface registry poisoned");
+            inner.pools.get(&pool_id).cloned()
+        }
+
         /// Consumer-side surface resolution (stands in for pool attach +
         /// surface lookup).
         #[must_use]
         pub fn surface_bytes(&self, pool_id: u64, slot_id: u32) -> Option<Vec<u8>> {
-            let inner = self.inner.lock().expect("fake surface registry poisoned");
-            let pool = inner.pools.get(&pool_id)?;
-            let slots = pool.lock().expect("fake surface pool poisoned");
-            slots.get(slot_id as usize).cloned()
+            let pool = self.pool(pool_id)?;
+            let pool = pool.lock().expect("fake surface pool poisoned");
+            pool.slots.get(slot_id as usize).cloned()
+        }
+
+        /// Consumer-side hold (stands in for `IOSurfaceIncrementUseCount`).
+        pub fn hold_surface(&self, pool_id: u64, slot_id: u32) {
+            let pool = self.pool(pool_id).expect("hold_surface on unknown pool");
+            let mut pool = pool.lock().expect("fake surface pool poisoned");
+            pool.use_counts[slot_id as usize] += 1;
+        }
+
+        /// Consumer-side release (stands in for `IOSurfaceDecrementUseCount`).
+        pub fn release_surface(&self, pool_id: u64, slot_id: u32) {
+            let pool = self.pool(pool_id).expect("release_surface on unknown pool");
+            let mut pool = pool.lock().expect("fake surface pool poisoned");
+            let count = &mut pool.use_counts[slot_id as usize];
+            *count = count.checked_sub(1).expect("release_surface without matching hold");
         }
 
         /// Consumer-side fence wait peek: the timeline's current value.
@@ -259,9 +445,7 @@ pub mod fake {
     #[derive(Debug)]
     pub struct FakeSurfacePool {
         pool_id: u64,
-        slots: Arc<Mutex<Vec<Vec<u8>>>>,
-        slot_count: u32,
-        next_slot: u32,
+        inner: Arc<Mutex<FakePool>>,
     }
 
     #[derive(Debug)]
@@ -291,26 +475,38 @@ pub mod fake {
             let mut inner = self.registry.inner.lock().expect("fake surface registry poisoned");
             inner.next_pool_id += 1;
             let pool_id = inner.next_pool_id;
-            let slots = Arc::new(Mutex::new(vec![Vec::new(); slot_count as usize]));
-            inner.pools.insert(pool_id, Arc::clone(&slots));
-            Ok(FakeSurfacePool {
-                pool_id,
-                slots,
-                slot_count,
-                next_slot: 0,
-            })
+            let pool = Arc::new(Mutex::new(FakePool {
+                slots: vec![Vec::new(); slot_count as usize],
+                use_counts: vec![0; slot_count as usize],
+            }));
+            inner.pools.insert(pool_id, Arc::clone(&pool));
+            Ok(FakeSurfacePool { pool_id, inner: pool })
         }
 
         fn pool_id(&self, pool: &FakeSurfacePool) -> u64 {
             pool.pool_id
         }
 
-        fn stage_frame(&mut self, pool: &mut FakeSurfacePool, frame: &FakeCapturedFrame) -> Result<u32> {
-            let slot_id = pool.next_slot;
-            pool.next_slot = (pool.next_slot + 1) % pool.slot_count;
-            let mut slots = pool.slots.lock().expect("fake surface pool poisoned");
-            slots[slot_id as usize] = frame.bytes.clone();
-            Ok(slot_id)
+        fn surface_use_count(&self, pool: &FakeSurfacePool, slot_id: u32) -> Result<u32> {
+            let pool = pool.inner.lock().expect("fake surface pool poisoned");
+            Ok(pool.use_counts[slot_id as usize])
+        }
+
+        fn stage_frame(&mut self, pool: &mut FakeSurfacePool, slot_id: u32, frame: &FakeCapturedFrame) -> Result<()> {
+            let mut pool = pool.inner.lock().expect("fake surface pool poisoned");
+            pool.slots[slot_id as usize] = frame.bytes.clone();
+            Ok(())
+        }
+
+        fn serialize_surface_handles(&self, pool: &FakeSurfacePool) -> Result<Vec<Vec<u8>>> {
+            let inner = pool.inner.lock().expect("fake surface pool poisoned");
+            Ok((0..inner.slots.len() as u32)
+                .map(|slot_id| {
+                    let mut handle = pool.pool_id.to_le_bytes().to_vec();
+                    handle.extend_from_slice(&slot_id.to_le_bytes());
+                    handle
+                })
+                .collect())
         }
 
         fn create_fence(&mut self) -> Result<FakeFence> {
@@ -350,10 +546,11 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeStreamParams, NativeTrackProducer,
+        NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy, PublishOutcome,
         fake::{FakeCapturedFrame, FakeNativeBackend, FakeSurfaceRegistry},
     };
     use crate::{
+        CaptureTransferError,
         control_page::{VideoRingReadError, VideoTrackControlPage},
         model::{ClockDomain, ColorSpace, FrameSyncKind, PayloadKind, PixelFormat},
     };
@@ -369,8 +566,32 @@ mod tests {
         }
     }
 
-    fn producer(registry: &FakeSurfaceRegistry, slot_count: u32) -> NativeTrackProducer<FakeNativeBackend> {
-        NativeTrackProducer::new(FakeNativeBackend::new(registry.clone()), params(), slot_count).unwrap()
+    fn producer(
+        registry: &FakeSurfaceRegistry,
+        ring_capacity: usize,
+        pool_slot_count: u32,
+        policy: PoolExhaustionPolicy,
+    ) -> NativeTrackProducer<FakeNativeBackend> {
+        NativeTrackProducer::new(
+            FakeNativeBackend::new(registry.clone()),
+            params(),
+            ring_capacity,
+            pool_slot_count,
+            policy,
+        )
+        .unwrap()
+    }
+
+    fn frame(bytes: &[u8]) -> FakeCapturedFrame {
+        FakeCapturedFrame { bytes: bytes.to_vec() }
+    }
+
+    fn publish_cursor(producer: &mut NativeTrackProducer<FakeNativeBackend>, bytes: &[u8], timestamp_ns: u64) -> u64 {
+        producer
+            .publish(&frame(bytes), timestamp_ns)
+            .unwrap()
+            .cursor()
+            .expect("publish expected to succeed")
     }
 
     /// The consumer half of the tracer: map the ring read-only over an fd the
@@ -380,11 +601,28 @@ mod tests {
     }
 
     #[test]
+    fn pool_must_exceed_rounded_ring_capacity() {
+        let registry = FakeSurfaceRegistry::default();
+        // Ring capacity 3 rounds to 4; a 4-slot pool could be fully pinned by
+        // live entries alone.
+        let error = NativeTrackProducer::new(
+            FakeNativeBackend::new(registry.clone()),
+            params(),
+            3,
+            4,
+            PoolExhaustionPolicy::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CaptureTransferError::NativeBackend { .. }));
+        assert!(error.to_string().contains("must exceed the rounded ring capacity"));
+    }
+
+    #[test]
     fn fake_backend_native_frame_round_trips_producer_ring_consumer() {
         let registry = FakeSurfaceRegistry::default();
-        let mut producer = producer(&registry, 4);
+        let mut producer = producer(&registry, 4, 5, PoolExhaustionPolicy::default());
 
-        let cursor = producer.publish(&FakeCapturedFrame { bytes: vec![9, 8, 7, 6] }, 1_000).unwrap();
+        let cursor = publish_cursor(&mut producer, &[9, 8, 7, 6], 1_000);
 
         let page = map_consumer_page(&producer);
         let entry = page.read_entry_for_cursor(cursor).unwrap();
@@ -415,35 +653,132 @@ mod tests {
     }
 
     #[test]
-    fn native_frames_reuse_pool_slots_with_monotonic_fence_values() {
+    fn native_frames_rotate_pool_slots_with_monotonic_fence_values() {
         let registry = FakeSurfaceRegistry::default();
-        let mut producer = producer(&registry, 2);
+        let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::default());
 
-        for (index, payload) in [vec![1], vec![2], vec![3]].into_iter().enumerate() {
-            let cursor = producer.publish(&FakeCapturedFrame { bytes: payload }, index as u64).unwrap();
+        for (index, payload) in [vec![1], vec![2], vec![3], vec![4]].into_iter().enumerate() {
+            let cursor = publish_cursor(&mut producer, &payload, index as u64);
             assert_eq!(cursor, index as u64 + 1);
         }
 
         let page = map_consumer_page(&producer);
-        let second = page.read_entry_for_cursor(2).unwrap();
         let third = page.read_entry_for_cursor(3).unwrap();
-        // Slot ids wrap around the pool; fence values and cursors do not.
-        assert_eq!(second.slot_id, 1);
-        assert_eq!(third.slot_id, 0);
-        assert_eq!(second.fence_value, 2);
+        let fourth = page.read_entry_for_cursor(4).unwrap();
+        // The pool rotates 0, 1, 2; by cursor 4 only cursors 3 and 4 are live
+        // in the 2-entry ring, so slot 0 has left the live window and is
+        // reused. Fence values and cursors never wrap.
+        assert_eq!(third.slot_id, 2);
+        assert_eq!(fourth.slot_id, 0);
         assert_eq!(third.fence_value, 3);
-        assert_eq!(second.config_generation, third.config_generation);
-        assert_eq!(registry.surface_bytes(third.pool_id, third.slot_id).unwrap(), vec![3]);
+        assert_eq!(fourth.fence_value, 4);
+        assert_eq!(third.config_generation, fourth.config_generation);
+        assert_eq!(registry.surface_bytes(fourth.pool_id, fourth.slot_id).unwrap(), vec![4]);
+    }
+
+    #[test]
+    fn held_surface_is_never_restaged_until_released() {
+        let registry = FakeSurfaceRegistry::default();
+        let mut producer = producer(&registry, 2, 4, PoolExhaustionPolicy::default());
+
+        let first = publish_cursor(&mut producer, &[1], 1);
+        let page = map_consumer_page(&producer);
+        let entry = page.read_entry_for_cursor(first).unwrap();
+        assert_eq!(entry.slot_id, 0);
+        // The consumer acquires the surface (IOSurfaceIncrementUseCount
+        // stand-in).
+        registry.hold_surface(entry.pool_id, entry.slot_id);
+
+        // Publish well past both the live window and the pool rotation; the
+        // held slot 0 must never be staged into again.
+        for sequence in 2..=8 {
+            let cursor = publish_cursor(&mut producer, &[sequence as u8], sequence);
+            let published = producer.control_page().read_entry_for_cursor(cursor).unwrap();
+            assert_ne!(published.slot_id, 0, "held surface restaged at cursor {cursor}");
+        }
+        assert_eq!(registry.surface_bytes(entry.pool_id, 0).unwrap(), vec![1]);
+
+        // Released, the slot rejoins the rotation.
+        registry.release_surface(entry.pool_id, entry.slot_id);
+        let mut reused = false;
+        for sequence in 9..=12 {
+            let cursor = publish_cursor(&mut producer, &[sequence as u8], sequence);
+            let published = producer.control_page().read_entry_for_cursor(cursor).unwrap();
+            reused |= published.slot_id == 0;
+        }
+        assert!(reused, "released surface never rejoined the rotation");
+    }
+
+    #[test]
+    fn exhausted_pool_drops_frames_and_accounts_the_gap() {
+        let registry = FakeSurfaceRegistry::default();
+        let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::DropFrame);
+
+        let pool_id = {
+            let cursor = publish_cursor(&mut producer, &[1], 1);
+            producer.control_page().read_entry_for_cursor(cursor).unwrap().pool_id
+        };
+        // Consumers hold every surface.
+        for slot_id in 0..3 {
+            registry.hold_surface(pool_id, slot_id);
+        }
+
+        assert_eq!(producer.publish(&frame(&[2]), 2).unwrap(), PublishOutcome::Dropped);
+        assert_eq!(producer.publish(&frame(&[3]), 3).unwrap(), PublishOutcome::Dropped);
+
+        // Releases make surfaces eligible again; the next publish carries the
+        // gap. The cursor only advances on publishes while the sequence also
+        // counts the dropped frames, so the gap stays visible to consumers.
+        registry.release_surface(pool_id, 1);
+        registry.release_surface(pool_id, 2);
+        let cursor = producer.publish(&frame(&[4]), 4).unwrap().cursor().unwrap();
+        let entry = producer.control_page().read_entry_for_cursor(cursor).unwrap();
+        assert_eq!(cursor, 2);
+        assert_eq!(entry.sequence, 4);
+        assert_eq!(entry.dropped_before_publish, 2);
+        assert_eq!(entry.producer_drop_count, 2);
+
+        // The gap is reported once, not re-reported.
+        let cursor = publish_cursor(&mut producer, &[5], 5);
+        let entry = producer.control_page().read_entry_for_cursor(cursor).unwrap();
+        assert_eq!(entry.dropped_before_publish, 0);
+        assert_eq!(entry.producer_drop_count, 2);
+    }
+
+    #[test]
+    fn exhausted_pool_fails_without_consuming_the_frame_under_fail_policy() {
+        let registry = FakeSurfaceRegistry::default();
+        let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::Fail);
+
+        let pool_id = {
+            let cursor = publish_cursor(&mut producer, &[1], 1);
+            producer.control_page().read_entry_for_cursor(cursor).unwrap().pool_id
+        };
+        for slot_id in 0..3 {
+            registry.hold_surface(pool_id, slot_id);
+        }
+
+        let error = producer.publish(&frame(&[2]), 2).unwrap_err();
+        assert_eq!(error, CaptureTransferError::SurfacePoolExhausted { slot_count: 3 });
+
+        // Nothing was consumed: after a release the same frame publishes with
+        // no gap recorded.
+        registry.release_surface(pool_id, 1);
+        let cursor = producer.publish(&frame(&[2]), 2).unwrap().cursor().unwrap();
+        let entry = producer.control_page().read_entry_for_cursor(cursor).unwrap();
+        assert_eq!(entry.sequence, 2);
+        assert_eq!(entry.dropped_before_publish, 0);
+        assert_eq!(entry.producer_drop_count, 0);
     }
 
     #[test]
     fn lapped_native_consumer_detects_lap_and_resyncs_to_latest() {
         let registry = FakeSurfaceRegistry::default();
-        let mut producer = producer(&registry, 2);
+        let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::default());
 
-        let first_cursor = producer.publish(&FakeCapturedFrame { bytes: vec![1] }, 1).unwrap();
-        producer.publish(&FakeCapturedFrame { bytes: vec![2] }, 2).unwrap();
-        producer.publish(&FakeCapturedFrame { bytes: vec![3] }, 3).unwrap();
+        let first_cursor = publish_cursor(&mut producer, &[1], 1);
+        publish_cursor(&mut producer, &[2], 2);
+        publish_cursor(&mut producer, &[3], 3);
 
         let page = map_consumer_page(&producer);
         assert_eq!(
@@ -465,8 +800,8 @@ mod tests {
     #[test]
     fn native_consumer_double_read_rejects_torn_slot() {
         let registry = FakeSurfaceRegistry::default();
-        let mut producer = producer(&registry, 2);
-        let cursor = producer.publish(&FakeCapturedFrame { bytes: vec![1] }, 1).unwrap();
+        let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::default());
+        let cursor = publish_cursor(&mut producer, &[1], 1);
 
         // Simulate a producer mid-rewrite of the slot under the reader.
         producer.control_page().set_slot_publication_sequence_for_test(0, 0);

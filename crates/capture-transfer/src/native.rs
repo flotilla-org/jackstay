@@ -15,6 +15,8 @@
 //! cursors are advisory.
 
 pub mod attach;
+#[cfg(all(target_os = "macos", feature = "backend-macos"))]
+pub mod macos;
 
 use std::os::fd::OwnedFd;
 
@@ -81,8 +83,12 @@ impl PublishOutcome {
 ///
 /// Implementations own the process-local surface and fence objects; everything
 /// that crosses a process boundary is either a plain id carried in ring slots
-/// (`pool_id`, `slot_id`, `fence_value`) or an opaque blob carried by the
-/// setup channel (the serialized surface and sync handles).
+/// (`pool_id`, `slot_id`, `fence_value`) or a transferable handle carried by
+/// the setup channel. Handles are typed, not byte blobs: real platform
+/// handles refuse byte serialization (an IOSurface or `MTLSharedEventHandle`
+/// crosses only a live XPC connection as an object; a dmabuf is an fd that
+/// crosses only via SCM_RIGHTS), so only the platform transport knows how to
+/// move them — the protocol just says *what* moves and *when*.
 ///
 /// Slot *selection* is not the backend's job: the neutral core picks an
 /// eligible slot (use count zero, outside the ring's live window) and the
@@ -94,6 +100,13 @@ pub trait NativeFrameBackend {
     type SurfacePool;
     /// The stream's timeline fence (e.g. MTLSharedEvent).
     type Fence;
+    /// One pool surface as the setup-channel transport transfers it (a
+    /// retained IOSurface on macOS, a dmabuf fd on Linux, bytes in the fake).
+    type SurfaceHandle;
+    /// The fence as the setup-channel transport transfers it (an
+    /// `MTLSharedEventHandle` on macOS, a syncobj fd on Linux, bytes in the
+    /// fake).
+    type SyncHandle;
 
     /// The payload kind frames staged by this backend publish as.
     fn payload_kind(&self) -> PayloadKind;
@@ -115,10 +128,9 @@ pub trait NativeFrameBackend {
     /// window. Zero-copy backends may adopt the captured surface directly.
     fn stage_frame(&mut self, pool: &mut Self::SurfacePool, slot_id: u32, frame: &Self::CapturedFrame) -> Result<()>;
 
-    /// Serialize each pool surface handle for setup-channel transfer (one
-    /// entry per slot; on macOS an XPC-encodable IOSurface reference, opaque
-    /// bytes at this layer).
-    fn serialize_surface_handles(&self, pool: &Self::SurfacePool) -> Result<Vec<Vec<u8>>>;
+    /// Export each pool surface for setup-channel transfer, one entry per
+    /// slot, indexed by `slot_id`.
+    fn export_surface_handles(&self, pool: &Self::SurfacePool) -> Result<Vec<Self::SurfaceHandle>>;
 
     /// Create the stream's timeline fence.
     fn create_fence(&mut self) -> Result<Self::Fence>;
@@ -132,9 +144,8 @@ pub trait NativeFrameBackend {
     /// must be monotonic.
     fn signal_fence(&mut self, fence: &mut Self::Fence, value: u64) -> Result<()>;
 
-    /// Serialize the fence handle for setup-channel transfer (on macOS an
-    /// NSXPCCoder-encoded MTLSharedEventHandle; opaque bytes at this layer).
-    fn serialize_sync_handle(&self, fence: &Self::Fence) -> Result<Vec<u8>>;
+    /// Export the fence for setup-channel transfer.
+    fn export_sync_handle(&self, fence: &Self::Fence) -> Result<Self::SyncHandle>;
 }
 
 /// Publishes native frames from a [`NativeFrameBackend`] through a jackstay
@@ -307,7 +318,7 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
     /// transferred exactly once at attach: the ring mapping, the pool's
     /// surface handles, and the serialized sync handle. Steady state after
     /// this is shared-memory only.
-    pub fn grant_attach(&mut self, consumer_id: u64) -> Result<AttachGrant> {
+    pub fn grant_attach(&mut self, consumer_id: u64) -> Result<AttachGrant<B::SurfaceHandle, B::SyncHandle>> {
         let consumer_slot = self.page.register_consumer_cursor(consumer_id)? as u64;
         Ok(AttachGrant {
             consumer_id,
@@ -316,9 +327,9 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
             ring_map_len: self.page.mapped_len() as u64,
             pool_id: self.backend.pool_id(&self.pool),
             pool_slot_count: self.pool_slot_count,
-            surface_handles: self.backend.serialize_surface_handles(&self.pool)?,
+            surface_handles: self.backend.export_surface_handles(&self.pool)?,
             fence_id: self.backend.fence_id(&self.fence),
-            sync_handle: self.backend.serialize_sync_handle(&self.fence)?,
+            sync_handle: self.backend.export_sync_handle(&self.fence)?,
         })
     }
 
@@ -332,9 +343,9 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
         self.page.mapped_len()
     }
 
-    /// The setup-channel blob a consumer deserializes into its fence handle.
-    pub fn serialized_sync_handle(&self) -> Result<Vec<u8>> {
-        self.backend.serialize_sync_handle(&self.fence)
+    /// The fence handle a consumer resolves on its side of the setup channel.
+    pub fn export_sync_handle(&self) -> Result<B::SyncHandle> {
+        self.backend.export_sync_handle(&self.fence)
     }
 
     #[must_use]
@@ -458,6 +469,11 @@ pub mod fake {
         type CapturedFrame = FakeCapturedFrame;
         type SurfacePool = FakeSurfacePool;
         type Fence = FakeFence;
+        // The fake's handles really are bytes: its "OS namespace" is the
+        // shared registry, so a handle only needs to name (pool, slot) / a
+        // fence id within it.
+        type SurfaceHandle = Vec<u8>;
+        type SyncHandle = Vec<u8>;
 
         fn payload_kind(&self) -> PayloadKind {
             // The fake mimics the macOS backend: surface ids resolve through
@@ -498,7 +514,7 @@ pub mod fake {
             Ok(())
         }
 
-        fn serialize_surface_handles(&self, pool: &FakeSurfacePool) -> Result<Vec<Vec<u8>>> {
+        fn export_surface_handles(&self, pool: &FakeSurfacePool) -> Result<Vec<Vec<u8>>> {
             let inner = pool.inner.lock().expect("fake surface pool poisoned");
             Ok((0..inner.slots.len() as u32)
                 .map(|slot_id| {
@@ -537,7 +553,7 @@ pub mod fake {
             Ok(())
         }
 
-        fn serialize_sync_handle(&self, fence: &FakeFence) -> Result<Vec<u8>> {
+        fn export_sync_handle(&self, fence: &FakeFence) -> Result<Vec<u8>> {
             Ok(fence.fence_id.to_le_bytes().to_vec())
         }
     }
@@ -640,9 +656,9 @@ mod tests {
         assert_eq!(entry.pixel_format, PixelFormat::Bgra8Unorm as u32);
         assert_eq!(entry.color_space, ColorSpace::Srgb as u32);
 
-        // Sync: the setup-channel blob names the same fence the ring does,
+        // Sync: the setup-channel handle names the same fence the ring does,
         // and the timeline has reached the frame's value.
-        let handle = producer.serialized_sync_handle().unwrap();
+        let handle = producer.export_sync_handle().unwrap();
         let fence_id = u64::from_le_bytes(handle.as_slice().try_into().unwrap());
         assert_eq!(fence_id, entry.fence_id);
         assert!(registry.fence_value(entry.fence_id).unwrap() >= entry.fence_value);

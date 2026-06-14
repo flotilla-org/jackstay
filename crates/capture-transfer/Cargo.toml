@@ -9,6 +9,15 @@ repository.workspace = true
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# The real macOS NativeFrameBackend (IOSurface + Metal). A feature rather
+# than bare cfg(target_os) so mac builds that only need the CPU path skip
+# the Metal/IOSurface linkage; the crate split is deferred (#84).
+backend-macos = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
 [dependencies]
 libc = "0.2"
 serde = { workspace = true }

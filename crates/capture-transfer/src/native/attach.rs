@@ -32,18 +32,28 @@ pub enum AttachRequest {
     Attach { consumer_id: u64 },
 }
 
-/// A producer-to-consumer response on the setup channel.
+/// A producer-to-consumer response on the setup channel, generic over the
+/// backend's transferable handle types.
 #[derive(Debug)]
-pub enum AttachResponse {
+pub enum AttachResponse<S, Y> {
     Authorized,
-    Granted(Box<AttachGrant>),
+    Granted(Box<AttachGrant<S, Y>>),
 }
 
 /// Everything a consumer needs, transferred once. After this message the
 /// consumer maps the ring, resolves its surface and fence handles, and never
 /// touches the setup channel again in steady state.
+///
+/// `S` and `Y` are the backend's [`SurfaceHandle`] and [`SyncHandle`] types.
+/// They are typed, not byte blobs, because real platform handles refuse byte
+/// serialization (IOSurface / `MTLSharedEventHandle` cross only a live XPC
+/// connection; a dmabuf fd crosses only via SCM_RIGHTS) — the transport that
+/// carries this grant is the one thing that knows how to move them.
+///
+/// [`SurfaceHandle`]: crate::native::NativeFrameBackend::SurfaceHandle
+/// [`SyncHandle`]: crate::native::NativeFrameBackend::SyncHandle
 #[derive(Debug)]
-pub struct AttachGrant {
+pub struct AttachGrant<S, Y> {
     pub consumer_id: u64,
     /// The consumer-cursor table slot assigned to this consumer.
     pub consumer_slot: u64,
@@ -52,14 +62,10 @@ pub struct AttachGrant {
     pub ring_map_len: u64,
     pub pool_id: u64,
     pub pool_slot_count: u32,
-    /// One serialized surface handle per pool slot, indexed by `slot_id`.
-    /// Opaque to the protocol; the transport and backend agree on the
-    /// encoding (e.g. XPC-encodable IOSurface references on macOS).
-    pub surface_handles: Vec<Vec<u8>>,
+    /// One surface handle per pool slot, indexed by `slot_id`.
+    pub surface_handles: Vec<S>,
     pub fence_id: u64,
-    /// The serialized sync handle (e.g. an NSXPCCoder-encoded
-    /// MTLSharedEventHandle on macOS).
-    pub sync_handle: Vec<u8>,
+    pub sync_handle: Y,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -120,7 +126,7 @@ impl AttachEndpoint {
         session: &mut AttachSession,
         producer: &mut NativeTrackProducer<B>,
         request: AttachRequest,
-    ) -> Result<AttachResponse, AttachError> {
+    ) -> Result<AttachResponse<B::SurfaceHandle, B::SyncHandle>, AttachError> {
         match request {
             AttachRequest::Authorize { bearer_token } => {
                 match &self.expected_bearer {
@@ -211,14 +217,18 @@ mod tests {
             &mut self,
             producer: &mut NativeTrackProducer<FakeNativeBackend>,
             request: AttachRequest,
-        ) -> Result<AttachResponse, AttachError> {
+        ) -> Result<AttachResponse<Vec<u8>, Vec<u8>>, AttachError> {
             // One request and one response (or error) cross the channel.
             self.messages += 2;
             self.endpoint.handle(&mut self.session, producer, request)
         }
     }
 
-    fn attach(transport: &mut FakeTransport, producer: &mut NativeTrackProducer<FakeNativeBackend>, consumer_id: u64) -> AttachGrant {
+    fn attach(
+        transport: &mut FakeTransport,
+        producer: &mut NativeTrackProducer<FakeNativeBackend>,
+        consumer_id: u64,
+    ) -> AttachGrant<Vec<u8>, Vec<u8>> {
         match transport.request(producer, AttachRequest::Attach { consumer_id }) {
             Ok(AttachResponse::Granted(grant)) => *grant,
             other => panic!("attach not granted: {other:?}"),

@@ -95,3 +95,37 @@ The same flow is available as a bounded smoke test:
 ```sh
 ./scripts/manual-capture-transfer-smoke.sh --frames 300
 ```
+
+## Native (IOSurface/Metal) capture
+
+On macOS the viewer also has a native present path: it attaches to a native
+capture session over XPC, latches the received `IOSurface` into an
+`MTLTexture` zero-copy, GPU-waits on the per-frame `MTLSharedEvent` value
+before sampling, and presents — no pixel readback. This needs the library
+built with the `backend-macos` feature so the `ft_native_*` symbols are
+present, and `portholed` running from `Porthole.app` under launchd so it owns
+the `work.flotilla.porthole.attach` mach service:
+
+```sh
+cargo build -p capture-transfer --features backend-macos --locked
+cmake -S tools/capture-viewer-sdl -B target/capture-viewer-sdl \
+  -DCAPTURE_TRANSFER_LIB="$PWD/target/debug/libcapture_transfer.dylib"
+cmake --build target/capture-viewer-sdl
+
+surface_id="$(porthole attach --frontmost --json | jq -r .surface_id)"
+descriptor="$(porthole capture-session surface "$surface_id" --native)"
+mach_service="$(printf '%s\n' "$descriptor" | awk '/^mach_service:/ { print $2 }')"
+attach_token="$(printf '%s\n' "$descriptor" | awk '/^attach_token:/ { print $2 }')"
+
+target/capture-viewer-sdl/capture-viewer-sdl \
+  --native --mach-service "$mach_service" --token "$attach_token"
+```
+
+The bounded smoke test for this path:
+
+```sh
+./scripts/manual-native-viewer-smoke.sh --frames 600
+```
+
+Scope: one native session at a time (launchd permits a single listener per
+mach-service name).

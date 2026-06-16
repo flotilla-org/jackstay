@@ -195,6 +195,72 @@ ft_status ft_consumer_acquire_latest_video_frame(ft_consumer *consumer,
 void ft_consumer_release_video_frame(ft_consumer *consumer, ft_video_frame *frame);
 void ft_consumer_destroy(ft_consumer *consumer);
 
+/*
+ * Native handle path (macOS, backend-macos builds only).
+ *
+ * The consumer connects to a jackstay XPC attach service, receives a one-time
+ * grant (ring fd + IOSurfaces + MTLSharedEventHandle), and reads the ring's
+ * latest descriptor. The viewer does its own Metal: take the raw IOSurfaceRefs
+ * and the raw MTLSharedEventHandle from the grant, resolve the handle into an
+ * MTLSharedEvent on your own MTLDevice, and on each frame encode a GPU wait for
+ * fence_value (encodeWaitForEvent:value:) before sampling surfaces[slot_id].
+ *
+ * Lifetime: ft_native_grant.surfaces and .sync_handle are BORROWED — owned by
+ * the ft_native_attach and valid only until ft_native_attach_destroy. Textures
+ * and the shared event you build from them hold their own retains and survive,
+ * but do not dereference the raw grant pointers after destroy.
+ *
+ * These symbols are present only in a macOS backend-macos build of the library.
+ */
+typedef struct ft_native_attach ft_native_attach;
+
+typedef struct ft_native_grant {
+  uint64_t consumer_id;
+  uint64_t consumer_slot;
+  uint64_t pool_id;             /* unique forever; never reused */
+  uint64_t fence_id;            /* names the stream's MTLSharedEvent */
+  void *const *surfaces;        /* IOSurfaceRef[pool_slot_count], borrowed */
+  void *sync_handle;            /* MTLSharedEventHandle, borrowed */
+  uint32_t pool_slot_count;
+} ft_native_grant;
+
+typedef struct ft_native_frame {
+  uint64_t cursor;
+  uint64_t sequence;
+  uint64_t timestamp_ns;
+  uint64_t fence_value;         /* GPU-wait this on the fence before sampling */
+  uint64_t fence_id;
+  uint32_t width;
+  uint32_t height;
+  uint32_t pixel_format;
+  uint32_t slot_id;             /* index into grant.surfaces */
+  uint32_t flags;
+} ft_native_frame;
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+/* Pin the native ABI; mirror is the #[repr(C)] block in src/ffi_native.rs. */
+_Static_assert(sizeof(ft_native_grant) == 56, "native grant size");
+_Static_assert(offsetof(ft_native_grant, surfaces) == 32, "native grant packing");
+_Static_assert(offsetof(ft_native_grant, sync_handle) == 40, "native grant packing");
+_Static_assert(offsetof(ft_native_grant, pool_slot_count) == 48, "native grant packing");
+_Static_assert(sizeof(ft_native_frame) == 64, "native frame size");
+_Static_assert(offsetof(ft_native_frame, width) == 40, "native frame packing");
+_Static_assert(offsetof(ft_native_frame, slot_id) == 52, "native frame packing");
+_Static_assert(offsetof(ft_native_frame, flags) == 56, "native frame packing");
+#endif
+
+/* mach_service_name: the launchd MachServices name to look up. bearer_token:
+ * NULL for an unauthenticated service, else the session's attach secret. */
+ft_status ft_native_attach_connect(const char *mach_service_name,
+                                   const char *bearer_token,
+                                   uint64_t consumer_id,
+                                   ft_native_attach **out);
+ft_status ft_native_attach_grant(const ft_native_attach *attach, ft_native_grant *out_grant);
+/* FT_STATUS_EMPTY when the ring has no frame yet; FT_STATUS_ERROR on a read
+ * fault. Always returns the newest published frame (drop-to-latest). */
+ft_status ft_native_read_latest(const ft_native_attach *attach, ft_native_frame *out_frame);
+void ft_native_attach_destroy(ft_native_attach *attach);
+
 #ifdef __cplusplus
 }
 #endif

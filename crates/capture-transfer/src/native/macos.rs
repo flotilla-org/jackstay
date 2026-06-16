@@ -84,6 +84,17 @@ mod ffi {
         ) -> *mut c_char;
         pub fn porthole_native_stage_commit(stage: *mut c_void, event: *mut c_void, value: u64) -> *mut c_char;
         pub fn porthole_native_stage_destroy(stage: *mut c_void);
+
+        pub fn porthole_native_consumer_sample(
+            metal: *mut c_void,
+            event: *mut c_void,
+            fence_value: u64,
+            src_surface: *mut c_void,
+            width: u32,
+            height: u32,
+            out_pixels: *mut u8,
+            out_len: usize,
+        ) -> *mut c_char;
     }
 }
 
@@ -508,7 +519,11 @@ impl ConsumerFence {
         })
     }
 
-    /// Block until the timeline reaches `value`; false on timeout.
+    /// Block until the timeline reaches `value`; false on timeout. This is a
+    /// CPU wait, for tests and diagnostics — a real viewer GPU-waits on the
+    /// fence by encoding the wait on its present command buffer (see
+    /// [`Self::sample_offscreen`] and the C viewer's Metal path) so sampling
+    /// is gated GPU-side without blocking a thread.
     #[must_use]
     pub fn wait(&self, value: u64, timeout_ms: u64) -> bool {
         unsafe { ffi::porthole_native_event_wait(self.raw.as_ptr(), value, timeout_ms) != 0 }
@@ -517,6 +532,38 @@ impl ConsumerFence {
     #[must_use]
     pub fn signaled_value(&self) -> u64 {
         unsafe { ffi::porthole_native_event_signaled_value(self.raw.as_ptr()) }
+    }
+
+    /// The consumer present path, rendered to an offscreen readback buffer so
+    /// it is testable without a display: latch `surface` into a texture on
+    /// `metal`, GPU-wait for `fence_value` on this fence, blit, and read back
+    /// `width * height * 4` BGRA8 bytes. No CPU fence wait — the GPU-encoded
+    /// wait is what orders the sample after the producer's staging blit.
+    ///
+    /// `metal` must be the same device this fence was resolved against in
+    /// [`Self::from_handle`]; the event belongs to that device.
+    pub fn sample_offscreen(
+        &self,
+        metal: &MetalContext,
+        surface: &IoSurface,
+        fence_value: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>> {
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        check("consumer-sample", unsafe {
+            ffi::porthole_native_consumer_sample(
+                metal.raw.as_ptr(),
+                self.raw.as_ptr(),
+                fence_value,
+                surface.as_raw(),
+                width,
+                height,
+                pixels.as_mut_ptr(),
+                pixels.len(),
+            )
+        })?;
+        Ok(pixels)
     }
 }
 
@@ -585,6 +632,31 @@ mod tests {
         let mut pixels = vec![0u8; WIDTH as usize * HEIGHT as usize * 4];
         surface.read_pixels(&mut pixels).unwrap();
         assert_eq!(pixels, gradient(7), "blitted pixels do not match the captured frame");
+    }
+
+    #[test]
+    fn consumer_gpu_sample_is_zero_copy_and_fence_ordered() {
+        let mut producer = producer();
+        let grant = producer.grant_attach(1).unwrap();
+
+        // The producer signals the fence on the same command buffer as its
+        // staging blit (#84), so the timeline only reaches fence_value once
+        // the pool surface actually holds these pixels.
+        producer.publish(&captured(9), 1).unwrap();
+        let entry = producer.control_page().read_latest_lossy_entry().unwrap().unwrap();
+
+        // A consumer with its OWN device, as a real viewer has. Resolve the
+        // transferred handle and GPU-sample the slot surface with NO CPU
+        // fence wait: the GPU-encoded encodeWaitForEvent is the only thing
+        // ordering the sample after the producer's blit. Correct pixels prove
+        // both the zero-copy IOSurface latch and the GPU ordering.
+        let metal = MetalContext::new().unwrap();
+        let fence = ConsumerFence::from_handle(&metal, &grant.sync_handle).unwrap();
+        let surface = &grant.surface_handles[entry.slot_id as usize];
+        let sampled = fence
+            .sample_offscreen(&metal, surface, entry.fence_value, entry.width, entry.height)
+            .unwrap();
+        assert_eq!(sampled, gradient(9), "GPU-sampled pixels do not match the published frame");
     }
 
     #[test]

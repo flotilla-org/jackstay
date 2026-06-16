@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "capture_transfer.h"
+#include "metal_present.h"
 
 enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4 };
 
@@ -12,6 +13,9 @@ typedef struct viewer_options {
   int max_frames;
   const char *porthole_socket;
   const char *session_id;
+  int native;
+  const char *mach_service;
+  const char *token;
 } viewer_options;
 
 typedef struct stream_state {
@@ -38,8 +42,12 @@ static void fill_frame(uint8_t *pixels, uint64_t sequence) {
 
 static viewer_options parse_options(int argc, char **argv) {
   viewer_options options = {0};
-  for (int i = 1; i + 1 < argc; i++) {
-    if (strcmp(argv[i], "--frames") == 0) {
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--native") == 0) {
+      options.native = 1;
+    } else if (i + 1 >= argc) {
+      continue;
+    } else if (strcmp(argv[i], "--frames") == 0) {
       options.max_frames = atoi(argv[i + 1]);
       i++;
     } else if (strcmp(argv[i], "--porthole-socket") == 0) {
@@ -47,6 +55,12 @@ static viewer_options parse_options(int argc, char **argv) {
       i++;
     } else if (strcmp(argv[i], "--session-id") == 0) {
       options.session_id = argv[i + 1];
+      i++;
+    } else if (strcmp(argv[i], "--mach-service") == 0) {
+      options.mach_service = argv[i + 1];
+      i++;
+    } else if (strcmp(argv[i], "--token") == 0) {
+      options.token = argv[i + 1];
       i++;
     }
   }
@@ -61,8 +75,96 @@ static int require_ok(ft_status status, const char *operation) {
   return 1;
 }
 
+// The native (IOSurface/Metal) path: attach over XPC, then present each frame
+// zero-copy with a GPU fence wait. Consumer ordering per jackstay_ring.h:
+// load-acquire the latest descriptor -> GPU-wait the fence value -> sample the
+// surface. Drop-to-latest (ft_native_read_latest always returns the newest)
+// resyncs a lapped viewer without stalling the producer; a stalled/absent
+// frame shows a placeholder so producer death does not crash the viewer.
+static int run_native(const viewer_options *options) {
+  if (options->mach_service == NULL) {
+    fprintf(stderr, "--native requires --mach-service <name> (and usually --token <secret>)\n");
+    return 1;
+  }
+
+  // One viewer, one session (the daemon vends a single native session today);
+  // a fixed consumer id is sufficient.
+  enum { VIEWER_CONSUMER_ID = 1 };
+  ft_native_attach *attach = NULL;
+  if (require_ok(ft_native_attach_connect(options->mach_service, options->token, VIEWER_CONSUMER_ID, &attach),
+                 "ft_native_attach_connect")) {
+    return 1;
+  }
+  ft_native_grant grant = {0};
+  if (require_ok(ft_native_attach_grant(attach, &grant), "ft_native_attach_grant")) {
+    ft_native_attach_destroy(attach);
+    return 1;
+  }
+
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+    ft_native_attach_destroy(attach);
+    return 1;
+  }
+  SDL_Window *window = SDL_CreateWindow("capture-viewer-sdl (native)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH,
+                                        HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE);
+  SDL_MetalView view = window != NULL ? SDL_Metal_CreateView(window) : NULL;
+  void *layer = view != NULL ? SDL_Metal_GetLayer(view) : NULL;
+  mp_presenter *presenter = layer != NULL ? mp_create(layer, grant.sync_handle) : NULL;
+  if (presenter == NULL) {
+    fprintf(stderr, "native present setup failed: %s\n", SDL_GetError());
+    if (view != NULL) {
+      SDL_Metal_DestroyView(view);
+    }
+    if (window != NULL) {
+      SDL_DestroyWindow(window);
+    }
+    SDL_Quit();
+    ft_native_attach_destroy(attach);
+    return 1;
+  }
+
+  int running = 1;
+  int presented = 0;
+  while (running && (options->max_frames <= 0 || presented < options->max_frames)) {
+    SDL_Event sdl_event;
+    while (SDL_PollEvent(&sdl_event)) {
+      if (sdl_event.type == SDL_QUIT) {
+        running = 0;
+      }
+    }
+
+    ft_native_frame frame = {0};
+    ft_status status = ft_native_read_latest(attach, &frame);
+    if (status == FT_STATUS_OK) {
+      if (frame.slot_id < grant.pool_slot_count) {
+        void *surface = grant.surfaces[frame.slot_id];
+        if (mp_present(presenter, surface, frame.fence_value, frame.width, frame.height) == 0) {
+          presented++;
+        }
+      }
+    } else {
+      // EMPTY (no frame yet) or a read fault / gone producer: hold the window
+      // alive with a placeholder and keep polling for (re)connection.
+      mp_present_placeholder(presenter);
+    }
+    SDL_Delay(16);
+  }
+
+  mp_destroy(presenter);
+  SDL_Metal_DestroyView(view);
+  SDL_DestroyWindow(window);
+  SDL_Quit();
+  ft_native_attach_destroy(attach);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   viewer_options options = parse_options(argc, argv);
+
+  if (options.native) {
+    return run_native(&options);
+  }
 
   stream_state stream = {
       .producer = NULL,

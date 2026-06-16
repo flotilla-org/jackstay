@@ -347,3 +347,69 @@ char *porthole_native_stage_commit(void *stagePtr, void *eventPtr, uint64_t valu
 void porthole_native_stage_destroy(void *stagePtr) {
   (void)(__bridge_transfer PortholeNativeStage *)stagePtr;
 }
+
+// ---- Consumer GPU-ordered sample (the viewer's present, to a readback) -------
+
+// Mirrors what a viewer does to present a native frame, but blits into an
+// offscreen shared texture and reads it back so the path is testable without
+// a display. The ordering is the whole point: the consumer command buffer
+// GPU-waits for `fenceValue` on `eventPtr` (the consumer device's resolution
+// of the producer's MTLSharedEventHandle) BEFORE the blit samples the
+// surface, so the readback can only observe pixels the producer's staging
+// blit already finished. There is no CPU fence wait; waitUntilCompleted here
+// is test synchronization for the readback, not the frame fence.
+//
+// `metalPtr` is the consumer's own device (distinct from the producer's, as
+// in a real viewer); `srcSurfacePtr` is a borrowed IOSurfaceRef; `outPixels`
+// must hold width*height*4 bytes (BGRA8).
+char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t fenceValue, void *srcSurfacePtr,
+                                      uint32_t width, uint32_t height, uint8_t *outPixels, size_t outLen) {
+  PortholeNativeMetal *metal = (__bridge PortholeNativeMetal *)metalPtr;
+  id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
+  IOSurfaceRef src = (IOSurfaceRef)srcSurfacePtr;
+  size_t wanted = (size_t)width * (size_t)height * 4;
+  if (outLen < wanted) {
+    return porthole_native_copy_error(
+        [NSString stringWithFormat:@"readback buffer is %zu bytes; sample needs %zu", outLen, wanted]);
+  }
+
+  MTLTextureDescriptor *descriptor =
+      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                         width:width
+                                                        height:height
+                                                     mipmapped:NO];
+  descriptor.usage = MTLTextureUsageShaderRead;
+  descriptor.storageMode = MTLStorageModeShared;
+  // Zero-copy latch of the received surface into a texture on our device.
+  id<MTLTexture> srcTexture = [metal.device newTextureWithDescriptor:descriptor iosurface:src plane:0];
+  if (srcTexture == nil) {
+    return porthole_native_copy_error(@"Metal texture creation failed for received surface");
+  }
+  id<MTLTexture> offscreen = [metal.device newTextureWithDescriptor:descriptor];
+  if (offscreen == nil) {
+    return porthole_native_copy_error(@"offscreen texture creation failed");
+  }
+
+  id<MTLCommandBuffer> commandBuffer = [metal.queue commandBuffer];
+  if (commandBuffer == nil) {
+    return porthole_native_copy_error(@"failed to create consumer command buffer");
+  }
+  // GPU-side wait: nothing in this buffer samples the surface until the
+  // producer's timeline reaches fenceValue.
+  [commandBuffer encodeWaitForEvent:event value:fenceValue];
+  id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+  [blit copyFromTexture:srcTexture toTexture:offscreen];
+  [blit endEncoding];
+  [commandBuffer commit];
+  [commandBuffer waitUntilCompleted];
+
+  if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+    return porthole_native_copy_error(
+        [NSString stringWithFormat:@"consumer command buffer failed (status %ld)", (long)commandBuffer.status]);
+  }
+  [offscreen getBytes:outPixels
+          bytesPerRow:(NSUInteger)width * 4
+           fromRegion:MTLRegionMake2D(0, 0, width, height)
+          mipmapLevel:0];
+  return NULL;
+}

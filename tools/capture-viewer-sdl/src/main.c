@@ -1,4 +1,5 @@
 #include <SDL.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,14 +8,15 @@
 #include "capture_transfer.h"
 #include "metal_present.h"
 
-enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4 };
+enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4, MAX_NATIVE_POOLS = 16 };
 
 typedef struct viewer_options {
   int max_frames;
   const char *porthole_socket;
   const char *session_id;
   int native;
-  const char *mach_service;
+  uint32_t transport_kind;
+  const char *endpoint;
   const char *token;
 } viewer_options;
 
@@ -27,6 +29,11 @@ typedef struct stream_state {
   uint32_t stride;
   int daemon_mode;
 } stream_state;
+
+typedef struct native_pool_cache {
+  ft_native_pool pools[MAX_NATIVE_POOLS];
+  uint32_t count;
+} native_pool_cache;
 
 static void fill_frame(uint8_t *pixels, uint64_t sequence) {
   for (uint32_t y = 0; y < HEIGHT; y++) {
@@ -57,7 +64,14 @@ static viewer_options parse_options(int argc, char **argv) {
       options.session_id = argv[i + 1];
       i++;
     } else if (strcmp(argv[i], "--mach-service") == 0) {
-      options.mach_service = argv[i + 1];
+      options.transport_kind = FT_NATIVE_ATTACH_TRANSPORT_MACOS_XPC;
+      options.endpoint = argv[i + 1];
+      i++;
+    } else if (strcmp(argv[i], "--transport-kind") == 0) {
+      options.transport_kind = (uint32_t)atoi(argv[i + 1]);
+      i++;
+    } else if (strcmp(argv[i], "--endpoint") == 0) {
+      options.endpoint = argv[i + 1];
       i++;
     } else if (strcmp(argv[i], "--token") == 0) {
       options.token = argv[i + 1];
@@ -75,30 +89,91 @@ static int require_ok(ft_status status, const char *operation) {
   return 1;
 }
 
-// The native (IOSurface/Metal) path: attach over XPC, then present each frame
-// zero-copy with a GPU fence wait. Consumer ordering per jackstay_ring.h:
-// load-acquire the latest descriptor -> GPU-wait the fence value -> sample the
-// surface. Drop-to-latest (ft_native_read_latest always returns the newest)
-// resyncs a lapped viewer without stalling the producer; a stalled/absent
-// frame shows a placeholder so producer death does not crash the viewer.
+static const ft_native_pool *native_pool_find(const native_pool_cache *cache, uint64_t pool_id) {
+  for (uint32_t i = 0; i < cache->count; i++) {
+    if (cache->pools[i].pool_id == pool_id) {
+      return &cache->pools[i];
+    }
+  }
+  return NULL;
+}
+
+static int native_pool_cache_add(native_pool_cache *cache, ft_native_pool pool) {
+  if (native_pool_find(cache, pool.pool_id) != NULL) {
+    return 0;
+  }
+  if (cache->count >= MAX_NATIVE_POOLS) {
+    fprintf(stderr, "native pool cache full; cannot add pool %" PRIu64 "\n", pool.pool_id);
+    return 1;
+  }
+  cache->pools[cache->count++] = pool;
+  return 0;
+}
+
+static int native_poll_control_events(ft_native_attach *attach, native_pool_cache *cache) {
+  for (;;) {
+    ft_native_event event = {.struct_size = sizeof(ft_native_event)};
+    ft_status status = ft_native_poll_event(attach, &event);
+    if (status == FT_STATUS_EMPTY) {
+      return 0;
+    }
+    if (status != FT_STATUS_OK) {
+      fprintf(stderr, "ft_native_poll_event failed with status %d\n", status);
+      return 1;
+    }
+    if (event.kind == FT_NATIVE_EVENT_POOL_ADDED) {
+      ft_native_pool pool = {
+          .struct_size = sizeof(ft_native_pool),
+      };
+      ft_status pool_status = ft_native_get_pool(attach, event.pool_id, &pool);
+      if (pool_status != FT_STATUS_OK) {
+        fprintf(stderr, "ft_native_get_pool(%" PRIu64 ") failed with status %d\n", event.pool_id, pool_status);
+        return 1;
+      }
+      if (native_pool_cache_add(cache, pool)) {
+        return 1;
+      }
+    } else if (event.kind == FT_NATIVE_EVENT_PRODUCER_STOPPED) {
+      return 1;
+    }
+  }
+}
+
+// The native path: attach through the descriptor endpoint, then present each frame
+// zero-copy with a GPU fence wait. Consumer ordering: wait for a newer cursor,
+// acquire a frame lease, GPU-wait the producer fence, sample the surface, and
+// release the lease when presentation work is complete.
 static int run_native(const viewer_options *options) {
-  if (options->mach_service == NULL) {
-    fprintf(stderr, "--native requires --mach-service <name> (and usually --token <secret>)\n");
+  if (options->endpoint == NULL || options->transport_kind == 0) {
+    fprintf(stderr, "--native requires --transport-kind <kind> --endpoint <value> (and usually --token <secret>)\n");
     return 1;
   }
 
-  // One viewer, one session (the daemon vends a single native session today);
-  // a fixed consumer id is sufficient.
-  enum { VIEWER_CONSUMER_ID = 1 };
   ft_native_attach *attach = NULL;
-  if (require_ok(ft_native_attach_connect(options->mach_service, options->token, VIEWER_CONSUMER_ID, &attach),
-                 "ft_native_attach_connect")) {
+  ft_native_attach_descriptor descriptor = {
+      .struct_size = sizeof(ft_native_attach_descriptor),
+      .transport_kind = options->transport_kind,
+      .requested_consumer_id = 0,
+      .endpoint = options->endpoint,
+      .bearer_token = options->token,
+      .flags = 0,
+  };
+  if (require_ok(ft_native_attach_connect(&descriptor, &attach), "ft_native_attach_connect")) {
     return 1;
   }
-  ft_native_grant grant = {0};
+  ft_native_grant grant = {
+      .struct_size = sizeof(ft_native_grant),
+  };
   if (require_ok(ft_native_attach_grant(attach, &grant), "ft_native_attach_grant")) {
     ft_native_attach_destroy(attach);
     return 1;
+  }
+  native_pool_cache pools = {0};
+  for (uint32_t i = 0; i < grant.pool_count; i++) {
+    if (native_pool_cache_add(&pools, grant.pools[i])) {
+      ft_native_attach_destroy(attach);
+      return 1;
+    }
   }
 
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -110,7 +185,8 @@ static int run_native(const viewer_options *options) {
                                         HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE);
   SDL_MetalView view = window != NULL ? SDL_Metal_CreateView(window) : NULL;
   void *layer = view != NULL ? SDL_Metal_GetLayer(view) : NULL;
-  mp_presenter *presenter = layer != NULL ? mp_create(layer, grant.sync_handle) : NULL;
+  void *producer_sync = grant.producer_sync.sync_kind == FT_NATIVE_SYNC_MTL_SHARED_EVENT ? grant.producer_sync.handle.object : NULL;
+  mp_presenter *presenter = layer != NULL ? mp_create(layer, producer_sync) : NULL;
   if (presenter == NULL) {
     fprintf(stderr, "native present setup failed: %s\n", SDL_GetError());
     if (view != NULL) {
@@ -126,6 +202,7 @@ static int run_native(const viewer_options *options) {
 
   int running = 1;
   int presented = 0;
+  uint64_t last_cursor = 0;
   while (running && (options->max_frames <= 0 || presented < options->max_frames)) {
     SDL_Event sdl_event;
     while (SDL_PollEvent(&sdl_event)) {
@@ -133,22 +210,41 @@ static int run_native(const viewer_options *options) {
         running = 0;
       }
     }
+    if (native_poll_control_events(attach, &pools)) {
+      break;
+    }
 
-    ft_native_frame frame = {0};
-    ft_status status = ft_native_read_latest(attach, &frame);
+    uint64_t ready_cursor = 0;
+    ft_status wait_status = ft_native_wait_frame(attach, last_cursor, 16 * 1000 * 1000, &ready_cursor);
+    ft_native_frame frame = {
+        .struct_size = sizeof(ft_native_frame),
+    };
+    ft_status status = wait_status == FT_STATUS_OK ? ft_native_acquire_latest(attach, last_cursor, &frame) : wait_status;
     if (status == FT_STATUS_OK) {
-      if (frame.slot_id < grant.pool_slot_count) {
-        void *surface = grant.surfaces[frame.slot_id];
-        if (mp_present(presenter, surface, frame.fence_value, frame.width, frame.height) == 0) {
-          presented++;
+      const ft_native_pool *pool = native_pool_find(&pools, frame.pool_id);
+      if (pool != NULL && frame.slot_id < pool->surface_count) {
+        const ft_native_surface *surface = &pool->surfaces[frame.slot_id];
+        if (surface->handle_kind == FT_NATIVE_HANDLE_IOSURFACE) {
+          (void)mp_present(presenter, surface->object, frame.producer_sync_value, frame.width, frame.height);
         }
       }
+      last_cursor = frame.cursor;
+      presented++;
+      ft_native_release release = {
+          .struct_size = sizeof(ft_native_release),
+          .release_kind = FT_NATIVE_RELEASE_NOW,
+          .lease_id = frame.lease_id,
+          .release_sync_id = 0,
+          .release_value = 0,
+      };
+      ft_native_release_frame(attach, &release);
+    } else if (status == FT_STATUS_CLOSED) {
+      break;
     } else {
-      // EMPTY (no frame yet) or a read fault / gone producer: hold the window
-      // alive with a placeholder and keep polling for (re)connection.
+      // EMPTY/TIMEOUT (no frame yet) or a read fault / gone producer: hold the
+      // window alive with a placeholder and keep polling for (re)connection.
       mp_present_placeholder(presenter);
     }
-    SDL_Delay(16);
   }
 
   mp_destroy(presenter);

@@ -24,7 +24,7 @@ use std::{
 use crate::{
     error::{CaptureTransferError, Result},
     model::{PayloadKind, PixelFormat},
-    native::{NativeFrameBackend, NativeStreamParams},
+    native::{NativeFrameBackend, NativeStreamParams, SlotClaim, SlotReuseCandidate},
 };
 
 mod ffi {
@@ -421,11 +421,20 @@ impl NativeFrameBackend for MacosFrameBackend {
         pool.pool_id
     }
 
-    fn surface_use_count(&self, pool: &MacosSurfacePool, slot_id: u32) -> Result<u32> {
-        // IOSurfaceIsInUse is the cross-process signal (a global bool, not a
-        // count): any consumer hold, and any still-in-flight GPU work that
-        // references the surface, keeps it true — both correctly block reuse.
-        Ok(unsafe { ffi::porthole_native_pool_surface_in_use(pool.raw.as_ptr(), slot_id) } as u32)
+    fn claim_reusable_slot(&mut self, pool: &mut MacosSurfacePool, candidates: &[SlotReuseCandidate]) -> Result<SlotClaim> {
+        for candidate in candidates {
+            // IOSurfaceIsInUse is the cross-process signal (a global bool,
+            // not a count): any consumer hold, and any still-in-flight GPU
+            // work that references the surface, keeps it true — both
+            // correctly block reuse.
+            let in_use = unsafe { ffi::porthole_native_pool_surface_in_use(pool.raw.as_ptr(), candidate.slot_id) } != 0;
+            if !in_use {
+                return Ok(SlotClaim::Ready {
+                    slot_id: candidate.slot_id,
+                });
+            }
+        }
+        Ok(SlotClaim::WouldBlock)
     }
 
     fn stage_frame(&mut self, pool: &mut MacosSurfacePool, slot_id: u32, frame: &MacosCapturedFrame) -> Result<()> {

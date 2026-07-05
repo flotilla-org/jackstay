@@ -96,15 +96,17 @@ The same flow is available as a bounded smoke test:
 ./scripts/manual-capture-transfer-smoke.sh --frames 300
 ```
 
-## Native (IOSurface/Metal) capture
+## Native attach capture
 
-On macOS the viewer also has a native present path: it attaches to a native
-capture session over XPC, latches the received `IOSurface` into an
-`MTLTexture` zero-copy, GPU-waits on the per-frame `MTLSharedEvent` value
-before sampling, and presents — no pixel readback. This needs the library
-built with the `backend-macos` feature so the `ft_native_*` symbols are
-present, and `portholed` running from `Porthole.app` under launchd so it owns
-the `work.flotilla.porthole.attach` mach service:
+The viewer also has a native attach path. On macOS it attaches over XPC,
+latches the received `IOSurface` into an `MTLTexture` zero-copy, GPU-waits on
+the per-frame `MTLSharedEvent` value before sampling, and presents without
+pixel readback. On Linux it attaches over a Unix-domain socket and can acquire
+dmabuf leases from the PipeWire native path, though this SDL viewer cannot
+present dmabuf through Metal. The macOS path needs the library built with the
+`backend-macos` feature so the `ft_native_*` symbols are present, and
+`portholed` running from `Porthole.app` under launchd so it owns the
+`work.flotilla.porthole.attach` mach service:
 
 ```sh
 cargo build -p capture-transfer --features backend-macos --locked
@@ -114,11 +116,12 @@ cmake --build target/capture-viewer-sdl
 
 surface_id="$(porthole attach --frontmost --json | jq -r .surface_id)"
 descriptor="$(porthole capture-session surface "$surface_id" --native)"
-mach_service="$(printf '%s\n' "$descriptor" | awk '/^mach_service:/ { print $2 }')"
+transport_kind="$(printf '%s\n' "$descriptor" | awk '/^native_transport:/ { print $2 }')"
+endpoint="$(printf '%s\n' "$descriptor" | awk '/^(mach_service|attach_socket):/ { print $2 }')"
 attach_token="$(printf '%s\n' "$descriptor" | awk '/^attach_token:/ { print $2 }')"
 
 target/capture-viewer-sdl/capture-viewer-sdl \
-  --native --mach-service "$mach_service" --token "$attach_token"
+  --native --transport-kind "$transport_kind" --endpoint "$endpoint" --token "$attach_token"
 ```
 
 The bounded smoke test for this path:

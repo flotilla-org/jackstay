@@ -273,10 +273,10 @@ fn create_anonymous_backing(len: usize) -> Result<File> {
 
 #[cfg(target_os = "linux")]
 fn create_anonymous_backing(len: usize) -> Result<File> {
-    use std::{ffi::CStr, os::fd::FromRawFd};
+    use std::os::fd::FromRawFd;
 
     // The name is purely diagnostic (/proc/self/fd); memfds are anonymous.
-    let name = CStr::from_bytes_with_nul(b"jackstay-segment\0").expect("static name is NUL-terminated");
+    let name = c"jackstay-segment";
     // SAFETY: name is a valid NUL-terminated string.
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {

@@ -3,7 +3,10 @@ pub mod daemon;
 pub mod error;
 pub mod fdpass;
 pub mod ffi;
-#[cfg(all(target_os = "macos", feature = "backend-macos"))]
+#[cfg(any(
+    all(target_os = "macos", feature = "backend-macos"),
+    all(target_os = "linux", feature = "backend-linux")
+))]
 pub mod ffi_native;
 pub mod model;
 pub mod native;

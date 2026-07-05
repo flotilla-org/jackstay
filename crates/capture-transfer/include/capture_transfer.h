@@ -12,6 +12,10 @@ extern "C" {
 #define FT_STATUS_EMPTY 1
 #define FT_STATUS_INVALID_ARGUMENT 2
 #define FT_STATUS_ERROR 3
+#define FT_STATUS_TIMEOUT 4
+#define FT_STATUS_CLOSED 5
+#define FT_STATUS_UNSUPPORTED 6
+#define FT_STATUS_INVALID_STATE 7
 
 #define FT_SOURCE_KIND_WINDOW 1
 #define FT_SOURCE_KIND_DISPLAY 2
@@ -195,70 +199,176 @@ ft_status ft_consumer_acquire_latest_video_frame(ft_consumer *consumer,
 void ft_consumer_release_video_frame(ft_consumer *consumer, ft_video_frame *frame);
 void ft_consumer_destroy(ft_consumer *consumer);
 
-/*
- * Native handle path (macOS, backend-macos builds only).
+/* Native handle path. This is intentionally a low-level C ABI:
  *
- * The consumer connects to a jackstay XPC attach service, receives a one-time
- * grant (ring fd + IOSurfaces + MTLSharedEventHandle), and reads the ring's
- * latest descriptor. The viewer does its own Metal: take the raw IOSurfaceRefs
- * and the raw MTLSharedEventHandle from the grant, resolve the handle into an
- * MTLSharedEvent on your own MTLDevice, and on each frame encode a GPU wait for
- * fence_value (encodeWaitForEvent:value:) before sampling surfaces[slot_id].
- *
- * Lifetime: ft_native_grant.surfaces and .sync_handle are BORROWED — owned by
- * the ft_native_attach and valid only until ft_native_attach_destroy. Textures
- * and the shared event you build from them hold their own retains and survive,
- * but do not dereference the raw grant pointers after destroy.
- *
- * These symbols are present only in a macOS backend-macos build of the library.
+ * - Every struct with a struct_size field must be initialized by the caller to
+ *   sizeof(that struct) before passing it to a ft_native_* function. Output
+ *   structs are validated the same way before they are overwritten.
+ * - Handles exposed through grants and pools are borrowed from the
+ *   ft_native_attach and stay valid until ft_native_attach_destroy or a later
+ *   reconfiguration contract retires them after outstanding leases drain.
+ * - Consumers acquire frame leases explicitly and must release each successful
+ *   acquire with ft_native_release_frame before the producer can safely reuse
+ *   that slot.
  */
 typedef struct ft_native_attach ft_native_attach;
 
-typedef struct ft_native_grant {
-  uint64_t consumer_id;
-  uint64_t consumer_slot;
-  uint64_t pool_id;             /* unique forever; never reused */
-  uint64_t fence_id;            /* names the stream's MTLSharedEvent */
-  void *const *surfaces;        /* IOSurfaceRef[pool_slot_count], borrowed */
-  void *sync_handle;            /* MTLSharedEventHandle, borrowed */
-  uint32_t pool_slot_count;
-} ft_native_grant;
+#define FT_WAIT_INFINITE UINT64_MAX
 
-typedef struct ft_native_frame {
-  uint64_t cursor;
-  uint64_t sequence;
-  uint64_t timestamp_ns;
-  uint64_t fence_value;         /* GPU-wait this on the fence before sampling */
-  uint64_t fence_id;
+#define FT_NATIVE_ATTACH_TRANSPORT_MACOS_XPC 1
+#define FT_NATIVE_ATTACH_TRANSPORT_UNIX_SOCKET 2
+
+#define FT_NATIVE_HANDLE_IOSURFACE 1
+#define FT_NATIVE_HANDLE_DMABUF 2
+#define FT_NATIVE_HANDLE_D3D12_RESOURCE 3
+#define FT_NATIVE_MAX_PLANES 4
+
+#define FT_NATIVE_SYNC_NONE 0
+#define FT_NATIVE_SYNC_MTL_SHARED_EVENT 1
+#define FT_NATIVE_SYNC_DRM_SYNCOBJ_TIMELINE 2
+#define FT_NATIVE_SYNC_D3D12_FENCE 3
+
+#define FT_NATIVE_RELEASE_NOW 1
+#define FT_NATIVE_RELEASE_TIMELINE_VALUE 2
+
+#define FT_NATIVE_EVENT_POOL_ADDED 1
+#define FT_NATIVE_EVENT_POOL_REMOVED 2
+#define FT_NATIVE_EVENT_STREAM_CONFIG_CHANGED 3
+#define FT_NATIVE_EVENT_PRODUCER_STOPPED 4
+
+typedef struct ft_native_attach_descriptor {
+  uint32_t struct_size;
+  uint32_t transport_kind;
+  uint64_t requested_consumer_id; /* 0 = assign */
+  const char *endpoint;
+  const char *bearer_token;
+  uint32_t flags; /* must be 0 in this ABI revision */
+} ft_native_attach_descriptor;
+
+typedef struct ft_native_plane {
+  int32_t fd;
+  uint32_t offset;
+  uint32_t stride;
+} ft_native_plane;
+
+typedef struct ft_native_surface {
+  uint32_t struct_size;
+  uint32_t handle_kind;
+  uint32_t plane_count;
   uint32_t width;
   uint32_t height;
   uint32_t pixel_format;
-  uint32_t slot_id;             /* index into grant.surfaces */
+  uint64_t modifier;
+  void *object; /* IOSurfaceRef / D3D resource wrapper; NULL for dmabuf */
+  ft_native_plane planes[FT_NATIVE_MAX_PLANES];
+} ft_native_surface;
+
+typedef union ft_native_sync_handle {
+  void *object;
+  int32_t fd;
+} ft_native_sync_handle;
+
+typedef struct ft_native_sync {
+  uint32_t struct_size;
+  uint32_t sync_kind;
+  uint64_t sync_id;
+  ft_native_sync_handle handle;
+} ft_native_sync;
+
+typedef struct ft_native_pool {
+  uint32_t struct_size;
+  uint32_t surface_count;
+  uint64_t pool_id;
+  const ft_native_surface *surfaces;
+} ft_native_pool;
+
+typedef struct ft_native_grant {
+  uint32_t struct_size;
+  uint32_t pool_count;
+  uint64_t consumer_id;
+  uint64_t consumer_slot;
+  const ft_native_pool *pools;
+  ft_native_sync producer_sync;
+} ft_native_grant;
+
+typedef struct ft_native_frame {
+  uint32_t struct_size;
   uint32_t flags;
+  uint64_t lease_id;
+  uint64_t cursor;
+  uint64_t sequence;
+  uint64_t timestamp_ns;
+  uint64_t pool_id;
+  uint32_t slot_id;
+  uint32_t width;
+  uint32_t height;
+  uint32_t pixel_format;
+  uint64_t producer_sync_id;
+  uint64_t producer_sync_value; /* GPU-wait this before sampling */
 } ft_native_frame;
 
+typedef struct ft_native_release {
+  uint32_t struct_size;
+  uint32_t release_kind;
+  uint64_t lease_id;
+  uint64_t release_sync_id;
+  uint64_t release_value;
+} ft_native_release;
+
+typedef struct ft_native_event {
+  uint32_t struct_size;
+  uint32_t kind;
+  uint64_t pool_id;
+  uint64_t config_generation;
+} ft_native_event;
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-/* Pin the native ABI; mirror is the #[repr(C)] block in src/ffi_native.rs. */
+/* Pin the native ABI; mirror is the #[repr(C)] block in src/ffi_native.rs.
+ * The sizes below assume 8-byte pointers (pointer-bearing structs like
+ * ft_native_sync and ft_native_grant shrink under ILP32). Declare the
+ * constraint explicitly so a 32-bit build fails with one clear message
+ * instead of a wall of packing asserts. */
+_Static_assert(sizeof(void *) == 8, "jackstay native ABI assumes 64-bit pointers (no ILP32 target yet)");
+_Static_assert(sizeof(ft_native_attach_descriptor) == 40, "native attach descriptor size");
+_Static_assert(offsetof(ft_native_attach_descriptor, requested_consumer_id) == 8, "native attach descriptor packing");
+_Static_assert(offsetof(ft_native_attach_descriptor, endpoint) == 16, "native attach descriptor packing");
+_Static_assert(offsetof(ft_native_attach_descriptor, bearer_token) == 24, "native attach descriptor packing");
+_Static_assert(offsetof(ft_native_attach_descriptor, flags) == 32, "native attach descriptor packing");
+_Static_assert(sizeof(ft_native_plane) == 12, "native plane size");
+_Static_assert(sizeof(ft_native_surface) == 88, "native surface size");
+_Static_assert(offsetof(ft_native_surface, object) == 32, "native surface packing");
+_Static_assert(sizeof(ft_native_sync) == 24, "native sync size");
+_Static_assert(sizeof(ft_native_pool) == 24, "native pool size");
 _Static_assert(sizeof(ft_native_grant) == 56, "native grant size");
-_Static_assert(offsetof(ft_native_grant, surfaces) == 32, "native grant packing");
-_Static_assert(offsetof(ft_native_grant, sync_handle) == 40, "native grant packing");
-_Static_assert(offsetof(ft_native_grant, pool_slot_count) == 48, "native grant packing");
-_Static_assert(sizeof(ft_native_frame) == 64, "native frame size");
-_Static_assert(offsetof(ft_native_frame, width) == 40, "native frame packing");
-_Static_assert(offsetof(ft_native_frame, slot_id) == 52, "native frame packing");
-_Static_assert(offsetof(ft_native_frame, flags) == 56, "native frame packing");
+_Static_assert(offsetof(ft_native_grant, pools) == 24, "native grant packing");
+_Static_assert(offsetof(ft_native_grant, producer_sync) == 32, "native grant packing");
+_Static_assert(sizeof(ft_native_frame) == 80, "native frame size");
+_Static_assert(offsetof(ft_native_frame, lease_id) == 8, "native frame packing");
+_Static_assert(offsetof(ft_native_frame, producer_sync_id) == 64, "native frame packing");
+_Static_assert(sizeof(ft_native_release) == 32, "native release size");
+_Static_assert(sizeof(ft_native_event) == 24, "native event size");
 #endif
 
-/* mach_service_name: the launchd MachServices name to look up. bearer_token:
- * NULL for an unauthenticated service, else the session's attach secret. */
-ft_status ft_native_attach_connect(const char *mach_service_name,
-                                   const char *bearer_token,
-                                   uint64_t consumer_id,
+ft_status ft_native_attach_connect(const ft_native_attach_descriptor *descriptor,
                                    ft_native_attach **out);
 ft_status ft_native_attach_grant(const ft_native_attach *attach, ft_native_grant *out_grant);
-/* FT_STATUS_EMPTY when the ring has no frame yet; FT_STATUS_ERROR on a read
- * fault. Always returns the newest published frame (drop-to-latest). */
-ft_status ft_native_read_latest(const ft_native_attach *attach, ft_native_frame *out_frame);
+ft_status ft_native_wait_frame(ft_native_attach *attach,
+                               uint64_t min_cursor,
+                               uint64_t timeout_ns,
+                               uint64_t *out_cursor);
+ft_status ft_native_acquire_latest(ft_native_attach *attach,
+                                   uint64_t min_cursor,
+                                   ft_native_frame *out_frame);
+// Registers a release timeline for FT_NATIVE_RELEASE_TIMELINE_VALUE.
+// Currently supported only for Linux DRM syncobj timeline handles; other
+// platforms return FT_STATUS_UNSUPPORTED.
+ft_status ft_native_register_release_sync(ft_native_attach *attach,
+                                          const ft_native_sync *sync,
+                                          uint64_t *out_release_sync_id);
+ft_status ft_native_release_frame(ft_native_attach *attach,
+                                  const ft_native_release *release);
+ft_status ft_native_poll_event(ft_native_attach *attach, ft_native_event *out_event);
+ft_status ft_native_get_pool(ft_native_attach *attach, uint64_t pool_id, ft_native_pool *out_pool);
 void ft_native_attach_destroy(ft_native_attach *attach);
 
 #ifdef __cplusplus

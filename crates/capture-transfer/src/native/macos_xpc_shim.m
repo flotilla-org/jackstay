@@ -39,10 +39,11 @@ static char *porthole_xpc_copy_error(NSString *message) {
 @protocol PortholeAttachXpc
 - (void)authorizeWithToken:(NSString *)token reply:(void (^)(int32_t status))reply;
 - (void)attachWithConsumerId:(uint64_t)consumerId
-                       reply:(void (^)(int32_t status,
-                                       uint64_t consumerSlot,
-                                       NSFileHandle *ringFd,
-                                       uint64_t ringMapLen,
+	                       reply:(void (^)(int32_t status,
+	                                       uint64_t consumerId,
+	                                       uint64_t consumerSlot,
+	                                       NSFileHandle *ringFd,
+	                                       uint64_t ringMapLen,
                                        uint64_t poolId,
                                        NSArray *surfaces,
                                        uint64_t fenceId,
@@ -52,12 +53,12 @@ static char *porthole_xpc_copy_error(NSString *message) {
 static NSXPCInterface *porthole_attach_interface(void) {
   NSXPCInterface *interface = [NSXPCInterface interfaceWithProtocol:@protocol(PortholeAttachXpc)];
   SEL attach = @selector(attachWithConsumerId:reply:);
-  [interface setClasses:[NSSet setWithObject:[NSFileHandle class]] forSelector:attach argumentIndex:2 ofReply:YES];
+  [interface setClasses:[NSSet setWithObject:[NSFileHandle class]] forSelector:attach argumentIndex:3 ofReply:YES];
   [interface setClasses:[NSSet setWithObjects:[NSArray class], [IOSurface class], nil]
             forSelector:attach
-          argumentIndex:5
+          argumentIndex:6
                 ofReply:YES];
-  [interface setClasses:[NSSet setWithObject:[MTLSharedEventHandle class]] forSelector:attach argumentIndex:7 ofReply:YES];
+  [interface setClasses:[NSSet setWithObject:[MTLSharedEventHandle class]] forSelector:attach argumentIndex:8 ofReply:YES];
   return interface;
 }
 
@@ -68,6 +69,7 @@ static NSXPCInterface *porthole_attach_interface(void) {
 // take their own references) and then asks Rust to release via the grant
 // release callback, still inside the message handler.
 typedef struct PortholeXpcGrant {
+  uint64_t consumer_id;
   uint64_t consumer_slot;
   int32_t ring_fd; // dup'd by Rust; the shim's NSFileHandle takes ownership
   uint64_t ring_map_len;
@@ -112,12 +114,12 @@ typedef void (*PortholeXpcStateReleaseCallback)(void *ctx);
 }
 
 - (void)attachWithConsumerId:(uint64_t)consumerId
-                       reply:(void (^)(int32_t, uint64_t, NSFileHandle *, uint64_t, uint64_t, NSArray *, uint64_t,
+                       reply:(void (^)(int32_t, uint64_t, uint64_t, NSFileHandle *, uint64_t, uint64_t, NSArray *, uint64_t,
                                        MTLSharedEventHandle *))reply {
   PortholeXpcGrant grant = {0};
   int32_t status = self.owner.attachCallback(self.owner.ctx, self.sessionId, consumerId, &grant);
   if (status != 0) {
-    reply(status, 0, nil, 0, 0, nil, 0, nil);
+    reply(status, 0, 0, nil, 0, 0, nil, 0, nil);
     return;
   }
   NSFileHandle *ringFd = [[NSFileHandle alloc] initWithFileDescriptor:grant.ring_fd closeOnDealloc:YES];
@@ -129,7 +131,7 @@ typedef void (*PortholeXpcStateReleaseCallback)(void *ctx);
   // The ObjC objects above hold their own references now; let Rust free the
   // grant's allocations before the reply is encoded.
   self.owner.grantReleaseCallback(self.owner.ctx, self.sessionId, &grant);
-  reply(0, grant.consumer_slot, ringFd, grant.ring_map_len, grant.pool_id, surfaces, grant.fence_id, syncHandle);
+  reply(0, grant.consumer_id, grant.consumer_slot, ringFd, grant.ring_map_len, grant.pool_id, surfaces, grant.fence_id, syncHandle);
 }
 @end
 
@@ -324,6 +326,7 @@ int32_t porthole_xpc_client_authorize(void *clientPtr, const char *token, char *
 // and the +1 retained sync handle.
 int32_t porthole_xpc_client_attach(void *clientPtr,
                                    uint64_t consumerId,
+                                   uint64_t *outConsumerId,
                                    uint64_t *outConsumerSlot,
                                    int32_t *outRingFd,
                                    uint64_t *outRingMapLen,
@@ -335,6 +338,7 @@ int32_t porthole_xpc_client_attach(void *clientPtr,
                                    char **outError) {
   PortholeAttachClientBox *box = (__bridge PortholeAttachClientBox *)clientPtr;
   *outError = NULL;
+  *outConsumerId = 0;
   *outSurfaces = NULL;
   *outSurfaceCount = 0;
   *outRingFd = -1;
@@ -345,12 +349,14 @@ int32_t porthole_xpc_client_attach(void *clientPtr,
     failure = error.localizedDescription;
   }];
   [proxy attachWithConsumerId:consumerId
-                        reply:^(int32_t replyStatus, uint64_t consumerSlot, NSFileHandle *ringFd, uint64_t ringMapLen,
-                                uint64_t poolId, NSArray *surfaces, uint64_t fenceId, MTLSharedEventHandle *syncHandle) {
+                        reply:^(int32_t replyStatus, uint64_t assignedConsumerId, uint64_t consumerSlot, NSFileHandle *ringFd,
+                                uint64_t ringMapLen, uint64_t poolId, NSArray *surfaces, uint64_t fenceId,
+                                MTLSharedEventHandle *syncHandle) {
                           status = replyStatus;
                           if (replyStatus != 0) {
                             return;
                           }
+                          *outConsumerId = assignedConsumerId;
                           *outConsumerSlot = consumerSlot;
                           // NSFileHandle closes its descriptor on dealloc;
                           // dup so Rust owns an independent fd.

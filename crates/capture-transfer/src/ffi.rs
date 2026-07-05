@@ -21,6 +21,10 @@ pub const FT_STATUS_OK: FtStatus = 0;
 pub const FT_STATUS_EMPTY: FtStatus = 1;
 pub const FT_STATUS_INVALID_ARGUMENT: FtStatus = 2;
 pub const FT_STATUS_ERROR: FtStatus = 3;
+pub const FT_STATUS_TIMEOUT: FtStatus = 4;
+pub const FT_STATUS_CLOSED: FtStatus = 5;
+pub const FT_STATUS_UNSUPPORTED: FtStatus = 6;
+pub const FT_STATUS_INVALID_STATE: FtStatus = 7;
 
 pub const FT_SOURCE_KIND_WINDOW: u32 = 1;
 pub const FT_SOURCE_KIND_DISPLAY: u32 = 2;

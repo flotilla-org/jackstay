@@ -8,6 +8,18 @@
 #include <drm/drm.h>
 #include <linux/dma-heap.h>
 
+/* Timeline export/import flags are recent kernel uapi additions; build
+ * hosts with older linux-libc-dev (e.g. ubuntu-latest CI) don't declare
+ * them yet. The values are kernel ABI and cannot change. Whether the
+ * *running* kernel supports them is a runtime question the ioctl answers
+ * with EINVAL either way. */
+#ifndef DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE
+#define DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE (1 << 1)
+#endif
+#ifndef DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE
+#define DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE (1 << 1)
+#endif
+
 static int porthole_native_linux_errno(void) {
   return errno == 0 ? EIO : errno;
 }

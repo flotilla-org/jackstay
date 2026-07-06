@@ -1067,7 +1067,7 @@ impl NativeFrameBackend for PipeWireNativeBackend {
 
 impl LinuxNativeLeaseBackend for PipeWireNativeBackend {
     fn acquire_linux_lease(&mut self, identity: NativeLeaseIdentity) -> Result<u64> {
-        Ok(self.lease_book.acquire(identity))
+        self.lease_book.acquire(identity).map_err(CaptureTransferError::from)
     }
 
     fn register_linux_release_sync(&mut self, sync: LinuxSyncDescriptor, fd: OwnedFd) -> Result<u64> {
@@ -1078,7 +1078,7 @@ impl LinuxNativeLeaseBackend for PipeWireNativeBackend {
             });
         }
         let timeline = self.drm.import_syncobj_timeline_fd(fd.as_raw_fd())?;
-        let release_sync_id = self.lease_book.register_release_sync();
+        let release_sync_id = self.lease_book.register_release_sync().map_err(CaptureTransferError::from)?;
         self.release_syncs.insert(release_sync_id, timeline);
         Ok(release_sync_id)
     }

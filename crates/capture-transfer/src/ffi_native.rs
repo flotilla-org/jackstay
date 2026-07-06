@@ -19,8 +19,8 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use crate::native::linux::{
-    LINUX_ATTACH_MAX_FDS, LinuxAttachRequest, LinuxAttachResponse, LinuxFdTable, LinuxLeaseIdentity, LinuxPoolDescriptor,
-    LinuxReleaseDescriptor, LinuxSyncDescriptor, recv_json, recv_json_with_fds, send_json, send_json_then_fds,
+    LINUX_ATTACH_MAX_FDS, LinuxAttachRequest, LinuxAttachResponse, LinuxFdTable, LinuxPoolDescriptor, LinuxReleaseDescriptor,
+    LinuxSyncDescriptor, recv_json, recv_json_with_fds, send_json, send_json_then_fds,
 };
 #[cfg(target_os = "macos")]
 use crate::native::macos::{IoSurface, SharedEventHandle, xpc::XpcAttachClient};
@@ -463,13 +463,7 @@ impl FtNativeAttach {
         #[cfg(target_os = "linux")]
         {
             let FtNativeAttachTransport::Linux { _stream: stream, .. } = &self._transport;
-            send_json(
-                stream,
-                &LinuxAttachRequest::AcquireLease {
-                    identity: LinuxLeaseIdentity::from(identity),
-                },
-            )
-            .map_err(|_| FT_STATUS_ERROR)?;
+            send_json(stream, &LinuxAttachRequest::AcquireLease { identity }).map_err(|_| FT_STATUS_ERROR)?;
             match recv_json::<LinuxAttachResponse>(stream).map_err(|_| FT_STATUS_ERROR)? {
                 LinuxAttachResponse::LeaseAcquired { lease_id } => Ok(lease_id),
                 LinuxAttachResponse::Error { .. } => Err(FT_STATUS_INVALID_STATE),
@@ -478,7 +472,7 @@ impl FtNativeAttach {
         }
 
         #[cfg(not(target_os = "linux"))]
-        Ok(self.lease_book.acquire(identity))
+        self.lease_book.acquire(identity).map_err(|_| FT_STATUS_ERROR)
     }
 }
 
@@ -830,7 +824,11 @@ pub unsafe extern "C" fn ft_native_register_release_sync(
                 }
                 match recv_json::<LinuxAttachResponse>(stream) {
                     Ok(LinuxAttachResponse::ReleaseSyncRegistered { release_sync_id }) => {
-                        attach.lease_book.register_release_sync_id(release_sync_id);
+                        // A server handing out the reserved id is a protocol
+                        // violation, not a state this client can hold.
+                        if attach.lease_book.register_release_sync_id(release_sync_id).is_err() {
+                            return FT_STATUS_ERROR;
+                        }
                         release_sync_id
                     }
                     Ok(LinuxAttachResponse::Error { .. }) => return FT_STATUS_ERROR,
@@ -1235,9 +1233,12 @@ mod linux_tests {
         fdpass::recv_fds,
         ffi::{FT_STATUS_CLOSED, FT_STATUS_EMPTY, FT_STATUS_INVALID_ARGUMENT, FT_STATUS_OK, FT_STATUS_UNSUPPORTED},
         model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
-        native::linux::{
-            LinuxAttachGrant, LinuxAttachRequest, LinuxAttachResponse, LinuxLeaseIdentity, LinuxPlaneDescriptor, LinuxPoolDescriptor,
-            LinuxReleaseDescriptor, LinuxSurfaceDescriptor, LinuxSyncDescriptor, recv_json, send_json, send_json_with_fds,
+        native::{
+            lease::NativeLeaseIdentity,
+            linux::{
+                LinuxAttachGrant, LinuxAttachRequest, LinuxAttachResponse, LinuxPlaneDescriptor, LinuxPoolDescriptor,
+                LinuxReleaseDescriptor, LinuxSurfaceDescriptor, LinuxSyncDescriptor, recv_json, send_json, send_json_with_fds,
+            },
         },
     };
 
@@ -1340,7 +1341,7 @@ mod linux_tests {
             assert_eq!(
                 recv_json::<LinuxAttachRequest>(&stream).unwrap(),
                 LinuxAttachRequest::AcquireLease {
-                    identity: LinuxLeaseIdentity {
+                    identity: NativeLeaseIdentity {
                         cursor: 2,
                         sequence: 11,
                         pool_id: 88,

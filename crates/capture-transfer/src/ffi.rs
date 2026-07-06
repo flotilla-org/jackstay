@@ -17,6 +17,23 @@ use crate::{
 
 pub type FtStatus = i32;
 
+/// ABI version of this library, as `(major << 16) | minor`. Mirror of
+/// `FT_ABI_VERSION` in `capture_transfer.h`; consumers compare their header's
+/// constant against [`ft_abi_version`] at startup. Additions land as new
+/// functions and new attach-stream operations under a minor bump; existing
+/// struct layouts never change without a major bump. Major 0 means
+/// pre-stabilization: layouts may still change freely, with a minor bump as
+/// the only signal; 1.0 waits until an external consumer needs the promise.
+pub const FT_ABI_VERSION_MAJOR: u32 = 0;
+pub const FT_ABI_VERSION_MINOR: u32 = 1;
+pub const FT_ABI_VERSION: u32 = (FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR;
+
+/// Report the linked library's ABI version.
+#[unsafe(no_mangle)]
+pub extern "C" fn ft_abi_version() -> u32 {
+    FT_ABI_VERSION
+}
+
 pub const FT_STATUS_OK: FtStatus = 0;
 pub const FT_STATUS_EMPTY: FtStatus = 1;
 pub const FT_STATUS_INVALID_ARGUMENT: FtStatus = 2;
@@ -903,6 +920,29 @@ mod tests {
         ft_consumer_poll_event, ft_consumer_release_video_frame, ft_producer_create, ft_producer_destroy, ft_producer_publish_video_frame,
         ft_producer_register_source, ft_producer_register_track,
     };
+
+    /// The header and this crate each state the ABI version; nothing else
+    /// ties them together, so a bump that touches one side and not the other
+    /// would silently break the startup check `ft_abi_version()` exists for.
+    /// Parse the header's defines and compare.
+    #[test]
+    fn header_and_library_agree_on_the_abi_version() {
+        let header = include_str!("../include/capture_transfer.h");
+        let define = |name: &str| -> u32 {
+            let marker = format!("#define {name} ");
+            header
+                .lines()
+                .find_map(|line| line.strip_prefix(&marker))
+                .unwrap_or_else(|| panic!("{name} not defined in capture_transfer.h"))
+                .trim()
+                .parse()
+                .unwrap_or_else(|error| panic!("{name} is not a bare integer: {error}"))
+        };
+        assert_eq!(define("FT_ABI_VERSION_MAJOR"), super::FT_ABI_VERSION_MAJOR);
+        assert_eq!(define("FT_ABI_VERSION_MINOR"), super::FT_ABI_VERSION_MINOR);
+        assert_eq!(super::ft_abi_version(), super::FT_ABI_VERSION);
+        assert_eq!(super::FT_ABI_VERSION, 0x0000_0001);
+    }
 
     #[test]
     fn producer_consumer_smoke_through_c_abi() {

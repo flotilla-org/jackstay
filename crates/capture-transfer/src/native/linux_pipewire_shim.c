@@ -258,7 +258,11 @@ int porthole_native_linux_pipewire_probe(struct porthole_native_linux_pipewire_p
   out->can_init = 0;
   out->can_create_thread_loop = 0;
   out->spa_data_dmabuf = SPA_DATA_DmaBuf;
-  out->spa_data_syncobj = SPA_DATA_SyncObj;
+  /* SPA_DATA_SyncObj is absent from older spa headers (ubuntu-24.04 ships
+   * PipeWire 1.0) and, being an enumerator, can't be probed with #ifndef.
+   * spa_data_type is a public append-only ABI enum, so the value is stable;
+   * state it. An older PipeWire at runtime simply never produces it. */
+  out->spa_data_syncobj = 5 /* SPA_DATA_SyncObj */;
   out->spa_meta_header = SPA_META_Header;
   out->spa_meta_video_damage = SPA_META_VideoDamage;
   out->spa_video_format_bgra = SPA_VIDEO_FORMAT_BGRA;

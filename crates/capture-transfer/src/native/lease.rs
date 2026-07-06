@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The frame identity protected by one native lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The frame identity protected by one native lease. Serde derives exist
+/// because this is also the wire shape on the Linux attach stream (ADR-0009);
+/// the fields are the identity, so wire and book agree by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeLeaseIdentity {
     pub cursor: u64,
     pub sequence: u64,
@@ -35,6 +38,10 @@ pub enum NativeLeaseError {
     AlreadyReleased(u64),
     #[error("native release sync id {0} is unknown")]
     UnknownReleaseSync(u64),
+    #[error("native lease id space is exhausted")]
+    LeaseIdsExhausted,
+    #[error("native release sync id space is exhausted")]
+    ReleaseSyncIdsExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,9 +78,14 @@ impl NativeLeaseBook {
         }
     }
 
-    pub fn acquire(&mut self, identity: NativeLeaseIdentity) -> u64 {
+    /// `u64::MAX` is reserved in both id spaces: exhaustion is an explicit
+    /// error rather than a silently reused (and colliding) saturated id.
+    pub fn acquire(&mut self, identity: NativeLeaseIdentity) -> Result<u64, NativeLeaseError> {
+        if self.next_lease_id == u64::MAX {
+            return Err(NativeLeaseError::LeaseIdsExhausted);
+        }
         let lease_id = self.next_lease_id;
-        self.next_lease_id = self.next_lease_id.saturating_add(1);
+        self.next_lease_id += 1;
         self.leases.insert(
             lease_id,
             LeaseEntry {
@@ -81,19 +93,26 @@ impl NativeLeaseBook {
                 state: LeaseState::Outstanding,
             },
         );
-        lease_id
+        Ok(lease_id)
     }
 
-    pub fn register_release_sync(&mut self) -> u64 {
+    pub fn register_release_sync(&mut self) -> Result<u64, NativeLeaseError> {
+        if self.next_release_sync_id == u64::MAX {
+            return Err(NativeLeaseError::ReleaseSyncIdsExhausted);
+        }
         let release_sync_id = self.next_release_sync_id;
-        self.next_release_sync_id = self.next_release_sync_id.saturating_add(1);
+        self.next_release_sync_id += 1;
         self.release_syncs.insert(release_sync_id);
-        release_sync_id
+        Ok(release_sync_id)
     }
 
-    pub fn register_release_sync_id(&mut self, release_sync_id: u64) {
-        self.next_release_sync_id = self.next_release_sync_id.max(release_sync_id.saturating_add(1));
+    pub fn register_release_sync_id(&mut self, release_sync_id: u64) -> Result<(), NativeLeaseError> {
+        if release_sync_id == u64::MAX {
+            return Err(NativeLeaseError::ReleaseSyncIdsExhausted);
+        }
+        self.next_release_sync_id = self.next_release_sync_id.max(release_sync_id + 1);
         self.release_syncs.insert(release_sync_id);
+        Ok(())
     }
 
     pub fn release(&mut self, lease_id: u64, release: NativeLeaseRelease) -> Result<ReleasedNativeLease, NativeLeaseError> {
@@ -167,9 +186,26 @@ mod tests {
     }
 
     #[test]
+    fn id_exhaustion_is_an_explicit_error_not_a_reused_id() {
+        let mut book = NativeLeaseBook::new();
+        book.next_lease_id = u64::MAX;
+        assert_eq!(book.acquire(identity(1)), Err(NativeLeaseError::LeaseIdsExhausted));
+
+        // The id just below the reserved sentinel is still usable; the
+        // sentinel itself is never handed out or accepted.
+        book.next_release_sync_id = u64::MAX - 1;
+        assert_eq!(book.register_release_sync().unwrap(), u64::MAX - 1);
+        assert_eq!(book.register_release_sync(), Err(NativeLeaseError::ReleaseSyncIdsExhausted));
+        assert_eq!(
+            book.register_release_sync_id(u64::MAX),
+            Err(NativeLeaseError::ReleaseSyncIdsExhausted)
+        );
+    }
+
+    #[test]
     fn release_now_resolves_one_lease_and_rejects_double_release() {
         let mut book = NativeLeaseBook::new();
-        let lease_id = book.acquire(identity(2));
+        let lease_id = book.acquire(identity(2)).unwrap();
         assert!(book.slot_has_unresolved_leases(7, 2));
 
         let released = book.release(lease_id, NativeLeaseRelease::Now).unwrap();
@@ -185,8 +221,8 @@ mod tests {
     #[test]
     fn multiple_leases_on_one_slot_must_all_resolve() {
         let mut book = NativeLeaseBook::new();
-        let first = book.acquire(identity(1));
-        let second = book.acquire(identity(1));
+        let first = book.acquire(identity(1)).unwrap();
+        let second = book.acquire(identity(1)).unwrap();
 
         book.release(first, NativeLeaseRelease::Now).unwrap();
         assert!(book.slot_has_unresolved_leases(7, 1));
@@ -198,8 +234,8 @@ mod tests {
     #[test]
     fn timeline_release_keeps_slot_unresolved_until_sync_completes() {
         let mut book = NativeLeaseBook::new();
-        let release_sync_id = book.register_release_sync();
-        let lease_id = book.acquire(identity(3));
+        let release_sync_id = book.register_release_sync().unwrap();
+        let lease_id = book.acquire(identity(3)).unwrap();
 
         book.release(lease_id, NativeLeaseRelease::TimelineValue { release_sync_id, value: 5 })
             .unwrap();
@@ -219,8 +255,8 @@ mod tests {
     #[test]
     fn externally_assigned_release_sync_id_can_be_registered() {
         let mut book = NativeLeaseBook::new();
-        book.register_release_sync_id(42);
-        let lease_id = book.acquire(identity(1));
+        book.register_release_sync_id(42).unwrap();
+        let lease_id = book.acquire(identity(1)).unwrap();
 
         book.release(
             lease_id,
@@ -234,6 +270,6 @@ mod tests {
 
         book.complete_release_sync(42, 9).unwrap();
         assert!(!book.slot_has_unresolved_leases(7, 1));
-        assert_eq!(book.register_release_sync(), 43);
+        assert_eq!(book.register_release_sync().unwrap(), 43);
     }
 }

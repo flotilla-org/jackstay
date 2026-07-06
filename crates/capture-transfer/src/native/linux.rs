@@ -58,7 +58,7 @@ pub enum LinuxAttachRequest {
     Authorize { bearer_token: String },
     Attach { consumer_id: u64 },
     GetPool { pool_id: u64 },
-    AcquireLease { identity: LinuxLeaseIdentity },
+    AcquireLease { identity: NativeLeaseIdentity },
     RegisterReleaseSync { sync: LinuxSyncDescriptor },
     ReleaseFrame { release: LinuxReleaseDescriptor },
 }
@@ -113,36 +113,6 @@ pub struct LinuxSyncDescriptor {
     pub sync_kind: u32,
     pub sync_id: u64,
     pub fd_index: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LinuxLeaseIdentity {
-    pub cursor: u64,
-    pub sequence: u64,
-    pub pool_id: u64,
-    pub slot_id: u32,
-}
-
-impl From<LinuxLeaseIdentity> for NativeLeaseIdentity {
-    fn from(identity: LinuxLeaseIdentity) -> Self {
-        Self {
-            cursor: identity.cursor,
-            sequence: identity.sequence,
-            pool_id: identity.pool_id,
-            slot_id: identity.slot_id,
-        }
-    }
-}
-
-impl From<NativeLeaseIdentity> for LinuxLeaseIdentity {
-    fn from(identity: NativeLeaseIdentity) -> Self {
-        Self {
-            cursor: identity.cursor,
-            sequence: identity.sequence,
-            pool_id: identity.pool_id,
-            slot_id: identity.slot_id,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,7 +566,7 @@ where
             })),
             Err(error) => Ok(LinuxAttachOutbound::json(linux_native_error_response(error))),
         },
-        LinuxAttachRequest::AcquireLease { identity } => match producer.backend_mut().acquire_linux_lease(identity.into()) {
+        LinuxAttachRequest::AcquireLease { identity } => match producer.backend_mut().acquire_linux_lease(identity) {
             Ok(lease_id) => Ok(LinuxAttachOutbound::json(LinuxAttachResponse::LeaseAcquired { lease_id })),
             Err(error) => Ok(LinuxAttachOutbound::json(linux_native_error_response(error))),
         },
@@ -835,9 +805,9 @@ mod tests {
             lease::{NativeLeaseBook, NativeLeaseIdentity, NativeLeaseRelease},
             linux::{
                 LinuxAttachGrant, LinuxAttachRequest, LinuxAttachResponse, LinuxAttachServer, LinuxAttachStreamSession,
-                LinuxDmabufPlaneHandle, LinuxLeaseIdentity, LinuxNativeLeaseBackend, LinuxPlaneDescriptor, LinuxPoolDescriptor,
-                LinuxReleaseDescriptor, LinuxSurfaceDescriptor, LinuxSurfaceHandle, LinuxSyncDescriptor, LinuxSyncHandle,
-                handle_linux_attach_stream_message, recv_json, recv_json_with_fds, send_json, send_json_then_fds, send_json_with_fds,
+                LinuxDmabufPlaneHandle, LinuxNativeLeaseBackend, LinuxPlaneDescriptor, LinuxPoolDescriptor, LinuxReleaseDescriptor,
+                LinuxSurfaceDescriptor, LinuxSurfaceHandle, LinuxSyncDescriptor, LinuxSyncHandle, handle_linux_attach_stream_message,
+                recv_json, recv_json_with_fds, send_json, send_json_then_fds, send_json_with_fds,
             },
         },
     };
@@ -1027,7 +997,7 @@ mod tests {
         send_json(
             &client,
             &LinuxAttachRequest::AcquireLease {
-                identity: LinuxLeaseIdentity {
+                identity: NativeLeaseIdentity {
                     cursor: 11,
                     sequence: 22,
                     pool_id: 700,
@@ -1115,7 +1085,7 @@ mod tests {
         send_json(
             &client,
             &LinuxAttachRequest::AcquireLease {
-                identity: LinuxLeaseIdentity {
+                identity: NativeLeaseIdentity {
                     cursor: 11,
                     sequence: 22,
                     pool_id: 700,
@@ -1245,7 +1215,7 @@ mod tests {
         send_json(
             &client,
             &LinuxAttachRequest::AcquireLease {
-                identity: LinuxLeaseIdentity {
+                identity: NativeLeaseIdentity {
                     cursor: 11,
                     sequence: 22,
                     pool_id: 700,
@@ -1307,11 +1277,11 @@ mod tests {
 
     impl LinuxNativeLeaseBackend for TestLinuxBackend {
         fn acquire_linux_lease(&mut self, identity: NativeLeaseIdentity) -> Result<u64> {
-            Ok(self.lease_book.acquire(identity))
+            self.lease_book.acquire(identity).map_err(CaptureTransferError::from)
         }
 
         fn register_linux_release_sync(&mut self, _sync: LinuxSyncDescriptor, _fd: std::os::fd::OwnedFd) -> Result<u64> {
-            Ok(self.lease_book.register_release_sync())
+            self.lease_book.register_release_sync().map_err(CaptureTransferError::from)
         }
 
         fn release_linux_lease(&mut self, lease_id: u64, release: NativeLeaseRelease) -> Result<()> {

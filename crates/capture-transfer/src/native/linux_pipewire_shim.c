@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,7 @@ struct porthole_native_linux_pipewire_probe {
 
 #define PORTHOLE_NATIVE_LINUX_PIPEWIRE_MAX_PLANES 4
 #define PORTHOLE_NATIVE_LINUX_PIPEWIRE_MAX_MODIFIERS 64
+#define PORTHOLE_NATIVE_LINUX_PIPEWIRE_REQUESTED_BUFFERS 4
 
 struct porthole_native_linux_pipewire_plane {
   int64_t fd;
@@ -104,6 +106,12 @@ struct porthole_native_linux_pipewire_buffer_user_data {
   uint32_t slot_id;
 };
 
+struct porthole_native_linux_pipewire_held_buffer {
+  uint32_t slot_id;
+  struct pw_buffer *buffer;
+  struct porthole_native_linux_pipewire_held_buffer *next;
+};
+
 struct porthole_native_linux_pipewire_stream {
   struct pw_thread_loop *loop;
   struct pw_context *context;
@@ -114,6 +122,11 @@ struct porthole_native_linux_pipewire_stream {
   enum pw_stream_state state;
   int error_code;
   uint32_t next_slot_id;
+  uint32_t buffer_count;
+  uint32_t held_count;
+  uint64_t forced_handback_count;
+  struct porthole_native_linux_pipewire_held_buffer *held_head;
+  struct porthole_native_linux_pipewire_held_buffer *held_tail;
   char error_message[256];
 };
 
@@ -178,21 +191,119 @@ static void porthole_pipewire_stream_add_buffer(void *data, struct pw_buffer *bu
   }
   buffer_data->slot_id = handle->next_slot_id++;
   buffer->user_data = buffer_data;
+  handle->buffer_count++;
   if (handle->callbacks.buffer_added != NULL) {
     handle->callbacks.buffer_added(handle->callbacks.user_data, buffer_data->slot_id, buffer->buffer);
   }
 }
 
+static struct porthole_native_linux_pipewire_held_buffer *
+porthole_pipewire_stream_detach_held(struct porthole_native_linux_pipewire_stream *handle, uint32_t slot_id);
+
 static void porthole_pipewire_stream_remove_buffer(void *data, struct pw_buffer *buffer) {
   struct porthole_native_linux_pipewire_stream *handle = data;
   struct porthole_native_linux_pipewire_buffer_user_data *buffer_data = buffer->user_data;
   if (buffer_data != NULL) {
+    /* If a consumer's lease has not resolved, this buffer may still be in the
+     * held list while PipeWire destroys it (e.g. a renegotiation replaces the
+     * pool). Drop the held-list node without queuing it back: the underlying
+     * pw_buffer is going away, so a later release or forced handback must not
+     * touch it. Runs on the loop thread, serialized against the locked
+     * release path. */
+    struct porthole_native_linux_pipewire_held_buffer *stale =
+      porthole_pipewire_stream_detach_held(handle, buffer_data->slot_id);
+    free(stale);
     if (handle->callbacks.buffer_removed != NULL) {
       handle->callbacks.buffer_removed(handle->callbacks.user_data, buffer_data->slot_id);
     }
     free(buffer_data);
     buffer->user_data = NULL;
   }
+  if (handle->buffer_count > 0) {
+    handle->buffer_count--;
+  }
+}
+
+static uint32_t porthole_pipewire_stream_max_held(const struct porthole_native_linux_pipewire_stream *handle) {
+  if (handle->buffer_count <= 1) {
+    return 0;
+  }
+  return handle->buffer_count - 1;
+}
+
+static struct porthole_native_linux_pipewire_held_buffer *
+porthole_pipewire_stream_detach_held(struct porthole_native_linux_pipewire_stream *handle, uint32_t slot_id) {
+  struct porthole_native_linux_pipewire_held_buffer *previous = NULL;
+  struct porthole_native_linux_pipewire_held_buffer *current = handle->held_head;
+  while (current != NULL) {
+    if (current->slot_id == slot_id) {
+      if (previous != NULL) {
+        previous->next = current->next;
+      } else {
+        handle->held_head = current->next;
+      }
+      if (handle->held_tail == current) {
+        handle->held_tail = previous;
+      }
+      current->next = NULL;
+      if (handle->held_count > 0) {
+        handle->held_count--;
+      }
+      return current;
+    }
+    previous = current;
+    current = current->next;
+  }
+  return NULL;
+}
+
+static void porthole_pipewire_stream_queue_held(struct porthole_native_linux_pipewire_stream *handle,
+                                                struct porthole_native_linux_pipewire_held_buffer *held) {
+  if (held == NULL) {
+    return;
+  }
+  pw_stream_queue_buffer(handle->stream, held->buffer);
+  free(held);
+}
+
+static void porthole_pipewire_stream_force_oldest_handback(struct porthole_native_linux_pipewire_stream *handle) {
+  struct porthole_native_linux_pipewire_held_buffer *held = handle->held_head;
+  if (held == NULL) {
+    return;
+  }
+  porthole_pipewire_stream_detach_held(handle, held->slot_id);
+  handle->forced_handback_count++;
+  porthole_pipewire_stream_queue_held(handle, held);
+}
+
+static bool porthole_pipewire_stream_hold_buffer(struct porthole_native_linux_pipewire_stream *handle,
+                                                 uint32_t slot_id,
+                                                 struct pw_buffer *buffer) {
+  uint32_t max_held = porthole_pipewire_stream_max_held(handle);
+  if (max_held == 0) {
+    return false;
+  }
+  while (handle->held_count >= max_held) {
+    porthole_pipewire_stream_force_oldest_handback(handle);
+  }
+
+  struct porthole_native_linux_pipewire_held_buffer *held = calloc(1, sizeof(*held));
+  if (held == NULL) {
+    /* Not a forced handback: the caller requeues this buffer immediately when
+     * hold returns false, so leave forced_handback_count (which counts held
+     * buffers stolen under saturation) unskewed. */
+    return false;
+  }
+  held->slot_id = slot_id;
+  held->buffer = buffer;
+  if (handle->held_tail != NULL) {
+    handle->held_tail->next = held;
+  } else {
+    handle->held_head = held;
+  }
+  handle->held_tail = held;
+  handle->held_count++;
+  return true;
 }
 
 static void porthole_pipewire_stream_process(void *data) {
@@ -200,20 +311,18 @@ static void porthole_pipewire_stream_process(void *data) {
   struct pw_buffer *buffer = NULL;
   while ((buffer = pw_stream_dequeue_buffer(handle->stream)) != NULL) {
     struct porthole_native_linux_pipewire_buffer_user_data *buffer_data = buffer->user_data;
+    uint32_t slot_id = UINT32_MAX;
     if (buffer_data != NULL && handle->callbacks.frame_ready != NULL) {
+      slot_id = buffer_data->slot_id;
       handle->callbacks.frame_ready(
         handle->callbacks.user_data,
-        buffer_data->slot_id,
+        slot_id,
         buffer->time,
         buffer->buffer);
     }
-    /* Known gap (#104): this hands the dmabuf straight back to the
-     * compositor, which may write the next frame into it before a consumer
-     * lease resolves. Lease gating only covers the producer's own republish
-     * of a slot; gating this handback needs a deeper buffer negotiation or
-     * an explicit-sync release point. Consumers can observe torn content
-     * until that lands. */
-    pw_stream_queue_buffer(handle->stream, buffer);
+    if (slot_id == UINT32_MAX || !porthole_pipewire_stream_hold_buffer(handle, slot_id, buffer)) {
+      pw_stream_queue_buffer(handle->stream, buffer);
+    }
   }
 }
 
@@ -343,7 +452,18 @@ static void porthole_native_linux_pipewire_stream_free(struct porthole_native_li
   if (handle == NULL) {
     return;
   }
+  /* Drain the held list under the thread-loop lock: the loop thread may still
+   * be running process/add_buffer/remove_buffer, which mutate the same list.
+   * Every other mutator locks first (see _release_buffer); this one must too.
+   * Release the lock before pw_thread_loop_stop, which reacquires it to join. */
   if (handle->loop != NULL) {
+    pw_thread_loop_lock(handle->loop);
+  }
+  while (handle->held_head != NULL) {
+    porthole_pipewire_stream_force_oldest_handback(handle);
+  }
+  if (handle->loop != NULL) {
+    pw_thread_loop_unlock(handle->loop);
     pw_thread_loop_stop(handle->loop);
   }
   if (handle->stream != NULL) {
@@ -454,21 +574,30 @@ int porthole_native_linux_pipewire_stream_open(
 
   pw_stream_add_listener(handle->stream, &handle->stream_listener, &porthole_pipewire_stream_events, handle);
 
-  uint8_t param_storage[2][1024];
-  const struct spa_pod *params[2];
-  params[0] = porthole_pipewire_build_dmabuf_format(
+  uint8_t param_storage[3][1024];
+  const struct spa_pod *params[3];
+  struct spa_pod_builder buffers_builder = SPA_POD_BUILDER_INIT(param_storage[2], sizeof(param_storage[2]));
+  params[0] = spa_pod_builder_add_object(
+    &buffers_builder,
+    SPA_TYPE_OBJECT_ParamBuffers,
+    SPA_PARAM_Buffers,
+    SPA_PARAM_BUFFERS_buffers,
+    SPA_POD_Int(PORTHOLE_NATIVE_LINUX_PIPEWIRE_REQUESTED_BUFFERS),
+    SPA_PARAM_BUFFERS_dataType,
+    SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_DmaBuf));
+  params[1] = porthole_pipewire_build_dmabuf_format(
     param_storage[0],
     sizeof(param_storage[0]),
     SPA_VIDEO_FORMAT_BGRA,
     desc->modifiers,
     desc->modifier_count);
-  params[1] = porthole_pipewire_build_dmabuf_format(
+  params[2] = porthole_pipewire_build_dmabuf_format(
     param_storage[1],
     sizeof(param_storage[1]),
     SPA_VIDEO_FORMAT_RGBA,
     desc->modifiers,
     desc->modifier_count);
-  if (params[0] == NULL || params[1] == NULL) {
+  if (params[0] == NULL || params[1] == NULL || params[2] == NULL) {
     pw_thread_loop_unlock(handle->loop);
     porthole_native_linux_pipewire_stream_free(handle);
     return ENOSPC;
@@ -480,7 +609,7 @@ int porthole_native_linux_pipewire_stream_open(
     target_id,
     PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_DONT_RECONNECT,
     params,
-    2);
+    3);
   if (connect_result < 0) {
     int error = errno != 0 ? errno : -connect_result;
     pw_thread_loop_unlock(handle->loop);
@@ -491,6 +620,20 @@ int porthole_native_linux_pipewire_stream_open(
   *out = handle;
   pw_thread_loop_unlock(handle->loop);
   return 0;
+}
+
+int porthole_native_linux_pipewire_stream_release_buffer(struct porthole_native_linux_pipewire_stream *handle,
+                                                        uint32_t slot_id) {
+  if (handle == NULL) {
+    return EINVAL;
+  }
+  pw_thread_loop_lock(handle->loop);
+  struct porthole_native_linux_pipewire_held_buffer *held = porthole_pipewire_stream_detach_held(handle, slot_id);
+  if (held != NULL) {
+    porthole_pipewire_stream_queue_held(handle, held);
+  }
+  pw_thread_loop_unlock(handle->loop);
+  return held == NULL ? ENOENT : 0;
 }
 
 void porthole_native_linux_pipewire_stream_close(struct porthole_native_linux_pipewire_stream *handle) {

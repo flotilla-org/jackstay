@@ -64,6 +64,7 @@ impl SyntheticLinuxBackend {
             let reached_value = timeline.query(0)?;
             self.lease_book
                 .complete_release_sync(*release_sync_id, reached_value)
+                .map(|_| ())
                 .map_err(CaptureTransferError::from)?;
         }
         Ok(())

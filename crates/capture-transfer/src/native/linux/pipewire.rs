@@ -185,6 +185,10 @@ mod ffi {
             callbacks: *const PortholeNativeLinuxPipewireStreamCallbacks,
             out: *mut *mut super::PortholeNativeLinuxPipewireStream,
         ) -> i32;
+        pub fn porthole_native_linux_pipewire_stream_release_buffer(
+            stream: *mut super::PortholeNativeLinuxPipewireStream,
+            slot_id: u32,
+        ) -> i32;
         pub fn porthole_native_linux_pipewire_stream_close(stream: *mut super::PortholeNativeLinuxPipewireStream);
     }
 }
@@ -274,6 +278,7 @@ pub struct PipeWireDmabufPlane {
 
 #[derive(Debug)]
 pub struct PipeWireDmabufFrame {
+    pub pipewire_slot_id: u32,
     pub width: u32,
     pub height: u32,
     pub spa_format: u32,
@@ -325,6 +330,57 @@ pub trait PipeWireStreamObserver: Send + 'static {
 }
 
 pub type SharedPipeWireNativeProducer = Arc<Mutex<NativeTrackProducer<PipeWireNativeBackend>>>;
+
+#[derive(Debug, Clone, Default)]
+pub struct PipeWireBufferReleaser {
+    inner: Arc<Mutex<PipeWireBufferReleaserState>>,
+}
+
+#[derive(Debug, Default)]
+struct PipeWireBufferReleaserState {
+    stream: Option<usize>,
+    released_slots: Vec<u32>,
+}
+
+impl PipeWireBufferReleaser {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set_stream(&self, stream: NonNull<PortholeNativeLinuxPipewireStream>) {
+        self.inner.lock().expect("pipewire buffer releaser poisoned").stream = Some(stream.as_ptr() as usize);
+    }
+
+    fn clear_stream(&self, stream: NonNull<PortholeNativeLinuxPipewireStream>) {
+        let mut state = self.inner.lock().expect("pipewire buffer releaser poisoned");
+        if state.stream == Some(stream.as_ptr() as usize) {
+            state.stream = None;
+        }
+    }
+
+    fn release_pipewire_slot(&self, pipewire_slot_id: u32) {
+        let stream = {
+            let mut state = self.inner.lock().expect("pipewire buffer releaser poisoned");
+            state.released_slots.push(pipewire_slot_id);
+            state.stream
+        };
+        if let Some(stream) = stream {
+            let errno = unsafe {
+                ffi::porthole_native_linux_pipewire_stream_release_buffer(
+                    stream as *mut PortholeNativeLinuxPipewireStream,
+                    pipewire_slot_id,
+                )
+            };
+            debug_assert!(errno == 0 || errno == libc::ENOENT);
+        }
+    }
+
+    #[cfg(test)]
+    fn released_slots(&self) -> Vec<u32> {
+        self.inner.lock().expect("pipewire buffer releaser poisoned").released_slots.clone()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PipeWireNativeProducerHandle {
@@ -513,7 +569,9 @@ impl PipeWireStreamObserver for PipeWireNativeProducerObserver {
             Self::record_error(&mut state, "PipeWire buffer arrived before stream config");
             return;
         };
-        match descriptor.and_then(|descriptor| descriptor.to_owned_frame(config.width, config.height, config.spa_format, config.modifier)) {
+        match descriptor
+            .and_then(|descriptor| descriptor.to_owned_frame(slot_id, config.width, config.height, config.spa_format, config.modifier))
+        {
             Ok(frame) => {
                 if state.producer.is_none() || state.reconfiguring {
                     state.buffers.insert(slot_id, frame);
@@ -582,6 +640,7 @@ struct PipeWireStreamObserverState {
 pub struct PipeWireStream {
     raw: NonNull<PortholeNativeLinuxPipewireStream>,
     _observer: Option<Box<PipeWireStreamObserverState>>,
+    releaser: Option<PipeWireBufferReleaser>,
 }
 
 // The stream handle owns an independent PipeWire thread loop and is not used
@@ -606,6 +665,18 @@ impl PipeWireStream {
         observer: Box<dyn PipeWireStreamObserver>,
     ) -> Result<Self> {
         Self::open_remote_fd(remote.as_fd().as_raw_fd(), target, Some(observer))
+    }
+
+    pub fn open_remote_with_observer_and_releaser(
+        remote: impl AsFd,
+        target: PipeWireStreamTarget,
+        observer: Box<dyn PipeWireStreamObserver>,
+        releaser: PipeWireBufferReleaser,
+    ) -> Result<Self> {
+        let mut stream = Self::open_remote_fd(remote.as_fd().as_raw_fd(), target, Some(observer))?;
+        releaser.set_stream(stream.raw);
+        stream.releaser = Some(releaser);
+        Ok(stream)
     }
 
     fn open_remote_fd(remote_fd: RawFd, target: PipeWireStreamTarget, observer: Option<Box<dyn PipeWireStreamObserver>>) -> Result<Self> {
@@ -654,6 +725,7 @@ impl PipeWireStream {
         Ok(Self {
             raw,
             _observer: observer_state,
+            releaser: None,
         })
     }
 }
@@ -676,6 +748,9 @@ fn modifier_array(modifiers: &[u64]) -> [u64; PIPEWIRE_MAX_MODIFIERS] {
 
 impl Drop for PipeWireStream {
     fn drop(&mut self) {
+        if let Some(releaser) = &self.releaser {
+            releaser.clear_stream(self.raw);
+        }
         unsafe { ffi::porthole_native_linux_pipewire_stream_close(self.raw.as_ptr()) };
     }
 }
@@ -788,7 +863,14 @@ impl PipeWireBufferDescriptor {
         Ok(Self { planes, header })
     }
 
-    pub fn to_owned_frame(&self, width: u32, height: u32, spa_format: u32, modifier: u64) -> Result<PipeWireDmabufFrame> {
+    pub fn to_owned_frame(
+        &self,
+        pipewire_slot_id: u32,
+        width: u32,
+        height: u32,
+        spa_format: u32,
+        modifier: u64,
+    ) -> Result<PipeWireDmabufFrame> {
         let mut planes = Vec::with_capacity(self.planes.len());
         for plane in &self.planes {
             planes.push(PipeWireDmabufPlane {
@@ -798,6 +880,7 @@ impl PipeWireBufferDescriptor {
             });
         }
         Ok(PipeWireDmabufFrame {
+            pipewire_slot_id,
             width,
             height,
             spa_format,
@@ -876,6 +959,8 @@ pub struct PipeWireNativeBackend {
     next_fence_id: u64,
     lease_book: NativeLeaseBook,
     release_syncs: HashMap<u64, DrmSyncobjTimeline>,
+    pipewire_slot_ids: HashMap<(u64, u32), u32>,
+    buffer_releaser: Option<PipeWireBufferReleaser>,
 }
 
 #[derive(Debug)]
@@ -898,6 +983,10 @@ pub struct PipeWireNativeFence {
 
 impl PipeWireNativeBackend {
     pub fn open(drm_render_path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_buffer_releaser(drm_render_path, None)
+    }
+
+    pub fn open_with_buffer_releaser(drm_render_path: impl AsRef<Path>, buffer_releaser: Option<PipeWireBufferReleaser>) -> Result<Self> {
         let probe = PipeWireRuntimeProbe::probe()?;
         if !probe.supports_dmabuf_producer_primitives() {
             return Err(CaptureTransferError::NativeBackend {
@@ -919,6 +1008,8 @@ impl PipeWireNativeBackend {
             next_fence_id: 1,
             lease_book: NativeLeaseBook::new(),
             release_syncs: HashMap::new(),
+            pipewire_slot_ids: HashMap::new(),
+            buffer_releaser,
         })
     }
 
@@ -933,9 +1024,24 @@ impl PipeWireNativeBackend {
         self.next_pool_id = self.next_pool_id.saturating_add(1);
         let surfaces = frames
             .into_iter()
-            .map(|frame| frame.into_surface_handle(&self.probe))
+            .map(|frame| {
+                let pipewire_slot_id = frame.pipewire_slot_id;
+                Ok((pipewire_slot_id, frame.into_surface_handle(&self.probe)?))
+            })
             .collect::<Result<Vec<_>>>()?;
+        let (pipewire_slot_ids, surfaces): (Vec<_>, Vec<_>) = surfaces.into_iter().unzip();
         let surface_count = surfaces.len();
+        // Drop mappings for superseded pools whose leases have all resolved.
+        // Entries with an outstanding lease are kept so release still finds the
+        // pw slot (a reconfigure can race a held buffer); they are pruned on a
+        // later allocation once their lease resolves. Bounds the map, which
+        // would otherwise grow one entry per slot per renegotiation forever.
+        let lease_book = &self.lease_book;
+        self.pipewire_slot_ids
+            .retain(|&(entry_pool, entry_slot), _| lease_book.slot_has_unresolved_leases(entry_pool, entry_slot));
+        for (slot_id, pipewire_slot_id) in pipewire_slot_ids.iter().copied().enumerate() {
+            self.pipewire_slot_ids.insert((pool_id, slot_id as u32), pipewire_slot_id);
+        }
         Ok(PipeWireNativePool {
             pool_id,
             surfaces,
@@ -951,11 +1057,28 @@ impl PipeWireNativeBackend {
     fn refresh_release_syncs(&mut self) -> Result<()> {
         for (release_sync_id, timeline) in &self.release_syncs {
             let reached_value = timeline.query(0)?;
-            self.lease_book
+            let released = self
+                .lease_book
                 .complete_release_sync(*release_sync_id, reached_value)
                 .map_err(CaptureTransferError::from)?;
+            for release in released {
+                self.release_pipewire_buffer_if_unblocked(&release.identity);
+            }
         }
         Ok(())
+    }
+
+    fn release_pipewire_buffer_if_unblocked(&self, identity: &NativeLeaseIdentity) {
+        if self.lease_book.slot_has_unresolved_leases(identity.pool_id, identity.slot_id) {
+            return;
+        }
+        let Some(releaser) = &self.buffer_releaser else {
+            return;
+        };
+        let Some(pipewire_slot_id) = self.pipewire_slot_ids.get(&(identity.pool_id, identity.slot_id)).copied() else {
+            return;
+        };
+        releaser.release_pipewire_slot(pipewire_slot_id);
     }
 }
 
@@ -1084,10 +1207,9 @@ impl LinuxNativeLeaseBackend for PipeWireNativeBackend {
     }
 
     fn release_linux_lease(&mut self, lease_id: u64, release: NativeLeaseRelease) -> Result<()> {
-        self.lease_book
-            .release(lease_id, release)
-            .map(|_| ())
-            .map_err(CaptureTransferError::from)
+        let released = self.lease_book.release(lease_id, release).map_err(CaptureTransferError::from)?;
+        self.release_pipewire_buffer_if_unblocked(&released.identity);
+        Ok(())
     }
 }
 
@@ -1136,15 +1258,19 @@ mod tests {
 
     use super::{
         DRM_FORMAT_BGRA8888, DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_RGBA8888, PipeWireBufferDescriptor, PipeWireBufferPlaneDescriptor,
-        PipeWireDmabufFrame, PipeWireDmabufPlane, PipeWireNativeBackend, PipeWireNativeFrame, PipeWireNativeProducerObserver,
-        PipeWireRuntimeProbe, PipeWireStream, PipeWireStreamConfig, PipeWireStreamObserver, PipeWireStreamObserverState,
-        PipeWireStreamTarget, PortholeNativeLinuxPipewireStreamConfig, drm_fourcc_for_pixel_format, pipewire_buffer_added,
-        pipewire_buffer_removed, pipewire_config_changed, pipewire_frame_ready, supported_pipewire_modifiers,
+        PipeWireBufferReleaser, PipeWireDmabufFrame, PipeWireDmabufPlane, PipeWireNativeBackend, PipeWireNativeFrame,
+        PipeWireNativeProducerObserver, PipeWireRuntimeProbe, PipeWireStream, PipeWireStreamConfig, PipeWireStreamObserver,
+        PipeWireStreamObserverState, PipeWireStreamTarget, PortholeNativeLinuxPipewireStreamConfig, drm_fourcc_for_pixel_format,
+        pipewire_buffer_added, pipewire_buffer_removed, pipewire_config_changed, pipewire_frame_ready, supported_pipewire_modifiers,
     };
     use crate::{
         CaptureTransferError,
         model::{ClockDomain, ColorSpace, PixelFormat},
-        native::{NativeFrameBackend, NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy},
+        native::{
+            NativeFrameBackend, NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy,
+            lease::{NativeLeaseIdentity, NativeLeaseRelease},
+            linux::LinuxNativeLeaseBackend,
+        },
     };
 
     #[test]
@@ -1320,6 +1446,7 @@ mod tests {
     fn maps_pipewire_dmabuf_frame_to_linux_surface_handle() {
         let probe = PipeWireRuntimeProbe::probe().unwrap();
         let frame = PipeWireDmabufFrame {
+            pipewire_slot_id: 0,
             width: 64,
             height: 32,
             spa_format: probe.spa_video_format_bgra,
@@ -1348,6 +1475,7 @@ mod tests {
 
         assert!(
             PipeWireDmabufFrame {
+                pipewire_slot_id: 0,
                 width: 0,
                 height: 32,
                 spa_format: probe.spa_video_format_bgra,
@@ -1360,6 +1488,7 @@ mod tests {
 
         assert!(
             PipeWireDmabufFrame {
+                pipewire_slot_id: 0,
                 width: 64,
                 height: 32,
                 spa_format: u32::MAX,
@@ -1372,6 +1501,7 @@ mod tests {
 
         assert!(
             PipeWireDmabufFrame {
+                pipewire_slot_id: 0,
                 width: 64,
                 height: 32,
                 spa_format: probe.spa_video_format_bgra,
@@ -1384,6 +1514,7 @@ mod tests {
 
         assert!(
             PipeWireDmabufFrame {
+                pipewire_slot_id: 0,
                 width: 64,
                 height: 32,
                 spa_format: probe.spa_video_format_bgra,
@@ -1396,6 +1527,7 @@ mod tests {
 
         assert!(
             PipeWireDmabufFrame {
+                pipewire_slot_id: 0,
                 width: 64,
                 height: 32,
                 spa_format: probe.spa_video_format_bgra,
@@ -1416,7 +1548,8 @@ mod tests {
 
     #[test]
     fn pipewire_native_backend_publishes_the_delivered_buffer_slot() {
-        let mut backend = match PipeWireNativeBackend::open("/dev/dri/renderD128") {
+        let releaser = PipeWireBufferReleaser::new();
+        let mut backend = match PipeWireNativeBackend::open_with_buffer_releaser("/dev/dri/renderD128", Some(releaser.clone())) {
             Ok(backend) => backend,
             Err(CaptureTransferError::NativeBackend {
                 operation: "linux-drm-open" | "linux-pipewire-drm-syncobj-timeline-cap",
@@ -1428,6 +1561,7 @@ mod tests {
         let pool = backend
             .allocate_pool_from_frames(vec![
                 PipeWireDmabufFrame {
+                    pipewire_slot_id: 10,
                     width: 64,
                     height: 32,
                     spa_format,
@@ -1435,6 +1569,7 @@ mod tests {
                     planes: vec![plane(256)],
                 },
                 PipeWireDmabufFrame {
+                    pipewire_slot_id: 20,
                     width: 64,
                     height: 32,
                     spa_format,
@@ -1475,6 +1610,26 @@ mod tests {
         assert_eq!(grant.pool_slot_count, 2);
         assert_eq!(grant.surface_handles.len(), 2);
         assert_eq!(grant.surface_handles[1].planes[0].stride, 256);
+
+        let identity = NativeLeaseIdentity {
+            cursor,
+            sequence: entry.sequence,
+            pool_id: entry.pool_id,
+            slot_id: entry.slot_id,
+        };
+        let first_lease = producer.backend_mut().acquire_linux_lease(identity).unwrap();
+        let second_lease = producer.backend_mut().acquire_linux_lease(identity).unwrap();
+        producer
+            .backend_mut()
+            .release_linux_lease(first_lease, NativeLeaseRelease::Now)
+            .unwrap();
+        assert!(releaser.released_slots().is_empty());
+
+        producer
+            .backend_mut()
+            .release_linux_lease(second_lease, NativeLeaseRelease::Now)
+            .unwrap();
+        assert_eq!(releaser.released_slots(), vec![20]);
     }
 
     #[test]
@@ -1651,7 +1806,7 @@ mod tests {
         assert_eq!(descriptor.header.as_ref().unwrap().sequence, 99);
 
         let frame = descriptor
-            .to_owned_frame(64, 32, probe.spa_video_format_bgra, DRM_FORMAT_MOD_LINEAR)
+            .to_owned_frame(7, 64, 32, probe.spa_video_format_bgra, DRM_FORMAT_MOD_LINEAR)
             .unwrap();
         let surface = frame.into_surface_handle(&probe).unwrap();
         assert_eq!(surface.planes[0].offset, 192);

@@ -143,20 +143,32 @@ impl NativeLeaseBook {
         }
     }
 
-    pub fn complete_release_sync(&mut self, release_sync_id: u64, reached_value: u64) -> Result<(), NativeLeaseError> {
+    pub fn complete_release_sync(
+        &mut self,
+        release_sync_id: u64,
+        reached_value: u64,
+    ) -> Result<Vec<ReleasedNativeLease>, NativeLeaseError> {
         if !self.release_syncs.contains(&release_sync_id) {
             return Err(NativeLeaseError::UnknownReleaseSync(release_sync_id));
         }
-        self.leases.retain(|_, entry| {
-            !matches!(
+        let mut released = Vec::new();
+        self.leases.retain(|lease_id, entry| {
+            let complete = matches!(
                 entry.state,
                 LeaseState::ReleasePending {
                     release_sync_id: pending_sync_id,
                     value
                 } if pending_sync_id == release_sync_id && value <= reached_value
-            )
+            );
+            if complete {
+                released.push(ReleasedNativeLease {
+                    lease_id: *lease_id,
+                    identity: entry.identity,
+                });
+            }
+            !complete
         });
-        Ok(())
+        Ok(released)
     }
 
     #[must_use]
@@ -245,10 +257,12 @@ mod tests {
             Err(NativeLeaseError::AlreadyReleased(lease_id))
         );
 
-        book.complete_release_sync(release_sync_id, 4).unwrap();
+        assert!(book.complete_release_sync(release_sync_id, 4).unwrap().is_empty());
         assert!(book.slot_has_unresolved_leases(7, 3));
 
-        book.complete_release_sync(release_sync_id, 5).unwrap();
+        let released = book.complete_release_sync(release_sync_id, 5).unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].identity, identity(3));
         assert!(!book.slot_has_unresolved_leases(7, 3));
     }
 
@@ -268,7 +282,8 @@ mod tests {
         .unwrap();
         assert!(book.slot_has_unresolved_leases(7, 1));
 
-        book.complete_release_sync(42, 9).unwrap();
+        let released = book.complete_release_sync(42, 9).unwrap();
+        assert_eq!(released.len(), 1);
         assert!(!book.slot_has_unresolved_leases(7, 1));
         assert_eq!(book.register_release_sync().unwrap(), 43);
     }

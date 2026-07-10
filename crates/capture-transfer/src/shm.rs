@@ -1,8 +1,9 @@
-use std::{
-    fs::File,
-    os::fd::{AsRawFd, OwnedFd},
-    ptr::NonNull,
-};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
+#[cfg(unix)]
+use std::{fs::File, os::fd::AsRawFd, ptr::NonNull};
 
 use crate::{
     error::{CaptureTransferError, Result},
@@ -11,9 +12,13 @@ use crate::{
 
 #[derive(Debug)]
 pub struct SharedMemorySegment {
+    #[cfg(unix)]
     ptr: NonNull<u8>,
+    #[cfg(unix)]
     len: usize,
+    #[cfg(unix)]
     writable: bool,
+    #[cfg(unix)]
     _file: File,
 }
 
@@ -28,6 +33,7 @@ unsafe impl Send for SharedMemorySegment {}
 // pinned by consumers.
 unsafe impl Sync for SharedMemorySegment {}
 
+#[cfg(unix)]
 impl SharedMemorySegment {
     pub fn new(len: usize) -> Result<Self> {
         if len == 0 {
@@ -205,6 +211,7 @@ impl SharedMemorySegment {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SharedMemorySegment {
     fn drop(&mut self) {
         // SAFETY: ptr/len describe the mapping created in new. The kernel keeps
@@ -213,6 +220,82 @@ impl Drop for SharedMemorySegment {
         unsafe {
             libc::munmap(self.ptr.as_ptr().cast(), self.len);
         }
+    }
+}
+
+#[cfg(windows)]
+impl SharedMemorySegment {
+    pub fn new(len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(CaptureTransferError::InvalidSharedMemoryLength);
+        }
+        Err(unimplemented_windows_shm("create"))
+    }
+
+    pub fn map_read_only(_fd: OwnedFd, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(CaptureTransferError::InvalidSharedMemoryLength);
+        }
+        Err(unimplemented_windows_shm("mmap-read-only"))
+    }
+
+    pub fn map_read_write(_fd: OwnedFd, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(CaptureTransferError::InvalidSharedMemoryLength);
+        }
+        Err(unimplemented_windows_shm("mmap-read-write"))
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        0
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        true
+    }
+
+    #[must_use]
+    pub const fn payload_kind(&self) -> PayloadKind {
+        PayloadKind::CpuShm
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &[]
+    }
+
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        panic!("shm backing unimplemented on Windows")
+    }
+
+    #[must_use]
+    pub fn slice_at(&self, offset: usize, len: usize) -> &[u8] {
+        assert_eq!(offset, 0);
+        assert_eq!(len, 0);
+        &[]
+    }
+
+    pub fn with_slice_at_mut<R>(&self, _offset: usize, _len: usize, _f: impl FnOnce(&mut [u8]) -> R) -> R {
+        panic!("shm backing unimplemented on Windows")
+    }
+
+    pub fn write_at(&self, _offset: usize, _bytes: &[u8]) {
+        panic!("shm backing unimplemented on Windows")
+    }
+
+    pub fn try_clone_fd(&self) -> Result<OwnedFd> {
+        Err(unimplemented_windows_shm("clone-fd"))
+    }
+}
+
+#[cfg(windows)]
+fn unimplemented_windows_shm(operation: &'static str) -> CaptureTransferError {
+    CaptureTransferError::SharedMemory {
+        operation,
+        message: "shm backing unimplemented on Windows".to_string(),
     }
 }
 
@@ -294,8 +377,13 @@ fn create_anonymous_backing(len: usize) -> Result<File> {
     Ok(file)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-compile_error!("anonymous shm backing is only implemented for macOS and Linux");
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn create_anonymous_backing(_len: usize) -> Result<File> {
+    Err(CaptureTransferError::SharedMemory {
+        operation: "create",
+        message: "anonymous shm backing is only implemented for macOS and Linux".to_string(),
+    })
+}
 
 #[cfg(test)]
 mod tests {

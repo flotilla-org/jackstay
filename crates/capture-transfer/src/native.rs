@@ -22,7 +22,11 @@ pub mod linux;
 #[cfg(all(target_os = "macos", feature = "backend-macos"))]
 pub mod macos;
 
-use std::{collections::VecDeque, os::fd::OwnedFd};
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
 
 use crate::{
     control_page::{PendingVideoRingEntry, VideoTrackControlPage},

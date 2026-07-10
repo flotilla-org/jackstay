@@ -1,7 +1,8 @@
-use std::{
-    os::fd::OwnedFd,
-    sync::atomic::{AtomicU64, Ordering, fence},
-};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use thiserror::Error;
 

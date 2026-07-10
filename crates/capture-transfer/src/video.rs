@@ -1,6 +1,9 @@
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::fd::OwnedFd,
     sync::Arc,
 };
 

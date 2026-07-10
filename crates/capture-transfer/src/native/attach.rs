@@ -13,10 +13,11 @@
 //! service (ADR-0007, #84) because `MTLSharedEventHandle` refuses plain
 //! serialization. Tests drive the protocol with an in-memory fake transport.
 
-use std::{
-    os::fd::OwnedFd,
-    sync::atomic::{AtomicU64, Ordering},
-};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 

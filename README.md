@@ -6,8 +6,8 @@ Rust implementation shared by Rust and C-ABI consumers.
 
 This repository starts at **0.1.0** with no API or ABI stability promise. The C
 headers carry their own ABI version; check that version when loading the library.
-Porthole consumes a pinned Git revision. The repository is initially private,
-so cloning and dependent CI builds require access to `flotilla-org/jackstay`.
+Porthole consumes a pinned Git revision. The repository is public; cloning and
+dependent CI builds need no GitHub credential.
 
 ## Build and run
 

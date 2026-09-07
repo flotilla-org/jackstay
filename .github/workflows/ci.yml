@@ -1,0 +1,63 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-03-12
+          components: rustfmt
+      - run: cargo +nightly-2026-03-12 fmt --check
+  unix:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            feature: backend-macos
+          - os: ubuntu-latest
+            feature: backend-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libsdl2-dev cmake pkg-config
+      - if: runner.os == 'macOS'
+        run: brew install sdl2 pkg-config cmake
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo build --workspace --locked --features ${{ matrix.feature }}
+      - run: cargo test --workspace --locked --features ${{ matrix.feature }}
+      - run: cargo clippy --workspace --all-targets --locked --features ${{ matrix.feature }} -- -D warnings
+      - run: scripts/smoke-viewer.sh
+        env:
+          SDL_VIDEODRIVER: dummy
+      - run: ctest --test-dir build/viewer --output-on-failure
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Preserve the existing Windows compile gate. Native capture is unsupported.
+      - run: cargo build --workspace --locked
+  abi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cc -std=c11 -fsyntax-only crates/jackstay/include/capture_transfer.h
+      - run: cc -std=c11 -fsyntax-only crates/jackstay/include/jackstay_ring.h
+      - run: cc -std=c11 -I crates/jackstay/include -fsyntax-only crates/jackstay/src/native/c_abi_header_smoke.c
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: zig translate-c -lc crates/jackstay/include/capture_transfer.h > /dev/null
+      - run: zig translate-c -lc crates/jackstay/include/jackstay_ring.h > /dev/null

@@ -13,13 +13,24 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 
-if(NOT CAPTURE_TRANSFER_LIB)
-  set(CAPTURE_TRANSFER_LIB "${CMAKE_SOURCE_DIR}/../../target/debug/libcapture_transfer.dylib")
+get_filename_component(JACKSTAY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(JACKSTAY_INCLUDE_DIR "${JACKSTAY_ROOT}/crates/jackstay/include" CACHE PATH "Jackstay public headers")
+if(NOT JACKSTAY_LIB)
+  if(APPLE)
+    set(JACKSTAY_LIB "${JACKSTAY_ROOT}/target/debug/libjackstay.dylib")
+  elseif(WIN32)
+    message(FATAL_ERROR "The SDL reference viewer currently supports macOS and Linux; Windows desktop capture is separate work")
+  else()
+    set(JACKSTAY_LIB "${JACKSTAY_ROOT}/target/debug/libjackstay.so")
+  endif()
+endif()
+if(NOT EXISTS "${JACKSTAY_LIB}")
+  message(FATAL_ERROR "Build Jackstay first (backend-macos on macOS), or set JACKSTAY_LIB to the built shared library")
 endif()
 
 set(VIEWER_SOURCES src/main.c)
 if(APPLE)
-  # Build libcapture_transfer with --features backend-macos so the
+  # Build libjackstay with --features backend-macos so the
   # ft_native_* symbols this viewer links against are present.
   list(APPEND VIEWER_SOURCES src/metal_present.m)
   # ARC: the present shim relies on __bridge_retained/__bridge_transfer to own
@@ -29,11 +40,11 @@ endif()
 
 add_executable(capture-viewer-sdl ${VIEWER_SOURCES})
 target_include_directories(capture-viewer-sdl PRIVATE
-  "${CMAKE_SOURCE_DIR}/../../crates/capture-transfer/include"
+  "${JACKSTAY_INCLUDE_DIR}"
   ${SDL2_INCLUDE_DIRS}
 )
 target_link_directories(capture-viewer-sdl PRIVATE ${SDL2_LIBRARY_DIRS})
-target_link_libraries(capture-viewer-sdl PRIVATE ${CAPTURE_TRANSFER_LIB} ${SDL2_LIBRARIES})
+target_link_libraries(capture-viewer-sdl PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES})
 target_compile_options(capture-viewer-sdl PRIVATE ${SDL2_CFLAGS_OTHER})
 
 if(APPLE)
@@ -43,4 +54,16 @@ if(APPLE)
     "-framework IOSurface"
     "-framework Foundation"
   )
+endif()
+
+enable_testing()
+add_test(NAME synthetic_c_abi COMMAND capture-viewer-sdl --frames 30)
+set_tests_properties(synthetic_c_abi PROPERTIES
+  ENVIRONMENT "SDL_VIDEODRIVER=dummy"
+  PASS_REGULAR_EXPRESSION "acquired_frames=30"
+  TIMEOUT 15
+)
+if(NOT APPLE)
+  add_test(NAME unsupported_native COMMAND capture-viewer-sdl --native --frames 1)
+  set_tests_properties(unsupported_native PROPERTIES WILL_FAIL TRUE TIMEOUT 5)
 endif()

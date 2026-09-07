@@ -1,134 +1,62 @@
-# Capture Viewer SDL
+# SDL reference viewer
 
-Small C-ABI dogfood viewer for `capture-transfer`.
+The default mode creates synthetic frames and consumes them through Jackstay's
+public C API in the same process. This mode needs no porthole daemon. The existing
+SDL rendering path remains available to Katzensteg's SDL interception.
 
-The viewer has two modes:
-
-- default: runs a synthetic producer in-process and consumes frames through the
-  public C ABI.
-- `--porthole-socket`: asks `portholed` to create a synthetic capture session,
-  connects back through a session descriptor, then receives frames through the
-  fd-passing transport.
-- `--porthole-socket` plus `--session-id`: attaches to an existing daemon
-  capture session without creating one.
-
-Build:
+From the Jackstay checkout:
 
 ```sh
-cargo build -p capture-transfer -p porthole -p portholed --locked
-cmake -S tools/capture-viewer-sdl -B target/capture-viewer-sdl \
-  -DCAPTURE_TRANSFER_LIB="$PWD/target/debug/libcapture_transfer.dylib"
-cmake --build target/capture-viewer-sdl
+./scripts/smoke-viewer.sh
 ```
 
-Run:
+Leave `--frames` off the resulting `build/viewer/capture-viewer-sdl` command to
+keep the window open. `SDL_VIDEODRIVER=dummy` supports offline synthetic checks;
+it is not a substitute for real desktop capture evidence.
+
+## External library build
+
+Build Jackstay first, with `--features backend-macos` on macOS. CMake defaults to
+the current Jackstay checkout's headers and debug library. For an installed or
+separately built library, pass both locations:
 
 ```sh
-target/capture-viewer-sdl/capture-viewer-sdl
+cmake -S tools/capture-viewer-sdl -B build/viewer \
+  -DJACKSTAY_LIB=/absolute/path/to/libjackstay.dylib \
+  -DJACKSTAY_INCLUDE_DIR=/absolute/path/to/jackstay/include
+cmake --build build/viewer
+ctest --test-dir build/viewer --output-on-failure
 ```
 
-Headless smoke test:
+Linux uses `libjackstay.so`. The CTest smoke checks 30 generated frames through
+the C ABI and SDL software renderer. It fails on missing/corrupt frames or renderer
+failure. The library and viewer support synthetic operation on macOS/Linux; the
+SDL native presenter uses Metal and rejects `--native` on Linux. Linux native
+import/sync verification lives in the Vulkan reference consumer checks.
+
+## Optional porthole integration
+
+These modes require a separately installed and authorized porthole. They are not
+needed to build or test the standalone example.
+
+`--porthole-socket PATH` creates a porthole synthetic capture session; adding
+`--session-id ID` attaches to an existing CPU session instead. The library's
+optional porthole client uses `PORTHOLE_AGENT_TOKEN` when applicable. The host
+remains responsible for capture permission, source selection and session cleanup.
+
+For a real macOS native capture session, keep porthole running as its installed
+launchd job so it owns its attach MachService. Use porthole's capture-session
+command to obtain the endpoint and attach token, then supply them to the viewer:
 
 ```sh
-SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl --frames 3
+./build/viewer/capture-viewer-sdl --native \
+  --transport-kind 1 --endpoint "$attach_endpoint" --token "$attach_token" \
+  --frames 120
 ```
 
-Daemon-backed smoke test:
-
-```sh
-runtime_dir="$(mktemp -d)"
-PORTHOLE_RUNTIME_DIR="$runtime_dir" target/debug/portholed >"$runtime_dir/portholed.log" 2>&1 &
-portholed_pid=$!
-
-for _ in $(seq 1 50); do
-  [ -S "$runtime_dir/porthole.sock" ] && break
-  sleep 0.1
-done
-
-SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl \
-  --porthole-socket "$runtime_dir/porthole.sock" \
-  --frames 3
-
-kill "$portholed_pid"
-rm -rf "$runtime_dir"
-```
-
-Attach-only daemon smoke test:
-
-```sh
-runtime_dir="$(mktemp -d)"
-PORTHOLE_RUNTIME_DIR="$runtime_dir" target/debug/portholed >"$runtime_dir/portholed.log" 2>&1 &
-portholed_pid=$!
-
-for _ in $(seq 1 50); do
-  [ -S "$runtime_dir/porthole.sock" ] && break
-  sleep 0.1
-done
-
-descriptor="$(PORTHOLE_RUNTIME_DIR="$runtime_dir" target/debug/porthole capture-session synthetic)"
-session_id="$(printf '%s\n' "$descriptor" | awk '/^session_id:/ { print $2 }')"
-
-SDL_VIDEODRIVER=dummy target/capture-viewer-sdl/capture-viewer-sdl \
-  --porthole-socket "$runtime_dir/porthole.sock" \
-  --session-id "$session_id" \
-  --frames 3
-
-kill "$portholed_pid"
-rm -rf "$runtime_dir"
-```
-
-Real surface capture:
-
-```sh
-surface_id="$(porthole attach --frontmost --json | jq -r .surface_id)"
-descriptor="$(porthole capture-session surface "$surface_id")"
-session_id="$(printf '%s\n' "$descriptor" | awk '/^session_id:/ { print $2 }')"
-porthole_socket="$(printf '%s\n' "$descriptor" | awk '/^porthole_socket:/ { print $2 }')"
-
-target/capture-viewer-sdl/capture-viewer-sdl \
-  --porthole-socket "$porthole_socket" \
-  --session-id "$session_id"
-```
-
-The same flow is available as a bounded smoke test:
-
-```sh
-./scripts/manual-capture-transfer-smoke.sh --frames 300
-```
-
-## Native attach capture
-
-The viewer also has a native attach path. On macOS it attaches over XPC,
-latches the received `IOSurface` into an `MTLTexture` zero-copy, GPU-waits on
-the per-frame `MTLSharedEvent` value before sampling, and presents without
-pixel readback. On Linux it attaches over a Unix-domain socket and can acquire
-dmabuf leases from the PipeWire native path, though this SDL viewer cannot
-present dmabuf through Metal. The macOS path needs the library built with the
-`backend-macos` feature so the `ft_native_*` symbols are present, and
-`portholed` running from `Porthole.app` under launchd so it owns the
-`work.flotilla.porthole.attach` mach service:
-
-```sh
-cargo build -p capture-transfer --features backend-macos --locked
-cmake -S tools/capture-viewer-sdl -B target/capture-viewer-sdl \
-  -DCAPTURE_TRANSFER_LIB="$PWD/target/debug/libcapture_transfer.dylib"
-cmake --build target/capture-viewer-sdl
-
-surface_id="$(porthole attach --frontmost --json | jq -r .surface_id)"
-descriptor="$(porthole capture-session surface "$surface_id" --native)"
-transport_kind="$(printf '%s\n' "$descriptor" | awk '/^native_transport:/ { print $2 }')"
-endpoint="$(printf '%s\n' "$descriptor" | awk '/^(mach_service|attach_socket):/ { print $2 }')"
-attach_token="$(printf '%s\n' "$descriptor" | awk '/^attach_token:/ { print $2 }')"
-
-target/capture-viewer-sdl/capture-viewer-sdl \
-  --native --transport-kind "$transport_kind" --endpoint "$endpoint" --token "$attach_token"
-```
-
-The bounded smoke test for this path:
-
-```sh
-./scripts/manual-native-viewer-smoke.sh --frames 600
-```
-
-Scope: one native session at a time (launchd permits a single listener per
-mach-service name).
+Transport kind 1 is the macOS XPC endpoint; `--mach-service NAME` also selects it.
+Use values returned by the host, not guessed surface handles or IDs. Consult the
+porthole native-viewer smoke for its complete authorized session lifecycle.
+Frame presentation waits on the transferred Metal fence and releases the acquired
+lease after rendering. Native capture needs separate live validation; the offline
+synthetic test makes no claim about GPU copies or desktop permissions.

@@ -89,6 +89,7 @@ static int require_ok(ft_status status, const char *operation) {
   return 1;
 }
 
+#ifdef __APPLE__
 static const ft_native_pool *native_pool_find(const native_pool_cache *cache, uint64_t pool_id) {
   for (uint32_t i = 0; i < cache->count; i++) {
     if (cache->pools[i].pool_id == pool_id) {
@@ -255,6 +256,14 @@ static int run_native(const viewer_options *options) {
   return 0;
 }
 
+#else
+static int run_native(const viewer_options *options) {
+  (void)options;
+  fprintf(stderr, "native SDL presentation requires macOS/Metal; use the Linux Vulkan reference checks for dmabuf frames\n");
+  return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
   viewer_options options = parse_options(argc, argv);
 
@@ -400,6 +409,8 @@ int main(int argc, char **argv) {
   }
 
   int running = 1;
+  int failed = 0;
+  uint64_t acquired_frames = 0;
   uint64_t sequence = 1;
   while (running && (options.max_frames <= 0 || sequence <= (uint64_t)options.max_frames)) {
     SDL_Event sdl_event;
@@ -422,7 +433,7 @@ int main(int argc, char **argv) {
       if (require_ok(ft_producer_publish_video_frame(stream.producer, stream.track_id, &frame_desc, pixels,
                                                      (size_t)STRIDE * HEIGHT),
                      "ft_producer_publish_video_frame")) {
-        running = 0;
+        failed = 1;
         break;
       }
     }
@@ -437,7 +448,16 @@ int main(int argc, char **argv) {
     }
 
     ft_video_frame frame = {0};
-    if (ft_consumer_acquire_latest_video_frame(stream.consumer, stream.track_id, &frame) == FT_STATUS_OK) {
+    ft_status acquire_status = ft_consumer_acquire_latest_video_frame(stream.consumer, stream.track_id, &frame);
+    if (acquire_status == FT_STATUS_OK) {
+      if (!stream.daemon_mode && (frame.desc.sequence != sequence ||
+          frame.data == NULL || frame.len != (size_t)STRIDE * HEIGHT ||
+          memcmp(frame.data, pixels, (size_t)STRIDE * HEIGHT) != 0)) {
+        fprintf(stderr, "synthetic frame payload/sequence mismatch\n");
+        ft_consumer_release_video_frame(stream.consumer, &frame);
+        failed = 1;
+        break;
+      }
       if (frame.desc.width != stream.width || frame.desc.height != stream.height) {
         SDL_Texture *resized_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA32,
                                                          SDL_TEXTUREACCESS_STREAMING,
@@ -445,7 +465,7 @@ int main(int argc, char **argv) {
         if (resized_texture == NULL) {
           fprintf(stderr, "SDL resize texture failed: %s\n", SDL_GetError());
           ft_consumer_release_video_frame(stream.consumer, &frame);
-          running = 0;
+          failed = 1;
           break;
         }
         SDL_DestroyTexture(texture);
@@ -456,17 +476,31 @@ int main(int argc, char **argv) {
         stream.height = frame.desc.height;
       }
       stream.stride = frame.desc.stride;
-      SDL_UpdateTexture(texture, NULL, frame.data, (int)frame.desc.stride);
-      SDL_RenderClear(renderer);
-      SDL_RenderCopy(renderer, texture, NULL, NULL);
+      if (SDL_UpdateTexture(texture, NULL, frame.data, (int)frame.desc.stride) != 0 ||
+          SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, NULL, NULL) != 0) {
+        fprintf(stderr, "SDL render failed: %s\n", SDL_GetError());
+        ft_consumer_release_video_frame(stream.consumer, &frame);
+        failed = 1;
+        break;
+      }
       SDL_RenderPresent(renderer);
       ft_consumer_release_video_frame(stream.consumer, &frame);
+      acquired_frames++;
+    } else if (!stream.daemon_mode || acquire_status != FT_STATUS_EMPTY) {
+      fprintf(stderr, "acquire frame failed with status %d\n", acquire_status);
+      failed = 1;
+      break;
     }
 
     sequence++;
     SDL_Delay(16);
   }
 
+  if (!stream.daemon_mode && options.max_frames > 0 && acquired_frames != (uint64_t)options.max_frames) {
+    fprintf(stderr, "expected %d synthetic frames, acquired %" PRIu64 "\n", options.max_frames, acquired_frames);
+    failed = 1;
+  }
+  printf("acquired_frames=%" PRIu64 "\n", acquired_frames);
   free(pixels);
   SDL_DestroyTexture(texture);
   SDL_DestroyRenderer(renderer);
@@ -476,5 +510,5 @@ int main(int argc, char **argv) {
   if (stream.producer != NULL) {
     ft_producer_destroy(stream.producer);
   }
-  return 0;
+  return failed ? 1 : 0;
 }

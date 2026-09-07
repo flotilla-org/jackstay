@@ -706,17 +706,13 @@ impl VideoSlotManager {
     }
 
     fn prune_unpinned(frames: &mut Vec<StoredFrame>, capacity: usize) -> u64 {
-        let mut evicted = 0;
-        while frames.len() > capacity {
-            let newest_index = frames.len() - 1;
-            if let Some(index) = frames.iter().take(newest_index).position(|frame| frame.pinned_by.is_empty()) {
-                frames.remove(index);
-                evicted += 1;
-            } else {
-                break;
-            }
-        }
-        evicted
+        let latest_cursor = frames.last().map_or(0, |frame| frame.cursor);
+        let evicted_through = latest_cursor.saturating_sub(capacity as u64);
+        let before = frames.len();
+        // Pins outside the ring are additional retained storage; they must not
+        // consume the capacity reserved for still-advertised ring entries.
+        frames.retain(|frame| frame.cursor > evicted_through || !frame.pinned_by.is_empty());
+        (before - frames.len()) as u64
     }
 
     fn publish_immutable_frame(&self, mut desc: VideoFrameDesc, pixels: &[u8]) -> Result<PublishedPayload> {
@@ -766,15 +762,27 @@ impl VideoSlotManager {
         let pool = self.pools_by_track.get(&track_id)?;
         let frames = self.frames_by_track.get(&track_id);
         let pending_claims = self.pending_claims_by_track.get(&track_id);
+        let next_cursor = self
+            .controls_by_track
+            .get(&track_id)
+            .and_then(TrackRingControl::retained_cursor_bounds)
+            .map_or(1, |(_, latest)| latest.saturating_add(1));
+        let evicted_through = next_cursor.saturating_sub(self.capacity_per_track as u64);
         for attempt in 0..pool.slot_count {
             let slot_index = (pool.next_slot + attempt) % pool.slot_count;
-            let pinned = frames.is_some_and(|frames| {
-                frames
-                    .iter()
-                    .any(|frame| frame.pool_id == Some(pool.pool_id) && frame.slot_index == Some(slot_index) && !frame.pinned_by.is_empty())
+            // A held oldest frame must not make us overwrite a newer frame
+            // that the ring will still advertise after the next publication.
+            // If no slot qualifies, claim_video_slot replaces the pool while
+            // retained frames keep their old backing allocation alive.
+            let retained_or_pinned = frames.is_some_and(|frames| {
+                frames.iter().any(|frame| {
+                    frame.pool_id == Some(pool.pool_id)
+                        && frame.slot_index == Some(slot_index)
+                        && (!frame.pinned_by.is_empty() || frame.cursor > evicted_through)
+                })
             });
             let claimed = pending_claims.is_some_and(|claims| claims.contains(&(pool.pool_id, slot_index)));
-            if !pinned && !claimed {
+            if !retained_or_pinned && !claimed {
                 return Some(slot_index);
             }
         }
@@ -909,6 +917,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pinned_oldest_frame_does_not_evict_other_retained_payloads() {
+        for mut slots in [VideoSlotManager::new(2), VideoSlotManager::new_reusable_pool(2)] {
+            let track = TrackId::new(1);
+            slots.publish(track, frame_desc(1), &[1]).unwrap();
+            let held = slots.acquire_latest(ConsumerId::new(7), track).unwrap();
+            slots.publish(track, frame_desc(2), &[2]).unwrap();
+            slots.publish(track, frame_desc(3), &[3]).unwrap();
+
+            let frame = match slots.acquire_next_after(ConsumerId::new(8), track, 0).unwrap() {
+                OrderedVideoAcquire::Frame(frame) => frame,
+                other => panic!("expected oldest retained frame, got {other:?}"),
+            };
+            assert_eq!(frame.producer_cursor(), 2);
+            assert_eq!(frame.bytes(), &[2]);
+            assert_eq!(held.bytes(), &[1]);
+            slots.release(frame);
+            slots.release(held);
+        }
     }
 
     #[test]

@@ -368,7 +368,10 @@ impl VideoSlotManager {
     #[must_use]
     pub fn new(capacity_per_track: usize) -> Self {
         Self {
-            capacity_per_track: capacity_per_track.max(1),
+            // The descriptor ring rounds to a power of two. Keep payload retention
+            // and reusable storage at that same capacity so every advertised
+            // retained cursor still has backing pixels.
+            capacity_per_track: capacity_per_track.max(1).next_power_of_two(),
             storage_mode: VideoStorageMode::ImmutablePerFrame,
             next_pool_id: 1,
             frames_by_track: BTreeMap::new(),
@@ -909,6 +912,29 @@ mod tests {
     }
 
     #[test]
+    fn ordered_reads_after_non_power_of_two_capacity_wrap_retain_payloads() {
+        for mut slots in [VideoSlotManager::new(3), VideoSlotManager::new_reusable_pool(3)] {
+            let track = TrackId::new(1);
+            let consumer = ConsumerId::new(7);
+            for sequence in 1..=8 {
+                slots.publish(track, frame_desc(sequence), &[sequence as u8]).unwrap();
+            }
+
+            let mut after_cursor = 0;
+            for expected in 5..=8 {
+                let frame = match slots.acquire_next_after(consumer, track, after_cursor).unwrap() {
+                    OrderedVideoAcquire::Frame(frame) => frame,
+                    other => panic!("expected retained frame {expected}, got {other:?}"),
+                };
+                assert_eq!(frame.producer_cursor(), expected);
+                assert_eq!(frame.bytes(), &[expected as u8]);
+                after_cursor = frame.producer_cursor();
+                slots.release(frame);
+            }
+        }
+    }
+
+    #[test]
     fn acquire_next_after_zero_returns_oldest_retained_frame() {
         let mut slots = VideoSlotManager::new_reusable_pool(3);
         let track = TrackId::new(1);
@@ -1108,7 +1134,8 @@ mod tests {
         assert_eq!(first_pool.pool_id, first.desc.pool_id);
         assert_eq!(first_pool.payload_map_len, first.desc.payload_map_len);
         assert_eq!(first_pool.slot_stride, 64);
-        assert_eq!(first_pool.slot_count, 3);
+        // Storage rounds with the descriptor ring, so all retained frames fit.
+        assert_eq!(first_pool.slot_count, 4);
         slots.release(first);
 
         slots.publish(track, frame_desc(2), &[5, 6, 7, 8]).unwrap();

@@ -60,3 +60,7 @@ porthole native-viewer smoke for its complete authorized session lifecycle.
 Frame presentation waits on the transferred Metal fence and releases the acquired
 lease after rendering. Native capture needs separate live validation; the offline
 synthetic test makes no claim about GPU copies or desktop permissions.
+
+A bounded native run reports `presented_frames=N` and fails if it ends before
+that count or a presentation/release call fails. This counts successful Metal
+submission, not GPU completion or a copy-overhead measurement.

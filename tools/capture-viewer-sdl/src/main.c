@@ -203,6 +203,7 @@ static int run_native(const viewer_options *options) {
 
   int running = 1;
   int presented = 0;
+  int failed = 0;
   uint64_t last_cursor = 0;
   while (running && (options->max_frames <= 0 || presented < options->max_frames)) {
     SDL_Event sdl_event;
@@ -212,6 +213,7 @@ static int run_native(const viewer_options *options) {
       }
     }
     if (native_poll_control_events(attach, &pools)) {
+      failed = 1;
       break;
     }
 
@@ -222,15 +224,21 @@ static int run_native(const viewer_options *options) {
     };
     ft_status status = wait_status == FT_STATUS_OK ? ft_native_acquire_latest(attach, last_cursor, &frame) : wait_status;
     if (status == FT_STATUS_OK) {
+      int presentation_status = 1;
       const ft_native_pool *pool = native_pool_find(&pools, frame.pool_id);
       if (pool != NULL && frame.slot_id < pool->surface_count) {
         const ft_native_surface *surface = &pool->surfaces[frame.slot_id];
         if (surface->handle_kind == FT_NATIVE_HANDLE_IOSURFACE) {
-          (void)mp_present(presenter, surface->object, frame.producer_sync_value, frame.width, frame.height);
+          presentation_status = mp_present(presenter, surface->object, frame.producer_sync_value, frame.width, frame.height);
         }
       }
       last_cursor = frame.cursor;
-      presented++;
+      if (presentation_status == 0) {
+        presented++;
+      } else {
+        fprintf(stderr, "native frame presentation failed\n");
+        failed = 1;
+      }
       ft_native_release release = {
           .struct_size = sizeof(ft_native_release),
           .release_kind = FT_NATIVE_RELEASE_NOW,
@@ -238,7 +246,13 @@ static int run_native(const viewer_options *options) {
           .release_sync_id = 0,
           .release_value = 0,
       };
-      ft_native_release_frame(attach, &release);
+      if (ft_native_release_frame(attach, &release) != FT_STATUS_OK) {
+        fprintf(stderr, "native frame release failed\n");
+        failed = 1;
+      }
+      if (failed) {
+        break;
+      }
     } else if (status == FT_STATUS_CLOSED) {
       break;
     } else {
@@ -248,12 +262,17 @@ static int run_native(const viewer_options *options) {
     }
   }
 
+  if (options->max_frames > 0 && presented != options->max_frames) {
+    fprintf(stderr, "expected %d native frames, presented %d\n", options->max_frames, presented);
+    failed = 1;
+  }
+  printf("presented_frames=%d\n", presented);
   mp_destroy(presenter);
   SDL_Metal_DestroyView(view);
   SDL_DestroyWindow(window);
   SDL_Quit();
   ft_native_attach_destroy(attach);
-  return 0;
+  return failed ? 1 : 0;
 }
 
 #else

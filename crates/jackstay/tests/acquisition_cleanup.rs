@@ -101,7 +101,7 @@ fn mapped_crash_child() {
     stream.read_exact(&mut json).unwrap();
     let (descriptor, registration): (_, Option<jackstay::acquisition::arena::ReleaseTimelineRegistration>) =
         serde_json::from_slice(&json).unwrap();
-    let fds = fdpass::recv_fds(&stream, 4).unwrap().try_into().unwrap();
+    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
     // SAFETY: the parent owns the producer and bound this single-use grant to
     // this process before handoff. No fork or forwarding of mapped claims.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();

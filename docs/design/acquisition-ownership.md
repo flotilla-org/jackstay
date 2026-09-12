@@ -216,8 +216,11 @@ native resources. `native::arena::NativeArenaProducer` uses the same retirement
 and claim scan before staging into an IOSurface; it also checks producer GPU
 completion before reusing a staging target. Actual IOSurface allocation sizes
 count against the arena byte budget. The old host/native and C paths have not
-yet been replaced. The new setup descriptor (version 4)
-carries four FDs: arena, claim page, notification reader, notification writer.
+yet been replaced. The new setup descriptor (version 5)
+carries five FDs: control, resources, claim page, notification reader,
+notification writer. Control and resource headers carry an arena scope; the
+claim header has an independent incarnation scope. Import rejects mappings
+mixed between otherwise identical arenas.
 Both the producer and the consumer's release path can notify that consumer.
 Its version/layout and handles must be included in the Rust/C ABI update; this
 is not the old control-page ABI. The memory budget covers resource/control
@@ -281,6 +284,19 @@ Next: implement [bounded reconfiguration](acquisition-reconfiguration.md),
 then replace the existing CPU/native acquisition paths with the shared arena. Do not add a
 per-frame broker update to keep admission informed; reserved claim slots are the
 holding credit.
+
+The control/resource split is implemented. Publication history and wait state
+live in the persistent control mapping; resource state, descriptors, and inline
+payloads live in a separate mapping. A shared consumer lifetime owns the claim
+page, so destroying one resource owner cannot acknowledge shutdown while another
+owner or lease remains. This does not yet implement configuration replacement
+or consumer-side retention of mappings consumed by deferred release.
+
+Validation of the split passed on macOS and Linux: eight arena tests, four
+cleanup tests, eight release tests, and four wait tests, including their invoked
+subprocess helpers. The three native arena tests and three concurrency tests
+passed on macOS. Workspace build, default and macOS-feature all-targets clippy,
+and pinned formatting passed. The old host regression remains unresolved.
 
 Process-bound cleanup now uses kqueue on macOS and pidfds on Linux. Remote grants
 are export-only and mandatory for setup FD transfer; local grants use ordinary

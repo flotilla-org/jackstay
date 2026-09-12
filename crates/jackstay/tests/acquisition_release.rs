@@ -279,7 +279,7 @@ fn mapped_release_child() {
     let mut json = vec![0; u32::from_le_bytes(len) as usize];
     stream.read_exact(&mut json).unwrap();
     let (descriptor, registration): (GrantDescriptor, ReleaseTimelineRegistration) = serde_json::from_slice(&json).unwrap();
-    let fds = fdpass::recv_fds(&stream, 4).unwrap().try_into().unwrap();
+    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer and this process is
     // the sole recipient. It does not fork or pass on these mapped claims.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();

@@ -1,17 +1,17 @@
 # Bounded acquisition reconfiguration
 
-Status: technical design for the next implementation step. The lifetime contract
-already requires these outcomes; the mechanisms below are not implemented yet.
+Status: the control/resource and consumer-lifetime split is implemented. The
+transition, retirement, and allocation accounting below remain to be implemented.
 
 ## Separate control lifetime from resource lifetime
 
-The current arena puts wait epochs, publication history, descriptors, and inline
+The original arena put wait epochs, publication history, descriptors, and inline
 CPU payloads in one mapping. Keeping that mapping to wait for new configuration
 also keeps its old allocation alive. If old and new allocations cannot coexist
 within budget, that creates a cycle: the consumer needs the old mapping to wait,
 while the producer needs it gone before allocating the replacement.
 
-Split the persistent control mapping from per-generation resource mappings.
+The persistent control mapping is now separate from resource mappings.
 Control holds terminal/reconfiguration state and publication notifications. A
 resource generation owns its descriptors, resource states, CPU payload storage,
 or imported native pool handles. Configuration transfer is a setup operation;
@@ -24,6 +24,14 @@ acknowledge shutdown while old frame leases still exist. A returned lease owns
 its original immutable descriptor, resource generation, and incarnation lifetime.
 All generations use the same holding slots, so old plus new holdings cannot
 exceed the incarnation's reservation.
+
+Deferred release also needs to retain the consumer's own resource mapping and
+imported handles until completion. A producer-side claim protects backing storage
+from reuse, but does not keep a consumer virtual address mapped. The current
+deferred-release tests keep the consumer's mapping alive; replacement and consumer
+teardown need explicit coverage before claiming this part of the contract. Local
+retirement must be bounded by holding credit and must not use EOF or a timeout as
+completion proof.
 
 ## Transition ordering
 

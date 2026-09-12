@@ -250,7 +250,7 @@ fn mapped_arena_child() {
     let mut bytes = vec![0; u32::from_le_bytes(len) as usize];
     stream.read_exact(&mut bytes).unwrap();
     let descriptor = serde_json::from_slice(&bytes).unwrap();
-    let fds = fdpass::recv_fds(&stream, 4).unwrap().try_into().unwrap();
+    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer; this process is the
     // only recipient of the single-use grant and does not fork its mappings.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
@@ -284,4 +284,24 @@ fn mapped_arena_child() {
         panic!("child missing frame after wait")
     };
     assert_eq!(next.bytes(), b"next");
+}
+
+#[test]
+fn setup_rejects_control_resource_or_claim_mappings_from_another_arena() {
+    use jackstay::acquisition::arena::ArenaError;
+    for swapped in 0..3 {
+        let mut first = ArenaProducer::new(config()).unwrap();
+        let mut second = ArenaProducer::new(config()).unwrap();
+        let (descriptor, mut fds) = first.attach_process(1, std::process::id()).unwrap().into_parts().unwrap();
+        let (_, mut foreign) = second.attach_process(1, std::process::id()).unwrap().into_parts().unwrap();
+        std::mem::swap(&mut fds[swapped], &mut foreign[swapped]);
+        // SAFETY: every mapping was initialized by a conforming producer and
+        // each claim page is unused and belongs solely to this process. Only
+        // setup identity is inconsistent; it must fail before any acquisition.
+        let result = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.and_then(ArenaConsumer::from_grant);
+        assert!(
+            matches!(result, Err(ArenaError::Mapping(_))),
+            "mixed setup mapping {swapped} was accepted"
+        );
+    }
 }

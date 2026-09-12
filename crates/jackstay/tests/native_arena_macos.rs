@@ -248,7 +248,7 @@ fn native_claim_crash_child() {
     let mut json = vec![0; u32::from_le_bytes(len) as usize];
     stream.read_exact(&mut json).unwrap();
     let descriptor = serde_json::from_slice(&json).unwrap();
-    let fds = fdpass::recv_fds(&stream, 4).unwrap().try_into().unwrap();
+    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
     // SAFETY: this is the exact lifetime to which the parent's producer bound
     // its single-use grant. The child never forks or forwards mapped claims.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();

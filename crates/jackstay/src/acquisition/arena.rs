@@ -25,15 +25,17 @@ use thiserror::Error;
 use super::{AdmissionBook, AdmissionError, AdmissionLimits, HoldingRequest, IncarnationId};
 use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
+mod mapping;
+use mapping::{ControlMap, ResourceLayout, ResourceMap};
+
 mod wait;
 pub use wait::{Cancellation, WaitEvents, WaitInterest, WaitOutcome};
 mod cleanup;
 mod process;
 pub use cleanup::{CleanupFailure, RejectedDeferredRelease, ReleaseNotification, ReleaseTimeline, ReleaseTimelineRegistration};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"JSACQ001");
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
-const VERSION: u64 = 4;
+const VERSION: u64 = 5;
 const HEADER_LEN: usize = 256;
 const LATEST: usize = 128;
 const TERMINAL: usize = 136;
@@ -102,19 +104,6 @@ struct ResourceRecord {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Header {
-    magic: u64,
-    version: u64,
-    resources: u64,
-    history: u64,
-    payload_capacity: u64,
-    map_len: u64,
-    records_offset: u64,
-    payload_offset: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 struct ClaimHeader {
     magic: u64,
     version: u64,
@@ -126,7 +115,6 @@ struct ClaimHeader {
 }
 
 const _: () = {
-    assert!(size_of::<Header>() <= LATEST);
     assert!(size_of::<ClaimHeader>() <= ACTIVE);
     assert!(align_of::<ResourceRecord>() == 128);
     assert!(size_of::<ResourceRecord>() == 256);
@@ -171,16 +159,6 @@ pub enum AcquireOutcome {
     Closed,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Layout {
-    resources: usize,
-    history: usize,
-    payload_capacity: usize,
-    records: usize,
-    payload: usize,
-    len: usize,
-}
-
 fn checked_add(a: usize, b: usize) -> Result<usize, ArenaError> {
     a.checked_add(b).ok_or(ArenaError::Configuration("mapping size overflow"))
 }
@@ -202,128 +180,6 @@ fn page_rounded(value: usize) -> Result<usize, ArenaError> {
     rounded(value, page as usize)
 }
 
-impl Layout {
-    fn new(resources: usize, history: usize, payload_capacity: usize) -> Result<Self, ArenaError> {
-        if history == 0 || resources <= history {
-            return Err(ArenaError::Configuration("resources must exceed a nonzero history"));
-        }
-        let records = rounded(checked_add(HEADER_LEN, checked_mul(history, size_of::<AtomicU64>())?)?, 128)?;
-        let payload = checked_add(records, checked_mul(resources, size_of::<ResourceRecord>())?)?;
-        let len = page_rounded(checked_add(payload, checked_mul(resources, payload_capacity)?)?)?;
-        Ok(Self {
-            resources,
-            history,
-            payload_capacity,
-            records,
-            payload,
-            len,
-        })
-    }
-
-    fn record_offset(self, index: usize) -> usize {
-        assert!(index < self.resources);
-        self.records + index * size_of::<ResourceRecord>()
-    }
-
-    fn payload_offset(self, index: usize) -> usize {
-        assert!(index < self.resources);
-        self.payload + index * self.payload_capacity
-    }
-
-    fn ring_offset(self, cursor: u64) -> usize {
-        HEADER_LEN + (((cursor - 1) % self.history as u64) as usize) * size_of::<AtomicU64>()
-    }
-}
-
-#[derive(Debug)]
-struct ArenaMap {
-    storage: SharedMemorySegment,
-    layout: Layout,
-}
-
-impl ArenaMap {
-    fn new(layout: Layout) -> Result<Self, ArenaError> {
-        let storage = SharedMemorySegment::new(layout.len)?;
-        let header = Header {
-            magic: MAGIC,
-            version: VERSION,
-            resources: layout.resources as u64,
-            history: layout.history as u64,
-            payload_capacity: layout.payload_capacity as u64,
-            map_len: layout.len as u64,
-            records_offset: layout.records as u64,
-            payload_offset: layout.payload as u64,
-        };
-        // SAFETY: fresh unpublished writable mapping; all typed objects are
-        // aligned, bounded by Layout, and initialized before any fd transfer.
-        unsafe {
-            storage.as_ptr().cast_mut().cast::<Header>().write(header);
-            for offset in [LATEST, TERMINAL, RECONFIGURATION_EPOCH] {
-                storage.as_ptr().add(offset).cast_mut().cast::<AtomicU64>().write(AtomicU64::new(0));
-            }
-            for index in 0..layout.history {
-                storage
-                    .as_ptr()
-                    .add(HEADER_LEN + index * 8)
-                    .cast_mut()
-                    .cast::<AtomicU64>()
-                    .write(AtomicU64::new(0));
-            }
-            for index in 0..layout.resources {
-                storage
-                    .as_ptr()
-                    .add(layout.record_offset(index))
-                    .cast_mut()
-                    .cast::<ResourceRecord>()
-                    .write(ResourceRecord {
-                        state: AtomicU64::new(0),
-                        descriptor: UnsafeCell::new(FrameDescriptor::default()),
-                    });
-            }
-        }
-        Ok(Self { storage, layout })
-    }
-
-    fn map(fd: OwnedFd, expected: Layout) -> Result<Self, ArenaError> {
-        let storage = SharedMemorySegment::map_read_only(fd, expected.len)?;
-        // SAFETY: the opaque grant names an initialized arena. Header bytes
-        // are immutable after creation; no mutable atomic fields are copied.
-        let header = unsafe { storage.as_ptr().cast::<Header>().read() };
-        if header.magic != MAGIC
-            || header.version != VERSION
-            || header.map_len != expected.len as u64
-            || header.resources != expected.resources as u64
-            || header.history != expected.history as u64
-            || header.payload_capacity != expected.payload_capacity as u64
-            || header.records_offset != expected.records as u64
-            || header.payload_offset != expected.payload as u64
-        {
-            return Err(ArenaError::Mapping("arena header disagrees with grant"));
-        }
-        Ok(Self { storage, layout: expected })
-    }
-
-    fn word(&self, offset: usize) -> &AtomicU64 {
-        assert!(offset % align_of::<AtomicU64>() == 0 && offset + 8 <= self.layout.len);
-        // SAFETY: every call names a initialized atomic word, never plain
-        // descriptor storage. No reference spans other mutable map contents.
-        unsafe { &*self.storage.as_ptr().add(offset).cast::<AtomicU64>() }
-    }
-
-    fn state(&self, index: usize) -> &AtomicU64 {
-        self.word(self.layout.record_offset(index))
-    }
-
-    fn descriptor_ptr(&self, index: usize) -> *mut FrameDescriptor {
-        // SAFETY: Layout bounds and aligns the record. Taking a raw field
-        // address does not read or borrow the concurrently protected contents.
-        unsafe {
-            let record = self.storage.as_ptr().add(self.layout.record_offset(index)).cast::<ResourceRecord>();
-            UnsafeCell::raw_get(std::ptr::addr_of!((*record).descriptor))
-        }
-    }
-}
-
 #[derive(Debug)]
 struct ClaimMap {
     storage: SharedMemorySegment,
@@ -333,6 +189,17 @@ struct ClaimMap {
     recipient_pid: u32,
     wake: Arc<wait::Wake>,
     release_wake: Arc<wait::Wake>,
+}
+
+fn random_scope() -> Result<[u8; 16], ArenaError> {
+    let mut scope = [0; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut scope))
+        .map_err(|error| CaptureTransferError::SharedMemory {
+            operation: "acquisition-scope",
+            message: error.to_string(),
+        })?;
+    Ok(scope)
 }
 
 impl ClaimMap {
@@ -351,13 +218,7 @@ impl ClaimMap {
         recipient_pid: u32,
     ) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::new(len)?;
-        let mut scope = [0; 16];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut random| random.read_exact(&mut scope))
-            .map_err(|error| CaptureTransferError::SharedMemory {
-                operation: "claim-scope",
-                message: error.to_string(),
-            })?;
+        let scope = random_scope()?;
         // SAFETY: initialized while the new writable map is exclusively owned.
         unsafe {
             storage.as_ptr().cast_mut().cast::<ClaimHeader>().write(ClaimHeader {
@@ -460,10 +321,12 @@ impl ClaimMap {
 /// An opaque, single-use grant for one incarnation. Dropping an unconsumed
 /// grant abandons that admission safely; mapped clients own their own lifetime.
 pub struct ConsumerGrant {
-    arena_fd: Option<OwnedFd>,
+    control_fd: Option<OwnedFd>,
+    arena_scope: [u8; 16],
+    resource_fd: Option<OwnedFd>,
     claim_fd: Option<OwnedFd>,
     reader_fd: Option<OwnedFd>,
-    layout: Layout,
+    layout: ResourceLayout,
     claims: Arc<ClaimMap>,
     consumed: bool,
 }
@@ -479,13 +342,13 @@ impl RemoteConsumerGrant {
         self.0.incarnation()
     }
 
-    pub fn into_parts(self) -> Result<(GrantDescriptor, [OwnedFd; 4]), ArenaError> {
+    pub fn into_parts(self) -> Result<(GrantDescriptor, [OwnedFd; 5]), ArenaError> {
         self.0.into_parts()
     }
 }
 
-/// Setup-channel descriptor. Accompanying FDs: arena, claim mapping, notification
-/// reader, notification writer, in that order. Never resend a consumed grant.
+/// Setup descriptor. FDs: control, resources, claims, notification reader,
+/// notification writer, in that order. Never resend a consumed grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantDescriptor {
     pub version: u64,
@@ -493,7 +356,10 @@ pub struct GrantDescriptor {
     pub resources: u32,
     pub history: u32,
     pub payload_capacity: u64,
-    pub arena_map_len: u64,
+    pub resource_map_len: u64,
+    pub control_map_len: u64,
+    pub arena_scope: [u8; 16],
+    pub claim_scope: [u8; 16],
     pub holding: u32,
     pub claim_map_len: u64,
     /// Zero for an unbound grant; otherwise the admitted recipient process.
@@ -506,7 +372,7 @@ impl ConsumerGrant {
         self.claims.incarnation
     }
 
-    fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 4]), ArenaError> {
+    fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 5]), ArenaError> {
         let writer_fd = self.claims.wake.fd()?;
         self.consumed = true;
         let descriptor = GrantDescriptor {
@@ -515,7 +381,10 @@ impl ConsumerGrant {
             resources: self.layout.resources as u32,
             history: self.layout.history as u32,
             payload_capacity: self.layout.payload_capacity as u64,
-            arena_map_len: self.layout.len as u64,
+            resource_map_len: self.layout.len as u64,
+            control_map_len: ControlMap::allocation_len(self.layout.history)? as u64,
+            arena_scope: self.arena_scope,
+            claim_scope: self.claims.scope,
             holding: self.claims.frames as u32,
             claim_map_len: self.claims.storage.len() as u64,
             recipient_pid: self.claims.recipient_pid,
@@ -523,7 +392,8 @@ impl ConsumerGrant {
         Ok((
             descriptor,
             [
-                self.arena_fd.take().expect("single-use grant"),
+                self.control_fd.take().expect("single-use grant"),
+                self.resource_fd.take().expect("single-use grant"),
                 self.claim_fd.take().expect("single-use grant"),
                 self.reader_fd.take().expect("single-use grant"),
                 writer_fd,
@@ -541,8 +411,8 @@ impl ConsumerGrant {
     /// only to the lifetime admitted by the sender, never a reused PID.
     /// Length/header checks cannot prove
     /// another process follows a shared-memory lifetime protocol.
-    pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 4]) -> Result<Self, ArenaError> {
-        let [arena_fd, claim_fd, reader_fd, writer_fd] = fds;
+    pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 5]) -> Result<Self, ArenaError> {
+        let [control_fd, resource_fd, claim_fd, reader_fd, writer_fd] = fds;
         if descriptor.recipient_pid != std::process::id() {
             return Err(ArenaError::Mapping("grant belongs to a different recipient process"));
         }
@@ -551,13 +421,16 @@ impl ConsumerGrant {
         }
         let payload_capacity =
             usize::try_from(descriptor.payload_capacity).map_err(|_| ArenaError::Mapping("payload capacity overflow"))?;
-        let layout = Layout::new(descriptor.resources as usize, descriptor.history as usize, payload_capacity)?;
+        let layout = ResourceLayout::new(descriptor.resources as usize, descriptor.history as usize, payload_capacity)?;
         let claim_len = ClaimMap::allocation_len(descriptor.holding)?;
-        if descriptor.arena_map_len != layout.len as u64 || descriptor.claim_map_len != claim_len as u64 {
+        if descriptor.resource_map_len != layout.len as u64
+            || descriptor.claim_map_len != claim_len as u64
+            || descriptor.control_map_len != ControlMap::allocation_len(layout.history)? as u64
+        {
             return Err(ArenaError::Mapping("grant mapping sizes disagree with layout"));
         }
         // Keep the mapped owner solely for abandonment acknowledgement until
-        // from_grant transfers the lifetime to a ConsumerInner.
+        // from_grant transfers the lifetime to a ConsumerLifetime.
         let claims = Arc::new(ClaimMap::map(
             claim_fd.try_clone().map_err(|error| CaptureTransferError::SharedMemory {
                 operation: "clone-claim-fd",
@@ -570,8 +443,13 @@ impl ConsumerGrant {
             Arc::new(wait::Wake::from_fd(reader_fd.try_clone()?)?),
             descriptor.recipient_pid,
         )?);
+        if claims.scope != descriptor.claim_scope {
+            return Err(ArenaError::Mapping("claim scope disagrees with grant"));
+        }
         Ok(Self {
-            arena_fd: Some(arena_fd),
+            control_fd: Some(control_fd),
+            arena_scope: descriptor.arena_scope,
+            resource_fd: Some(resource_fd),
             claim_fd: Some(claim_fd),
             reader_fd: Some(reader_fd),
             layout,
@@ -594,7 +472,8 @@ impl Drop for ConsumerGrant {
 /// resource retirement, and publication; consumer operations require no call
 /// into this object and run through separate shared mappings.
 pub struct ArenaProducer {
-    map: Arc<ArenaMap>,
+    resources: Arc<ResourceMap>,
+    control: Arc<ControlMap>,
     admission: AdmissionBook,
     claims: BTreeMap<IncarnationId, Arc<ClaimMap>>,
     cursor: u64,
@@ -606,7 +485,7 @@ pub struct ArenaProducer {
 
 impl ArenaProducer {
     pub(crate) fn stop(&mut self) {
-        self.map.word(TERMINAL).store(1, SeqCst);
+        self.control.word(TERMINAL).store(1, SeqCst);
         for claims in self.claims.values() {
             claims.close();
         }
@@ -623,23 +502,28 @@ impl ArenaProducer {
         if config.drain_timeout.is_zero() || std::time::Instant::now().checked_add(config.drain_timeout).is_none() {
             return Err(ArenaError::Configuration("drain interval must be positive and representable"));
         }
-        let layout = Layout::new(
+        let layout = ResourceLayout::new(
             config.resource_capacity as usize,
             config.retained_history as usize,
             config.payload_capacity,
         )?;
+        let control_len = ControlMap::allocation_len(layout.history)?;
         let admission = AdmissionBook::new(AdmissionLimits {
             resource_capacity: config.resource_capacity,
             retained_history: config.retained_history,
             producer_reserve: config.producer_reserve,
             allocated_bytes: (layout.len as u64)
-                .checked_add(external_bytes)
+                .checked_add(control_len as u64)
+                .and_then(|bytes| bytes.checked_add(external_bytes))
                 .ok_or(ArenaError::Configuration("allocation byte total overflow"))?,
             memory_budget: config.memory_budget,
             max_incarnations: config.max_incarnations,
         })?;
+        let control = Arc::new(ControlMap::new(layout.history)?);
+        let resources = Arc::new(ResourceMap::new(layout, control.scope)?);
         Ok(Self {
-            map: Arc::new(ArenaMap::new(layout)?),
+            resources,
+            control,
             admission,
             claims: BTreeMap::new(),
             cursor: 0,
@@ -669,7 +553,7 @@ impl ArenaProducer {
         recipient_pid: u32,
         process: Option<Arc<process::ProcessWatch>>,
     ) -> Result<ConsumerGrant, ArenaError> {
-        if self.map.word(TERMINAL).load(SeqCst) != 0 {
+        if self.control.word(TERMINAL).load(SeqCst) != 0 {
             return Err(ArenaError::Closed);
         }
         self.poll_cleanup()?;
@@ -683,13 +567,16 @@ impl ArenaProducer {
             let (wake, receiver) = wait::channel()?;
             let release_wake = Arc::new(wait::Wake::from_fd(receiver.fd()?)?);
             let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake, release_wake, recipient_pid)?);
-            let arena_fd = self.map.storage.try_clone_fd()?;
+            let control_fd = self.control.storage.try_clone_fd()?;
+            let resource_fd = self.resources.storage.try_clone_fd()?;
             let claim_fd = claims.storage.try_clone_fd()?;
             let grant = ConsumerGrant {
-                arena_fd: Some(arena_fd),
+                control_fd: Some(control_fd),
+                arena_scope: self.control.scope,
+                resource_fd: Some(resource_fd),
                 claim_fd: Some(claim_fd),
                 reader_fd: Some(receiver.into_fd()),
-                layout: self.map.layout,
+                layout: self.resources.layout,
                 claims,
                 consumed: false,
             };
@@ -724,7 +611,7 @@ impl ArenaProducer {
         &mut self,
         prepare: impl FnMut(u32, u64) -> Result<Option<FrameDescriptor>, ArenaError>,
     ) -> Result<PublishOutcome, ArenaError> {
-        if self.map.layout.payload_capacity != 0 {
+        if self.resources.layout.payload_capacity != 0 {
             return Err(ArenaError::Configuration("native resources require no inline CPU storage"));
         }
         self.publish_prepared(&[], prepare)
@@ -735,28 +622,28 @@ impl ArenaProducer {
         bytes: &[u8],
         mut prepare: impl FnMut(u32, u64) -> Result<Option<FrameDescriptor>, ArenaError>,
     ) -> Result<PublishOutcome, ArenaError> {
-        if bytes.len() > self.map.layout.payload_capacity {
+        if bytes.len() > self.resources.layout.payload_capacity {
             return Err(ArenaError::PayloadTooLarge);
         }
         if self.cursor == MAX_GENERATION {
-            self.map.word(TERMINAL).store(1, SeqCst);
+            self.control.word(TERMINAL).store(1, SeqCst);
             for claims in self.claims.values() {
                 claims.close();
             }
             return Err(ArenaError::GenerationsExhausted);
         }
         self.poll_cleanup()?;
-        let oldest = self.cursor.saturating_sub(self.map.layout.history as u64 - 1).max(1);
-        for offset in 0..self.map.layout.resources {
-            let index = (self.next_slot + offset) % self.map.layout.resources;
-            let state = self.map.state(index).load(SeqCst);
+        let oldest = self.cursor.saturating_sub(self.resources.layout.history as u64 - 1).max(1);
+        for offset in 0..self.resources.layout.resources {
+            let index = (self.next_slot + offset) % self.resources.layout.resources;
+            let state = self.resources.state(index).load(SeqCst);
             let generation = state >> 1;
             if generation != 0 && generation >= oldest {
                 continue;
             }
             // Retire BEFORE scanning claims. Repeated attempts leave the
             // generation retired, so no new successful acquisitions can pin it.
-            self.map.state(index).store(generation << 1, SeqCst);
+            self.resources.state(index).store(generation << 1, SeqCst);
             if generation != 0 && self.claims.values().any(|claims| claims.contains(generation)) {
                 continue;
             }
@@ -764,7 +651,7 @@ impl ArenaProducer {
                 continue;
             };
             let cursor = self.cursor + 1;
-            let payload_offset = self.map.layout.payload_offset(index);
+            let payload_offset = self.resources.layout.payload_offset(index);
             descriptor.cursor = cursor;
             descriptor.payload_offset = payload_offset as u64;
             descriptor.payload_len = bytes.len() as u64;
@@ -775,16 +662,16 @@ impl ArenaProducer {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
-                    self.map.storage.as_ptr().add(payload_offset).cast_mut(),
+                    self.resources.storage.as_ptr().add(payload_offset).cast_mut(),
                     bytes.len(),
                 );
-                self.map.descriptor_ptr(index).write(descriptor);
+                self.resources.descriptor_ptr(index).write(descriptor);
             }
-            self.map.state(index).store((cursor << 1) | 1, SeqCst);
-            self.map.word(self.map.layout.ring_offset(cursor)).store(index as u64 + 1, SeqCst);
-            self.map.word(LATEST).store(cursor, SeqCst);
+            self.resources.state(index).store((cursor << 1) | 1, SeqCst);
+            self.control.ring(cursor).store(index as u64 + 1, SeqCst);
+            self.control.word(LATEST).store(cursor, SeqCst);
             self.cursor = cursor;
-            self.next_slot = (index + 1) % self.map.layout.resources;
+            self.next_slot = (index + 1) % self.resources.layout.resources;
             for claims in self.claims.values() {
                 claims.signal(wait::DATA)?;
             }
@@ -825,12 +712,17 @@ impl Drop for ArenaProducer {
 }
 
 #[derive(Debug)]
-struct ConsumerInner {
-    map: Arc<ArenaMap>,
+struct ConsumerLifetime {
     claims: ClaimMap,
 }
 
-impl Drop for ConsumerInner {
+#[derive(Debug)]
+struct ConsumerResources {
+    map: ResourceMap,
+    lifetime: Arc<ConsumerLifetime>,
+}
+
+impl Drop for ConsumerLifetime {
     fn drop(&mut self) {
         self.claims.close();
         // No consumer method can still access this mapping. Deferred claims
@@ -841,13 +733,20 @@ impl Drop for ConsumerInner {
 
 #[derive(Debug)]
 pub struct ArenaConsumer {
-    inner: Arc<ConsumerInner>,
+    control: Arc<ControlMap>,
+    lifetime: Arc<ConsumerLifetime>,
+    resources: Arc<ConsumerResources>,
     receiver: wait::Receiver,
 }
 
 impl ArenaConsumer {
     pub fn from_grant(mut grant: ConsumerGrant) -> Result<Self, ArenaError> {
-        let map = ArenaMap::map(grant.arena_fd.take().expect("single-use grant"), grant.layout)?;
+        let control = ControlMap::map(
+            grant.control_fd.take().expect("single-use grant"),
+            grant.layout.history,
+            grant.arena_scope,
+        )?;
+        let map = ResourceMap::map(grant.resource_fd.take().expect("single-use grant"), grant.layout, control.scope)?;
         let claims = ClaimMap::map(
             grant.claim_fd.take().expect("single-use grant"),
             grant.claims.incarnation,
@@ -859,22 +758,25 @@ impl ArenaConsumer {
         )?;
         let receiver = wait::Receiver::from_fd(grant.reader_fd.take().expect("single-use grant"))?;
         grant.consumed = true;
+        let lifetime = Arc::new(ConsumerLifetime { claims });
         Ok(Self {
             receiver,
-            inner: Arc::new(ConsumerInner {
-                map: Arc::new(map),
-                claims,
+            control: Arc::new(control),
+            resources: Arc::new(ConsumerResources {
+                map,
+                lifetime: Arc::clone(&lifetime),
             }),
+            lifetime,
         })
     }
 
     #[must_use]
     pub fn incarnation(&self) -> IncarnationId {
-        self.inner.claims.incarnation
+        self.lifetime.claims.incarnation
     }
 
     pub fn acquire_latest(&self, after: u64) -> Result<AcquireOutcome, ArenaError> {
-        let cursor = self.inner.map.word(LATEST).load(SeqCst);
+        let cursor = self.control.word(LATEST).load(SeqCst);
         if self.is_closed() {
             return Ok(AcquireOutcome::Closed);
         }
@@ -888,14 +790,14 @@ impl ArenaConsumer {
     /// frame. A gap names published cursors, not pre-publication drops. The
     /// caller may acknowledge a gap by continuing after its `last` cursor.
     pub fn acquire_next(&self, after: u64) -> Result<AcquireOutcome, ArenaError> {
-        let latest = self.inner.map.word(LATEST).load(SeqCst);
+        let latest = self.control.word(LATEST).load(SeqCst);
         if self.is_closed() {
             return Ok(AcquireOutcome::Closed);
         }
         if latest == 0 || after >= latest {
             return Ok(AcquireOutcome::Empty);
         }
-        let oldest = latest.saturating_sub(self.inner.map.layout.history as u64 - 1).max(1);
+        let oldest = latest.saturating_sub(self.resources.map.layout.history as u64 - 1).max(1);
         let cursor = if after == 0 { oldest } else { after + 1 };
         if cursor < oldest {
             return Ok(AcquireOutcome::Gap {
@@ -912,14 +814,14 @@ impl ArenaConsumer {
         if cursor == 0 {
             return Err(ArenaError::Configuration("frame cursors start at one"));
         }
-        let latest = self.inner.map.word(LATEST).load(SeqCst);
+        let latest = self.control.word(LATEST).load(SeqCst);
         if self.is_closed() {
             return Ok(AcquireOutcome::Closed);
         }
         if cursor > latest {
             return Ok(AcquireOutcome::Empty);
         }
-        let oldest = latest.saturating_sub(self.inner.map.layout.history as u64 - 1).max(1);
+        let oldest = latest.saturating_sub(self.resources.map.layout.history as u64 - 1).max(1);
         if cursor < oldest {
             return Ok(AcquireOutcome::Miss { cursor });
         }
@@ -927,25 +829,25 @@ impl ArenaConsumer {
     }
 
     fn is_closed(&self) -> bool {
-        self.inner.claims.word(ACTIVE).load(SeqCst) == 0 || self.inner.map.word(TERMINAL).load(SeqCst) != 0
+        self.lifetime.claims.word(ACTIVE).load(SeqCst) == 0 || self.control.word(TERMINAL).load(SeqCst) != 0
     }
 
     fn acquire(&self, cursor: u64) -> Result<AcquireOutcome, ArenaError> {
-        let map = &self.inner.map;
-        let advertised = map.word(map.layout.ring_offset(cursor)).load(SeqCst);
+        let map = &self.resources.map;
+        let advertised = self.control.ring(cursor).load(SeqCst);
         if advertised == 0 || advertised > map.layout.resources as u64 {
             return Err(ArenaError::Mapping("advertised resource index is invalid"));
         }
         let index = advertised as usize - 1;
         #[cfg(test)]
         concurrency_tests::run_hook(concurrency_tests::Phase::Selected);
-        let Some(claim_slot) =
-            (0..self.inner.claims.frames).find(|slot| self.inner.claims.slot(*slot).compare_exchange(0, cursor, SeqCst, SeqCst).is_ok())
+        let Some(claim_slot) = (0..self.lifetime.claims.frames)
+            .find(|slot| self.lifetime.claims.slot(*slot).compare_exchange(0, cursor, SeqCst, SeqCst).is_ok())
         else {
             return Ok(AcquireOutcome::HoldingLimit);
         };
         let claim = Claim {
-            owner: Arc::clone(&self.inner),
+            owner: Arc::clone(&self.resources),
             slot: claim_slot,
             release_on_drop: true,
         };
@@ -977,13 +879,13 @@ impl ArenaConsumer {
 
 impl Drop for ArenaConsumer {
     fn drop(&mut self) {
-        self.inner.claims.close();
+        self.lifetime.claims.close();
     }
 }
 
 #[derive(Debug)]
 struct Claim {
-    owner: Arc<ConsumerInner>,
+    owner: Arc<ConsumerResources>,
     slot: usize,
     release_on_drop: bool,
 }
@@ -991,7 +893,7 @@ struct Claim {
 impl Drop for Claim {
     fn drop(&mut self) {
         if self.release_on_drop {
-            self.owner.claims.return_credit(self.slot);
+            self.owner.lifetime.claims.return_credit(self.slot);
         }
     }
 }

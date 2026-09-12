@@ -481,7 +481,7 @@ impl FrameLease {
     /// returned frame on failure remains leased; success consumes it so it can
     /// no longer expose a byte slice after the completion observer releases it.
     pub fn defer_release(mut self, registration: &ReleaseTimelineRegistration, value: u64) -> Result<(), RejectedDeferredRelease> {
-        let claims = &self.claim.owner.claims;
+        let claims = &self.claim.owner.lifetime.claims;
         if registration.incarnation != claims.incarnation.0
             || registration.scope != claims.scope
             || !(0..claims.frames).any(|index| claims.registered_timeline(index).load(SeqCst) == registration.id)

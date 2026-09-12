@@ -207,9 +207,9 @@ impl ArenaConsumer {
     #[must_use]
     pub fn events(&self) -> WaitEvents {
         WaitEvents {
-            data_cursor: self.inner.map.word(LATEST).load(SeqCst),
-            capacity_epoch: self.inner.claims.word(CAPACITY_EPOCH).load(SeqCst),
-            reconfiguration_epoch: self.inner.map.word(RECONFIGURATION_EPOCH).load(SeqCst),
+            data_cursor: self.control.word(LATEST).load(SeqCst),
+            capacity_epoch: self.lifetime.claims.word(CAPACITY_EPOCH).load(SeqCst),
+            reconfiguration_epoch: self.control.word(RECONFIGURATION_EPOCH).load(SeqCst),
             closed: self.is_closed(),
         }
     }
@@ -236,7 +236,7 @@ impl ArenaConsumer {
         };
         // Arm before draining/rechecking. A writer either precedes the recheck
         // (its state change is seen) or observes the arm and signals the poll.
-        self.inner
+        self.lifetime
             .claims
             .word(WAIT_INTEREST)
             .store(interest.0 | CLOSED | RECONFIGURATION, SeqCst);
@@ -246,7 +246,7 @@ impl ArenaConsumer {
                 self.0.word(WAIT_INTEREST).store(0, SeqCst);
             }
         }
-        let _disarm = Disarm(&self.inner.claims);
+        let _disarm = Disarm(&self.lifetime.claims);
         loop {
             self.receiver.drain()?;
             if cancel.is_cancelled() {

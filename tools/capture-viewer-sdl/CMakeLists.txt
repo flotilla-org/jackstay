@@ -71,6 +71,12 @@ set_tests_properties(synthetic_c_abi PROPERTIES
   PASS_REGULAR_EXPRESSION "acquired_frames=30"
   TIMEOUT 15
 )
+add_test(NAME delayed_cpu_acquisition COMMAND capture-viewer-sdl --frames 3 --hold-ms 25)
+set_tests_properties(delayed_cpu_acquisition PROPERTIES
+  ENVIRONMENT "SDL_VIDEODRIVER=dummy"
+  PASS_REGULAR_EXPRESSION "acquired_frames=3"
+  TIMEOUT 15
+)
 if(NOT APPLE)
   add_test(NAME unsupported_native COMMAND capture-viewer-sdl --native --frames 1)
   set_tests_properties(unsupported_native PROPERTIES WILL_FAIL TRUE TIMEOUT 5)

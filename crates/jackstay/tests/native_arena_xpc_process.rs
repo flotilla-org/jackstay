@@ -168,7 +168,17 @@ fn reference_viewer_completes_bgra_and_rgba_frames_and_returns_admission() {
         let stderr = directory.join(format!("viewer-{cycle}.stderr.log"));
         let mut viewer = child::KillOnDrop(
             Command::new(&viewer)
-                .args(["--native", "--mach-service", &service.name, "--token", TOKEN, "--frames", "8"])
+                .args([
+                    "--native",
+                    "--mach-service",
+                    &service.name,
+                    "--token",
+                    TOKEN,
+                    "--frames",
+                    "8",
+                    "--hold-ms",
+                    if cycle == 0 { "0" } else { "250" },
+                ])
                 .env_remove("SDL_VIDEODRIVER")
                 .stdout(std::fs::File::create(&stdout).unwrap())
                 .stderr(std::fs::File::create(&stderr).unwrap())

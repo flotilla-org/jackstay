@@ -37,6 +37,13 @@ transfer or live capture. The [C producer API](docs/design/acquisition-c-boundar
 exposes admission limits, dropped publication, byte-budgeted replacement and
 retained destruction directly.
 
+For delayed-consumer checks, add `--hold-ms 250` to either CPU or native viewing.
+The viewer keeps each acquired lease for at least that delay before consuming
+it, while still handling window-close events. CPU mode compares the held bytes
+before and after the delay; native mode delays GPU submission and then retains
+the frame until actual completion. Apply the option to an authorized live source
+for capture acceptance; synthetic mode only checks the consumer machinery.
+
 Build just the Rust library with `cargo build --workspace --locked`. For macOS
 native capture consumers, add `--features backend-macos`; for Linux native
 transport add `--features backend-linux`. Windows currently has a library compile

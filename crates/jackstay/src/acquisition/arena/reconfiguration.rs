@@ -268,7 +268,21 @@ impl ArenaProducer {
     }
 
     pub(crate) fn signal_reconfiguration(&self) -> Result<(), ArenaError> {
-        self.control.word(RECONFIGURATION_EPOCH).fetch_add(1, SeqCst);
+        if self
+            .control
+            .word(RECONFIGURATION_EPOCH)
+            .fetch_update(SeqCst, SeqCst, |epoch| epoch.checked_add(1))
+            .is_err()
+        {
+            // Epochs participate in the wait predicate. Reusing an old value
+            // could hide a transition; close acquisition without revoking any
+            // already acquired storage or discarding its retirement owner.
+            self.control.word(TERMINAL).store(1, SeqCst);
+            for claims in self.claims.values() {
+                claims.close();
+            }
+            return Err(ArenaError::GenerationsExhausted);
+        }
         for claims in self.claims.values() {
             claims.signal(wait::RECONFIGURATION)?;
         }
@@ -447,6 +461,56 @@ impl Drop for ConfigurationGrant {
             self.claims.mapping_slot(self.mapping_slot).store(0, SeqCst);
             self.claims.word(OFFERED_GENERATION).store(0, SeqCst);
             let _ = self.claims.release_wake.signal();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::acquisition::arena::{AcquireOutcome, ArenaConfig, Cancellation, FrameDescriptor, WaitInterest, WaitOutcome};
+
+    #[test]
+    fn exhausted_reconfiguration_epochs_close_waiters_without_revoking_frames() {
+        // A replacement signals both retirement and installation. Exercise
+        // exhaustion at each boundary, without executing 2^64 transitions.
+        for epoch in [u64::MAX, u64::MAX - 1] {
+            let mut producer = ArenaProducer::new(ArenaConfig {
+                resource_capacity: 6,
+                retained_history: 2,
+                producer_reserve: 1,
+                max_incarnations: 1,
+                payload_capacity: 4,
+                memory_budget: 1024 * 1024,
+                drain_timeout: Duration::from_secs(5),
+            })
+            .unwrap();
+            let mut consumer = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+            producer.publish(FrameDescriptor::default(), b"held").unwrap();
+            let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
+                panic!("missing frame")
+            };
+            producer.control.word(RECONFIGURATION_EPOCH).store(epoch, SeqCst);
+            let observed = consumer.events();
+            assert!(matches!(producer.reconfigure_cpu(8), Err(ArenaError::GenerationsExhausted)));
+            assert_eq!(consumer.events().reconfiguration_epoch, u64::MAX, "epoch wrapped");
+            assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Closed));
+            assert!(matches!(producer.attach(1), Err(ArenaError::Closed)));
+            assert!(matches!(
+                producer.publish(FrameDescriptor::default(), b"late"),
+                Err(ArenaError::Closed)
+            ));
+            assert!(
+                matches!(consumer.wait(observed, WaitInterest::ALL, &Cancellation::new().unwrap(), Some(Duration::from_secs(1))).unwrap(),
+                WaitOutcome::Changed(events) if events.closed)
+            );
+            assert_eq!(held.bytes(), b"held");
+            drop(consumer);
+            assert!(!producer.poll_shutdown_ready().unwrap());
+            drop(held);
+            assert!(producer.poll_shutdown_ready().unwrap());
         }
     }
 }

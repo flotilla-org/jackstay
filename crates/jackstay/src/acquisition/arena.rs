@@ -144,7 +144,7 @@ pub enum ArenaError {
     Configuration(&'static str),
     #[error("invalid acquisition mapping: {0}")]
     Mapping(&'static str),
-    #[error("frame generations exhausted")]
+    #[error("acquisition generations exhausted")]
     GenerationsExhausted,
     #[error("the acquisition arena is closed")]
     Closed,

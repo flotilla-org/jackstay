@@ -446,3 +446,10 @@ removed. Standalone and Porthole CPU viewing now share a render/acquire loop.
 The C producer retains ownership when destruction reports draining or recovery
 required. See [the C boundary](acquisition-c-boundary.md#cpu-producers) for its
 explicit limits and replacement operations. Live acceptance is still outstanding.
+
+Reconfiguration notification epochs now use checked increments. Exhaustion at
+either retirement or installation closes admission, publication and waiting
+consumers without revoking acquired storage. A deterministic test sets each
+boundary near exhaustion and checks closure, unchanged bytes and final drainage.
+The reference viewer's `--hold-ms` option keeps a lease across a deliberate
+consumption delay; CPU mode also checks its bytes before and after that delay.

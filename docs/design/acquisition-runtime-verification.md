@@ -30,3 +30,13 @@ generated fixtures. They do not prove the required live ScreenCaptureKit CPU/GPU
 capture, long playback, delayed consumer or host resize acceptance. Those remain
 outstanding. The installed Porthole daemon still serves an existing user capture;
 updating that installation would interrupt it.
+
+The delayed reference-viewer check also passed on 2026-09-12. It completed eight
+BGRA frames normally and eight RGBA frames with a 250 ms hold before each GPU
+submission, while the producer continued publishing every 20 ms. Both exits
+returned admission. Log: `/tmp/jackstay-delayed-native-viewer.log`. The full
+non-ignored macOS backend suite passed in
+`/tmp/jackstay-delayed-full-native-tests.log`; the required default gates passed
+on macOS and Linux, as did each platform's backend Clippy check. The two offline
+SDL CTests passed, including the CPU delay option. These remain generated-fixture
+checks; live acceptance is still outstanding.

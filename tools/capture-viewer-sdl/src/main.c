@@ -1,4 +1,5 @@
 #include <SDL.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdint.h>
@@ -13,6 +14,8 @@ enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4 };
 
 typedef struct viewer_options {
   int max_frames;
+  uint32_t hold_ms;
+  int invalid;
   const char *porthole_socket;
   const char *session_id;
   int native;
@@ -38,6 +41,21 @@ static viewer_options parse_options(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--native") == 0) {
       options.native = 1;
+    } else if (strcmp(argv[i], "--hold-ms") == 0) {
+      if (++i >= argc || argv[i][0] < '0' || argv[i][0] > '9') {
+        fprintf(stderr, "--hold-ms requires an unsigned millisecond count\n");
+        options.invalid = 1;
+        return options;
+      }
+      errno = 0;
+      char *end = NULL;
+      unsigned long value = strtoul(argv[i], &end, 10);
+      if (errno || *end != '\0' || value > UINT32_MAX) {
+        fprintf(stderr, "invalid --hold-ms value\n");
+        options.invalid = 1;
+        return options;
+      }
+      options.hold_ms = (uint32_t)value;
     } else if (i + 1 >= argc) {
       continue;
     } else if (strcmp(argv[i], "--frames") == 0) {
@@ -65,6 +83,19 @@ static viewer_options parse_options(int argc, char **argv) {
     }
   }
   return options;
+}
+
+/* Keep the actual lease while deliberately delaying consumption. Pump events
+ * so even a long requested delay can be cancelled by closing this window. */
+static int hold_frame(uint32_t remaining_ms) {
+  while (remaining_ms != 0) {
+    uint32_t chunk = remaining_ms < 16 ? remaining_ms : 16;
+    SDL_Delay(chunk);
+    remaining_ms -= chunk;
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) return 0;
+  }
+  return 1;
 }
 
 static int require_ok(ft_status status, const char *operation) {
@@ -138,6 +169,10 @@ static int run_native(const viewer_options *options) {
     ft_status status = ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, last_cursor, &frame, &range);
     uint32_t interest = FT_WAIT_DATA;
     if (status == FT_STATUS_OK) {
+      if (!hold_frame(options->hold_ms)) {
+        ft_acquired_frame_release(&frame);
+        break;
+      }
       ft_acquired_frame_descriptor descriptor = {0};
       if (require_ok(ft_acquired_frame_describe(frame, &descriptor), "ft_acquired_frame_describe") ||
           mp_present(presenter, &frame) != 0) {
@@ -291,6 +326,22 @@ static int run_cpu(const viewer_options *options) {
           require_ok(ft_acquired_frame_bytes(frame, &bytes, &len), "ft_acquired_frame_bytes")) {
         ft_acquired_frame_release(&frame); failed = 1; break;
       }
+      if (options->hold_ms != 0) {
+        uint8_t *before_hold = malloc(len);
+        if (before_hold == NULL) {
+          fprintf(stderr, "held-frame validation allocation failed\n");
+          ft_acquired_frame_release(&frame); failed = 1; break;
+        }
+        memcpy(before_hold, bytes, len);
+        int continuing = hold_frame(options->hold_ms);
+        int unchanged = memcmp(before_hold, bytes, len) == 0;
+        free(before_hold);
+        if (!unchanged || !continuing) {
+          if (!unchanged) { fprintf(stderr, "acquired CPU pixels changed while held\n"); failed = 1; }
+          ft_acquired_frame_release(&frame);
+          break;
+        }
+      }
       if (producer != NULL && published_cursor != 0 &&
           (desc.cursor != published_cursor || desc.sequence != acquired + 1 ||
            len != (size_t)STRIDE * HEIGHT || memcmp(bytes, pixels, len) != 0)) {
@@ -372,5 +423,6 @@ int main(int argc, char **argv) {
     return 1;
   }
   viewer_options options = parse_options(argc, argv);
+  if (options.invalid) return 1;
   return options.native ? run_native(&options) : run_cpu(&options);
 }

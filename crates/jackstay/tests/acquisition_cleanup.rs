@@ -14,6 +14,8 @@ use std::{
 #[path = "support/child.rs"]
 mod child;
 use child::KillOnDrop;
+#[path = "support/completion.rs"]
+mod shared_completion;
 use jackstay::{
     acquisition::{
         IncarnationId,
@@ -23,8 +25,9 @@ use jackstay::{
     },
     fdpass,
 };
+use shared_completion::SharedCompletion;
 
-fn spawn_consumer(producer: &mut ArenaProducer, timeline: Option<Arc<dyn ReleaseTimeline>>) -> (KillOnDrop, IncarnationId) {
+fn spawn_consumer(producer: &mut ArenaProducer, timeline: Option<Arc<SharedCompletion>>) -> (KillOnDrop, IncarnationId) {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("crash.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -38,8 +41,11 @@ fn spawn_consumer(producer: &mut ArenaProducer, timeline: Option<Arc<dyn Release
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let grant = producer.attach_process(1, child.id()).unwrap();
     let incarnation = grant.incarnation();
+    let completion_fd = timeline.as_ref().map(|timeline| timeline.export_fd());
     let registration = timeline.map(|timeline| producer.register_release_timeline(incarnation, timeline).unwrap());
     let (descriptor, fds) = grant.into_parts().unwrap();
+    let mut fds = Vec::from(fds);
+    fds.extend(completion_fd);
     let json = serde_json::to_vec(&(descriptor, registration)).unwrap();
     stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
     stream.write_all(&json).unwrap();
@@ -141,7 +147,11 @@ fn mapped_crash_child() {
     stream.read_exact(&mut json).unwrap();
     let (descriptor, registration): (_, Option<jackstay::acquisition::arena::ReleaseTimelineRegistration>) =
         serde_json::from_slice(&json).unwrap();
-    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
+    let mut fds = fdpass::recv_fds(&stream, 5 + usize::from(registration.is_some())).unwrap();
+    let completion = registration
+        .as_ref()
+        .map(|_| Arc::new(SharedCompletion::from_fd(fds.pop().unwrap())));
+    let fds = fds.try_into().unwrap();
     // SAFETY: the parent owns the producer and bound this single-use grant to
     // this process before handoff. No fork or forwarding of mapped claims.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
@@ -151,6 +161,7 @@ fn mapped_crash_child() {
     };
     assert_eq!(held.bytes().len(), 4);
     let _held = if let Some(registration) = registration {
+        let registration = consumer.bind_release_timeline(&registration, completion.unwrap()).unwrap();
         held.defer_release(&registration, 5).unwrap();
         None
     } else {
@@ -208,7 +219,7 @@ fn a_process_crash_keeps_its_submitted_deferred_claim_until_external_completion(
     })
     .unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
-    let completion = Arc::new(Completion::default());
+    let completion = Arc::new(SharedCompletion::new());
     let (mut child, old) = spawn_consumer(&mut producer, Some(completion.clone()));
     child.kill().unwrap();
     assert!(!child.wait().unwrap().success());
@@ -253,6 +264,7 @@ fn a_drain_deadline_reports_recovery_without_revoking_storage_and_late_completio
         panic!("missing frame")
     };
     let address = frame.bytes().as_ptr();
+    let registration = stalled.bind_release_timeline(&registration, completion.clone()).unwrap();
     frame.defer_release(&registration, 5).unwrap();
     // An active consumer may legitimately hold its reserved capacity indefinitely.
     std::thread::sleep(Duration::from_millis(30));
@@ -278,6 +290,11 @@ fn a_drain_deadline_reports_recovery_without_revoking_storage_and_late_completio
     assert_eq!(unsafe { std::slice::from_raw_parts(address, 4) }, b"abcd");
     assert!(matches!(healthy.acquire_latest(0).unwrap(), AcquireOutcome::Frame(_)));
     completion.signal(5);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while registration.pending_releases() != 0 {
+        assert!(Instant::now() < deadline, "local retirement stalled");
+        std::thread::yield_now();
+    }
     producer.poll_cleanup().unwrap();
     assert_eq!(stalled.events().capacity_epoch, 1);
     let old = stalled.incarnation();

@@ -33,12 +33,14 @@ use mapping::{ControlMap, ResourceLayout, ResourceMap};
 
 mod wait;
 pub use wait::{Cancellation, WaitEvents, WaitInterest, WaitOutcome};
+mod retirement;
+pub use retirement::ConsumerReleaseTimeline;
 mod cleanup;
 mod process;
 pub use cleanup::{CleanupFailure, RejectedDeferredRelease, ReleaseNotification, ReleaseTimeline, ReleaseTimelineRegistration};
 
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
-const VERSION: u64 = 6;
+const VERSION: u64 = 7;
 const HEADER_LEN: usize = 256;
 const LATEST: usize = 128;
 const TERMINAL: usize = 136;
@@ -344,6 +346,7 @@ pub struct ConsumerGrant {
     reader_fd: Option<OwnedFd>,
     layout: ResourceLayout,
     generation: u64,
+    drain_timeout: Duration,
     mapping_slot: usize,
     claims: Arc<ClaimMap>,
     consumed: bool,
@@ -371,6 +374,7 @@ impl RemoteConsumerGrant {
 pub struct GrantDescriptor {
     pub version: u64,
     pub generation: u64,
+    pub drain_timeout: Duration,
     pub mapping_slot: u32,
     pub incarnation: u64,
     pub resources: u32,
@@ -398,6 +402,7 @@ impl ConsumerGrant {
         let descriptor = GrantDescriptor {
             version: VERSION,
             generation: self.generation,
+            drain_timeout: self.drain_timeout,
             mapping_slot: self.mapping_slot as u32,
             incarnation: self.claims.incarnation.0,
             resources: self.layout.resources as u32,
@@ -435,6 +440,9 @@ impl ConsumerGrant {
     /// another process follows a shared-memory lifetime protocol.
     pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 5]) -> Result<Self, ArenaError> {
         let [control_fd, resource_fd, claim_fd, reader_fd, writer_fd] = fds;
+        if descriptor.drain_timeout.is_zero() || std::time::Instant::now().checked_add(descriptor.drain_timeout).is_none() {
+            return Err(ArenaError::Mapping("invalid consumer drain interval"));
+        }
         if descriptor.recipient_pid != std::process::id() {
             return Err(ArenaError::Mapping("grant belongs to a different recipient process"));
         }
@@ -482,6 +490,7 @@ impl ConsumerGrant {
             reader_fd: Some(reader_fd),
             layout,
             generation: descriptor.generation,
+            drain_timeout: descriptor.drain_timeout,
             mapping_slot: descriptor.mapping_slot as usize,
             claims,
             consumed: false,
@@ -618,6 +627,7 @@ impl ArenaProducer {
                 reader_fd: Some(receiver.into_fd()),
                 layout: resources.layout,
                 generation: resources.generation,
+                drain_timeout: self.drain_timeout,
                 mapping_slot: 0,
                 claims,
                 consumed: false,
@@ -769,21 +779,19 @@ impl Drop for ArenaProducer {
 #[derive(Debug)]
 struct ConsumerLifetime {
     claims: Arc<ClaimMap>,
+    retirement: retirement::Retirement,
 }
 
 #[derive(Debug)]
 struct ConsumerResources {
     map: ManuallyDrop<ResourceMap>,
     mapping_slot: usize,
-    lifetime: Arc<ConsumerLifetime>,
+    claims: Arc<ClaimMap>,
 }
 
 impl Drop for ConsumerLifetime {
     fn drop(&mut self) {
-        self.claims.close();
-        // No consumer method can still access this mapping. Deferred claims
-        // may remain producer-owned; their completion is checked separately.
-        self.claims.acknowledge_quiescent();
+        self.retirement.close();
     }
 }
 
@@ -818,16 +826,18 @@ impl ArenaConsumer {
             grant.claims.recipient_pid,
         )?;
         let receiver = wait::Receiver::from_fd(grant.reader_fd.take().expect("single-use grant"))?;
+        let claims = Arc::new(claims);
+        let retirement = retirement::Retirement::new(Arc::clone(&claims), grant.drain_timeout)?;
+        let lifetime = Arc::new(ConsumerLifetime { claims, retirement });
         grant.consumed = true;
         grant.claims.word(OFFERED_GENERATION).store(0, SeqCst);
-        let lifetime = Arc::new(ConsumerLifetime { claims: Arc::new(claims) });
         Ok(Self {
             receiver,
             control: Arc::new(control),
             resources: Some(Arc::new(ConsumerResources {
                 map: ManuallyDrop::new(map),
                 mapping_slot: grant.mapping_slot,
-                lifetime: Arc::clone(&lifetime),
+                claims: Arc::clone(&lifetime.claims),
             })),
             lifetime,
         })
@@ -933,7 +943,8 @@ impl ArenaConsumer {
             return Ok(AcquireOutcome::HoldingLimit);
         };
         let claim = Claim {
-            owner: Arc::clone(resources),
+            owner: Some(Arc::clone(resources)),
+            lifetime: Arc::clone(&self.lifetime),
             slot: claim_slot,
             release_on_drop: true,
         };
@@ -968,13 +979,14 @@ impl ArenaConsumer {
 
 impl Drop for ArenaConsumer {
     fn drop(&mut self) {
-        self.lifetime.claims.close();
+        self.lifetime.retirement.begin_drain();
     }
 }
 
 #[derive(Debug)]
 struct Claim {
-    owner: Arc<ConsumerResources>,
+    owner: Option<Arc<ConsumerResources>>,
+    lifetime: Arc<ConsumerLifetime>,
     slot: usize,
     release_on_drop: bool,
 }
@@ -982,7 +994,7 @@ struct Claim {
 impl Drop for Claim {
     fn drop(&mut self) {
         if self.release_on_drop {
-            self.owner.lifetime.claims.return_credit(self.slot);
+            self.lifetime.claims.return_credit(self.slot);
         }
     }
 }
@@ -1013,7 +1025,14 @@ impl FrameLease {
         // producer writes throughout the returned slice's borrow lifetime.
         unsafe {
             std::slice::from_raw_parts(
-                self.claim.owner.map.storage.as_ptr().add(self.descriptor.payload_offset as usize),
+                self.claim
+                    .owner
+                    .as_ref()
+                    .expect("live frame owns storage")
+                    .map
+                    .storage
+                    .as_ptr()
+                    .add(self.descriptor.payload_offset as usize),
                 self.descriptor.payload_len as usize,
             )
         }

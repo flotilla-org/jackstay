@@ -16,9 +16,10 @@ use super::{
     QUIESCENT, RELEASE_ID, RELEASE_PENDING, RELEASE_VALUE, process::ProcessWatch, wait,
 };
 
-/// Producer-owned access to a registered native completion timeline. Returning a
+/// Access to a registered completion timeline. Returning a
 /// value asserts that the corresponding consumer GPU work has completed, not
-/// merely been submitted. The imported handle must remain alive through draining.
+/// merely been submitted. Producer and consumer owners each retain a handle
+/// through draining, so either can observe completion after the other shuts down.
 pub trait ReleaseTimeline: Send + Sync + Debug {
     /// Read the monotonic completion value without blocking.
     fn completed_value(&self) -> crate::Result<u64>;
@@ -35,9 +36,9 @@ pub trait ReleaseTimeline: Send + Sync + Debug {
 /// a restarted producer from satisfying this registration accidentally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseTimelineRegistration {
-    incarnation: u64,
-    scope: [u8; 16],
-    id: u64,
+    pub(super) incarnation: u64,
+    pub(super) scope: [u8; 16],
+    pub(super) id: u64,
 }
 
 /// A one-shot wake owned by a bounded release observation. Backends may call
@@ -48,13 +49,33 @@ pub struct ReleaseNotification(Arc<NotificationInner>);
 #[derive(Debug)]
 struct NotificationInner {
     fired: AtomicBool,
-    wake: Arc<wait::Wake>,
+    wake: NotificationWake,
+}
+
+#[derive(Debug)]
+enum NotificationWake {
+    Producer(Arc<wait::Wake>),
+    Consumer(Arc<super::retirement::LocalWake>),
 }
 
 impl ReleaseNotification {
+    pub(super) fn has_fired(&self) -> bool {
+        self.0.fired.load(SeqCst)
+    }
+
+    pub(super) fn for_local(wake: Arc<super::retirement::LocalWake>) -> Self {
+        Self(Arc::new(NotificationInner {
+            fired: AtomicBool::new(false),
+            wake: NotificationWake::Consumer(wake),
+        }))
+    }
+
     pub fn notify(&self) -> std::io::Result<()> {
         if !self.0.fired.swap(true, SeqCst) {
-            self.0.wake.signal()?;
+            match &self.0.wake {
+                NotificationWake::Producer(wake) => wake.signal()?,
+                NotificationWake::Consumer(wake) => wake.signal(),
+            }
         }
         Ok(())
     }
@@ -139,7 +160,9 @@ impl ObservationState {
             match self.claims.release_word(index, RELEASE_PENDING).load(SeqCst) {
                 // Submitted deferred uses retain their imported completion
                 // source, including on a CPU arena used for asynchronous work.
-                1 => {}
+                1 | 2 => {
+                    self.claims.release_word(index, RELEASE_PENDING).store(2, SeqCst);
+                }
                 0 if !self.native_resources && self.timelines.is_empty() => {
                     self.claims.return_credit(index);
                     self.released = self.released.saturating_add(1);
@@ -218,7 +241,7 @@ impl ObservationState {
             }
             match self.claims.release_word(index, RELEASE_PENDING).load(SeqCst) {
                 0 => continue,
-                1 => {}
+                1 | 2 => {}
                 _ => {
                     self.fail("invalid deferred release state".to_owned());
                     break;
@@ -237,13 +260,13 @@ impl ObservationState {
                     break;
                 }
             };
-            if completed >= value {
+            if completed >= value && self.claims.release_word(index, RELEASE_PENDING).load(SeqCst) == 2 {
                 self.claims.return_credit(index);
                 self.released = self.released.saturating_add(1);
-            } else if self.armed[index].is_none() {
+            } else if completed < value && self.armed[index].is_none() {
                 let notification = ReleaseNotification(Arc::new(NotificationInner {
                     fired: AtomicBool::new(false),
-                    wake: Arc::clone(&self.claims.release_wake),
+                    wake: NotificationWake::Producer(Arc::clone(&self.claims.release_wake)),
                 }));
                 match timeline.notify_at(value, notification.clone()) {
                     Ok(()) => self.armed[index] = Some(notification),
@@ -348,12 +371,12 @@ impl Drop for IncarnationObserver {
 }
 
 impl ClaimMap {
-    fn release_word(&self, index: usize, field: usize) -> &std::sync::atomic::AtomicU64 {
+    pub(super) fn release_word(&self, index: usize, field: usize) -> &std::sync::atomic::AtomicU64 {
         assert!(index < self.frames && matches!(field, RELEASE_ID | RELEASE_VALUE | RELEASE_PENDING));
         self.word(HEADER_LEN + index * CLAIM_SLOT_LEN + field)
     }
 
-    fn registered_timeline(&self, index: usize) -> &std::sync::atomic::AtomicU64 {
+    pub(super) fn registered_timeline(&self, index: usize) -> &std::sync::atomic::AtomicU64 {
         assert!(index < self.frames);
         self.word(HEADER_LEN + self.frames * CLAIM_SLOT_LEN + index * 8)
     }
@@ -483,34 +506,18 @@ pub struct RejectedDeferredRelease {
 }
 
 impl FrameLease {
-    /// Hand ownership of this claim to the producer's completion observer. The
-    /// returned frame on failure remains leased; success consumes it so it can
-    /// no longer expose a byte slice after the completion observer releases it.
-    pub fn defer_release(mut self, registration: &ReleaseTimelineRegistration, value: u64) -> Result<(), RejectedDeferredRelease> {
-        let claims = &self.claim.owner.lifetime.claims;
-        if registration.incarnation != claims.incarnation.0
-            || registration.scope != claims.scope
-            || !(0..claims.frames).any(|index| claims.registered_timeline(index).load(SeqCst) == registration.id)
-            || registration.id == 0
-        {
-            return Err(RejectedDeferredRelease {
-                error: ArenaError::Mapping("release timeline belongs to another incarnation or is unregistered"),
+    /// Hand this lease to both completion owners. The consumer retains its own
+    /// mapping/handles until its bound local completion, then the producer may
+    /// return credit after independently observing the registered completion.
+    /// Failure returns the original still-owned frame.
+    pub fn defer_release(mut self, completion: &super::ConsumerReleaseTimeline, value: u64) -> Result<(), RejectedDeferredRelease> {
+        let lifetime = Arc::clone(&self.claim.lifetime);
+        match lifetime.retirement.handoff(&mut self.claim, completion, value) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(RejectedDeferredRelease {
+                error,
                 frame: Box::new(self),
-            });
+            }),
         }
-        // Disable RAII release BEFORE making the handoff visible. The producer
-        // can observe an already-complete event and clear/reuse this claim slot
-        // immediately after the final store. Nothing below may touch it again.
-        self.claim.release_on_drop = false;
-        claims.release_word(self.claim.slot, RELEASE_ID).store(registration.id, SeqCst);
-        claims.release_word(self.claim.slot, RELEASE_VALUE).store(value, SeqCst);
-        claims.release_word(self.claim.slot, RELEASE_PENDING).store(1, SeqCst);
-        // Ownership is already transferred: a wake failure must not return the
-        // frame or clear its claim. Close acquisition; the owner retains it for
-        // observation/recovery. Normal socket saturation means a wake is pending.
-        if claims.release_wake.signal().is_err() {
-            claims.close();
-        }
-        Ok(())
     }
 }

@@ -40,6 +40,22 @@ impl ReleaseTimeline for ControlledTimeline {
     }
 }
 
+#[path = "support/completion.rs"]
+mod shared_completion;
+use shared_completion::SharedCompletion;
+
+fn wait_local_retirement(binding: &jackstay::acquisition::arena::ConsumerReleaseTimeline) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while binding.pending_releases() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local retirement stalled: {:?}",
+            binding.cleanup_failure()
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn producer(max_incarnations: u32) -> ArenaProducer {
     ArenaProducer::new(ArenaConfig {
         resource_capacity: 6,
@@ -61,6 +77,7 @@ fn deferred_release_keeps_storage_and_credit_until_the_registered_timeline_compl
     let registration = producer
         .register_release_timeline(consumer.incarnation(), timeline.clone())
         .unwrap();
+    let registration = consumer.bind_release_timeline(&registration, timeline.clone()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing frame")
@@ -81,6 +98,7 @@ fn deferred_release_keeps_storage_and_credit_until_the_registered_timeline_compl
     assert_eq!(producer.poll_cleanup().unwrap(), 0);
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
     timeline.signal(5);
+    wait_local_retirement(&registration);
     assert_eq!(producer.poll_cleanup().unwrap(), 1);
     assert_eq!(consumer.events().capacity_epoch, before.capacity_epoch + 1);
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Frame(_)));
@@ -94,6 +112,7 @@ fn consumer_shutdown_keeps_pending_gpu_reservations_until_completion_then_allows
     let old_id = consumer.incarnation();
     let timeline = Arc::new(ControlledTimeline::default());
     let registration = producer.register_release_timeline(old_id, timeline.clone()).unwrap();
+    let registration = consumer.bind_release_timeline(&registration, timeline.clone()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing frame")
@@ -104,6 +123,7 @@ fn consumer_shutdown_keeps_pending_gpu_reservations_until_completion_then_allows
     assert_eq!(producer.poll_cleanup().unwrap(), 0);
     assert!(producer.attach(1).is_err());
     timeline.signal(9);
+    wait_local_retirement(&registration);
     assert_eq!(producer.poll_cleanup().unwrap(), 1);
     let restarted = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
     assert_ne!(old_id, restarted.incarnation());
@@ -115,12 +135,16 @@ fn a_registration_from_another_arena_cannot_release_a_matching_local_incarnation
     let mut second = producer(1);
     let first_consumer = ArenaConsumer::from_grant(first.attach(1).unwrap()).unwrap();
     let second_consumer = ArenaConsumer::from_grant(second.attach(1).unwrap()).unwrap();
+    let local_source = Arc::new(ControlledTimeline::default());
+    let foreign_source = Arc::new(ControlledTimeline::default());
     let local = first
-        .register_release_timeline(first_consumer.incarnation(), Arc::new(ControlledTimeline::default()))
+        .register_release_timeline(first_consumer.incarnation(), local_source.clone())
         .unwrap();
     let foreign = second
-        .register_release_timeline(second_consumer.incarnation(), Arc::new(ControlledTimeline::default()))
+        .register_release_timeline(second_consumer.incarnation(), foreign_source.clone())
         .unwrap();
+    let local = first_consumer.bind_release_timeline(&local, local_source.clone()).unwrap();
+    let foreign = second_consumer.bind_release_timeline(&foreign, foreign_source).unwrap();
     first.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let AcquireOutcome::Frame(frame) = first_consumer.acquire_latest(0).unwrap() else {
         panic!("missing frame")
@@ -130,6 +154,8 @@ fn a_registration_from_another_arena_cannot_release_a_matching_local_incarnation
     assert!(matches!(first_consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
     rejected.frame.defer_release(&local, 1).unwrap();
     assert_eq!(first.poll_cleanup().unwrap(), 0);
+    local_source.signal(1);
+    wait_local_retirement(&local);
 }
 
 #[test]
@@ -174,9 +200,12 @@ fn a_failed_release_observer_quarantines_its_incarnation_without_stalling_a_heal
     let AcquireOutcome::Frame(good_frame) = healthy.acquire_latest(0).unwrap() else {
         panic!("missing frame")
     };
+    let bad_reg = failed.bind_release_timeline(&bad_reg, source.clone()).unwrap();
+    let good_reg = healthy.bind_release_timeline(&good_reg, good_source.clone()).unwrap();
     bad_frame.defer_release(&bad_reg, 1).unwrap();
     good_frame.defer_release(&good_reg, 1).unwrap();
     good_source.signal(1);
+    wait_local_retirement(&good_reg);
     assert_eq!(producer.poll_cleanup().unwrap(), 1);
     let failures = producer.cleanup_failures();
     assert_eq!(failures.len(), 1);
@@ -189,6 +218,8 @@ fn a_failed_release_observer_quarantines_its_incarnation_without_stalling_a_heal
     source.timeline.signal(1);
     // Recovery is explicit; reaching a timeout or catching an error never clears
     // the claim. Retrying observes actual completion through the retained source.
+    bad_reg.retry_cleanup().unwrap();
+    wait_local_retirement(&bad_reg);
     producer.retry_cleanup(failed.incarnation()).unwrap();
     assert_eq!(producer.poll_cleanup().unwrap(), 1);
     assert!(producer.cleanup_failures().is_empty());
@@ -205,6 +236,7 @@ fn deferred_completion_wakes_a_capacity_wait_without_more_producer_calls() {
     let registration = producer
         .register_release_timeline(consumer.incarnation(), timeline.clone())
         .unwrap();
+    let registration = consumer.bind_release_timeline(&registration, timeline.clone()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing frame")
@@ -239,10 +271,13 @@ fn an_imported_grant_hands_off_release_and_wakes_without_a_frame_broker() {
         .unwrap();
     let grant = producer.attach_process(1, child.id()).unwrap();
     let old = grant.incarnation();
-    let timeline = Arc::new(ControlledTimeline::default());
+    let timeline = Arc::new(SharedCompletion::new());
     let registration = producer.register_release_timeline(old, timeline.clone()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let (descriptor, fds) = grant.into_parts().unwrap();
+    let completion_fd = timeline.export_fd();
+    let mut fds = Vec::from(fds);
+    fds.push(completion_fd);
     let (mut stream, _) = listener.accept().unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let json = serde_json::to_vec(&(descriptor, registration)).unwrap();
@@ -279,11 +314,14 @@ fn mapped_release_child() {
     let mut json = vec![0; u32::from_le_bytes(len) as usize];
     stream.read_exact(&mut json).unwrap();
     let (descriptor, registration): (GrantDescriptor, ReleaseTimelineRegistration) = serde_json::from_slice(&json).unwrap();
-    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
+    let mut fds = fdpass::recv_fds(&stream, 6).unwrap();
+    let completion = Arc::new(SharedCompletion::from_fd(fds.pop().unwrap()));
+    let fds = fds.try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer and this process is
     // the sole recipient. It does not fork or pass on these mapped claims.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
     let mut consumer = ArenaConsumer::from_grant(grant).unwrap();
+    let registration = consumer.bind_release_timeline(&registration, completion).unwrap();
     let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing frame")
     };
@@ -309,6 +347,7 @@ fn producer_shutdown_joins_the_observer_without_waiting_for_unfinished_gpu_work(
     let registration = producer
         .register_release_timeline(consumer.incarnation(), timeline.clone())
         .unwrap();
+    let registration = consumer.bind_release_timeline(&registration, timeline.clone()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let AcquireOutcome::Frame(retained) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing retained frame")
@@ -363,6 +402,7 @@ fn a_backend_notification_registration_failure_can_be_retried_without_releasing_
     let timeline = Arc::new(FailingRegistration::default());
     timeline.failed.store(true, SeqCst);
     let registration = producer.register_release_timeline(old, timeline.clone()).unwrap();
+    let registration = consumer.bind_release_timeline(&registration, timeline.clone()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing frame")
@@ -372,12 +412,14 @@ fn a_backend_notification_registration_failure_can_be_retried_without_releasing_
     assert_eq!(producer.cleanup_failures().len(), 1);
     assert_eq!(consumer.events().capacity_epoch, 0);
     timeline.failed.store(false, SeqCst);
+    registration.retry_cleanup().unwrap();
     producer.retry_cleanup(old).unwrap();
     assert_eq!(producer.poll_cleanup().unwrap(), 0);
     assert_eq!(consumer.events().capacity_epoch, 0);
     drop(consumer);
     assert!(producer.attach(1).is_err());
     timeline.timeline.signal(5);
+    wait_local_retirement(&registration);
     assert_eq!(producer.poll_cleanup().unwrap(), 1);
     assert_ne!(producer.attach(1).unwrap().incarnation(), old);
 }

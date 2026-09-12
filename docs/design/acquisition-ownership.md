@@ -183,7 +183,7 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-bound remote grants now reclaim ordinary CPU claims on verified exit; asynchronous claims still require completion evidence. |
 | 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, cancellable notification waits, and local CPU reconfiguration are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Replacement-offer FD transfer is implemented; host integration remains pending; the old socket/shadow regression still fails. |
 | 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Completion observation wakes capacity waits while publication is idle. Replacement of the existing host path remains pending. |
-| 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished drains now report recovery failure without revocation; bounded reconfiguration and real GPU command retirement after process death remain pending. |
+| 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished drains now report recovery failure without revocation; CPU reconfiguration and deferred consumer mapping retirement are implemented. Native pool replacement and real GPU command retirement after process death remain pending. |
 | 6: ABI/host/live acceptance | Pending. |
 
 Admission-layer validation: `cargo test --locked --test acquisition_admission`,
@@ -216,7 +216,7 @@ fixed allocation. `native::arena::NativeArenaProducer` uses the same retirement
 and claim scan before staging into an IOSurface; it also checks producer GPU
 completion before reusing a staging target. Actual IOSurface allocation sizes
 count against the arena byte budget. The old host/native and C paths have not
-yet been replaced. The new setup descriptor (version 6)
+yet been replaced. The new setup descriptor (version 7)
 carries five FDs: control, resources, claim page, notification reader,
 notification writer. Control and resource headers carry an arena scope; the
 claim header has an independent incarnation scope. Import rejects mappings
@@ -289,8 +289,9 @@ The control/resource split is implemented. Publication history and wait state
 live in the persistent control mapping; resource state, descriptors, and inline
 payloads live in a separate mapping. A shared consumer lifetime owns the claim
 page, so destroying one resource owner cannot acknowledge shutdown while another
-owner or lease remains. This does not yet implement configuration replacement
-or consumer-side retention of mappings consumed by deferred release.
+owner or lease remains. At that checkpoint, configuration replacement and consumer-side retention of
+mappings consumed by deferred release were still pending; both CPU paths are
+implemented by the subsequent changes described below.
 
 Validation of the split passed on macOS and Linux: eight arena tests, four
 cleanup tests, eight release tests, and four wait tests, including their invoked
@@ -318,7 +319,7 @@ bytes, shared holding credit, overlap pause/retry, cancellation, published curso
 gaps, and repeated healthy changes while a stale offer remains outstanding. The
 existing acquisition suites, three concurrency tests, three native GPU tests,
 workspace build, default/macOS clippy, and pinned formatting remain green.
-Native replacement and deferred consumer-side mapping/handle retention still need
+Native replacement and imported native-resource handle ownership still need
 implementation. Cross-process replacement grants now transfer a single resource
 FD to the existing process-bound incarnation. A child-process test retains the
 old frame through 100 publications before installing the replacement; another
@@ -331,3 +332,21 @@ Process-bound cleanup now uses kqueue on macOS and pidfds on Linux. Remote grant
 are export-only and mandatory for setup FD transfer; local grants use ordinary
 Rust ownership. The process-exit, failure, and native quarantine rules and source
 evidence are recorded in [acquisition-process-cleanup.md](acquisition-process-cleanup.md).
+
+
+Deferred release now binds a consumer-local completion source as well as the
+producer's imported registration. One bounded local worker retains pending
+resource maps through configuration replacement and API teardown, without an
+ownership cycle or dependence on the producer observer staying alive. The
+consumer acknowledges local mapping retirement before the producer may return
+holding credit; both independently check actual completion. Source errors and
+drain deadlines expose recovery failures without unmapping resources. Consumer
+API closure starts that deadline even when an ordinary lease survives.
+
+Three consumer-retirement tests pass on macOS and Linux, covering the exact raw
+address after both API owners are dropped, exhausted replacement capacity, and
+late completion after deadline failure. The release, cleanup, arena, transition,
+and wait suites remain green; the three concurrency and three native tests,
+workspace build, default/macOS clippy, and pinned formatting also pass. Imported
+native surface/readiness ownership, native reconfiguration, host/C replacement,
+full-suite gates, and live CPU/GPU acceptance remain outstanding.

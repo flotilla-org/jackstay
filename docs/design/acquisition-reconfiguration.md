@@ -1,8 +1,8 @@
 # Bounded acquisition reconfiguration
 
 Status: CPU transitions, local and cross-process replacement setup, mapping
-retirement, and admission-book accounting are implemented. Deferred consumer
-mapping/handle retention and native pool replacement remain unfinished.
+retirement, admission-book accounting, and deferred CPU mapping retention are
+implemented. Native imported-resource ownership and pool replacement remain unfinished.
 
 ## Separate control lifetime from resource lifetime
 
@@ -26,21 +26,33 @@ its original immutable descriptor, resource generation, and incarnation lifetime
 All generations use the same holding slots, so old plus new holdings cannot
 exceed the incarnation's reservation.
 
-Deferred release also needs to retain the consumer's own resource mapping and
-imported handles until completion. A producer-side claim protects backing storage
-from reuse, but does not keep a consumer virtual address mapped. The current
-deferred-release tests keep the consumer's mapping alive; replacement and consumer
-teardown need explicit coverage before claiming this part of the contract. Local
-retirement must be bounded by holding credit and must not use EOF or a timeout as
-completion proof.
+Deferred release now retains the consumer's resource mapping independently of
+both public API owners. Before asynchronous use, the consumer binds its local
+completion handle to the producer's registration with `bind_release_timeline`.
+`FrameLease::defer_release` consumes that binding rather than bare setup metadata.
+Both handles must observe the same actual completion source.
 
-Consumer retention cannot depend solely on the producer clearing shared claims:
-the producer's shutdown joins its observer without waiting for unfinished GPU
-work. The consumer therefore needs access to actual completion independently of
-that observer, with a retirement owner bounded by its holding reservation. The
-next implementation must test pending use after both consumer and producer API
-teardown, and avoid an ownership cycle between that retirement owner and the
-resource generations it keeps alive.
+Each incarnation has one local retirement worker with H pending slots and at most
+H bound sources. Notifications wake a condition variable; the worker rechecks
+actual completion, with no timed polling while active. It retains the original
+consumer mapping, unmaps it before acknowledging local retirement, and keeps at
+most one outstanding callback per slot. Resource owners hold the claim page, not
+the incarnation lifetime, so pending resources cannot form an ownership cycle.
+
+Deferred-release state 1 means the consumer still owns the pending use. State 2
+acknowledges local mapping retirement. Only after state 2 and independently
+observed producer-side completion does the producer return holding credit.
+Verified process exit also supplies local mapping-retirement proof, but does not
+replace producer-side GPU completion. The local worker can complete and release
+its mapping even after the producer's observer has been destroyed.
+
+Consumer API shutdown starts its drain deadline even if another ordinary frame
+lease remains alive. Final lifetime teardown and retries do not reset that
+interval. Binding handles expose pending local releases, cleanup failure, and
+explicit retry without keeping completed resources alive. Expiry reports failure
+and retains the mapping; late actual completion still retires it. Native imported
+surface/readiness handle ownership still needs to be attached to the corresponding
+resource generation during native integration.
 
 ## Transition ordering
 
@@ -128,8 +140,9 @@ its slot. The producer reclaims a retired allocation only after no mapping slot
 or resource claim names it, and destroys its own mapping before returning bytes.
 Process-exit proof clears mapping references; unresolved asynchronous claims still
 prevent allocation reclamation. Initial setup uses the same bookkeeping. Setup
-version 6 adds the resource generation and mapping slot to its descriptor and
-binds the resource header to that generation.
+version 7 retains the resource generation and mapping slot, carries the consumer
+drain interval, and changes deferred-release state to require local retirement.
+The resource header remains bound to its generation.
 
 Native staging
 needs an allocation upper bound before creating a replacement pool; checking its
@@ -146,7 +159,12 @@ under shared holding credit; exhausted overlap capacity and cancellation; cursor
 gaps before and after replacement publication; and 100 healthy replacements while
 another consumer retains one stale offer. A separate real-process crash test
 unblocks a capacity-paused CPU replacement after process-exit proof. These tests
-do not cover deferred consumer mapping retention or native pool replacement.
+do not cover native pool replacement. Three further retirement tests now cover
+the exact consumer address after both API owners are destroyed, deferred use
+blocking an exhausted replacement, and deadline failure with a surviving ordinary
+lease followed by late completion. They pass on macOS and Linux. Existing release
+tests now bind local completion explicitly; the subprocess tests transfer a
+controlled completion source over its own event channel.
 
 Two additional tests pass on macOS and Linux: a separate process keeps an old
 frame through 100 publications, imports the replacement, and shares holding credit

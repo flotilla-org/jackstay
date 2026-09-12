@@ -92,6 +92,7 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
     let registration = producer
         .register_release_timeline(consumer.incarnation(), observed_release.clone())
         .unwrap();
+    let registration = consumer.bind_release_timeline(&registration, observed_release.clone()).unwrap();
     producer.publish(&captured(37), 1).unwrap();
     let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing frame")

@@ -286,7 +286,7 @@ impl ArenaConsumer {
         self.resources = Some(Arc::new(ConsumerResources {
             map: ManuallyDrop::new(map),
             mapping_slot: grant.mapping_slot,
-            lifetime: Arc::clone(&self.lifetime),
+            claims: Arc::clone(&self.lifetime.claims),
         }));
         grant.consumed = true;
         grant.claims.word(OFFERED_GENERATION).store(0, SeqCst);
@@ -316,8 +316,8 @@ impl Drop for ConsumerResources {
         // SAFETY: the last Arc owns this map exclusively. Unmap before the
         // acknowledgement permits the producer to reclaim its allocation bytes.
         unsafe { ManuallyDrop::drop(&mut self.map) };
-        self.lifetime.claims.mapping_slot(self.mapping_slot).store(0, SeqCst);
-        let _ = self.lifetime.claims.release_wake.signal();
+        self.claims.mapping_slot(self.mapping_slot).store(0, SeqCst);
+        let _ = self.claims.release_wake.signal();
     }
 }
 

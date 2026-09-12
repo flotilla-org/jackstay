@@ -17,7 +17,7 @@ from a client-supplied identity field. That is a transport provenance requiremen
 not an authorization policy assigned to Jackstay. XPC and Unix-socket host
 integration still need to supply that binding.
 
-Setup version 4 includes the recipient PID in the descriptor and immutable claim
+Setup version 7 includes the recipient PID in the descriptor and immutable claim
 header. Import rejects a different PID. The unsafe import contract additionally
 requires the exact process lifetime admitted by the sender: a restarted process,
 a reused PID, or a child inheriting handles cannot adopt an old grant. A new
@@ -145,3 +145,22 @@ wait, native arena, and deterministic concurrency tests passed on macOS; the
 Linux cleanup/wait tests and all-targets clippy also passed. macOS workspace build,
 macOS-feature all-targets clippy, and pinned formatting passed. These are targeted
 checks; final full-suite and live acceptance remain required.
+
+
+Consumer-local deferred retirement now has an additional bounded owner. The
+consumer binds its own handle for the registered completion source and retains
+its mapping until actual completion, even after the producer observer shuts
+down. Release state 1 retains consumer use; state 2 acknowledges local mapping
+retirement. On verified process exit the producer can establish state 2, but must
+still observe actual external completion before reclaiming a deferred claim.
+Library shutdown acknowledges quiescence after local retirement finishes; mapping
+references and claims remain separate reclamation checks.
+
+The consumer owner reports source failures and drain expiry through its binding
+handle. API closure starts the deadline even when other ordinary leases survive;
+final lifetime teardown and retries do not reset it. Late completion remains
+observable and releases the mapping without either original API object alive.
+The mapped-process release/crash tests now transfer an independently observable
+controlled completion event at setup. These and three new retirement tests pass
+on macOS and Linux; they do not prove native GPU command retirement after process
+termination.

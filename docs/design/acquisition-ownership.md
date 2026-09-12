@@ -181,7 +181,7 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | --- | --- |
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
 | 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-bound remote grants now reclaim ordinary CPU claims on verified exit; asynchronous claims still require completion evidence. |
-| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, cancellable notification waits, and local CPU reconfiguration are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Replacement-offer FD transfer and host integration remain pending; the old socket/shadow regression still fails. |
+| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, cancellable notification waits, and local CPU reconfiguration are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Replacement-offer FD transfer is implemented; host integration remains pending; the old socket/shadow regression still fails. |
 | 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Completion observation wakes capacity waits while publication is idle. Replacement of the existing host path remains pending. |
 | 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished drains now report recovery failure without revocation; bounded reconfiguration and real GPU command retirement after process death remain pending. |
 | 6: ABI/host/live acceptance | Pending. |
@@ -318,8 +318,13 @@ bytes, shared holding credit, overlap pause/retry, cancellation, published curso
 gaps, and repeated healthy changes while a stale offer remains outstanding. The
 existing acquisition suites, three concurrency tests, three native GPU tests,
 workspace build, default/macOS clippy, and pinned formatting remain green.
-Cross-process replacement grants, native replacement, and deferred consumer-side
-mapping/handle retention still need implementation. The full suite and live
+Native replacement and deferred consumer-side mapping/handle retention still need
+implementation. Cross-process replacement grants now transfer a single resource
+FD to the existing process-bound incarnation. A child-process test retains the
+old frame through 100 publications before installing the replacement; another
+test rejects a contradictory resource header even when its offer is stale. Both
+pass on macOS and Linux. The existing acquisition suites, native GPU tests,
+build, clippy, and formatting remain green. The full suite and live
 acceptance are not claimed complete.
 
 Process-bound cleanup now uses kqueue on macOS and pidfds on Linux. Remote grants

@@ -26,7 +26,7 @@ use super::{AdmissionBook, AdmissionError, AdmissionLimits, AllocationId, Holdin
 use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
 mod reconfiguration;
-pub use reconfiguration::{ConfigurationGrant, ConfigurationInstall, ReconfigurationStatus};
+pub use reconfiguration::{ConfigurationDescriptor, ConfigurationGrant, ConfigurationInstall, ReconfigurationStatus};
 
 mod mapping;
 use mapping::{ControlMap, ResourceLayout, ResourceMap};
@@ -768,7 +768,7 @@ impl Drop for ArenaProducer {
 
 #[derive(Debug)]
 struct ConsumerLifetime {
-    claims: ClaimMap,
+    claims: Arc<ClaimMap>,
 }
 
 #[derive(Debug)]
@@ -820,7 +820,7 @@ impl ArenaConsumer {
         let receiver = wait::Receiver::from_fd(grant.reader_fd.take().expect("single-use grant"))?;
         grant.consumed = true;
         grant.claims.word(OFFERED_GENERATION).store(0, SeqCst);
-        let lifetime = Arc::new(ConsumerLifetime { claims });
+        let lifetime = Arc::new(ConsumerLifetime { claims: Arc::new(claims) });
         Ok(Self {
             receiver,
             control: Arc::new(control),

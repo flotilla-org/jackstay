@@ -1,8 +1,8 @@
 # Bounded acquisition reconfiguration
 
-Status: local CPU transitions, mapping retirement, and admission-book accounting
-are implemented. Cross-process replacement setup, deferred consumer mapping/handle
-retention, and native pool replacement remain unfinished.
+Status: CPU transitions, local and cross-process replacement setup, mapping
+retirement, and admission-book accounting are implemented. Deferred consumer
+mapping/handle retention and native pool replacement remain unfinished.
 
 ## Separate control lifetime from resource lifetime
 
@@ -33,6 +33,14 @@ deferred-release tests keep the consumer's mapping alive; replacement and consum
 teardown need explicit coverage before claiming this part of the contract. Local
 retirement must be bounded by holding credit and must not use EOF or a timeout as
 completion proof.
+
+Consumer retention cannot depend solely on the producer clearing shared claims:
+the producer's shutdown joins its observer without waiting for unfinished GPU
+work. The consumer therefore needs access to actual completion independently of
+that observer, with a retirement owner bounded by its holding reservation. The
+next implementation must test pending use after both consumer and producer API
+teardown, and avoid an ownership cycle between that retirement owner and the
+resource generations it keeps alive.
 
 ## Transition ordering
 
@@ -105,7 +113,13 @@ The CPU arena now uses this ledger through `reconfigure_cpu` and
 The host retries advancement after retirement; allocation failure leaves the
 proposal paused for retry. `configuration_offer` supplies an opaque local setup
 grant, and `install_configuration` or dropping the grant disposes that offer.
-Cross-process export/import of replacement offers still needs implementation.
+`ConfigurationGrant::into_parts` exports one resource FD with a
+`ConfigurationDescriptor`, only for a process-bound incarnation. Unsafe import
+uses the existing consumer's claim mapping and checks process, arena, incarnation,
+mapping slot, outstanding offer, and layout. It creates no new holding reservation
+or notification channel. The raw setup contract prohibits replay and forwarding,
+and requires relinquishing extra setup FD copies. Installation validates the
+resource header even for a stale offer; contradictory metadata remains an error.
 
 Claim maps contain `H + 2` mapping-reference slots: at most H generations retained
 by leases, one current mapping, and one outstanding offer. A resource owner keeps
@@ -133,6 +147,14 @@ gaps before and after replacement publication; and 100 healthy replacements whil
 another consumer retains one stale offer. A separate real-process crash test
 unblocks a capacity-paused CPU replacement after process-exit proof. These tests
 do not cover deferred consumer mapping retention or native pool replacement.
+
+Two additional tests pass on macOS and Linux: a separate process keeps an old
+frame through 100 publications, imports the replacement, and shares holding credit
+across generations; an imported stale offer with a contradictory resource header
+returns an error and disposes its offer. The transition suite now has six tests
+plus its explicitly invoked subprocess helper. Existing arena, cleanup, release,
+and wait suites and native GPU tests remain green, as do workspace build, default
+and macOS-feature clippy, and pinned formatting.
 
 Complete the remaining transition evidence through the agreed seams:
 

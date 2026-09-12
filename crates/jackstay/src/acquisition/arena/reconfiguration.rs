@@ -4,9 +4,12 @@ use std::{
     sync::{Arc, atomic::Ordering::SeqCst},
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     ACTIVE, AdmissionError, ArenaConsumer, ArenaError, ArenaProducer, CLAIM_SLOT_LEN, CONFIGURATION, ClaimMap, ConsumerResources,
-    FIRST_CURSOR, HEADER_LEN, IncarnationId, OFFERED_GENERATION, RECONFIGURATION_EPOCH, ResourceLayout, ResourceMap, TERMINAL, wait,
+    FIRST_CURSOR, HEADER_LEN, IncarnationId, OFFERED_GENERATION, RECONFIGURATION_EPOCH, ResourceLayout, ResourceMap, TERMINAL, VERSION,
+    wait,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,97 @@ pub struct ConfigurationGrant {
     claims: Arc<ClaimMap>,
     mapping_slot: usize,
     consumed: bool,
+}
+
+/// Setup metadata accompanying one replacement resource FD. Control, claim,
+/// and notification mappings remain those of the existing incarnation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigurationDescriptor {
+    pub version: u64,
+    pub generation: u64,
+    pub incarnation: u64,
+    pub arena_scope: [u8; 16],
+    pub claim_scope: [u8; 16],
+    pub recipient_pid: u32,
+    pub mapping_slot: u32,
+    pub resources: u32,
+    pub history: u32,
+    pub payload_capacity: u64,
+    pub resource_map_len: u64,
+}
+
+impl ConfigurationGrant {
+    /// Export only to the incarnation's already monitored process. The host
+    /// must transfer this single-use offer to that process and relinquish its
+    /// setup FD. Dropping an exported FD is not recipient retirement proof.
+    pub fn into_parts(mut self) -> Result<(ConfigurationDescriptor, OwnedFd), ArenaError> {
+        if self.claims.recipient_pid == 0 {
+            return Err(ArenaError::Configuration("replacement export requires a process-bound incarnation"));
+        }
+        let descriptor = ConfigurationDescriptor {
+            version: VERSION,
+            generation: self.generation,
+            incarnation: self.claims.incarnation.0,
+            arena_scope: self.arena_scope,
+            claim_scope: self.claims.scope,
+            recipient_pid: self.claims.recipient_pid,
+            mapping_slot: self.mapping_slot as u32,
+            resources: self.layout.resources as u32,
+            history: self.layout.history as u32,
+            payload_capacity: self.layout.payload_capacity as u64,
+            resource_map_len: self.layout.len as u64,
+        };
+        let fd = self.fd.take().expect("single-use offer");
+        self.consumed = true;
+        Ok((descriptor, fd))
+    }
+
+    /// Import a replacement for an already mapped consumer incarnation.
+    ///
+    /// # Safety
+    /// The sender must be that arena's conforming sole producer and this
+    /// process the sole recipient of this single-use offer. Do not replay,
+    /// forward, or fork it. The sender must keep the allocation charged and
+    /// initialized until this recipient's mapping/lease retirement or verified
+    /// process exit. Header checks cannot prove another process obeys that
+    /// lifetime protocol. Drop all other copies of the received resource FD.
+    pub unsafe fn from_parts(consumer: &ArenaConsumer, descriptor: ConfigurationDescriptor, fd: OwnedFd) -> Result<Self, ArenaError> {
+        let claims = &consumer.lifetime.claims;
+        if descriptor.version != VERSION
+            || descriptor.generation == 0
+            || descriptor.arena_scope != consumer.control.scope
+            || descriptor.claim_scope != claims.scope
+            || descriptor.incarnation != claims.incarnation.0
+            || descriptor.recipient_pid != std::process::id()
+            || descriptor.recipient_pid != claims.recipient_pid
+        {
+            return Err(ArenaError::Mapping(
+                "replacement grant belongs to another arena, incarnation, or process",
+            ));
+        }
+        let mapping_slot = descriptor.mapping_slot as usize;
+        if mapping_slot >= claims.frames + 2
+            || claims.mapping_slot(mapping_slot).load(SeqCst) != descriptor.generation
+            || claims.word(OFFERED_GENERATION).load(SeqCst) != descriptor.generation
+        {
+            return Err(ArenaError::Mapping("replacement grant disagrees with outstanding offer"));
+        }
+        let payload_capacity =
+            usize::try_from(descriptor.payload_capacity).map_err(|_| ArenaError::Mapping("replacement payload capacity overflows"))?;
+        let layout = ResourceLayout::new(descriptor.resources as usize, descriptor.history as usize, payload_capacity)?;
+        if layout.history != consumer.control.history || layout.len as u64 != descriptor.resource_map_len {
+            return Err(ArenaError::Mapping("replacement mapping layout disagrees with setup"));
+        }
+        Ok(Self {
+            fd: Some(fd),
+            layout,
+            generation: descriptor.generation,
+            arena_scope: descriptor.arena_scope,
+            claims: Arc::clone(claims),
+            mapping_slot,
+            consumed: false,
+        })
+    }
 }
 
 impl ArenaProducer {
@@ -177,15 +271,18 @@ impl ArenaConsumer {
         if self.is_closed() {
             return Err(ArenaError::Closed);
         }
-        if grant.generation != self.control.word(CONFIGURATION).load(SeqCst) {
-            return Ok(ConfigurationInstall::Stale);
-        }
         let map = ResourceMap::map(
             grant.fd.take().expect("single-use offer"),
             grant.layout,
             grant.arena_scope,
             grant.generation,
         )?;
+        // Staleness is a normal retry only for a valid resource mapping. Do not
+        // hide contradictory available metadata behind the stale outcome.
+        if grant.generation != self.control.word(CONFIGURATION).load(SeqCst) {
+            drop(map);
+            return Ok(ConfigurationInstall::Stale);
+        }
         self.resources = Some(Arc::new(ConsumerResources {
             map: ManuallyDrop::new(map),
             mapping_slot: grant.mapping_slot,

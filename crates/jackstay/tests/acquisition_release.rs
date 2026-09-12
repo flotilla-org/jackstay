@@ -1,20 +1,42 @@
 #![cfg(unix)]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering::SeqCst},
-};
+use std::sync::{Arc, Mutex, atomic::Ordering::SeqCst};
 
 use jackstay::{
     Result,
-    acquisition::arena::{AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, FrameDescriptor, ReleaseTimeline},
+    acquisition::arena::{
+        AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, FrameDescriptor, ReleaseNotification, ReleaseTimeline,
+    },
 };
 
 #[derive(Debug, Default)]
-struct ControlledTimeline(AtomicU64);
+struct ControlledTimeline(Mutex<(u64, Vec<(u64, ReleaseNotification)>)>);
+impl ControlledTimeline {
+    fn signal(&self, value: u64) {
+        let mut state = self.0.lock().unwrap();
+        state.0 = value;
+        state.1.retain(|(target, notification)| {
+            if *target <= value {
+                notification.notify().unwrap();
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
 impl ReleaseTimeline for ControlledTimeline {
     fn completed_value(&self) -> Result<u64> {
-        Ok(self.0.load(SeqCst))
+        Ok(self.0.lock().unwrap().0)
+    }
+    fn notify_at(&self, value: u64, notification: ReleaseNotification) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.0 >= value {
+            notification.notify().unwrap();
+        } else {
+            state.1.push((value, notification));
+        }
+        Ok(())
     }
 }
 
@@ -54,10 +76,10 @@ fn deferred_release_keeps_storage_and_credit_until_the_registered_timeline_compl
     assert_eq!(unsafe { std::slice::from_raw_parts(address, 4) }, b"abcd");
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
     assert_eq!(consumer.events().capacity_epoch, before.capacity_epoch);
-    timeline.0.store(4, SeqCst);
+    timeline.signal(4);
     assert_eq!(producer.poll_release_completions().unwrap(), 0);
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
-    timeline.0.store(5, SeqCst);
+    timeline.signal(5);
     assert_eq!(producer.poll_release_completions().unwrap(), 1);
     assert_eq!(consumer.events().capacity_epoch, before.capacity_epoch + 1);
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Frame(_)));
@@ -80,7 +102,7 @@ fn consumer_shutdown_keeps_pending_gpu_reservations_until_completion_then_allows
     drop(consumer);
     assert_eq!(producer.poll_release_completions().unwrap(), 0);
     assert!(producer.attach(1).is_err());
-    timeline.0.store(9, SeqCst);
+    timeline.signal(9);
     assert_eq!(producer.poll_release_completions().unwrap(), 1);
     let restarted = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
     assert_ne!(old_id, restarted.incarnation());
@@ -115,7 +137,7 @@ fn a_failed_release_observer_quarantines_its_incarnation_without_stalling_a_heal
     #[derive(Debug)]
     struct FailingTimeline {
         failed: AtomicBool,
-        value: AtomicU64,
+        timeline: ControlledTimeline,
     }
     impl ReleaseTimeline for FailingTimeline {
         fn completed_value(&self) -> Result<u64> {
@@ -125,8 +147,11 @@ fn a_failed_release_observer_quarantines_its_incarnation_without_stalling_a_heal
                     message: "event unavailable".to_owned(),
                 })
             } else {
-                Ok(self.value.load(SeqCst))
+                self.timeline.completed_value()
             }
+        }
+        fn notify_at(&self, value: u64, notification: ReleaseNotification) -> Result<()> {
+            self.timeline.notify_at(value, notification)
         }
     }
     let mut producer = producer(2);
@@ -134,7 +159,7 @@ fn a_failed_release_observer_quarantines_its_incarnation_without_stalling_a_heal
     let healthy = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
     let source = Arc::new(FailingTimeline {
         failed: AtomicBool::new(true),
-        value: AtomicU64::new(0),
+        timeline: ControlledTimeline::default(),
     });
     let bad_reg = producer.register_release_timeline(failed.incarnation(), source.clone()).unwrap();
     let good_source = Arc::new(ControlledTimeline::default());
@@ -150,7 +175,7 @@ fn a_failed_release_observer_quarantines_its_incarnation_without_stalling_a_heal
     };
     bad_frame.defer_release(&bad_reg, 1).unwrap();
     good_frame.defer_release(&good_reg, 1).unwrap();
-    good_source.0.store(1, SeqCst);
+    good_source.signal(1);
     assert_eq!(producer.poll_release_completions().unwrap(), 1);
     let failures = producer.release_recovery_failures();
     assert_eq!(failures.len(), 1);
@@ -160,10 +185,198 @@ fn a_failed_release_observer_quarantines_its_incarnation_without_stalling_a_heal
     producer.publish(FrameDescriptor::default(), b"wxyz").unwrap();
     assert!(matches!(healthy.acquire_latest(0).unwrap(), AcquireOutcome::Frame(_)));
     source.failed.store(false, SeqCst);
-    source.value.store(1, SeqCst);
+    source.timeline.signal(1);
     // Recovery is explicit; reaching a timeout or catching an error never clears
     // the claim. Retrying observes actual completion through the retained source.
     producer.retry_release_cleanup(failed.incarnation()).unwrap();
     assert_eq!(producer.poll_release_completions().unwrap(), 1);
     assert!(producer.release_recovery_failures().is_empty());
+}
+
+#[test]
+fn deferred_completion_wakes_a_capacity_wait_without_more_producer_calls() {
+    use std::time::Duration;
+
+    use jackstay::acquisition::arena::{Cancellation, WaitInterest, WaitOutcome};
+    let mut producer = producer(1);
+    let mut consumer = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+    let timeline = Arc::new(ControlledTimeline::default());
+    let registration = producer
+        .register_release_timeline(consumer.incarnation(), timeline.clone())
+        .unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    let observed = consumer.events();
+    frame.defer_release(&registration, 5).unwrap();
+    timeline.signal(5);
+    assert!(
+        matches!(consumer.wait(observed, WaitInterest::CAPACITY, &Cancellation::new().unwrap(), Some(Duration::from_secs(1))).unwrap(), WaitOutcome::Changed(events) if events.capacity_epoch == observed.capacity_epoch + 1)
+    );
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Frame(_)));
+}
+
+#[test]
+fn an_imported_grant_hands_off_release_and_wakes_without_a_frame_broker() {
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixListener},
+        process::Command,
+        time::Duration,
+    };
+
+    use jackstay::fdpass;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("release.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut producer = producer(1);
+    let grant = producer.attach(1).unwrap();
+    let old = grant.incarnation();
+    let timeline = Arc::new(ControlledTimeline::default());
+    let registration = producer.register_release_timeline(old, timeline.clone()).unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let (descriptor, fds) = grant.into_parts().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "mapped_release_child", "--nocapture"])
+        .env("JACKSTAY_RELEASE_TEST_SOCKET", &socket)
+        .spawn()
+        .unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let json = serde_json::to_vec(&(descriptor, registration)).unwrap();
+    stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
+    stream.write_all(&json).unwrap();
+    fdpass::send_fds(&stream, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
+    let mut ready = [0];
+    stream.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [1]);
+    // Barrier only: no frame acquire/release or metadata messages after setup.
+    // Completion alone must wake the child, without a producer call here.
+    timeline.signal(5);
+    assert!(child.wait().unwrap().success());
+    assert_ne!(producer.attach(1).unwrap().incarnation(), old);
+}
+
+#[test]
+#[ignore = "subprocess helper invoked by an_imported_grant_hands_off_release_and_wakes_without_a_frame_broker"]
+fn mapped_release_child() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    use jackstay::{
+        acquisition::arena::{Cancellation, ConsumerGrant, GrantDescriptor, ReleaseTimelineRegistration, WaitInterest, WaitOutcome},
+        fdpass,
+    };
+    let mut stream = UnixStream::connect(std::env::var("JACKSTAY_RELEASE_TEST_SOCKET").unwrap()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut len = [0; 4];
+    stream.read_exact(&mut len).unwrap();
+    let mut json = vec![0; u32::from_le_bytes(len) as usize];
+    stream.read_exact(&mut json).unwrap();
+    let (descriptor, registration): (GrantDescriptor, ReleaseTimelineRegistration) = serde_json::from_slice(&json).unwrap();
+    let fds = fdpass::recv_fds(&stream, 4).unwrap().try_into().unwrap();
+    // SAFETY: the parent is the sole conforming producer and this process is
+    // the sole recipient. It does not fork or pass on these mapped claims.
+    let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
+    let mut consumer = ArenaConsumer::from_grant(grant).unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    let observed = consumer.events();
+    frame.defer_release(&registration, 5).unwrap();
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
+    stream.write_all(&[1]).unwrap();
+    assert!(
+        matches!(consumer.wait(observed, WaitInterest::CAPACITY, &Cancellation::new().unwrap(), Some(Duration::from_secs(5))).unwrap(), WaitOutcome::Changed(events) if events.capacity_epoch == observed.capacity_epoch + 1)
+    );
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("credit not returned")
+    };
+    assert_eq!(frame.bytes(), b"abcd");
+}
+
+#[test]
+fn producer_shutdown_joins_the_observer_without_waiting_for_unfinished_gpu_work() {
+    use std::{sync::mpsc, time::Duration};
+    let mut producer = producer(1);
+    let consumer = ArenaConsumer::from_grant(producer.attach(2).unwrap()).unwrap();
+    let timeline = Arc::new(ControlledTimeline::default());
+    let registration = producer
+        .register_release_timeline(consumer.incarnation(), timeline.clone())
+        .unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let AcquireOutcome::Frame(retained) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing retained frame")
+    };
+    let AcquireOutcome::Frame(deferred) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing deferred frame")
+    };
+    deferred.defer_release(&registration, 5).unwrap();
+    assert_eq!(producer.poll_release_completions().unwrap(), 0);
+    let (finished, wait) = mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        drop(producer);
+        finished.send(()).unwrap();
+    });
+    wait.recv_timeout(Duration::from_secs(2))
+        .expect("observer shutdown waited for GPU completion");
+    shutdown.join().unwrap();
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Closed));
+    assert_eq!(retained.bytes(), b"abcd");
+    // An already-queued backend callback may arrive after its observer stops.
+    // Its wake has no ownership authority and cannot invalidate surviving leases.
+    timeline.signal(5);
+    assert_eq!(retained.bytes(), b"abcd");
+}
+
+#[test]
+fn a_backend_notification_registration_failure_can_be_retried_without_releasing_early() {
+    use std::sync::atomic::AtomicBool;
+    #[derive(Debug, Default)]
+    struct FailingRegistration {
+        failed: AtomicBool,
+        timeline: ControlledTimeline,
+    }
+    impl ReleaseTimeline for FailingRegistration {
+        fn completed_value(&self) -> Result<u64> {
+            self.timeline.completed_value()
+        }
+        fn notify_at(&self, value: u64, notification: ReleaseNotification) -> Result<()> {
+            if self.failed.load(SeqCst) {
+                Err(jackstay::CaptureTransferError::NativeBackend {
+                    operation: "test-notify",
+                    message: "could not register event notification".to_owned(),
+                })
+            } else {
+                self.timeline.notify_at(value, notification)
+            }
+        }
+    }
+    let mut producer = producer(1);
+    let consumer = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+    let old = consumer.incarnation();
+    let timeline = Arc::new(FailingRegistration::default());
+    timeline.failed.store(true, SeqCst);
+    let registration = producer.register_release_timeline(old, timeline.clone()).unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    frame.defer_release(&registration, 5).unwrap();
+    assert_eq!(producer.poll_release_completions().unwrap(), 0);
+    assert_eq!(producer.release_recovery_failures().len(), 1);
+    assert_eq!(consumer.events().capacity_epoch, 0);
+    timeline.failed.store(false, SeqCst);
+    producer.retry_release_cleanup(old).unwrap();
+    assert_eq!(producer.poll_release_completions().unwrap(), 0);
+    assert_eq!(consumer.events().capacity_epoch, 0);
+    drop(consumer);
+    assert!(producer.attach(1).is_err());
+    timeline.timeline.signal(5);
+    assert_eq!(producer.poll_release_completions().unwrap(), 1);
+    assert_ne!(producer.attach(1).unwrap().incarnation(), old);
 }

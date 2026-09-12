@@ -443,3 +443,39 @@ char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t f
   return porthole_native_consumer_sample_ordered(metalPtr, eventPtr, fenceValue, srcSurfacePtr,
       width, height, outPixels, outLen, NULL, 0, NULL, 0, NULL, 0);
 }
+
+// ---- Bounded deferred-release notifications -------------------------------
+
+// The block owns this token, which owns the Rust wake. No reference from the
+// token to the event or claim mapping creates an event/callback ownership cycle.
+@interface PortholeReleaseNotification : NSObject
+@property(nonatomic, assign) void *context;
+@property(nonatomic, assign) void (*notify)(void *);
+@property(nonatomic, assign) void (*destroy)(void *);
+@end
+@implementation PortholeReleaseNotification
+- (void)dealloc {
+  if (_destroy != NULL) { _destroy(_context); }
+}
+@end
+
+void porthole_native_event_notify(void *eventPtr, uint64_t value, void *context,
+                                  void (*notify)(void *), void (*destroy)(void *)) {
+  static MTLSharedEventListener *listener;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    listener = [[MTLSharedEventListener alloc] init];
+  });
+  PortholeReleaseNotification *token = [[PortholeReleaseNotification alloc] init];
+  token.context = context;
+  token.notify = notify;
+  token.destroy = destroy;
+  id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
+  // MTLEvent.h guarantees notification at value or higher, including an event
+  // that has already reached the value when this registration races completion.
+  [event notifyListener:listener atValue:value block:^(id<MTLSharedEvent> completed, uint64_t signaled) {
+    (void)completed;
+    (void)signaled;
+    token.notify(token.context);
+  }];
+}

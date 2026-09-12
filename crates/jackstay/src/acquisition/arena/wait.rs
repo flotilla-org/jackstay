@@ -60,6 +60,33 @@ impl Wake {
 }
 
 impl Receiver {
+    pub(super) fn fd(&self) -> io::Result<OwnedFd> {
+        self.0.try_clone().map(OwnedFd::from)
+    }
+
+    pub(super) fn sleep(&self) -> io::Result<()> {
+        let mut descriptor = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: the initialized descriptor and its owned FD live through poll.
+            let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
+                return Err(io::Error::other("release observation channel failed"));
+            }
+            return Ok(());
+        }
+    }
+
     pub(super) fn from_fd(fd: OwnedFd) -> io::Result<Self> {
         let stream = UnixStream::from(fd);
         stream.set_nonblocking(true)?;
@@ -70,7 +97,7 @@ impl Receiver {
         self.0.into()
     }
 
-    fn drain(&mut self) -> io::Result<()> {
+    pub(super) fn drain(&mut self) -> io::Result<()> {
         // Bounded drain: a notification flood must not starve cancellation or
         // the predicate recheck. Residual bytes keep the next poll readable.
         let mut bytes = [0; 4096];

@@ -27,7 +27,7 @@ use crate::{CaptureTransferError, shm::SharedMemorySegment};
 mod wait;
 pub use wait::{Cancellation, WaitEvents, WaitInterest, WaitOutcome};
 mod release;
-pub use release::{RejectedDeferredRelease, ReleaseRecoveryFailure, ReleaseTimeline, ReleaseTimelineRegistration};
+pub use release::{RejectedDeferredRelease, ReleaseNotification, ReleaseRecoveryFailure, ReleaseTimeline, ReleaseTimelineRegistration};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"JSACQ001");
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
@@ -323,6 +323,7 @@ struct ClaimMap {
     frames: usize,
     scope: [u8; 16],
     wake: Arc<wait::Wake>,
+    release_wake: Arc<wait::Wake>,
 }
 
 impl ClaimMap {
@@ -332,7 +333,13 @@ impl ClaimMap {
         page_rounded(checked_add(HEADER_LEN, checked_mul(frames as usize, CLAIM_SLOT_LEN + 8)?)?)
     }
 
-    fn new(incarnation: IncarnationId, frames: u32, len: usize, wake: Arc<wait::Wake>) -> Result<Self, ArenaError> {
+    fn new(
+        incarnation: IncarnationId,
+        frames: u32,
+        len: usize,
+        wake: Arc<wait::Wake>,
+        release_wake: Arc<wait::Wake>,
+    ) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::new(len)?;
         let mut scope = [0; 16];
         std::fs::File::open("/dev/urandom")
@@ -374,10 +381,18 @@ impl ClaimMap {
             frames: frames as usize,
             scope,
             wake,
+            release_wake,
         })
     }
 
-    fn map(fd: OwnedFd, incarnation: IncarnationId, frames: usize, len: usize, wake: Arc<wait::Wake>) -> Result<Self, ArenaError> {
+    fn map(
+        fd: OwnedFd,
+        incarnation: IncarnationId,
+        frames: usize,
+        len: usize,
+        wake: Arc<wait::Wake>,
+        release_wake: Arc<wait::Wake>,
+    ) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::map_read_write(fd, len)?;
         // SAFETY: grant owns this initialized incarnation's map; header never changes.
         let header = unsafe { storage.as_ptr().cast::<ClaimHeader>().read() };
@@ -395,6 +410,7 @@ impl ClaimMap {
             frames,
             scope: header.scope,
             wake,
+            release_wake,
         })
     }
 
@@ -445,6 +461,11 @@ pub struct GrantDescriptor {
 }
 
 impl ConsumerGrant {
+    #[must_use]
+    pub fn incarnation(&self) -> IncarnationId {
+        self.claims.incarnation
+    }
+
     pub fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 4]), ArenaError> {
         let writer_fd = self.claims.wake.fd()?;
         self.consumed = true;
@@ -500,6 +521,7 @@ impl ConsumerGrant {
             descriptor.holding as usize,
             claim_len,
             Arc::new(wait::Wake::from_fd(writer_fd)?),
+            Arc::new(wait::Wake::from_fd(reader_fd.try_clone()?)?),
         )?);
         Ok(Self {
             arena_fd: Some(arena_fd),
@@ -583,7 +605,8 @@ impl ArenaProducer {
         let incarnation = reservation.incarnation();
         let result = (|| {
             let (wake, receiver) = wait::channel()?;
-            let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake)?);
+            let release_wake = Arc::new(wait::Wake::from_fd(receiver.fd()?)?);
+            let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake, release_wake)?);
             let arena_fd = self.map.storage.try_clone_fd()?;
             let claim_fd = claims.storage.try_clone_fd()?;
             Ok(ConsumerGrant {
@@ -752,6 +775,7 @@ impl ArenaConsumer {
             grant.claims.frames,
             grant.claims.storage.len(),
             Arc::clone(&grant.claims.wake),
+            Arc::clone(&grant.claims.release_wake),
         )?;
         let receiver = wait::Receiver::from_fd(grant.reader_fd.take().expect("single-use grant"))?;
         grant.consumed = true;

@@ -182,7 +182,7 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
 | 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-exit cleanup remains pending. |
 | 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, and cancellable notification waits are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Reconfiguration events await the transition implementation. Host integration remains pending; the old socket/shadow regression still fails. |
-| 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Automatic completion observation while idle and replacement of the existing host path remain pending. |
+| 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Completion observation wakes capacity waits while publication is idle. Replacement of the existing host path remains pending. |
 | 5: cleanup/reconfiguration | Pending; GPU process-death proof remains open. |
 | 6: ABI/host/live acceptance | Pending. |
 
@@ -224,25 +224,58 @@ is not the old control-page ABI. The memory budget covers resource/control
 mappings; kernel notification buffers and bookkeeping are additionally bounded
 by the incarnation limit, rather than described as a process RSS limit.
 
-Four deferred-release tests cover storage/credit retention, shutdown with pending
+Eight deferred-release tests cover storage/credit retention, shutdown with pending
 GPU work, registrations scoped to an arena and incarnation, and failed observer
 isolation with explicit cleanup retry. The producer retains imported timeline
 handles and pending claims after consumer shutdown. A failed observer closes only
 its incarnation and reports a persistent recovery failure; it does not clear
-claims or block healthy incarnations. Polling currently runs on publication,
-admission, or an explicit call; automatic observation while idle is next.
+claims or block healthy incarnations. Backend notification-registration errors
+also retain claims and allow explicit retry. Failure of the internal observation
+channel remains a persistent recovery failure; retrying a backend cannot repair
+that channel.
+
+An incarnation that registers a release timeline gets one producer-owned observer
+thread. It sleeps on the reverse direction of the existing notification socket;
+CPU-only incarnations create no observer. After storing deferred-release metadata,
+the consumer writes a coalesced wake to that reverse channel. The observer drains
+before inspecting shared claims and then sleeps, so a racing handoff either
+appears in its scan or leaves a readable notification. Backend completion uses
+the same channel. On macOS, `MTLSharedEvent::notifyListener:atValue:block:` wakes
+the observer, which rechecks actual completion before returning credit. Callback
+registration covers completion racing the registration itself. No timed polling
+or per-frame broker request is required.
+
+Manual refresh and background observation serialize through one mutex per
+incarnation. A holding slot permits at most one outstanding completion callback.
+Even if a refresh observes completion before its queued callback runs, that
+callback remains charged to the slot until it fires; immediate slot reuse cannot
+accumulate callbacks. Callback objects retain only their wake, not the event,
+claim map, or frame. Worker stacks and callback bookkeeping are bounded by the
+incarnation and holding limits; they are outside the resource-mapping byte total.
+Producer shutdown wakes and joins the observer without waiting for incomplete GPU
+work. Shutdown does not make old storage available for reuse or invalidate leases.
+The producer still collects acknowledged, empty incarnations during publication
+or admission; process-death observation and unresolved-work recovery remain below.
+
+The added tests cover idle capacity wakeup, a deferred handoff from an imported
+cross-process grant, observer shutdown with an unfinished event, and a late
+callback after shutdown. The child-process helper is invoked explicitly by its
+parent test. These are ordinary shutdown tests, not process-crash proof.
 
 Two macOS tests use actual IOSurfaces and Metal commands. The first retains a
 lease across ring wrap and samples after producer readiness. The second proves
 submission occurred, blocks sampling behind a GPU gate while further publications
 wrap the ring, and retains holding credit until the GPU samples the original
-pixels and signals the registered release event. These are offscreen tests using
-synthetic pixels, not live desktop acceptance. All four release tests, arena and
-wait tests, both native arena tests, eleven existing macOS backend/XPC tests,
-all-targets macOS-feature clippy, and pinned formatting passed at this checkpoint.
+pixels and signals the registered release event. Publication stops before that
+completion, and a capacity wait wakes without any further producer call. These
+are offscreen tests using synthetic pixels, not live desktop acceptance. The eight
+release tests (plus the invoked child helper), arena and wait tests, three
+concurrency tests, both native arena tests, workspace build, default and
+macOS-feature all-targets clippy, and pinned formatting passed during this slice.
+The eleven existing macOS backend/XPC tests passed before adding automatic
+observation; their existing sampling wrapper was unchanged by that addition.
 
-Next: observe deferred GPU completion while publication is idle.
-Extend the arena with bounded reconfiguration and verified process-exit cleanup,
+Next: extend the arena with bounded reconfiguration and verified process-exit cleanup,
 and replace the existing CPU/native acquisition paths with it. Do not add a
 per-frame broker update to keep admission informed; reserved claim slots are the
 holding credit.

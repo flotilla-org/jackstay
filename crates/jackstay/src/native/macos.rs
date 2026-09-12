@@ -75,6 +75,13 @@ mod ffi {
         pub fn porthole_native_event_from_handle(metal: *mut c_void, handle: *mut c_void, out_event: *mut *mut c_void) -> *mut c_char;
         pub fn porthole_native_event_signaled_value(event: *mut c_void) -> u64;
         pub fn porthole_native_event_signal_cpu(event: *mut c_void, value: u64);
+        pub fn porthole_native_event_notify(
+            event: *mut c_void,
+            value: u64,
+            context: *mut c_void,
+            notify: unsafe extern "C" fn(*mut c_void),
+            destroy: unsafe extern "C" fn(*mut c_void),
+        );
         pub fn porthole_native_event_wait(event: *mut c_void, value: u64, timeout_ms: u64) -> i32;
 
         pub fn porthole_native_stage_blit(
@@ -544,6 +551,33 @@ pub struct SampleCompletion<'a> {
 impl crate::acquisition::arena::ReleaseTimeline for ConsumerFence {
     fn completed_value(&self) -> Result<u64> {
         Ok(self.signaled_value())
+    }
+
+    fn notify_at(&self, value: u64, notification: crate::acquisition::arena::ReleaseNotification) -> Result<()> {
+        use crate::acquisition::arena::ReleaseNotification;
+        unsafe extern "C" fn notify(context: *mut c_void) {
+            // SAFETY: the Objective-C callback owner keeps this Box alive until
+            // its block is destroyed, including throughout callback execution.
+            let notification = unsafe { &*context.cast::<ReleaseNotification>() };
+            let _ = notification.notify();
+        }
+        unsafe extern "C" fn destroy(context: *mut c_void) {
+            // SAFETY: called exactly once by the callback owner's dealloc.
+            drop(unsafe { Box::from_raw(context.cast::<ReleaseNotification>()) });
+        }
+        // SAFETY: event is retained by this registered ConsumerFence. The shim
+        // unconditionally takes the Box and frees it on callback destruction.
+        // Notification code neither blocks nor unwinds across Objective-C.
+        unsafe {
+            ffi::porthole_native_event_notify(
+                self.raw.as_ptr(),
+                value,
+                Box::into_raw(Box::new(notification)).cast(),
+                notify,
+                destroy,
+            );
+        }
+        Ok(())
     }
 }
 

@@ -1,7 +1,7 @@
 #![cfg(all(target_os = "macos", feature = "backend-macos"))]
 
 use jackstay::{
-    acquisition::arena::{AcquireOutcome, ArenaConfig, ArenaConsumer},
+    acquisition::arena::{AcquireOutcome, ArenaConfig, ArenaConsumer, Cancellation, WaitInterest, WaitOutcome},
     model::{ClockDomain, ColorSpace, PixelFormat},
     native::{
         NativeFrameBackend, NativeStreamParams,
@@ -92,7 +92,7 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
     };
     let mut producer = NativeArenaProducer::from_allocated_parts(backend, pool, fence, params, config).unwrap();
     let grant = producer.attach(1).unwrap();
-    let consumer = ArenaConsumer::from_grant(grant.consumer).unwrap();
+    let mut consumer = ArenaConsumer::from_grant(grant.consumer).unwrap();
     let metal = MetalContext::new().unwrap();
     let readiness = ConsumerFence::from_handle(&metal, &grant.sync_handle).unwrap();
     let release = ConsumerFence::new(&metal).unwrap();
@@ -139,7 +139,13 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
             producer.publish(&captured(91), timestamp).unwrap();
         }
         assert_eq!(producer.poll_release_completions().unwrap(), 0);
+        let before_completion = consumer.events();
         gate.signal_cpu(1);
+        assert!(
+            matches!(consumer.wait(before_completion, WaitInterest::CAPACITY, &Cancellation::new().unwrap(), Some(std::time::Duration::from_secs(5))).unwrap(),
+            WaitOutcome::Changed(events) if events.capacity_epoch == before_completion.capacity_epoch + 1),
+            "GPU completion did not return credit while the producer was idle"
+        );
         assert!(observed_release.wait(1, 5000), "GPU release did not complete");
         assert_eq!(sample.join().unwrap().unwrap(), vec![37; 16 * 16 * 4]);
         assert_eq!(producer.poll_release_completions().unwrap(), 1);

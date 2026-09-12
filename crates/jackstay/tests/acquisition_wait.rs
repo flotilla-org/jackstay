@@ -14,6 +14,7 @@ fn producer() -> ArenaProducer {
         payload_capacity: 4,
         memory_budget: 1024 * 1024,
         max_incarnations: 3,
+        drain_timeout: std::time::Duration::from_secs(5),
     })
     .unwrap()
 }

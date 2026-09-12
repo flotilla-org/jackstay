@@ -44,7 +44,9 @@ This follows the Linux [pidfd_open documentation](https://www.man7.org/linux/man
 Unsupported process observation is an admission error, never a fallback to PID
 polling or connection EOF.
 
-The sleeping cleanup worker polls the process descriptor alongside its existing
+Each admitted incarnation has one cleanup owner, including local CPU consumers.
+This lets consumer-initiated closure report a stalled local lease while the host
+is idle. The sleeping worker polls the process descriptor alongside its existing
 handoff/completion wake channel. A host can also call `poll_cleanup`; both paths
 serialize through the same incarnation mutex. A worker retains the process FD
 while sleeping, even if a concurrent refresh consumes the exit event. Joining
@@ -76,6 +78,28 @@ channel cannot be repaired by retrying a backend. No timeout authorizes reuse.
 Acknowledged empty incarnations are collected during publication, admission, or
 an explicit cleanup refresh. Until then their allocations remain charged.
 
+## Drain deadlines
+
+`ArenaConfig::drain_timeout` is a required positive interval. Current fixtures use
+five seconds unless testing expiry. The owner starts its monotonic deadline when
+it observes closure; active consumers can hold their reservation indefinitely.
+Host closure, consumer closure, and final quiescence acknowledgement wake the
+owner. Closed-incarnation releases wake it too, so a final CPU lease can finish
+cleanup without a further publication.
+
+The worker sleeps until a handoff, process event, completion callback, or drain
+deadline. Expiry adds a visible recovery failure but does not clear a claim,
+acknowledge quiescence, return credit, or cancel native completion observation.
+Once failure is reported there is no repeated expired-timer polling. A late valid
+completion still returns credit; once claims and claim-page use finish, the
+failure disappears and the next refresh/admission collects the incarnation.
+Retry does not restart the grace period or hide expired, unresolved work.
+
+The thread count remains bounded by the incarnation limit. Worker stacks and
+handle bookkeeping are outside the resource/control-mapping byte budget, as
+before. An owner exits after acknowledged quiescence and an empty claim page;
+producer teardown also cancels and joins it without waiting for GPU completion.
+
 ## Evidence and remaining work
 
 The CPU crash test closes the child's control socket while the child still owns
@@ -95,8 +119,7 @@ pixels from both the quarantined surface and a distinct healthy lease after ring
 wrap. The child does not submit GPU work in that test; it proves conservative
 retention, not backend retirement of commands from a dead process.
 
-Still required: bounded reporting when a valid submitted completion never
-arrives, reconfiguration with old and new allocations charged together, real GPU
+Still required: reconfiguration with old and new allocations charged together, real GPU
 work across consumer death, and the host/C API replacement and live acceptance.
 There is no force-reclaim or restart-in-place operation for unproven native work.
 
@@ -110,3 +133,15 @@ default all-targets clippy, and pinned formatting passed. The Linux checks ran i
 `/tmp/jackstay-acquisition-apjY1L`; they did not modify an installed daemon or
 existing checkout. The full suite is still not claimed clean: the old local
 socket/shadow regression awaits replacement of that data path.
+
+
+The two deadline tests passed on macOS and Paneer Linux. One holds an active
+consumer beyond the configured drain interval without failure, then closes it,
+waits for background expiry, checks its bytes and credit through ring wrap, and
+finishes reclamation after a late completion. The other drops a local consumer
+while retaining a CPU lease: failure is reported without a host cleanup poll,
+and dropping that lease permits a fresh incarnation. Updated arena, release,
+wait, native arena, and deterministic concurrency tests passed on macOS; the
+Linux cleanup/wait tests and all-targets clippy also passed. macOS workspace build,
+macOS-feature all-targets clippy, and pinned formatting passed. These are targeted
+checks; final full-suite and live acceptance remain required.

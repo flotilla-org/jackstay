@@ -64,7 +64,7 @@ impl Receiver {
         self.0.try_clone().map(OwnedFd::from)
     }
 
-    pub(super) fn sleep(&self, process_fd: Option<std::os::fd::RawFd>) -> io::Result<()> {
+    pub(super) fn sleep(&self, process_fd: Option<std::os::fd::RawFd>, deadline: Option<Instant>) -> io::Result<()> {
         let mut descriptors = [
             libc::pollfd {
                 fd: self.0.as_raw_fd(),
@@ -79,7 +79,14 @@ impl Receiver {
         ];
         loop {
             // SAFETY: initialized descriptors and their owned FDs live through poll.
-            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+            let milliseconds = deadline.map_or(-1, |deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                remaining
+                    .as_millis()
+                    .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                    .min(i32::MAX as u128) as i32
+            });
+            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, milliseconds) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {

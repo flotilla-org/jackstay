@@ -60,6 +60,7 @@ fn cpu_process_crash_reclaims_only_that_incarnation_and_never_treats_connection_
         payload_capacity: 4,
         memory_budget: 1024 * 1024,
         max_incarnations: 2,
+        drain_timeout: std::time::Duration::from_secs(5),
     })
     .unwrap();
     let healthy = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
@@ -163,6 +164,7 @@ fn a_process_crash_keeps_its_submitted_deferred_claim_until_external_completion(
         payload_capacity: 4,
         memory_budget: 1024 * 1024,
         max_incarnations: 1,
+        drain_timeout: std::time::Duration::from_secs(5),
     })
     .unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
@@ -184,5 +186,97 @@ fn a_process_crash_keeps_its_submitted_deferred_claim_until_external_completion(
     assert!(producer.attach(1).is_err(), "an earlier timeline value completed the lease");
     completion.signal(5);
     producer.poll_cleanup().unwrap();
+    assert_ne!(producer.attach(1).unwrap().incarnation(), old);
+}
+
+#[test]
+fn a_drain_deadline_reports_recovery_without_revoking_storage_and_late_completion_still_reclaims() {
+    use std::time::Instant;
+    let mut producer = ArenaProducer::new(ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 4,
+        memory_budget: 1024 * 1024,
+        max_incarnations: 2,
+        drain_timeout: Duration::from_millis(20),
+    })
+    .unwrap();
+    let stalled = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+    let healthy = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+    let completion = Arc::new(Completion::default());
+    let registration = producer
+        .register_release_timeline(stalled.incarnation(), completion.clone())
+        .unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let AcquireOutcome::Frame(frame) = stalled.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    let address = frame.bytes().as_ptr();
+    frame.defer_release(&registration, 5).unwrap();
+    // An active consumer may legitimately hold its reserved capacity indefinitely.
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(producer.cleanup_failures().is_empty());
+    producer.close(stalled.incarnation()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while producer.cleanup_failures().is_empty() {
+        assert!(Instant::now() < deadline, "idle cleanup never reported the expired drain interval");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let failures = producer.cleanup_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].incarnation, stalled.incarnation());
+    assert!(failures[0].reason.contains("drain deadline"));
+    assert!(producer.retry_cleanup(stalled.incarnation()).is_err());
+    for _ in 0..100 {
+        producer.publish(FrameDescriptor::default(), b"wxyz").unwrap();
+    }
+    assert!(producer.attach(1).is_err());
+    assert_eq!(stalled.events().capacity_epoch, 0);
+    // SAFETY: stalled still owns this mapping, publication has finished, and
+    // the declared external use has not completed. Timeout must retain bytes.
+    assert_eq!(unsafe { std::slice::from_raw_parts(address, 4) }, b"abcd");
+    assert!(matches!(healthy.acquire_latest(0).unwrap(), AcquireOutcome::Frame(_)));
+    completion.signal(5);
+    producer.poll_cleanup().unwrap();
+    assert_eq!(stalled.events().capacity_epoch, 1);
+    let old = stalled.incarnation();
+    drop(stalled);
+    producer.poll_cleanup().unwrap();
+    assert!(producer.cleanup_failures().is_empty());
+    assert_ne!(producer.attach(1).unwrap().incarnation(), old);
+}
+
+#[test]
+fn local_consumer_shutdown_reports_a_stalled_cpu_lease_without_a_host_poll() {
+    use std::time::Instant;
+    let mut producer = ArenaProducer::new(ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 4,
+        memory_budget: 1024 * 1024,
+        max_incarnations: 1,
+        drain_timeout: Duration::from_millis(20),
+    })
+    .unwrap();
+    let consumer = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+    let old = consumer.incarnation();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    drop(consumer);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while producer.cleanup_failures().is_empty() {
+        assert!(Instant::now() < deadline, "consumer closure did not wake its cleanup owner");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(producer.cleanup_failures()[0].incarnation, old);
+    assert_eq!(frame.bytes(), b"abcd");
+    assert!(producer.attach(1).is_err());
+    drop(frame);
+    producer.poll_cleanup().unwrap();
+    assert!(producer.cleanup_failures().is_empty());
     assert_ne!(producer.attach(1).unwrap().incarnation(), old);
 }

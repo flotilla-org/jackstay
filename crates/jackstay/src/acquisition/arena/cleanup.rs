@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering::SeqCst},
     },
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -65,14 +66,15 @@ pub(super) struct CleanupRegistry {
 }
 
 impl CleanupRegistry {
-    pub(super) fn track_process(
+    pub(super) fn track(
         &mut self,
         claims: Arc<ClaimMap>,
         native_resources: bool,
-        process: Arc<ProcessWatch>,
+        process: Option<Arc<ProcessWatch>>,
+        drain_timeout: Duration,
     ) -> Result<(), ArenaError> {
         let incarnation = claims.incarnation;
-        let observer = IncarnationObserver::new(claims, native_resources, Some(process))?;
+        let observer = IncarnationObserver::new(claims, native_resources, process, drain_timeout)?;
         assert!(self.observers.insert(incarnation, observer).is_none(), "new incarnation");
         Ok(())
     }
@@ -88,6 +90,9 @@ struct ObservationState {
     native_resources: bool,
     process: Option<Arc<ProcessWatch>>,
     unresolved_native_claims: usize,
+    drain_timeout: Duration,
+    drain_deadline: Option<Instant>,
+    drain_expired: bool,
     timelines: Vec<Arc<dyn ReleaseTimeline>>,
     armed: Vec<Option<ReleaseNotification>>,
     failure: Option<String>,
@@ -123,7 +128,7 @@ impl ObservationState {
         self.claims.close();
         // The watch was bound before this remote grant escaped. The OS event
         // proves no admitted process thread can still read or publish a claim.
-        self.claims.word(QUIESCENT).store(1, SeqCst);
+        self.claims.acknowledge_quiescent();
         for index in 0..self.claims.frames {
             if self.claims.slot(index).load(SeqCst) == 0 {
                 continue;
@@ -142,19 +147,57 @@ impl ObservationState {
         }
     }
 
+    fn drained(&self) -> bool {
+        self.claims.word(QUIESCENT).load(SeqCst) != 0 && (0..self.claims.frames).all(|index| self.claims.slot(index).load(SeqCst) == 0)
+    }
+
+    fn observe_deadline(&mut self) {
+        if self.claims.word(ACTIVE).load(SeqCst) != 0 || self.drained() {
+            return;
+        }
+        let now = Instant::now();
+        if self.drain_deadline.is_none() {
+            self.drain_deadline = now.checked_add(self.drain_timeout);
+            if self.drain_deadline.is_none() {
+                self.fail("drain deadline is not representable; resources remain quarantined".to_owned());
+            }
+        }
+        if self.drain_deadline.is_some_and(|deadline| now >= deadline) {
+            self.drain_expired = true;
+        }
+    }
+
+    fn wake_deadline(&self) -> Option<Instant> {
+        if self.drained() || self.failure_reason().is_some() {
+            None
+        } else {
+            self.drain_deadline
+        }
+    }
+
     fn failure_reason(&self) -> Option<String> {
-        self.failure.clone().or_else(|| {
-            (self.unresolved_native_claims != 0).then(|| {
-                format!(
-                    "process exited with {} asynchronous claims lacking completion evidence; resources remain quarantined",
-                    self.unresolved_native_claims,
-                )
+        if self.drained() {
+            return None;
+        }
+        self.failure
+            .clone()
+            .or_else(|| {
+                (self.unresolved_native_claims != 0).then(|| {
+                    format!(
+                        "process exited with {} asynchronous claims lacking completion evidence; resources remain quarantined",
+                        self.unresolved_native_claims,
+                    )
+                })
             })
-        })
+            .or_else(|| {
+                self.drain_expired
+                    .then(|| "drain deadline expired; claims or claim-page access remain unresolved".to_owned())
+            })
     }
 
     fn poll(&mut self) {
         self.observe_process();
+        self.observe_deadline();
         if self.failure.is_some() {
             return;
         }
@@ -209,9 +252,8 @@ impl ObservationState {
     }
 }
 
-/// At most one sleeping thread per monitored incarnation. Local CPU-only
-/// consumers need none; remote consumers and native timeline registrations use
-/// this same owner. Manual refresh and the worker serialize reclamation.
+/// One sleeping owner per admitted incarnation handles closure, process exit,
+/// and release completion. Manual refresh and the worker serialize reclamation.
 #[derive(Debug)]
 struct IncarnationObserver {
     state: Arc<Mutex<ObservationState>>,
@@ -221,7 +263,12 @@ struct IncarnationObserver {
 }
 
 impl IncarnationObserver {
-    fn new(claims: Arc<ClaimMap>, native_resources: bool, process: Option<Arc<ProcessWatch>>) -> Result<Self, ArenaError> {
+    fn new(
+        claims: Arc<ClaimMap>,
+        native_resources: bool,
+        process: Option<Arc<ProcessWatch>>,
+        drain_timeout: Duration,
+    ) -> Result<Self, ArenaError> {
         // Socket directions are independent: consumers read data/capacity wakes
         // on one end and write handoff wakes back to this sole reverse reader.
         let mut receiver = wait::Receiver::from_fd(claims.wake.fd()?)?;
@@ -232,6 +279,9 @@ impl IncarnationObserver {
             native_resources,
             process,
             unresolved_native_claims: 0,
+            drain_timeout,
+            drain_deadline: None,
+            drain_expired: false,
             timelines: Vec::new(),
             failure: None,
             notification_failed: false,
@@ -257,8 +307,14 @@ impl IncarnationObserver {
                 }
                 // Retain the watch FD while sleeping: a concurrent host refresh
                 // can consume its exit event and remove it from shared state.
-                let process = worker_state.lock().expect("incarnation cleanup state").process.clone();
-                if let Err(error) = receiver.sleep(process.as_ref().map(|process| process.fd())) {
+                let (process, deadline) = {
+                    let state = worker_state.lock().expect("incarnation cleanup state");
+                    if state.drained() {
+                        break;
+                    }
+                    (state.process.clone(), state.wake_deadline())
+                };
+                if let Err(error) = receiver.sleep(process.as_ref().map(|process| process.fd()), deadline) {
                     worker_state
                         .lock()
                         .expect("incarnation cleanup state")
@@ -306,6 +362,9 @@ impl ClaimMap {
             self.close();
         }
         let _ = self.signal(wait::CAPACITY);
+        if self.word(ACTIVE).load(SeqCst) == 0 {
+            let _ = self.release_wake.signal();
+        }
     }
 }
 
@@ -365,9 +424,6 @@ impl ArenaProducer {
         let claims = self.claims.get(&incarnation).ok_or(AdmissionError::UnknownIncarnation)?;
         if claims.word(ACTIVE).load(SeqCst) == 0 {
             return Err(ArenaError::Closed);
-        }
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.cleanup.observers.entry(incarnation) {
-            entry.insert(IncarnationObserver::new(Arc::clone(claims), self.native_resources, None)?);
         }
         let observer = &self.cleanup.observers[&incarnation];
         let mut state = observer.state.lock().expect("incarnation cleanup state");

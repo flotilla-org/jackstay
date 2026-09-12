@@ -38,6 +38,7 @@ fn producer(max_incarnations: u32) -> NativeArenaProducer<MacosFrameBackend> {
         payload_capacity: 0,
         memory_budget: 1024 * 1024,
         max_incarnations,
+        drain_timeout: std::time::Duration::from_secs(5),
     };
     NativeArenaProducer::from_allocated_parts(backend, pool, fence, params, config).unwrap()
 }

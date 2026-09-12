@@ -16,6 +16,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering::SeqCst},
     },
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,9 @@ pub struct ArenaConfig {
     pub payload_capacity: usize,
     pub memory_budget: u64,
     pub max_incarnations: u32,
+    /// Time allowed to drain after closure is observed. Expiry reports recovery
+    /// failure; it never permits reuse. Active consumers may keep their leases.
+    pub drain_timeout: Duration,
 }
 
 /// Complete, immutable metadata copied only after acquiring the resource.
@@ -441,8 +445,15 @@ impl ClaimMap {
     }
 
     fn close(&self) {
-        self.word(ACTIVE).store(0, SeqCst);
-        let _ = self.signal(wait::CLOSED);
+        if self.word(ACTIVE).swap(0, SeqCst) != 0 {
+            let _ = self.signal(wait::CLOSED);
+            let _ = self.release_wake.signal();
+        }
+    }
+
+    fn acknowledge_quiescent(&self) {
+        self.word(QUIESCENT).store(1, SeqCst);
+        let _ = self.release_wake.signal();
     }
 }
 
@@ -574,7 +585,7 @@ impl Drop for ConsumerGrant {
     fn drop(&mut self) {
         if !self.consumed {
             self.claims.close();
-            self.claims.word(QUIESCENT).store(1, SeqCst);
+            self.claims.acknowledge_quiescent();
         }
     }
 }
@@ -590,6 +601,7 @@ pub struct ArenaProducer {
     next_slot: usize,
     cleanup: cleanup::CleanupRegistry,
     native_resources: bool,
+    drain_timeout: Duration,
 }
 
 impl ArenaProducer {
@@ -608,6 +620,9 @@ impl ArenaProducer {
     }
 
     fn create(config: ArenaConfig, external_bytes: u64, native_resources: bool) -> Result<Self, ArenaError> {
+        if config.drain_timeout.is_zero() || std::time::Instant::now().checked_add(config.drain_timeout).is_none() {
+            return Err(ArenaError::Configuration("drain interval must be positive and representable"));
+        }
         let layout = Layout::new(
             config.resource_capacity as usize,
             config.retained_history as usize,
@@ -631,11 +646,12 @@ impl ArenaProducer {
             next_slot: 0,
             cleanup: cleanup::CleanupRegistry::default(),
             native_resources,
+            drain_timeout: config.drain_timeout,
         })
     }
 
     pub fn attach(&mut self, holding: u32) -> Result<ConsumerGrant, ArenaError> {
-        self.attach_with_recipient(holding, 0)
+        self.attach_with_recipient(holding, 0, None)
     }
 
     /// Bind cleanup to the current kernel lifetime for this PID before any
@@ -644,19 +660,15 @@ impl ArenaProducer {
     /// through the safe in-process consumer constructor.
     pub fn attach_process(&mut self, holding: u32, pid: u32) -> Result<RemoteConsumerGrant, ArenaError> {
         let process = Arc::new(process::ProcessWatch::new(pid)?);
-        let grant = self.attach_with_recipient(holding, pid)?;
-        let result = self
-            .cleanup
-            .track_process(Arc::clone(&grant.claims), self.native_resources, process);
-        if let Err(error) = result {
-            drop(grant);
-            self.collect_quiescent();
-            return Err(error);
-        }
-        Ok(RemoteConsumerGrant(grant))
+        self.attach_with_recipient(holding, pid, Some(process)).map(RemoteConsumerGrant)
     }
 
-    fn attach_with_recipient(&mut self, holding: u32, recipient_pid: u32) -> Result<ConsumerGrant, ArenaError> {
+    fn attach_with_recipient(
+        &mut self,
+        holding: u32,
+        recipient_pid: u32,
+        process: Option<Arc<process::ProcessWatch>>,
+    ) -> Result<ConsumerGrant, ArenaError> {
         if self.map.word(TERMINAL).load(SeqCst) != 0 {
             return Err(ArenaError::Closed);
         }
@@ -673,14 +685,17 @@ impl ArenaProducer {
             let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake, release_wake, recipient_pid)?);
             let arena_fd = self.map.storage.try_clone_fd()?;
             let claim_fd = claims.storage.try_clone_fd()?;
-            Ok(ConsumerGrant {
+            let grant = ConsumerGrant {
                 arena_fd: Some(arena_fd),
                 claim_fd: Some(claim_fd),
                 reader_fd: Some(receiver.into_fd()),
                 layout: self.map.layout,
                 claims,
                 consumed: false,
-            })
+            };
+            self.cleanup
+                .track(Arc::clone(&grant.claims), self.native_resources, process, self.drain_timeout)?;
+            Ok(grant)
         })();
         match result {
             Ok(grant) => {
@@ -820,7 +835,7 @@ impl Drop for ConsumerInner {
         self.claims.close();
         // No consumer method can still access this mapping. Deferred claims
         // may remain producer-owned; their completion is checked separately.
-        self.claims.word(QUIESCENT).store(1, SeqCst);
+        self.claims.acknowledge_quiescent();
     }
 }
 
@@ -1069,6 +1084,7 @@ mod concurrency_tests {
             payload_capacity: 4,
             memory_budget: 1024 * 1024,
             max_incarnations: 2,
+            drain_timeout: std::time::Duration::from_secs(5),
         }
     }
 

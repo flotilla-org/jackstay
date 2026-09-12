@@ -183,7 +183,7 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-bound remote grants now reclaim ordinary CPU claims on verified exit; asynchronous claims still require completion evidence. |
 | 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, and cancellable notification waits are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Reconfiguration events await the transition implementation. Host integration remains pending; the old socket/shadow regression still fails. |
 | 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Completion observation wakes capacity waits while publication is idle. Replacement of the existing host path remains pending. |
-| 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished-signal recovery, bounded reconfiguration, and real GPU command retirement after process death remain pending. |
+| 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished drains now report recovery failure without revocation; bounded reconfiguration and real GPU command retirement after process death remain pending. |
 | 6: ABI/host/live acceptance | Pending. |
 
 Admission-layer validation: `cargo test --locked --test acquisition_admission`,
@@ -234,9 +234,9 @@ also retain claims and allow explicit retry. Failure of the internal observation
 channel remains a persistent recovery failure; retrying a backend cannot repair
 that channel.
 
-An incarnation that registers a release timeline gets one producer-owned observer
-thread. It sleeps on the reverse direction of the existing notification socket;
-Local CPU-only incarnations create no observer. Remote grants use the same owner to watch their admitted process. After storing deferred-release metadata,
+Each admitted incarnation gets one producer-owned cleanup thread. It sleeps on
+the reverse direction of the existing notification socket, alongside any process
+watch and drain deadline. After storing deferred-release metadata,
 the consumer writes a coalesced wake to that reverse channel. The observer drains
 before inspecting shared claims and then sleeps, so a racing handoff either
 appears in its scan or leaves a readable notification. Backend completion uses
@@ -256,7 +256,8 @@ Producer shutdown wakes and joins the observer without waiting for incomplete GP
 work. Shutdown does not make old storage available for reuse or invalidate leases.
 The producer collects acknowledged, empty incarnations during publication,
 admission, or `poll_cleanup`. Remote process observation now supplies CPU exit
-proof; unresolved asynchronous-work recovery remains incomplete.
+proof. Drain deadlines report unresolved use while preserving claims and
+continuing completion observation.
 
 The added tests cover idle capacity wakeup, a deferred handoff from an imported
 cross-process grant, observer shutdown with an unfinished event, and a late
@@ -276,8 +277,8 @@ macOS-feature all-targets clippy, and pinned formatting passed during this slice
 The eleven existing macOS backend/XPC tests passed before adding automatic
 observation; their existing sampling wrapper was unchanged by that addition.
 
-Next: finish unresolved-completion recovery and bounded reconfiguration,
-and replace the existing CPU/native acquisition paths with it. Do not add a
+Next: implement [bounded reconfiguration](acquisition-reconfiguration.md),
+then replace the existing CPU/native acquisition paths with the shared arena. Do not add a
 per-frame broker update to keep admission informed; reserved claim slots are the
 holding credit.
 

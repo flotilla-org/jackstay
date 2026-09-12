@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+#[cfg(unix)]
+pub mod arena;
+
 /// One admitted lifetime, scoped to its producer's admission book. A name or
 /// authorization identity is deliberately not part of this identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

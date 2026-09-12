@@ -169,8 +169,8 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | Slice | Status / next evidence |
 | --- | --- |
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
-| 2: admission/incarnations | `acquisition::AdmissionBook` implements worst-case holding reservations, memory and incarnation-table limits, fresh IDs, and retention of capacity until cleanup acknowledgement. Four public-boundary tests pass. Shared claim integration and actual deferred-release credit remain pending. |
-| 3: CPU shared acquisition/waits | Pending; existing slow-consumer regression still fails. |
+| 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Actual deferred-release credit and process-exit cleanup remain pending. |
+| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, and holding-limit outcomes are implemented. Mapped and cross-process tests pass. Cancellable notification waits and host integration remain pending; the old socket/shadow regression still fails. |
 | 4: existing GPU | macOS selected; readiness encoding exists, acquisition/completion integration pending. |
 | 5: cleanup/reconfiguration | Pending; GPU process-death proof remains open. |
 | 6: ABI/host/live acceptance | Pending. |
@@ -183,8 +183,28 @@ The admission book's cleanup acknowledgement is accounting only; it must be
 called by the future arena cleanup owner after actual resource and mapping
 reclamation, never directly on disconnect.
 
-Next: implement mapped claim slots and resource-generation validation under the
-ordering above. Exercise duplicate/overlapping leases and deferred-release credit
-through actual claims, then join admission, publication, and acquisition in the
-shared CPU/native arena. Do not add a per-frame broker update just to keep the
-admission book informed; reserved claim slots are the holding credit.
+The first arena implementation has seven integration tests (one invokes an
+ignored child-process helper explicitly), plus two deterministic concurrency
+tests. They hold CPU bytes across 100 publications; distinguish duplicate and
+overlapping leases; exercise closure with a surviving lease, fresh restart after
+acknowledged cleanup, and producer shutdown; report ordered gaps and exact misses;
+and transfer setup FDs to a separate process with no per-frame broker exchange.
+Scheduler hooks force publication after selection, after claim publication, and
+after successful generation validation. They also close an incarnation during
+acquisition. Hooks exist only in the test build, and assertions use public
+publication/acquisition outcomes. These tests do not establish GPU safety or
+unexpected-process-death reclamation.
+
+The initial arena is a fixed allocation with inline CPU payloads. It is not yet
+wired into `VideoSlotManager`, Porthole, or the native producer. The descriptor
+includes native readiness fields, but native write-target selection and release
+completion are still to be connected. The new setup descriptor currently carries
+the arena and claim-page FDs. Its version/layout and eventual notification handles
+must be included in the Rust/C ABI update; this is not the old control-page ABI.
+
+Next: add efficient cancellable waits using coalesced notification handles and
+state epochs, then connect deferred GPU completion to the same claim slots.
+Extend the arena with bounded reconfiguration and verified process-exit cleanup,
+and replace the existing CPU/native acquisition paths with it. Do not add a
+per-frame broker update to keep admission informed; reserved claim slots are the
+holding credit.

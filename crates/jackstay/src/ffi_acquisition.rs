@@ -485,3 +485,6 @@ destroy!(
     FtAcquisitionReleaseTimeline,
     "Destroy a binding handle; pending use keeps its own completion observer."
 );
+
+#[cfg(all(target_os = "macos", feature = "backend-macos"))]
+pub mod macos;

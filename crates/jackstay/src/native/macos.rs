@@ -666,9 +666,19 @@ impl ConsumerFence {
     }
 
     pub fn from_handle(metal: &MetalContext, handle: &SharedEventHandle) -> Result<Self> {
+        // SAFETY: the owning handle remains live throughout the import.
+        unsafe { Self::from_borrowed_handle(metal, handle.raw) }
+    }
+
+    /// Import a borrowed MTLSharedEventHandle into an independently owned event.
+    /// The caller may dispose its handle after this call returns.
+    ///
+    /// # Safety
+    /// `handle` must be a valid MTLSharedEventHandle for this call's duration.
+    pub unsafe fn from_borrowed_handle(metal: &MetalContext, handle: NonNull<c_void>) -> Result<Self> {
         let mut raw: *mut c_void = std::ptr::null_mut();
         check("fence-from-handle", unsafe {
-            ffi::porthole_native_event_from_handle(metal.raw.as_ptr(), handle.as_raw(), &mut raw)
+            ffi::porthole_native_event_from_handle(metal.raw.as_ptr(), handle.as_ptr(), &mut raw)
         })?;
         Ok(Self {
             raw: NonNull::new(raw).expect("shim returned NULL event without error"),

@@ -48,6 +48,90 @@ fn producer() -> Arc<Mutex<NativeArenaProducer<MacosFrameBackend>>> {
 }
 
 #[test]
+fn c_native_frames_keep_their_generation_handles_after_replacement_and_api_teardown() {
+    use std::ptr;
+
+    use jackstay::{
+        acquisition::arena::FrameDescriptor,
+        ffi::*,
+        ffi_acquisition::{macos::*, *},
+    };
+    let producer = producer();
+    let (_server, endpoint) = XpcArenaServer::start_anonymous(None, producer.clone()).unwrap();
+    let client = XpcArenaClient::connect_endpoint(&endpoint).unwrap();
+    let (mut connection, mut consumer) = FtMacosAcquisitionConnection::attach(client, 2).unwrap();
+    let source = IoSurface::allocate(16, 16, PixelFormat::Bgra8Unorm).unwrap();
+    source.write_pixels(&vec![31; 16 * 16 * 4]).unwrap();
+    producer
+        .lock()
+        .unwrap()
+        .publish(&MacosCapturedFrame { surface: source }, 1)
+        .unwrap();
+    // SAFETY: exclusive C handles. Borrowed native resources are imported only
+    // while their corresponding frame is held, and sampling completes before
+    // immediate release. No copied transport handles survive frame release.
+    unsafe {
+        let mut old = ptr::null_mut();
+        let mut new = ptr::null_mut();
+        let mut range = FtAcquisitionRange::default();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut old, &mut range),
+            FT_STATUS_OK
+        );
+        producer
+            .lock()
+            .unwrap()
+            .reconfigure(NativeStreamParams {
+                width: 17,
+                height: 19,
+                pixel_format: PixelFormat::Rgba8Unorm,
+                color_space: ColorSpace::Srgb,
+                clock_domain: ClockDomain::HostTime,
+                modifier: 0,
+            })
+            .unwrap();
+        assert_eq!(ft_acquisition_macos_install_configuration(connection, consumer), FT_STATUS_OK);
+        assert_eq!(ft_acquisition_macos_install_configuration(connection, consumer), FT_STATUS_EMPTY);
+        let source = IoSurface::allocate(17, 19, PixelFormat::Rgba8Unorm).unwrap();
+        source.write_pixels(&vec![83; 17 * 19 * 4]).unwrap();
+        producer
+            .lock()
+            .unwrap()
+            .publish(&MacosCapturedFrame { surface: source }, 2)
+            .unwrap();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut new, &mut range),
+            FT_STATUS_OK
+        );
+        ft_acquisition_consumer_destroy(&mut consumer);
+        ft_acquisition_macos_connection_destroy(&mut connection);
+        let metal = MetalContext::new().unwrap();
+        for (frame, expected, generation) in [(&mut old, vec![31; 16 * 16 * 4], 1), (&mut new, vec![83; 17 * 19 * 4], 2)] {
+            let mut descriptor = FrameDescriptor::default();
+            let mut surface = ptr::null_mut();
+            let mut readiness = ptr::null_mut();
+            assert_eq!(ft_acquired_frame_describe(*frame, &mut descriptor), FT_STATUS_OK);
+            assert_eq!(descriptor.config_generation, generation);
+            assert_eq!(
+                ft_acquired_frame_macos_resources(*frame, &mut surface, &mut readiness),
+                FT_STATUS_OK
+            );
+            {
+                let surface = IoSurface::from_borrowed(std::ptr::NonNull::new(surface).unwrap());
+                let readiness = ConsumerFence::from_borrowed_handle(&metal, std::ptr::NonNull::new(readiness).unwrap()).unwrap();
+                assert_eq!(
+                    readiness
+                        .sample_offscreen(&metal, &surface, descriptor.fence_value, descriptor.width, descriptor.height)
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(ft_acquired_frame_release(frame), FT_STATUS_OK);
+        }
+    }
+}
+
+#[test]
 fn xpc_admits_its_authenticated_peer_and_transfers_owned_acquisition_resources() {
     let producer = producer();
     let (_server, endpoint) = XpcArenaServer::start_anonymous(Some("test-authority".to_owned()), producer.clone()).unwrap();
@@ -144,70 +228,108 @@ fn xpc_replacement_keeps_an_acquired_old_generation_and_installs_new_native_hand
 }
 
 #[test]
-fn xpc_registers_the_consumers_actual_gpu_completion_event() {
+fn xpc_registers_the_consumers_actual_gpu_completion_event_through_c() {
+    use std::ptr;
+
     use jackstay::{
-        acquisition::arena::{Cancellation, WaitInterest, WaitOutcome},
+        acquisition::arena::FrameDescriptor,
+        ffi::*,
+        ffi_acquisition::{macos::*, *},
         native::macos::SampleCompletion,
     };
     let producer = producer();
     let (_server, endpoint) = XpcArenaServer::start_anonymous(None, producer.clone()).unwrap();
-    let mut client = XpcArenaClient::connect_endpoint(&endpoint).unwrap();
-    let mut consumer = client.attach(1).unwrap();
+    let client = XpcArenaClient::connect_endpoint(&endpoint).unwrap();
+    let (mut connection, mut consumer) = FtMacosAcquisitionConnection::attach(client, 1).unwrap();
     let metal = MetalContext::new().unwrap();
-    let release = Arc::new(ConsumerFence::new(&metal).unwrap());
-    let registration = client.register_release_timeline(&consumer, release.clone()).unwrap();
-    let source = IoSurface::allocate(16, 16, PixelFormat::Bgra8Unorm).unwrap();
-    source.write_pixels(&vec![68; 16 * 16 * 4]).unwrap();
-    producer
-        .lock()
-        .unwrap()
-        .publish(&MacosCapturedFrame { surface: source }, 1)
-        .unwrap();
-    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
-        panic!("no GPU frame")
-    };
-    let native = frame.native_resources::<IoSurface, SharedEventHandle>().unwrap();
-    let readiness = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
-    let surface = native.surface.clone();
-    let ready_value = frame.descriptor().fence_value;
-    let gate = ConsumerFence::new(&metal).unwrap();
-    let submitted = ConsumerFence::new(&metal).unwrap();
-    std::thread::scope(|scope| {
-        struct OpenOnDrop<'a>(&'a ConsumerFence);
-        impl Drop for OpenOnDrop<'_> {
-            fn drop(&mut self) {
-                self.0.signal_cpu(1);
-            }
-        }
-        let _open_on_unwind = OpenOnDrop(&gate);
-        let sample = scope.spawn(|| {
-            let surface = surface;
-            readiness.sample_offscreen_with_completion(
-                &metal,
-                &surface,
-                ready_value,
-                (16, 16),
-                SampleCompletion {
-                    release: (&release, 1),
-                    before_sample: Some((&gate, 1)),
-                    submitted: Some((&submitted, 1)),
-                },
-            )
-        });
-        assert!(submitted.wait(1, 5000));
-        frame.defer_release(&registration, 1).unwrap();
-        assert_eq!(release.signaled_value(), 0);
-        assert_eq!(producer.lock().unwrap().poll_cleanup().unwrap(), 0);
-        assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
-        let before = consumer.events();
-        gate.signal_cpu(1);
-        assert!(
-            matches!(consumer.wait(before, WaitInterest::CAPACITY, &Cancellation::new().unwrap(),
-            Some(std::time::Duration::from_secs(5))).unwrap(), WaitOutcome::Changed(events) if events.capacity_epoch > before.capacity_epoch)
+    let release = ConsumerFence::new(&metal).unwrap();
+    let exported = release.export_handle().unwrap();
+    let mut binding = ptr::null_mut();
+    // SAFETY: all C handles are exclusively owned. The exported event remains
+    // live through registration; the library must then retain its own observer.
+    unsafe {
+        assert_eq!(
+            ft_acquisition_macos_register_release(connection, consumer, exported.as_raw(), &mut binding),
+            FT_STATUS_OK
         );
-        assert_eq!(sample.join().unwrap().unwrap(), vec![68; 16 * 16 * 4]);
-        assert_eq!(producer.lock().unwrap().poll_cleanup().unwrap(), 1);
-    });
+        drop(exported);
+        let source = IoSurface::allocate(16, 16, PixelFormat::Bgra8Unorm).unwrap();
+        source.write_pixels(&vec![68; 16 * 16 * 4]).unwrap();
+        producer
+            .lock()
+            .unwrap()
+            .publish(&MacosCapturedFrame { surface: source }, 1)
+            .unwrap();
+        let mut frame = ptr::null_mut();
+        let mut range = FtAcquisitionRange::default();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut frame, &mut range),
+            FT_STATUS_OK
+        );
+        let mut descriptor = FrameDescriptor::default();
+        let mut raw_surface = ptr::null_mut();
+        let mut raw_readiness = ptr::null_mut();
+        assert_eq!(ft_acquired_frame_describe(frame, &mut descriptor), FT_STATUS_OK);
+        assert_eq!(
+            ft_acquired_frame_macos_resources(frame, &mut raw_surface, &mut raw_readiness),
+            FT_STATUS_OK
+        );
+        let readiness = ConsumerFence::from_borrowed_handle(&metal, std::ptr::NonNull::new(raw_readiness).unwrap()).unwrap();
+        let surface = IoSurface::from_borrowed(std::ptr::NonNull::new(raw_surface).unwrap());
+        let gate = ConsumerFence::new(&metal).unwrap();
+        let submitted = ConsumerFence::new(&metal).unwrap();
+        let mut cancellation = ptr::null_mut();
+        assert_eq!(ft_acquisition_cancellation_create(&mut cancellation), FT_STATUS_OK);
+        std::thread::scope(|scope| {
+            struct OpenOnDrop<'a>(&'a ConsumerFence);
+            impl Drop for OpenOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.signal_cpu(1);
+                }
+            }
+            let _open_on_unwind = OpenOnDrop(&gate);
+            let sample = scope.spawn(|| {
+                let surface = surface;
+                let readiness = readiness;
+                readiness.sample_offscreen_with_completion(
+                    &metal,
+                    &surface,
+                    descriptor.fence_value,
+                    (16, 16),
+                    SampleCompletion {
+                        release: (&release, 1),
+                        before_sample: Some((&gate, 1)),
+                        submitted: Some((&submitted, 1)),
+                    },
+                )
+            });
+            assert!(submitted.wait(1, 5000));
+            assert_eq!(ft_acquired_frame_defer_release(&mut frame, binding, 1), FT_STATUS_OK);
+            assert!(frame.is_null());
+            assert_eq!(release.signaled_value(), 0);
+            assert_eq!(producer.lock().unwrap().poll_cleanup().unwrap(), 0);
+            let mut unavailable = ptr::null_mut();
+            assert_eq!(
+                ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut unavailable, &mut range),
+                FT_STATUS_HOLDING_LIMIT
+            );
+            let mut before = FtAcquisitionEvents::default();
+            let mut after = FtAcquisitionEvents::default();
+            assert_eq!(ft_acquisition_snapshot(consumer, &mut before), FT_STATUS_OK);
+            gate.signal_cpu(1);
+            assert_eq!(
+                ft_acquisition_wait(consumer, &before, FT_WAIT_CAPACITY, cancellation, 5_000_000_000, &mut after),
+                FT_STATUS_OK
+            );
+            assert!(after.capacity_epoch > before.capacity_epoch);
+            assert_eq!(sample.join().unwrap().unwrap(), vec![68; 16 * 16 * 4]);
+            assert_eq!(producer.lock().unwrap().poll_cleanup().unwrap(), 1);
+        });
+        ft_acquisition_cancellation_destroy(&mut cancellation);
+        ft_acquisition_release_timeline_destroy(&mut binding);
+        ft_acquisition_consumer_destroy(&mut consumer);
+        ft_acquisition_macos_connection_destroy(&mut connection);
+    }
 }
 
 #[test]

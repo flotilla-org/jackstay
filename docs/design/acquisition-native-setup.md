@@ -51,15 +51,16 @@ to obey shared-memory lifetime rules. The bearer token authorizes the consumer;
 it does not authenticate the producer. This preserves the trust obligation of
 `ConsumerGrant::from_parts` instead of hiding it behind a safe arbitrary-name API.
 
-Five tests use real anonymous XPC connections and Metal objects: authorization
+Before the shared-event allocation failure below, five tests passed using real
+anonymous XPC connections and Metal objects: authorization
 and initial GPU sampling; old/new sampling through replacement under shared
 holding credit; registration of the event signalled by actual gated GPU work;
 disconnect while a live peer retains a frame, followed by fresh admission; and
-foreign claim-scope rejection when numeric incarnation IDs match. All pass.
-The four existing XPC tests and ten native arena tests also pass, along with
+foreign claim-scope rejection when numeric incarnation IDs match.
+The four existing XPC tests and ten native arena tests also passed, along with
 workspace build, default/macOS clippy, and pinned formatting.
 
-The five ordinary tests keep producer and consumer in the same OS process.
+These ordinary tests keep producer and consumer in the same OS process.
 `native_arena_xpc_process.rs` adds explicit, ignored acceptance runs using a
 unique launchd Mach service and the test executable as its producer. A temporary
 directory contains the job plist, control socket, and logs. Normal teardown
@@ -86,5 +87,37 @@ both acceptance commands rerun after shared-event allocation recovers. The cause
 of that device-wide allocation failure has not been established, and no crash
 cleanup outcome is claimed from this attempt.
 
-The C ABI, reference viewer, host resumption of paused transitions, Porthole
+## C native bridge
+
+`ffi_acquisition::macos` now exposes the existing XPC setup through C. Connection
+and consumer handles have separate lifetimes. Named connection requests admission
+with a holding reservation; optional authorization precedes attachment. Native
+replacement verifies the original connection/incarnation and installs the native
+handles with their resource mapping through the common installer.
+
+`ft_acquired_frame_macos_resources` borrows the particular acquired generation's
+IOSurface and readiness handle. It does not export a separate pool cache. The
+common immutable descriptor provides dimensions, format and the readiness value.
+Caller imports must remain within the lease's declared lifetime.
+
+Release registration imports the caller's borrowed `MTLSharedEventHandle` into
+an independently owned `ConsumerFence`, registers the same actual event with
+the producer, and returns the common C release binding. The original handle may
+be disposed after registration. Deferred release still uses the shared arena and
+its retirement owner, without per-frame XPC requests.
+
+The gated GPU release test now goes through the C registration/acquire/defer/wait
+functions. An additional test acquires old/new native generations through C,
+destroys both setup/consumer API handles, then samples each held frame using its
+borrowed resources. Both compile, but neither current C/GPU scenario has runtime
+verification: the standalone probe still returns `shared_event=nil` on kiwi.
+The eight CPU/C boundary tests and SDL smoke pass; they do not prove native
+sampling. After recovery, run the ordinary suite as well as the two named-process
+acceptance commands above:
+
+```
+cargo test -p jackstay --locked --features backend-macos --test native_arena_xpc
+```
+
+Reference viewer migration, host resumption of paused transitions, Porthole
 integration, full-suite gates, and live capture acceptance remain outstanding.

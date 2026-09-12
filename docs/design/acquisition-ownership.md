@@ -413,3 +413,12 @@ now stamps the installed allocation's configuration generation for CPU frames
 as well as native frames. Eight boundary tests and the CPU arena/replacement
 suites pass on macOS and Linux; the default full-suite run has only the existing
 legacy daemon regression failure.
+
+The native C bridge now wraps the process-bound XPC connection, configuration
+installer and completion registration. Resource getters borrow directly from
+the common acquired frame's retained generation. Its C/GPU scenarios compile;
+runtime verification is pending the shared-event allocation recovery described
+in [acquisition-native-setup.md](acquisition-native-setup.md#c-native-bridge).
+CPU boundary tests, workspace build, default/macOS Clippy, pinned formatting and
+the existing SDL smoke pass. The default full-suite run still reports only the
+known legacy daemon regression. No native viewer or Porthole migration is claimed.

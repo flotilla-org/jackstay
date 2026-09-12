@@ -89,10 +89,14 @@ test run with `--no-fail-fast` passes every integration binary and reports just
 the known legacy daemon regression among its library tests (124 passed, one
 failed). The full log is `/tmp/jackstay-acquisition-c-workspace-tests.log` on kiwi.
 
+The [native C bridge](acquisition-native-setup.md#c-native-bridge) adds named XPC
+connection, native replacement, frame-scoped resource access and actual Metal
+completion-event registration. Its C/GPU tests compile but await recovery of
+Metal shared-event allocation before runtime verification.
+
 This is an integration step, not completion of the acquisition contract. The
 reference viewer and Porthole still use the legacy setup/data paths. Remaining
-work includes C native setup and resource access, native replacement configuration
-import, viewer completion signaling, host migration and live acceptance. The
+work includes viewer completion signaling, host migration and live acceptance. The
 legacy daemon shadow-ring regression is intentionally still failing. The
 independent Metal shared-event allocation blocker and native rerun commands are
 recorded in [acquisition-native-setup.md](acquisition-native-setup.md).

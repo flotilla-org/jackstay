@@ -207,6 +207,38 @@ void ft_acquisition_cancellation_destroy(ft_acquisition_cancellation **);
  * All destroy functions accept NULL or *handle=NULL and clear live handles. */
 void ft_acquisition_consumer_destroy(ft_acquisition_consumer **);
 
+#if defined(__APPLE__)
+/* Requires a library built with backend-macos. The host-selected Mach service
+ * must obey the common acquisition protocol; the optional client token does
+ * not authenticate the producer. Both output handles must start NULL. Setup
+ * connection and consumer are separate owners; serialize their operations. */
+typedef struct ft_macos_acquisition_connection ft_macos_acquisition_connection;
+ft_status ft_acquisition_macos_connect(const char *endpoint, const char *token, uint32_t holding,
+                                       ft_macos_acquisition_connection **out_connection,
+                                       ft_acquisition_consumer **out_consumer);
+/* Request and install one native replacement. OK installed, EMPTY no offer,
+ * STALE disposed a valid superseded offer. Old frames retain their own handles. */
+ft_status ft_acquisition_macos_install_configuration(ft_macos_acquisition_connection *,
+                                                    ft_acquisition_consumer *);
+/* Borrow the consumer's actual MTLSharedEventHandle during registration. The
+ * library imports an independent observer and returns a common release binding.
+ * The caller keeps ownership of event_handle; *out must initially be NULL. */
+ft_status ft_acquisition_macos_register_release(ft_macos_acquisition_connection *,
+                                               const ft_acquisition_consumer *, void *event_handle,
+                                               ft_acquisition_release_timeline **out);
+/* Borrow IOSurfaceRef + MTLSharedEventHandle from this acquired generation.
+ * Outputs must not alias and are cleared on non-success. UNSUPPORTED means the
+ * frame has no macOS native resources. The frame descriptor supplies dimensions,
+ * format and the producer fence value to wait before sampling. Finish use and
+ * dispose imported handle copies within the frame's lease, including its
+ * declared deferred completion. No pool cache is needed. */
+ft_status ft_acquired_frame_macos_resources(const ft_acquired_frame *, void **out_surface,
+                                           void **out_readiness);
+/* Close setup without declaring outstanding work complete; clears the handle.
+ * Consumer/frame handles have their own lifetimes. NULL is harmless. */
+void ft_acquisition_macos_connection_destroy(ft_macos_acquisition_connection **);
+#endif
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(ft_acquired_frame_descriptor) == 144, "acquired descriptor size");
 _Static_assert(offsetof(ft_acquired_frame_descriptor, fence_value) == 72, "acquired readiness packing");

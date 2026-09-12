@@ -20,6 +20,12 @@ int jackstay_c_acquisition_finish(ft_acquired_frame **frame) {
       descriptor.cursor != 1 || descriptor.width != 1 || descriptor.height != 1 ||
       descriptor.stride != 4 || descriptor.flags != 0x1234 ||
       len != 4 || bytes == NULL || memcmp(bytes, "abcd", 4) != 0;
+#if defined(__APPLE__)
+  void *surface = &descriptor;
+  void *readiness = &descriptor;
+  if (ft_acquired_frame_macos_resources(*frame, &surface, &readiness) != FT_STATUS_UNSUPPORTED ||
+      surface != NULL || readiness != NULL) failed = 1;
+#endif
   if (ft_acquired_frame_release(frame) != FT_STATUS_OK || *frame != NULL) return 1;
   return failed;
 }

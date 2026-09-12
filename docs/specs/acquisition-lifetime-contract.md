@@ -4,6 +4,9 @@ Status: agreed design; implementation pending. The bounded design interview
 settled the behavior below. Atomic layouts and backend mechanisms still need
 technical design and verification.
 
+The [ownership audit and implementation design](../design/acquisition-ownership.md)
+tracks the current paths, proposed claim protocol, and verification by slice.
+
 ## Acquisition and publication
 
 A successful acquisition provides an immutable descriptor, a lease on the

@@ -193,12 +193,12 @@ fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange
     let listener = UnixListener::bind(&socket).unwrap();
     let mut producer = ArenaProducer::new(config()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
-    let (descriptor, fds) = producer.attach(2).unwrap().into_parts().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "mapped_arena_child", "--nocapture"])
         .env("JACKSTAY_ARENA_TEST_SOCKET", &socket)
         .spawn()
         .unwrap();
+    let (descriptor, fds) = producer.attach_process(2, child.id()).unwrap().into_parts().unwrap();
     let (mut stream, _) = listener.accept().unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let json = serde_json::to_vec(&descriptor).unwrap();

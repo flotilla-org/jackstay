@@ -180,10 +180,10 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | Slice | Status / next evidence |
 | --- | --- |
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
-| 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-exit cleanup remains pending. |
+| 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-bound remote grants now reclaim ordinary CPU claims on verified exit; asynchronous claims still require completion evidence. |
 | 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, and cancellable notification waits are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Reconfiguration events await the transition implementation. Host integration remains pending; the old socket/shadow regression still fails. |
 | 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Completion observation wakes capacity waits while publication is idle. Replacement of the existing host path remains pending. |
-| 5: cleanup/reconfiguration | Pending; GPU process-death proof remains open. |
+| 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished-signal recovery, bounded reconfiguration, and real GPU command retirement after process death remain pending. |
 | 6: ABI/host/live acceptance | Pending. |
 
 Admission-layer validation: `cargo test --locked --test acquisition_admission`,
@@ -216,7 +216,7 @@ native resources. `native::arena::NativeArenaProducer` uses the same retirement
 and claim scan before staging into an IOSurface; it also checks producer GPU
 completion before reusing a staging target. Actual IOSurface allocation sizes
 count against the arena byte budget. The old host/native and C paths have not
-yet been replaced. The new setup descriptor (version 3)
+yet been replaced. The new setup descriptor (version 4)
 carries four FDs: arena, claim page, notification reader, notification writer.
 Both the producer and the consumer's release path can notify that consumer.
 Its version/layout and handles must be included in the Rust/C ABI update; this
@@ -236,7 +236,7 @@ that channel.
 
 An incarnation that registers a release timeline gets one producer-owned observer
 thread. It sleeps on the reverse direction of the existing notification socket;
-CPU-only incarnations create no observer. After storing deferred-release metadata,
+Local CPU-only incarnations create no observer. Remote grants use the same owner to watch their admitted process. After storing deferred-release metadata,
 the consumer writes a coalesced wake to that reverse channel. The observer drains
 before inspecting shared claims and then sleeps, so a racing handoff either
 appears in its scan or leaves a readable notification. Backend completion uses
@@ -254,8 +254,9 @@ claim map, or frame. Worker stacks and callback bookkeeping are bounded by the
 incarnation and holding limits; they are outside the resource-mapping byte total.
 Producer shutdown wakes and joins the observer without waiting for incomplete GPU
 work. Shutdown does not make old storage available for reuse or invalidate leases.
-The producer still collects acknowledged, empty incarnations during publication
-or admission; process-death observation and unresolved-work recovery remain below.
+The producer collects acknowledged, empty incarnations during publication,
+admission, or `poll_cleanup`. Remote process observation now supplies CPU exit
+proof; unresolved asynchronous-work recovery remains incomplete.
 
 The added tests cover idle capacity wakeup, a deferred handoff from an imported
 cross-process grant, observer shutdown with an unfinished event, and a late
@@ -275,7 +276,12 @@ macOS-feature all-targets clippy, and pinned formatting passed during this slice
 The eleven existing macOS backend/XPC tests passed before adding automatic
 observation; their existing sampling wrapper was unchanged by that addition.
 
-Next: extend the arena with bounded reconfiguration and verified process-exit cleanup,
+Next: finish unresolved-completion recovery and bounded reconfiguration,
 and replace the existing CPU/native acquisition paths with it. Do not add a
 per-frame broker update to keep admission informed; reserved claim slots are the
 holding credit.
+
+Process-bound cleanup now uses kqueue on macOS and pidfds on Linux. Remote grants
+are export-only and mandatory for setup FD transfer; local grants use ordinary
+Rust ownership. The process-exit, failure, and native quarantine rules and source
+evidence are recorded in [acquisition-process-cleanup.md](acquisition-process-cleanup.md).

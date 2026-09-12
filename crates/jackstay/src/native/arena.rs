@@ -9,7 +9,7 @@ use crate::{
         IncarnationId,
         arena::{
             ArenaConfig, ArenaError, ArenaProducer, ConsumerGrant, FrameDescriptor, PublishOutcome, ReleaseTimeline,
-            ReleaseTimelineRegistration,
+            ReleaseTimelineRegistration, RemoteConsumerGrant,
         },
     },
     model::{DamageKind, FrameSyncKind},
@@ -23,8 +23,8 @@ pub trait ArenaNativeBackend: NativeFrameBackend {
     fn completed_producer_value(&self, fence: &Self::Fence) -> crate::Result<u64>;
 }
 
-pub struct NativeArenaGrant<S, Y> {
-    pub consumer: ConsumerGrant,
+pub struct NativeArenaGrant<S, Y, G = ConsumerGrant> {
+    pub consumer: G,
     pub pool_id: u64,
     pub surface_handles: Vec<S>,
     pub fence_id: u64,
@@ -80,6 +80,19 @@ impl<B: ArenaNativeBackend> NativeArenaProducer<B> {
 
     pub fn attach(&mut self, holding: u32) -> Result<NativeArenaGrant<B::SurfaceHandle, B::SyncHandle>, ArenaError> {
         let consumer = self.arena.attach(holding)?;
+        self.grant(consumer)
+    }
+
+    pub fn attach_process(
+        &mut self,
+        holding: u32,
+        pid: u32,
+    ) -> Result<NativeArenaGrant<B::SurfaceHandle, B::SyncHandle, RemoteConsumerGrant>, ArenaError> {
+        let consumer = self.arena.attach_process(holding, pid)?;
+        self.grant(consumer)
+    }
+
+    fn grant<G>(&self, consumer: G) -> Result<NativeArenaGrant<B::SurfaceHandle, B::SyncHandle, G>, ArenaError> {
         Ok(NativeArenaGrant {
             consumer,
             pool_id: self.backend.pool_id(&self.pool),
@@ -168,16 +181,16 @@ impl<B: ArenaNativeBackend> NativeArenaProducer<B> {
         self.arena.register_release_timeline(incarnation, timeline)
     }
 
-    pub fn poll_release_completions(&mut self) -> Result<usize, ArenaError> {
-        self.arena.poll_release_completions()
+    pub fn poll_cleanup(&mut self) -> Result<usize, ArenaError> {
+        self.arena.poll_cleanup()
     }
 
-    pub fn release_recovery_failures(&self) -> Vec<crate::acquisition::arena::ReleaseRecoveryFailure> {
-        self.arena.release_recovery_failures()
+    pub fn cleanup_failures(&self) -> Vec<crate::acquisition::arena::CleanupFailure> {
+        self.arena.cleanup_failures()
     }
 
-    pub fn retry_release_cleanup(&mut self, incarnation: IncarnationId) -> Result<(), ArenaError> {
-        self.arena.retry_release_cleanup(incarnation)
+    pub fn retry_cleanup(&mut self, incarnation: IncarnationId) -> Result<(), ArenaError> {
+        self.arena.retry_cleanup(incarnation)
     }
 
     pub fn close(&mut self, incarnation: IncarnationId) -> Result<(), ArenaError> {

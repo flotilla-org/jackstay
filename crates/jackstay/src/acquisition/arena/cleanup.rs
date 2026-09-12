@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ACTIVE, AdmissionError, ArenaError, ArenaProducer, CAPACITY_EPOCH, CLAIM_SLOT_LEN, ClaimMap, FrameLease, HEADER_LEN, IncarnationId,
-    RELEASE_ID, RELEASE_PENDING, RELEASE_VALUE, wait,
+    QUIESCENT, RELEASE_ID, RELEASE_PENDING, RELEASE_VALUE, process::ProcessWatch, wait,
 };
 
 /// Producer-owned access to a registered native completion timeline. Returning a
@@ -60,11 +60,23 @@ impl ReleaseNotification {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct ReleaseRegistry {
-    observers: BTreeMap<IncarnationId, ReleaseObserver>,
+pub(super) struct CleanupRegistry {
+    observers: BTreeMap<IncarnationId, IncarnationObserver>,
 }
 
-impl ReleaseRegistry {
+impl CleanupRegistry {
+    pub(super) fn track_process(
+        &mut self,
+        claims: Arc<ClaimMap>,
+        native_resources: bool,
+        process: Arc<ProcessWatch>,
+    ) -> Result<(), ArenaError> {
+        let incarnation = claims.incarnation;
+        let observer = IncarnationObserver::new(claims, native_resources, Some(process))?;
+        assert!(self.observers.insert(incarnation, observer).is_none(), "new incarnation");
+        Ok(())
+    }
+
     pub(super) fn remove(&mut self, incarnation: IncarnationId) {
         self.observers.remove(&incarnation);
     }
@@ -73,6 +85,9 @@ impl ReleaseRegistry {
 #[derive(Debug)]
 struct ObservationState {
     claims: Arc<ClaimMap>,
+    native_resources: bool,
+    process: Option<Arc<ProcessWatch>>,
+    unresolved_native_claims: usize,
     timelines: Vec<Arc<dyn ReleaseTimeline>>,
     armed: Vec<Option<ReleaseNotification>>,
     failure: Option<String>,
@@ -91,7 +106,55 @@ impl ObservationState {
         self.fail(reason);
     }
 
+    fn observe_process(&mut self) {
+        let Some(process) = &self.process else {
+            return;
+        };
+        match process.exited() {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                self.process = None;
+                self.fail_notification(error.to_string());
+                return;
+            }
+        }
+        self.process = None;
+        self.claims.close();
+        // The watch was bound before this remote grant escaped. The OS event
+        // proves no admitted process thread can still read or publish a claim.
+        self.claims.word(QUIESCENT).store(1, SeqCst);
+        for index in 0..self.claims.frames {
+            if self.claims.slot(index).load(SeqCst) == 0 {
+                continue;
+            }
+            match self.claims.release_word(index, RELEASE_PENDING).load(SeqCst) {
+                // Submitted deferred uses retain their imported completion
+                // source, including on a CPU arena used for asynchronous work.
+                1 => {}
+                0 if !self.native_resources && self.timelines.is_empty() => {
+                    self.claims.return_credit(index);
+                    self.released = self.released.saturating_add(1);
+                }
+                0 => self.unresolved_native_claims += 1,
+                _ => self.fail("invalid release state at process exit".to_owned()),
+            }
+        }
+    }
+
+    fn failure_reason(&self) -> Option<String> {
+        self.failure.clone().or_else(|| {
+            (self.unresolved_native_claims != 0).then(|| {
+                format!(
+                    "process exited with {} asynchronous claims lacking completion evidence; resources remain quarantined",
+                    self.unresolved_native_claims,
+                )
+            })
+        })
+    }
+
     fn poll(&mut self) {
+        self.observe_process();
         if self.failure.is_some() {
             return;
         }
@@ -146,19 +209,19 @@ impl ObservationState {
     }
 }
 
-/// At most one sleeping thread for each admitted incarnation that registers
-/// native timelines. CPU-only incarnations need none. Manual polling and the
-/// worker share one mutex, giving deferred claims exactly one release owner.
+/// At most one sleeping thread per monitored incarnation. Local CPU-only
+/// consumers need none; remote consumers and native timeline registrations use
+/// this same owner. Manual refresh and the worker serialize reclamation.
 #[derive(Debug)]
-struct ReleaseObserver {
+struct IncarnationObserver {
     state: Arc<Mutex<ObservationState>>,
     stop: Arc<AtomicBool>,
     wake: Arc<wait::Wake>,
     worker: Option<JoinHandle<()>>,
 }
 
-impl ReleaseObserver {
-    fn new(claims: Arc<ClaimMap>) -> Result<Self, ArenaError> {
+impl IncarnationObserver {
+    fn new(claims: Arc<ClaimMap>, native_resources: bool, process: Option<Arc<ProcessWatch>>) -> Result<Self, ArenaError> {
         // Socket directions are independent: consumers read data/capacity wakes
         // on one end and write handoff wakes back to this sole reverse reader.
         let mut receiver = wait::Receiver::from_fd(claims.wake.fd()?)?;
@@ -166,6 +229,9 @@ impl ReleaseObserver {
         let state = Arc::new(Mutex::new(ObservationState {
             armed: vec![None; claims.frames],
             claims,
+            native_resources,
+            process,
+            unresolved_native_claims: 0,
             timelines: Vec::new(),
             failure: None,
             notification_failed: false,
@@ -174,25 +240,28 @@ impl ReleaseObserver {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
         let worker_stop = Arc::clone(&stop);
-        let worker = std::thread::Builder::new().name("jackstay-release".to_owned()).spawn(move || {
+        let worker = std::thread::Builder::new().name("jackstay-cleanup".to_owned()).spawn(move || {
             while !worker_stop.load(SeqCst) {
                 // Drain BEFORE checking shared state. A subsequent handoff or
                 // completed-event callback leaves a byte for the following poll.
                 if let Err(error) = receiver.drain() {
                     worker_state
                         .lock()
-                        .expect("release observer state")
+                        .expect("incarnation cleanup state")
                         .fail_notification(error.to_string());
                     break;
                 }
-                worker_state.lock().expect("release observer state").poll();
+                worker_state.lock().expect("incarnation cleanup state").poll();
                 if worker_stop.load(SeqCst) {
                     break;
                 }
-                if let Err(error) = receiver.sleep() {
+                // Retain the watch FD while sleeping: a concurrent host refresh
+                // can consume its exit event and remove it from shared state.
+                let process = worker_state.lock().expect("incarnation cleanup state").process.clone();
+                if let Err(error) = receiver.sleep(process.as_ref().map(|process| process.fd())) {
                     worker_state
                         .lock()
-                        .expect("release observer state")
+                        .expect("incarnation cleanup state")
                         .fail_notification(error.to_string());
                     break;
                 }
@@ -207,7 +276,7 @@ impl ReleaseObserver {
     }
 }
 
-impl Drop for ReleaseObserver {
+impl Drop for IncarnationObserver {
     fn drop(&mut self) {
         self.stop.store(true, SeqCst);
         let _ = self.wake.signal();
@@ -243,18 +312,17 @@ impl ClaimMap {
 impl ArenaProducer {
     /// Persistent per-incarnation recovery failures. Healthy incarnations keep
     /// their acquisition and completion guarantees while these claims drain.
-    pub fn release_recovery_failures(&self) -> Vec<ReleaseRecoveryFailure> {
-        self.releases
+    pub fn cleanup_failures(&self) -> Vec<CleanupFailure> {
+        self.cleanup
             .observers
             .iter()
             .filter_map(|(incarnation, observer)| {
                 observer
                     .state
                     .lock()
-                    .expect("release observer state")
-                    .failure
-                    .clone()
-                    .map(|reason| ReleaseRecoveryFailure {
+                    .expect("incarnation cleanup state")
+                    .failure_reason()
+                    .map(|reason| CleanupFailure {
                         incarnation: *incarnation,
                         reason,
                     })
@@ -264,12 +332,12 @@ impl ArenaProducer {
 
     /// Retry observing a retained completion source after the host repairs its
     /// backend. This neither reopens acquisition nor force-releases any claim.
-    pub fn retry_release_cleanup(&mut self, incarnation: IncarnationId) -> Result<(), ArenaError> {
+    pub fn retry_cleanup(&mut self, incarnation: IncarnationId) -> Result<(), ArenaError> {
         if !self.claims.contains_key(&incarnation) {
             return Err(AdmissionError::UnknownIncarnation.into());
         }
-        if let Some(observer) = self.releases.observers.get(&incarnation) {
-            let mut state = observer.state.lock().expect("release observer state");
+        if let Some(observer) = self.cleanup.observers.get(&incarnation) {
+            let mut state = observer.state.lock().expect("incarnation cleanup state");
             if state.notification_failed {
                 // A backend retry cannot repair a dead notification channel or
                 // restart its reader. Keep this recovery failure visible.
@@ -277,11 +345,16 @@ impl ArenaProducer {
             }
             state.failure = None;
             observer.wake.signal()?;
+            if let Some(reason) = state.failure_reason() {
+                return Err(ArenaError::RecoveryRequired { reason });
+            }
         }
         Ok(())
     }
 
-    /// Import each consumer release timeline once through setup. Registrations
+    /// Import each consumer release timeline once through setup, before starting
+    /// asynchronous use. Registration opts CPU resources into conservative
+    /// asynchronous crash handling as well: exit cannot prove GPU completion. Registrations
     /// and outstanding backend notifications are bounded by the incarnation's
     /// holding reservation. The observer also runs while publication is idle.
     pub fn register_release_timeline(
@@ -293,11 +366,14 @@ impl ArenaProducer {
         if claims.word(ACTIVE).load(SeqCst) == 0 {
             return Err(ArenaError::Closed);
         }
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.releases.observers.entry(incarnation) {
-            entry.insert(ReleaseObserver::new(Arc::clone(claims))?);
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.cleanup.observers.entry(incarnation) {
+            entry.insert(IncarnationObserver::new(Arc::clone(claims), self.native_resources, None)?);
         }
-        let observer = &self.releases.observers[&incarnation];
-        let mut state = observer.state.lock().expect("release observer state");
+        let observer = &self.cleanup.observers[&incarnation];
+        let mut state = observer.state.lock().expect("incarnation cleanup state");
+        if claims.word(ACTIVE).load(SeqCst) == 0 {
+            return Err(ArenaError::Closed);
+        }
         if state.timelines.len() >= claims.frames {
             return Err(ArenaError::Configuration(
                 "release timeline capacity equals the holding reservation",
@@ -318,10 +394,10 @@ impl ArenaProducer {
     /// including automatic observation while idle. Publication and admission
     /// call this too; hosts need not poll to wake a consumer's capacity wait.
     /// Consumer shutdown never clears a pending claim.
-    pub fn poll_release_completions(&mut self) -> Result<usize, ArenaError> {
+    pub fn poll_cleanup(&mut self) -> Result<usize, ArenaError> {
         let mut released = 0_usize;
-        for observer in self.releases.observers.values() {
-            let mut state = observer.state.lock().expect("release observer state");
+        for observer in self.cleanup.observers.values() {
+            let mut state = observer.state.lock().expect("incarnation cleanup state");
             state.poll();
             released = released.saturating_add(std::mem::take(&mut state.released));
         }
@@ -331,7 +407,7 @@ impl ArenaProducer {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReleaseRecoveryFailure {
+pub struct CleanupFailure {
     pub incarnation: IncarnationId,
     pub reason: String,
 }

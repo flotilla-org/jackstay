@@ -64,15 +64,22 @@ impl Receiver {
         self.0.try_clone().map(OwnedFd::from)
     }
 
-    pub(super) fn sleep(&self) -> io::Result<()> {
-        let mut descriptor = libc::pollfd {
-            fd: self.0.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
+    pub(super) fn sleep(&self, process_fd: Option<std::os::fd::RawFd>) -> io::Result<()> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: process_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
         loop {
-            // SAFETY: the initialized descriptor and its owned FD live through poll.
-            let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+            // SAFETY: initialized descriptors and their owned FDs live through poll.
+            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -80,9 +87,15 @@ impl Receiver {
                 }
                 return Err(error);
             }
-            if descriptor.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
-                return Err(io::Error::other("release observation channel failed"));
+            if descriptors[0].revents & libc::POLLHUP != 0
+                || descriptors
+                    .iter()
+                    .any(|descriptor| descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+            {
+                return Err(io::Error::other("cleanup observation channel failed"));
             }
+            // A process descriptor's HUP is a wake, not a socket failure. The
+            // lifetime observer validates its backend-specific terminal event.
             return Ok(());
         }
     }

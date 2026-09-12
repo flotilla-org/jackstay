@@ -26,12 +26,13 @@ use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
 mod wait;
 pub use wait::{Cancellation, WaitEvents, WaitInterest, WaitOutcome};
-mod release;
-pub use release::{RejectedDeferredRelease, ReleaseNotification, ReleaseRecoveryFailure, ReleaseTimeline, ReleaseTimelineRegistration};
+mod cleanup;
+mod process;
+pub use cleanup::{CleanupFailure, RejectedDeferredRelease, ReleaseNotification, ReleaseTimeline, ReleaseTimelineRegistration};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"JSACQ001");
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
-const VERSION: u64 = 3;
+const VERSION: u64 = 4;
 const HEADER_LEN: usize = 256;
 const LATEST: usize = 128;
 const TERMINAL: usize = 136;
@@ -117,6 +118,7 @@ struct ClaimHeader {
     frames: u64,
     map_len: u64,
     scope: [u8; 16],
+    recipient_pid: u64,
 }
 
 const _: () = {
@@ -145,6 +147,8 @@ pub enum ArenaError {
     Closed,
     #[error("payload exceeds resource capacity")]
     PayloadTooLarge,
+    #[error("incarnation recovery required: {reason}")]
+    RecoveryRequired { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +326,7 @@ struct ClaimMap {
     incarnation: IncarnationId,
     frames: usize,
     scope: [u8; 16],
+    recipient_pid: u32,
     wake: Arc<wait::Wake>,
     release_wake: Arc<wait::Wake>,
 }
@@ -339,6 +344,7 @@ impl ClaimMap {
         len: usize,
         wake: Arc<wait::Wake>,
         release_wake: Arc<wait::Wake>,
+        recipient_pid: u32,
     ) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::new(len)?;
         let mut scope = [0; 16];
@@ -357,6 +363,7 @@ impl ClaimMap {
                 frames: frames as u64,
                 map_len: len as u64,
                 scope,
+                recipient_pid: u64::from(recipient_pid),
             });
             for (offset, value) in [(ACTIVE, 1), (QUIESCENT, 0), (CAPACITY_EPOCH, 0), (WAIT_INTEREST, 0)] {
                 storage
@@ -380,6 +387,7 @@ impl ClaimMap {
             incarnation,
             frames: frames as usize,
             scope,
+            recipient_pid,
             wake,
             release_wake,
         })
@@ -392,6 +400,7 @@ impl ClaimMap {
         len: usize,
         wake: Arc<wait::Wake>,
         release_wake: Arc<wait::Wake>,
+        recipient_pid: u32,
     ) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::map_read_write(fd, len)?;
         // SAFETY: grant owns this initialized incarnation's map; header never changes.
@@ -401,6 +410,7 @@ impl ClaimMap {
             || header.incarnation != incarnation.0
             || header.frames != frames as u64
             || header.map_len != len as u64
+            || header.recipient_pid != u64::from(recipient_pid)
         {
             return Err(ArenaError::Mapping("claim header disagrees with grant"));
         }
@@ -409,6 +419,7 @@ impl ClaimMap {
             incarnation,
             frames,
             scope: header.scope,
+            recipient_pid,
             wake,
             release_wake,
         })
@@ -446,6 +457,22 @@ pub struct ConsumerGrant {
     consumed: bool,
 }
 
+/// Export-only grant for a monitored process. Keeping this separate prevents a
+/// safe local reader from outliving a different process's reclamation proof.
+/// Import still uses ConsumerGrant::from_parts with its process-lifetime contract.
+pub struct RemoteConsumerGrant(ConsumerGrant);
+
+impl RemoteConsumerGrant {
+    #[must_use]
+    pub fn incarnation(&self) -> IncarnationId {
+        self.0.incarnation()
+    }
+
+    pub fn into_parts(self) -> Result<(GrantDescriptor, [OwnedFd; 4]), ArenaError> {
+        self.0.into_parts()
+    }
+}
+
 /// Setup-channel descriptor. Accompanying FDs: arena, claim mapping, notification
 /// reader, notification writer, in that order. Never resend a consumed grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +485,8 @@ pub struct GrantDescriptor {
     pub arena_map_len: u64,
     pub holding: u32,
     pub claim_map_len: u64,
+    /// Zero for an unbound grant; otherwise the admitted recipient process.
+    pub recipient_pid: u32,
 }
 
 impl ConsumerGrant {
@@ -466,7 +495,7 @@ impl ConsumerGrant {
         self.claims.incarnation
     }
 
-    pub fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 4]), ArenaError> {
+    fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 4]), ArenaError> {
         let writer_fd = self.claims.wake.fd()?;
         self.consumed = true;
         let descriptor = GrantDescriptor {
@@ -478,6 +507,7 @@ impl ConsumerGrant {
             arena_map_len: self.layout.len as u64,
             holding: self.claims.frames as u32,
             claim_map_len: self.claims.storage.len() as u64,
+            recipient_pid: self.claims.recipient_pid,
         };
         Ok((
             descriptor,
@@ -496,10 +526,15 @@ impl ConsumerGrant {
     /// The sender must be a conforming, sole producer of this arena, obeying the
     /// immutable-header and claim-before-reuse protocol. This process must be
     /// the sole recipient of this incarnation's claim grant. It must not fork
-    /// or pass that grant on after mapping it. Length/header checks cannot prove
+    /// or pass that grant on after mapping it. A process-bound grant belongs
+    /// only to the lifetime admitted by the sender, never a reused PID.
+    /// Length/header checks cannot prove
     /// another process follows a shared-memory lifetime protocol.
     pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 4]) -> Result<Self, ArenaError> {
         let [arena_fd, claim_fd, reader_fd, writer_fd] = fds;
+        if descriptor.recipient_pid != std::process::id() {
+            return Err(ArenaError::Mapping("grant belongs to a different recipient process"));
+        }
         if descriptor.version != VERSION || descriptor.incarnation == 0 || descriptor.holding == 0 {
             return Err(ArenaError::Mapping("invalid grant version or incarnation reservation"));
         }
@@ -522,6 +557,7 @@ impl ConsumerGrant {
             claim_len,
             Arc::new(wait::Wake::from_fd(writer_fd)?),
             Arc::new(wait::Wake::from_fd(reader_fd.try_clone()?)?),
+            descriptor.recipient_pid,
         )?);
         Ok(Self {
             arena_fd: Some(arena_fd),
@@ -552,7 +588,8 @@ pub struct ArenaProducer {
     claims: BTreeMap<IncarnationId, Arc<ClaimMap>>,
     cursor: u64,
     next_slot: usize,
-    releases: release::ReleaseRegistry,
+    cleanup: cleanup::CleanupRegistry,
+    native_resources: bool,
 }
 
 impl ArenaProducer {
@@ -563,10 +600,14 @@ impl ArenaProducer {
         }
     }
     pub fn new(config: ArenaConfig) -> Result<Self, ArenaError> {
-        Self::with_external_allocation(config, 0)
+        Self::create(config, 0, false)
     }
 
     pub(crate) fn with_external_allocation(config: ArenaConfig, external_bytes: u64) -> Result<Self, ArenaError> {
+        Self::create(config, external_bytes, true)
+    }
+
+    fn create(config: ArenaConfig, external_bytes: u64, native_resources: bool) -> Result<Self, ArenaError> {
         let layout = Layout::new(
             config.resource_capacity as usize,
             config.retained_history as usize,
@@ -588,15 +629,38 @@ impl ArenaProducer {
             claims: BTreeMap::new(),
             cursor: 0,
             next_slot: 0,
-            releases: release::ReleaseRegistry::default(),
+            cleanup: cleanup::CleanupRegistry::default(),
+            native_resources,
         })
     }
 
     pub fn attach(&mut self, holding: u32) -> Result<ConsumerGrant, ArenaError> {
+        self.attach_with_recipient(holding, 0)
+    }
+
+    /// Bind cleanup to the current kernel lifetime for this PID before any
+    /// mapping escapes. The host selects/authorizes the recipient and must send
+    /// this grant only to that process. A remote grant cannot be mapped locally
+    /// through the safe in-process consumer constructor.
+    pub fn attach_process(&mut self, holding: u32, pid: u32) -> Result<RemoteConsumerGrant, ArenaError> {
+        let process = Arc::new(process::ProcessWatch::new(pid)?);
+        let grant = self.attach_with_recipient(holding, pid)?;
+        let result = self
+            .cleanup
+            .track_process(Arc::clone(&grant.claims), self.native_resources, process);
+        if let Err(error) = result {
+            drop(grant);
+            self.collect_quiescent();
+            return Err(error);
+        }
+        Ok(RemoteConsumerGrant(grant))
+    }
+
+    fn attach_with_recipient(&mut self, holding: u32, recipient_pid: u32) -> Result<ConsumerGrant, ArenaError> {
         if self.map.word(TERMINAL).load(SeqCst) != 0 {
             return Err(ArenaError::Closed);
         }
-        self.poll_release_completions()?;
+        self.poll_cleanup()?;
         let len = ClaimMap::allocation_len(holding)?;
         let reservation = self.admission.admit(HoldingRequest {
             frames: holding,
@@ -606,7 +670,7 @@ impl ArenaProducer {
         let result = (|| {
             let (wake, receiver) = wait::channel()?;
             let release_wake = Arc::new(wait::Wake::from_fd(receiver.fd()?)?);
-            let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake, release_wake)?);
+            let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake, release_wake, recipient_pid)?);
             let arena_fd = self.map.storage.try_clone_fd()?;
             let claim_fd = claims.storage.try_clone_fd()?;
             Ok(ConsumerGrant {
@@ -666,7 +730,7 @@ impl ArenaProducer {
             }
             return Err(ArenaError::GenerationsExhausted);
         }
-        self.poll_release_completions()?;
+        self.poll_cleanup()?;
         let oldest = self.cursor.saturating_sub(self.map.layout.history as u64 - 1).max(1);
         for offset in 0..self.map.layout.resources {
             let index = (self.next_slot + offset) % self.map.layout.resources;
@@ -733,7 +797,7 @@ impl ArenaProducer {
             // empty-claim check above. Process-exit cleanup needs OS proof.
             self.admission.close(*incarnation).expect("tracked incarnation");
             self.admission.complete_cleanup(*incarnation).expect("closed incarnation");
-            self.releases.remove(*incarnation);
+            self.cleanup.remove(*incarnation);
             false
         });
     }
@@ -776,6 +840,7 @@ impl ArenaConsumer {
             grant.claims.storage.len(),
             Arc::clone(&grant.claims.wake),
             Arc::clone(&grant.claims.release_wake),
+            grant.claims.recipient_pid,
         )?;
         let receiver = wait::Receiver::from_fd(grant.reader_fd.take().expect("single-use grant"))?;
         grant.consumed = true;

@@ -101,3 +101,9 @@ still use legacy setup/data paths. Remaining work includes host migration and li
 legacy daemon shadow-ring regression is intentionally still failing. The
 independent Metal shared-event allocation blocker and native rerun commands are
 recorded in [acquisition-native-setup.md](acquisition-native-setup.md).
+
+The [CPU socket setup boundary](acquisition-cpu-setup.md) now transfers the common
+arena's process-bound grants and replacement maps without per-frame messages.
+Its Rust client returns `ArenaConsumer` directly. Connecting it to Porthole's
+authorization/routing and the CPU Rust/C consumers is the next integration step;
+the new transport alone does not fix the older daemon path.

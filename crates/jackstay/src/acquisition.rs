@@ -10,6 +10,8 @@ use thiserror::Error;
 
 #[cfg(unix)]
 pub mod arena;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod socket;
 
 mod allocation;
 pub use allocation::AllocationId;

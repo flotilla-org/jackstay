@@ -895,7 +895,7 @@ impl ArenaConsumer {
         self.lifetime.claims.incarnation
     }
 
-    #[cfg(all(target_os = "macos", feature = "backend-macos"))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn claim_scope(&self) -> [u8; 16] {
         self.lifetime.claims.scope
     }
@@ -969,7 +969,7 @@ impl ArenaConsumer {
         self.acquire(cursor)
     }
 
-    fn is_configured(&self) -> bool {
+    pub(crate) fn is_configured(&self) -> bool {
         self.resources
             .as_ref()
             .is_some_and(|resources| resources.map.generation == self.control.word(CONFIGURATION).load(SeqCst))

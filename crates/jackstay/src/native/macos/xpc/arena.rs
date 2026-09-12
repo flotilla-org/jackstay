@@ -361,6 +361,9 @@ impl XpcArenaClient {
 
     pub fn install_configuration(&mut self, consumer: &mut ArenaConsumer) -> Result<Option<ConfigurationInstall>, ArenaError> {
         self.check_consumer(consumer)?;
+        if consumer.is_configured() {
+            return Ok(None);
+        }
         let reply = self.request(Request::Configuration, None)?;
         if matches!(reply.metadata, Response::Empty) && reply.fds.is_empty() && reply.surfaces.is_empty() && reply.event.is_none() {
             return Ok(None);

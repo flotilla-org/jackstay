@@ -1,15 +1,16 @@
 /* Metal present shim for the native capture path (#85).
  *
  * The viewer's per-frame GPU work — latch the received IOSurface into an
- * MTLTexture, GPU-wait on the frame's MTLSharedEvent value, blit, present —
+ * MTLTexture, GPU-wait on the frame's MTLSharedEvent value, render, present —
  * is ObjC/Metal and lives here so main.c stays C11. The C API below is all
- * main.c calls; pointers cross as void* (CAMetalLayer*, MTLSharedEventHandle*,
- * IOSurfaceRef) and are bridged inside metal_present.m.
+ * main.c calls. The presenter accepts a layer and acquired frame ownership;
+ * native resource imports stay within the frame's lease.
  */
 #ifndef METAL_PRESENT_H
 #define METAL_PRESENT_H
 
 #include <stdint.h>
+#include "capture_transfer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,20 +18,22 @@ extern "C" {
 
 typedef struct mp_presenter mp_presenter;
 
-/* ca_metal_layer: a CAMetalLayer* (SDL_Metal_GetLayer). sync_handle: the
- * grant's MTLSharedEventHandle, resolved into an MTLSharedEvent on the
- * presenter's own device. Returns NULL on failure. */
-mp_presenter *mp_create(void *ca_metal_layer, void *sync_handle);
+/* ca_metal_layer is a CAMetalLayer* from SDL_Metal_GetLayer. */
+mp_presenter *mp_create(void *ca_metal_layer);
 
-/* GPU-wait fence_value on the shared event, then blit io_surface into the
- * drawable and present. The wait is encoded on the command buffer before the
- * blit, so the drawable never samples a surface the producer has not finished.
- * Returns 0 on success, non-zero on failure (e.g. no drawable). */
-int mp_present(mp_presenter *presenter, void *io_surface, uint64_t fence_value, uint32_t width, uint32_t height);
+/* On success transfers *frame to a completion owner and clears the handle.
+ * Waits for producer readiness on the GPU, presents, then releases the frame
+ * after all GPU use and temporary native imports have finished. Failure leaves
+ * the frame owned by the caller and submits no GPU work. */
+int mp_present(mp_presenter *presenter, ft_acquired_frame **frame);
 
-/* Present a solid placeholder (producer gone or no frame yet). */
-void mp_present_placeholder(mp_presenter *presenter);
+int mp_failed(const mp_presenter *presenter);
+uint64_t mp_completed_frames(const mp_presenter *presenter);
+/* Wait efficiently for completion owners. Timeout/failure returns nonzero and
+ * never discards still-owned frames. Call before destroying a healthy viewer. */
+int mp_drain(mp_presenter *presenter, uint64_t timeout_ns);
 
+/* Outstanding completion owners remain valid independently of this API handle. */
 void mp_destroy(mp_presenter *presenter);
 
 #ifdef __cplusplus

@@ -54,6 +54,10 @@ For a real macOS native capture session, keep porthole running as its installed
 launchd job so it owns its attach MachService. Use porthole's capture-session
 command to obtain the endpoint and attach token, then supply them to the viewer:
 
+The native viewer now requires the common XPC acquisition service
+(`XpcArenaServer`). Porthole's host migration is still pending on this branch;
+its legacy `XpcAttachServer` is not compatible with this viewer's native mode.
+
 ```sh
 ./build/viewer/capture-viewer-sdl --native \
   --transport-kind 1 --endpoint "$attach_endpoint" --token "$attach_token" \
@@ -63,10 +67,39 @@ command to obtain the endpoint and attach token, then supply them to the viewer:
 Transport kind 1 is the macOS XPC endpoint; `--mach-service NAME` also selects it.
 Use values returned by the host, not guessed surface handles or IDs. Consult the
 porthole native-viewer smoke for its complete authorized session lifecycle.
-Frame presentation waits on the transferred Metal fence and releases the acquired
-lease after rendering. Native capture needs separate live validation; the offline
+The viewer requests a two-frame holding reservation. It waits for producer
+readiness on the GPU and retains each frame and its native imports until the
+Metal completion callback. Replacement uses the acquired generation's own
+resources; the viewer keeps no persistent surface or texture cache.
+Native capture needs separate live validation; the offline
 synthetic test makes no claim about GPU copies or desktop permissions.
 
 A bounded native run reports `presented_frames=N` and fails if it ends before
-that count or a presentation/release call fails. This counts successful Metal
-submission, not GPU completion or a copy-overhead measurement.
+that count or presentation/release fails. This counts completed GPU command
+buffers whose leases have been released. Shutdown waits up to five seconds for
+pending completion owners; timeout reports failure without releasing frames
+still in use. This is not a copy-overhead measurement.
+
+## Native verification
+
+The optional pipeline smoke compiles the real Metal shaders and initializes the
+presenter without capture or shared events:
+
+```sh
+cmake --build build/viewer --target metal-presenter-smoke
+./build/viewer/metal-presenter-smoke
+```
+
+The separate-process acceptance test opens two temporary viewer windows, renders
+BGRA and RGBA frames from its own native producer, and verifies clean exit returns
+the admission reservation. Build with `scripts/smoke-viewer.sh` first so the
+library includes the macOS bridge:
+
+```sh
+JACKSTAY_VIEWER_TEST_BINARY="$PWD/build/viewer/capture-viewer-sdl" \
+  cargo test -p jackstay --locked --features backend-macos --test native_arena_xpc_process \
+  -- --ignored --exact reference_viewer_completes_bgra_and_rgba_frames_and_returns_admission --nocapture
+```
+
+This test requires a logged-in GUI session and working Metal shared events. It
+uses synthetic native sources; authorized live capture acceptance is separate.

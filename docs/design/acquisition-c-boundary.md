@@ -95,8 +95,9 @@ completion-event registration. Its C/GPU tests compile but await recovery of
 Metal shared-event allocation before runtime verification.
 
 This is an integration step, not completion of the acquisition contract. The
-reference viewer and Porthole still use the legacy setup/data paths. Remaining
-work includes viewer completion signaling, host migration and live acceptance. The
+native reference viewer now uses this boundary and retains frames through Metal
+completion; its runtime verification remains pending. The CPU viewer and Porthole
+still use legacy setup/data paths. Remaining work includes host migration and live acceptance. The
 legacy daemon shadow-ring regression is intentionally still failing. The
 independent Metal shared-event allocation blocker and native rerun commands are
 recorded in [acquisition-native-setup.md](acquisition-native-setup.md).

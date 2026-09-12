@@ -119,5 +119,9 @@ acceptance commands above:
 cargo test -p jackstay --locked --features backend-macos --test native_arena_xpc
 ```
 
-Reference viewer migration, host resumption of paused transitions, Porthole
+The [native reference viewer](acquisition-viewer.md) now uses this bridge and
+retains acquired frames through Metal completion. Its native rendering/cleanup
+acceptance is still unverified while shared-event allocation is unavailable.
+
+Viewer runtime verification, host resumption of paused transitions, Porthole
 integration, full-suite gates, and live capture acceptance remain outstanding.

@@ -1,6 +1,6 @@
 # Acquisition lifetime contract
 
-Status: agreed design; implementation pending. The bounded design interview
+Status: agreed design; implementation in progress. The bounded design interview
 settled the behavior below. Atomic layouts and backend mechanisms still need
 technical design and verification.
 

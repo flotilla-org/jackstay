@@ -155,6 +155,66 @@ impl Drop for Service {
 }
 
 #[test]
+#[ignore = "requires a GUI/Metal device and JACKSTAY_VIEWER_TEST_BINARY; opens two temporary SDL windows"]
+fn reference_viewer_completes_bgra_and_rgba_frames_and_returns_admission() {
+    let viewer = std::fs::canonicalize(std::env::var("JACKSTAY_VIEWER_TEST_BINARY").expect("build the native SDL viewer first")).unwrap();
+    let mut service = Service::start();
+    let directory = service.directory.as_ref().unwrap().path().to_owned();
+    for cycle in 0..2 {
+        if cycle == 1 {
+            assert_eq!(service.request(json!({"command":"resize"}))["ok"], true);
+        }
+        let stdout = directory.join(format!("viewer-{cycle}.stdout.log"));
+        let stderr = directory.join(format!("viewer-{cycle}.stderr.log"));
+        let mut viewer = child::KillOnDrop(
+            Command::new(&viewer)
+                .args(["--native", "--mach-service", &service.name, "--token", TOKEN, "--frames", "8"])
+                .env_remove("SDL_VIDEODRIVER")
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = viewer.try_wait().unwrap() {
+                assert!(status.success(), "viewer failed: {}", std::fs::read_to_string(&stderr).unwrap());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "viewer stalled: {}",
+                std::fs::read_to_string(&stderr).unwrap()
+            );
+            service.request(json!({"command":"publish", "seed":51 + cycle}));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = std::fs::read_to_string(&stdout).unwrap();
+        assert!(
+            output.lines().any(|line| line == "presented_frames=8"),
+            "viewer did not confirm eight GPU completions: {output}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = service.request(json!({"command":"stats"}));
+            assert!(
+                stats["failures"].as_array().unwrap().is_empty(),
+                "clean viewer exit left recovery failures: {stats}"
+            );
+            if stats["admission_available"] == true {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "viewer exit did not return its reservation: {stats}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    service.stop();
+}
+
+#[test]
 #[ignore = "requires a launchd GUI bootstrap session and a Metal device; creates and removes an isolated test service"]
 fn named_xpc_transfers_frames_replacements_and_gpu_release_across_processes() {
     let mut service = Service::start();

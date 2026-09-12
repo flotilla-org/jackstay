@@ -31,7 +31,7 @@ endif()
 set(VIEWER_SOURCES src/main.c)
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
-  # ft_native_* symbols this viewer links against are present.
+  # ft_acquisition_macos_* symbols this viewer links against are present.
   list(APPEND VIEWER_SOURCES src/metal_present.m)
   # ARC: the present shim relies on __bridge_retained/__bridge_transfer to own
   # the presenter and on ARC to retain textures/event — no-ops without it.
@@ -54,6 +54,14 @@ if(APPLE)
     "-framework IOSurface"
     "-framework Foundation"
   )
+  # Explicit hardware check, outside the CPU-only default build/CTest. This
+  # compiles the actual presentation shaders/pipeline on a Metal device. It
+  # does not create capture sources or prove frame completion ordering.
+  add_executable(metal-presenter-smoke EXCLUDE_FROM_ALL tests/metal_present_smoke.m src/metal_present.m)
+  target_include_directories(metal-presenter-smoke PRIVATE "${JACKSTAY_INCLUDE_DIR}" src)
+  target_compile_options(metal-presenter-smoke PRIVATE -fobjc-arc)
+  target_link_libraries(metal-presenter-smoke PRIVATE ${JACKSTAY_LIB}
+    "-framework Metal" "-framework QuartzCore" "-framework IOSurface" "-framework Foundation")
 endif()
 
 enable_testing()

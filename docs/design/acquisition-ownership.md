@@ -422,3 +422,12 @@ in [acquisition-native-setup.md](acquisition-native-setup.md#c-native-bridge).
 CPU boundary tests, workspace build, default/macOS Clippy, pinned formatting and
 the existing SDL smoke pass. The default full-suite run still reports only the
 known legacy daemon regression. No native viewer or Porthole migration is claimed.
+
+The [native viewer migration](acquisition-viewer.md) now removes its separate pool
+cache and uses common acquisition, waits and configuration installation. Each
+submitted frame and its imported native objects live through Metal completion;
+shutdown drains those owners with a bounded wait. The real shader/pipeline setup
+test and macOS CPU/SDL smoke pass. The named-service BGRA/RGBA viewer acceptance
+test compiles but awaits working shared events. Linux viewer verification awaits
+CMake/SDL2 development dependencies on paneer. Porthole host migration and live
+capture acceptance remain outstanding.

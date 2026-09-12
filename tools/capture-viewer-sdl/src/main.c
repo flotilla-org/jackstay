@@ -8,7 +8,7 @@
 #include "capture_transfer.h"
 #include "metal_present.h"
 
-enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4, MAX_NATIVE_POOLS = 16 };
+enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4 };
 
 typedef struct viewer_options {
   int max_frames;
@@ -29,11 +29,6 @@ typedef struct stream_state {
   uint32_t stride;
   int daemon_mode;
 } stream_state;
-
-typedef struct native_pool_cache {
-  ft_native_pool pools[MAX_NATIVE_POOLS];
-  uint32_t count;
-} native_pool_cache;
 
 static void fill_frame(uint8_t *pixels, uint64_t sequence) {
   for (uint32_t y = 0; y < HEIGHT; y++) {
@@ -90,188 +85,134 @@ static int require_ok(ft_status status, const char *operation) {
 }
 
 #ifdef __APPLE__
-static const ft_native_pool *native_pool_find(const native_pool_cache *cache, uint64_t pool_id) {
-  for (uint32_t i = 0; i < cache->count; i++) {
-    if (cache->pools[i].pool_id == pool_id) {
-      return &cache->pools[i];
-    }
-  }
-  return NULL;
-}
-
-static int native_pool_cache_add(native_pool_cache *cache, ft_native_pool pool) {
-  if (native_pool_find(cache, pool.pool_id) != NULL) {
-    return 0;
-  }
-  if (cache->count >= MAX_NATIVE_POOLS) {
-    fprintf(stderr, "native pool cache full; cannot add pool %" PRIu64 "\n", pool.pool_id);
-    return 1;
-  }
-  cache->pools[cache->count++] = pool;
-  return 0;
-}
-
-static int native_poll_control_events(ft_native_attach *attach, native_pool_cache *cache) {
-  for (;;) {
-    ft_native_event event = {.struct_size = sizeof(ft_native_event)};
-    ft_status status = ft_native_poll_event(attach, &event);
-    if (status == FT_STATUS_EMPTY) {
-      return 0;
-    }
-    if (status != FT_STATUS_OK) {
-      fprintf(stderr, "ft_native_poll_event failed with status %d\n", status);
-      return 1;
-    }
-    if (event.kind == FT_NATIVE_EVENT_POOL_ADDED) {
-      ft_native_pool pool = {
-          .struct_size = sizeof(ft_native_pool),
-      };
-      ft_status pool_status = ft_native_get_pool(attach, event.pool_id, &pool);
-      if (pool_status != FT_STATUS_OK) {
-        fprintf(stderr, "ft_native_get_pool(%" PRIu64 ") failed with status %d\n", event.pool_id, pool_status);
-        return 1;
-      }
-      if (native_pool_cache_add(cache, pool)) {
-        return 1;
-      }
-    } else if (event.kind == FT_NATIVE_EVENT_PRODUCER_STOPPED) {
-      return 1;
-    }
-  }
-}
-
-// The native path: attach through the descriptor endpoint, then present each frame
-// zero-copy with a GPU fence wait. Consumer ordering: wait for a newer cursor,
-// acquire a frame lease, GPU-wait the producer fence, sample the surface, and
-// release the lease when presentation work is complete.
 static int run_native(const viewer_options *options) {
-  if (options->endpoint == NULL || options->transport_kind == 0) {
-    fprintf(stderr, "--native requires --transport-kind <kind> --endpoint <value> (and usually --token <secret>)\n");
+  if (options->endpoint == NULL || options->transport_kind != FT_NATIVE_ATTACH_TRANSPORT_MACOS_XPC) {
+    fprintf(stderr, "--native requires a macOS acquisition endpoint (--mach-service <name>)\n");
     return 1;
   }
 
-  ft_native_attach *attach = NULL;
-  ft_native_attach_descriptor descriptor = {
-      .struct_size = sizeof(ft_native_attach_descriptor),
-      .transport_kind = options->transport_kind,
-      .requested_consumer_id = 0,
-      .endpoint = options->endpoint,
-      .bearer_token = options->token,
-      .flags = 0,
-  };
-  if (require_ok(ft_native_attach_connect(&descriptor, &attach), "ft_native_attach_connect")) {
-    return 1;
+  ft_macos_acquisition_connection *connection = NULL;
+  ft_acquisition_consumer *consumer = NULL;
+  ft_acquisition_cancellation *cancellation = NULL;
+  SDL_Window *window = NULL;
+  SDL_MetalView view = NULL;
+  mp_presenter *presenter = NULL;
+  int failed = 1;
+  int sdl_started = 0;
+  // Two outstanding frames allow presentation to overlap while keeping the
+  // consumer's resource demand explicit and bounded at admission.
+  if (require_ok(ft_acquisition_macos_connect(options->endpoint, options->token, 2,
+                                             &connection, &consumer), "ft_acquisition_macos_connect") ||
+      require_ok(ft_acquisition_cancellation_create(&cancellation), "ft_acquisition_cancellation_create")) {
+    goto cleanup;
   }
-  ft_native_grant grant = {
-      .struct_size = sizeof(ft_native_grant),
-  };
-  if (require_ok(ft_native_attach_grant(attach, &grant), "ft_native_attach_grant")) {
-    ft_native_attach_destroy(attach);
-    return 1;
-  }
-  native_pool_cache pools = {0};
-  for (uint32_t i = 0; i < grant.pool_count; i++) {
-    if (native_pool_cache_add(&pools, grant.pools[i])) {
-      ft_native_attach_destroy(attach);
-      return 1;
-    }
-  }
-
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
     fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-    ft_native_attach_destroy(attach);
-    return 1;
+    goto cleanup;
   }
-  SDL_Window *window = SDL_CreateWindow("capture-viewer-sdl (native)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH,
-                                        HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE);
-  SDL_MetalView view = window != NULL ? SDL_Metal_CreateView(window) : NULL;
+  sdl_started = 1;
+  window = SDL_CreateWindow("capture-viewer-sdl (native)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                            WIDTH, HEIGHT, SDL_WINDOW_SHOWN | SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE);
+  view = window != NULL ? SDL_Metal_CreateView(window) : NULL;
   void *layer = view != NULL ? SDL_Metal_GetLayer(view) : NULL;
-  void *producer_sync = grant.producer_sync.sync_kind == FT_NATIVE_SYNC_MTL_SHARED_EVENT ? grant.producer_sync.handle.object : NULL;
-  mp_presenter *presenter = layer != NULL ? mp_create(layer, producer_sync) : NULL;
+  presenter = layer != NULL ? mp_create(layer) : NULL;
   if (presenter == NULL) {
     fprintf(stderr, "native present setup failed: %s\n", SDL_GetError());
-    if (view != NULL) {
-      SDL_Metal_DestroyView(view);
-    }
-    if (window != NULL) {
-      SDL_DestroyWindow(window);
-    }
-    SDL_Quit();
-    ft_native_attach_destroy(attach);
-    return 1;
+    goto cleanup;
   }
 
-  int running = 1;
-  int presented = 0;
-  int failed = 0;
+  failed = 0;
+  uint64_t submitted = 0;
   uint64_t last_cursor = 0;
-  while (running && (options->max_frames <= 0 || presented < options->max_frames)) {
-    SDL_Event sdl_event;
-    while (SDL_PollEvent(&sdl_event)) {
-      if (sdl_event.type == SDL_QUIT) {
-        running = 0;
-      }
+  uint64_t requested_configuration_epoch = 0;
+  int requested_configuration = 0;
+  int running = 1;
+  while (running && (options->max_frames <= 0 || submitted < (uint64_t)options->max_frames)) {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+      if (event.type == SDL_QUIT) running = 0;
     }
-    if (native_poll_control_events(attach, &pools)) {
+    if (!running) break;
+    if (mp_failed(presenter)) { failed = 1; break; }
+
+    // Snapshot before acquisition so publication/release/reconfiguration
+    // between the check and wait cannot be lost.
+    ft_acquisition_events before = {0};
+    if (require_ok(ft_acquisition_snapshot(consumer, &before), "ft_acquisition_snapshot")) {
       failed = 1;
       break;
     }
-
-    uint64_t ready_cursor = 0;
-    ft_status wait_status = ft_native_wait_frame(attach, last_cursor, 16 * 1000 * 1000, &ready_cursor);
-    ft_native_frame frame = {
-        .struct_size = sizeof(ft_native_frame),
-    };
-    ft_status status = wait_status == FT_STATUS_OK ? ft_native_acquire_latest(attach, last_cursor, &frame) : wait_status;
+    ft_acquired_frame *frame = NULL;
+    ft_acquisition_range range = {0};
+    ft_status status = ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, last_cursor, &frame, &range);
+    uint32_t interest = FT_WAIT_DATA;
     if (status == FT_STATUS_OK) {
-      int presentation_status = 1;
-      const ft_native_pool *pool = native_pool_find(&pools, frame.pool_id);
-      if (pool != NULL && frame.slot_id < pool->surface_count) {
-        const ft_native_surface *surface = &pool->surfaces[frame.slot_id];
-        if (surface->handle_kind == FT_NATIVE_HANDLE_IOSURFACE) {
-          presentation_status = mp_present(presenter, surface->object, frame.producer_sync_value, frame.width, frame.height);
-        }
-      }
-      last_cursor = frame.cursor;
-      if (presentation_status == 0) {
-        presented++;
-      } else {
-        fprintf(stderr, "native frame presentation failed\n");
+      ft_acquired_frame_descriptor descriptor = {0};
+      if (require_ok(ft_acquired_frame_describe(frame, &descriptor), "ft_acquired_frame_describe") ||
+          mp_present(presenter, &frame) != 0) {
+        // Presentation failures leave the frame owned here and submit no GPU
+        // work. Successful submission transfers it to the completion owner.
+        if (frame != NULL) ft_acquired_frame_release(&frame);
         failed = 1;
-      }
-      ft_native_release release = {
-          .struct_size = sizeof(ft_native_release),
-          .release_kind = FT_NATIVE_RELEASE_NOW,
-          .lease_id = frame.lease_id,
-          .release_sync_id = 0,
-          .release_value = 0,
-      };
-      if (ft_native_release_frame(attach, &release) != FT_STATUS_OK) {
-        fprintf(stderr, "native frame release failed\n");
-        failed = 1;
-      }
-      if (failed) {
         break;
       }
-    } else if (status == FT_STATUS_CLOSED) {
+      last_cursor = descriptor.cursor;
+      submitted++;
+      continue;
+    }
+    if (status == FT_STATUS_CLOSED) break;
+    if (status == FT_STATUS_RECONFIGURATION) {
+      interest = FT_WAIT_ALL;
+      if (!requested_configuration || requested_configuration_epoch != before.reconfiguration_epoch) {
+        requested_configuration = 1;
+        requested_configuration_epoch = before.reconfiguration_epoch;
+        if (require_ok(ft_acquisition_relinquish_configuration(consumer), "ft_acquisition_relinquish_configuration")) {
+          failed = 1;
+          break;
+        }
+        status = ft_acquisition_macos_install_configuration(connection, consumer);
+        if (status == FT_STATUS_OK) continue;
+        if (status == FT_STATUS_CLOSED) break;
+        if (status != FT_STATUS_EMPTY && status != FT_STATUS_STALE) {
+          fprintf(stderr, "native configuration failed with status %d\n", status);
+          failed = 1;
+          break;
+        }
+      }
+    } else if (status == FT_STATUS_HOLDING_LIMIT) {
+      interest = FT_WAIT_CAPACITY;
+    } else if (status != FT_STATUS_EMPTY && status != FT_STATUS_MISS) {
+      fprintf(stderr, "native acquisition failed with status %d\n", status);
+      failed = 1;
       break;
-    } else {
-      // EMPTY/TIMEOUT (no frame yet) or a read fault / gone producer: hold the
-      // window alive with a placeholder and keep polling for (re)connection.
-      mp_present_placeholder(presenter);
+    }
+    ft_acquisition_events after = {0};
+    status = ft_acquisition_wait(consumer, &before, interest, cancellation, 16 * 1000 * 1000, &after);
+    if (status == FT_STATUS_CLOSED || status == FT_STATUS_CANCELLED) break;
+    if (status != FT_STATUS_OK && status != FT_STATUS_TIMEOUT) {
+      fprintf(stderr, "native acquisition wait failed with status %d\n", status);
+      failed = 1;
+      break;
     }
   }
 
-  if (options->max_frames > 0 && presented != options->max_frames) {
-    fprintf(stderr, "expected %d native frames, presented %d\n", options->max_frames, presented);
+  // A timeout reports failure; it never releases resources still in GPU use.
+  if (mp_drain(presenter, 5 * UINT64_C(1000) * 1000 * 1000) != 0) failed = 1;
+  uint64_t completed = mp_completed_frames(presenter);
+  if (options->max_frames > 0 && completed != (uint64_t)options->max_frames) {
+    fprintf(stderr, "expected %d native frames, completed %" PRIu64 "\n", options->max_frames, completed);
     failed = 1;
   }
-  printf("presented_frames=%d\n", presented);
+  printf("presented_frames=%" PRIu64 "\n", completed);
+
+cleanup:
   mp_destroy(presenter);
-  SDL_Metal_DestroyView(view);
-  SDL_DestroyWindow(window);
-  SDL_Quit();
-  ft_native_attach_destroy(attach);
+  if (view != NULL) SDL_Metal_DestroyView(view);
+  if (window != NULL) SDL_DestroyWindow(window);
+  if (sdl_started) SDL_Quit();
+  ft_acquisition_cancellation_destroy(&cancellation);
+  ft_acquisition_consumer_destroy(&consumer);
+  ft_acquisition_macos_connection_destroy(&connection);
   return failed ? 1 : 0;
 }
 

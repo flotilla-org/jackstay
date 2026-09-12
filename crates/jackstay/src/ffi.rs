@@ -47,6 +47,7 @@ pub const FT_STATUS_RECONFIGURATION: FtStatus = 9;
 pub const FT_STATUS_MISS: FtStatus = 10;
 pub const FT_STATUS_GAP: FtStatus = 11;
 pub const FT_STATUS_CANCELLED: FtStatus = 12;
+pub const FT_STATUS_STALE: FtStatus = 13;
 
 pub const FT_SOURCE_KIND_WINDOW: u32 = 1;
 pub const FT_SOURCE_KIND_DISPLAY: u32 = 2;

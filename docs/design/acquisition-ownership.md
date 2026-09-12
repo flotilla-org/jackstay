@@ -405,3 +405,11 @@ existing retirement owner. ABI 0.3 updates the header and library together. The
 boundary and compiled-C tests pass on macOS and Linux, and the existing SDL ABI smoke still
 acquires 30 frames. The reference viewer and Porthole remain on their legacy
 paths; their migration and the outstanding live acceptance are still required.
+
+C CPU consumers can also install a one-FD replacement offer, distinguish a stale
+offer, and relinquish their unleased current mapping during a capacity pause.
+Held frames retain their mapping and credit across these operations. Publication
+now stamps the installed allocation's configuration generation for CPU frames
+as well as native frames. Eight boundary tests and the CPU arena/replacement
+suites pass on macOS and Linux; the default full-suite run has only the existing
+legacy daemon regression failure.

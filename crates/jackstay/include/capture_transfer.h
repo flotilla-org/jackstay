@@ -39,6 +39,7 @@ uint32_t ft_abi_version(void);
 #define FT_STATUS_MISS 10
 #define FT_STATUS_GAP 11
 #define FT_STATUS_CANCELLED 12
+#define FT_STATUS_STALE 13
 
 #define FT_SOURCE_KIND_WINDOW 1
 #define FT_SOURCE_KIND_DISPLAY 2
@@ -155,6 +156,19 @@ typedef struct ft_acquisition_events {
  * resources require the backend setup that retains their handles with leases. */
 ft_status ft_acquisition_import_cpu(const uint8_t *json, size_t len, int32_t fds[5],
                                    ft_acquisition_consumer **out);
+/* Install ConfigurationDescriptor JSON plus its single owned resource FD on
+ * this already admitted consumer. The same single-use, no-fork and no-extra-FD
+ * rules apply. Invalid pointers, lengths or a negative FD reject without
+ * transfer. After basic validation the FD is consumed and set to -1 on every
+ * outcome. OK installs it; STALE disposes a valid superseded offer so the host
+ * can offer the current generation. Contradictory mappings remain ERROR.
+ * Existing frame handles keep their original storage and holding credit. */
+ft_status ft_acquisition_install_cpu_configuration(ft_acquisition_consumer *,
+                                                  const uint8_t *json, size_t len, int32_t *fd);
+/* Drop the consumer's unleased current mapping, e.g. during a capacity pause.
+ * Frame handles and deferred uses retain their own mappings; admission and
+ * notification state survive. The host retries allocation once budget permits. */
+ft_status ft_acquisition_relinquish_configuration(ft_acquisition_consumer *);
 
 /* Latest/next select after cursor; exact selects cursor (zero is invalid).
  * *out must start NULL. Success owns one frame, including duplicate acquisitions.

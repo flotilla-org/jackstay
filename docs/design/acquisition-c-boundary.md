@@ -51,6 +51,22 @@ selectable; reconfiguration and closure always wake. Cancellation is one-way,
 thread-safe and does not release frames. Consumer calls require external
 serialization; cancellation handles must outlive all concurrent callers.
 
+## Configuration replacement
+
+`ft_acquisition_install_cpu_configuration` consumes a single resource FD and its
+`ConfigurationDescriptor` JSON for the existing incarnation. Installed and stale
+offers have distinct results. A stale offer is disposed before another offer can
+be accepted; contradictory metadata or mappings remain errors. Existing frame
+handles keep their original descriptor and storage, and installing a new
+configuration adds no holding credit.
+
+During a capacity pause, `ft_acquisition_relinquish_configuration` drops the
+consumer's unleased current mapping. Leased and deferred frames retain their own
+mapping owners. The host explicitly retries allocation; relinquishing alone
+cannot make still-held storage reusable. The arena stamps `config_generation`
+from the installed resource allocation at publication, including for CPU frames,
+so the acquired descriptor agrees with its setup grant.
+
 ## Evidence and remaining work
 
 The boundary tests cover process-bound CPU import, FD disposal on malformed
@@ -60,17 +76,22 @@ and rejected/accepted deferred release through separate completion observers.
 A compiled C translation unit also acquires, describes, reads and releases a
 Rust producer's frame after consumer destruction and history wrap.
 
-All six tests pass on macOS with `backend-macos` and Linux with `backend-linux`;
-the five tests that do not require the compiled C shim also pass with Linux's
-default features. macOS workspace build, default and macOS-feature Clippy, pinned
-formatting, and the SDL smoke pass. The full workspace test run reports 124
-passing library tests and the existing daemon shadow-ring regression failure,
-then stops before running integration binaries. These checks do not establish
-live capture or actual GPU completion at the C boundary.
+Two further tests cover stale/current replacement offers with old and new frames
+held together, and a capacity pause that cannot finish until an old C frame is
+released. The Rust replacement test also checks the arena-stamped configuration
+generation. These checks do not establish live capture or actual GPU completion
+at the C boundary.
+
+All eight boundary tests, the arena suite and the replacement suite pass on
+macOS with `backend-macos` and Linux with `backend-linux`. Backend-feature Clippy
+passes on both. The SDL smoke acquires 30 frames. The macOS default workspace
+test run with `--no-fail-fast` passes every integration binary and reports just
+the known legacy daemon regression among its library tests (124 passed, one
+failed). The full log is `/tmp/jackstay-acquisition-c-workspace-tests.log` on kiwi.
 
 This is an integration step, not completion of the acquisition contract. The
 reference viewer and Porthole still use the legacy setup/data paths. Remaining
-work includes C native setup and resource access, replacement configuration
+work includes C native setup and resource access, native replacement configuration
 import, viewer completion signaling, host migration and live acceptance. The
 legacy daemon shadow-ring regression is intentionally still failing. The
 independent Metal shared-event allocation blocker and native rerun commands are

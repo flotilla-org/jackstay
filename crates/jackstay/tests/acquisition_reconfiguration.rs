@@ -341,6 +341,7 @@ fn a_consumer_installs_a_replacement_while_its_old_frame_keeps_its_descriptor_st
         panic!("missing old frame")
     };
     let old_descriptor = *old.descriptor();
+    assert_eq!(old_descriptor.config_generation, 1);
     let before = consumer.events();
     assert!(matches!(producer.reconfigure_cpu(8).unwrap(), ReconfigurationStatus::Ready { .. }));
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Reconfiguration));
@@ -367,6 +368,7 @@ fn a_consumer_installs_a_replacement_while_its_old_frame_keeps_its_descriptor_st
     assert_eq!(old.descriptor(), &old_descriptor);
     assert_eq!(old.bytes(), b"abcd");
     assert_eq!(new.descriptor().width, 2);
+    assert_eq!(new.descriptor().config_generation, 2);
     assert_eq!(new.bytes(), b"12345678");
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
     drop(old);

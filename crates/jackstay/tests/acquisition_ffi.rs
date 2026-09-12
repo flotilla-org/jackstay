@@ -88,6 +88,152 @@ fn producer() -> ArenaProducer {
     .unwrap()
 }
 
+fn imported_consumer(producer: &mut ArenaProducer, holding: u32) -> (jackstay::acquisition::IncarnationId, *mut FtAcquisitionConsumer) {
+    use std::os::fd::IntoRawFd;
+    let grant = producer.attach_process(holding, std::process::id()).unwrap();
+    let incarnation = grant.incarnation();
+    let (descriptor, fds) = grant.into_parts().unwrap();
+    let json = serde_json::to_vec(&descriptor).unwrap();
+    let mut fds = fds.map(IntoRawFd::into_raw_fd);
+    let mut consumer = ptr::null_mut();
+    // SAFETY: conforming producer; sole intended recipient of this single-use
+    // grant. No other FD copies remain and this test does not fork mappings.
+    assert_eq!(
+        unsafe { ft_acquisition_import_cpu(json.as_ptr(), json.len(), fds.as_mut_ptr(), &mut consumer) },
+        FT_STATUS_OK
+    );
+    assert_eq!(fds, [-1; 5]);
+    (incarnation, consumer)
+}
+
+#[test]
+fn c_replacement_distinguishes_stale_offers_and_preserves_old_frames_and_credit() {
+    use std::os::fd::IntoRawFd;
+    let mut producer = producer();
+    let (incarnation, mut consumer) = imported_consumer(&mut producer, 2);
+    producer
+        .publish(
+            FrameDescriptor {
+                width: 1,
+                ..Default::default()
+            },
+            b"abcd",
+        )
+        .unwrap();
+    // SAFETY: this test is the only owner of these process-bound grants and
+    // handles; old byte borrows remain within their explicitly held frame.
+    unsafe {
+        let mut old = ptr::null_mut();
+        let mut new = ptr::null_mut();
+        let mut range = FtAcquisitionRange::default();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut old, &mut range),
+            FT_STATUS_OK
+        );
+        producer.reconfigure_cpu(8).unwrap();
+        let (stale, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
+        producer.reconfigure_cpu(12).unwrap();
+        let json = serde_json::to_vec(&stale).unwrap();
+        let mut fd = fd.into_raw_fd();
+        assert_eq!(
+            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), &mut fd),
+            FT_STATUS_STALE
+        );
+        assert_eq!(fd, -1);
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut new, &mut range),
+            FT_STATUS_RECONFIGURATION
+        );
+        let (current, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
+        let json = serde_json::to_vec(&current).unwrap();
+        let mut fd = fd.into_raw_fd();
+        assert_eq!(
+            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), &mut fd),
+            FT_STATUS_OK
+        );
+        assert_eq!(fd, -1);
+        producer
+            .publish(
+                FrameDescriptor {
+                    width: 3,
+                    ..Default::default()
+                },
+                b"replacement!",
+            )
+            .unwrap();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut new, &mut range),
+            FT_STATUS_OK
+        );
+        let mut unavailable = ptr::null_mut();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut unavailable, &mut range),
+            FT_STATUS_HOLDING_LIMIT
+        );
+        let mut before = FrameDescriptor::default();
+        let mut after = FrameDescriptor::default();
+        assert_eq!(ft_acquired_frame_describe(old, &mut before), FT_STATUS_OK);
+        assert_eq!(ft_acquired_frame_describe(new, &mut after), FT_STATUS_OK);
+        assert_eq!((before.width, after.width), (1, 3));
+        assert_eq!(before.config_generation, 1);
+        assert_eq!(after.config_generation, current.generation);
+        ft_acquisition_consumer_destroy(&mut consumer);
+        let mut bytes = ptr::null();
+        let mut len = 0;
+        assert_eq!(ft_acquired_frame_bytes(old, &mut bytes, &mut len), FT_STATUS_OK);
+        assert_eq!(std::slice::from_raw_parts(bytes, len), b"abcd");
+        assert_eq!(ft_acquired_frame_release(&mut old), FT_STATUS_OK);
+        assert_eq!(ft_acquired_frame_bytes(new, &mut bytes, &mut len), FT_STATUS_OK);
+        assert_eq!(std::slice::from_raw_parts(bytes, len), b"replacement!");
+        assert_eq!(ft_acquired_frame_release(&mut new), FT_STATUS_OK);
+    }
+}
+
+#[test]
+fn c_relinquish_does_not_allow_an_exhausted_transition_to_reuse_a_held_frame() {
+    use jackstay::acquisition::arena::ReconfigurationStatus;
+    let mut producer = ArenaProducer::new(ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 32 * 1024,
+        memory_budget: 512 * 1024,
+        max_incarnations: 2,
+        drain_timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    let (_, mut consumer) = imported_consumer(&mut producer, 1);
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    // SAFETY: exclusive handles and no byte access after the frame is released.
+    unsafe {
+        let mut frame = ptr::null_mut();
+        let mut range = FtAcquisitionRange::default();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut frame, &mut range),
+            FT_STATUS_OK
+        );
+        assert!(matches!(
+            producer.reconfigure_cpu(64 * 1024).unwrap(),
+            ReconfigurationStatus::PausedCapacity { .. }
+        ));
+        assert_eq!(ft_acquisition_relinquish_configuration(consumer), FT_STATUS_OK);
+        assert!(matches!(
+            producer.advance_reconfiguration().unwrap(),
+            ReconfigurationStatus::PausedCapacity { .. }
+        ));
+        let mut bytes = ptr::null();
+        let mut len = 0;
+        assert_eq!(ft_acquired_frame_bytes(frame, &mut bytes, &mut len), FT_STATUS_OK);
+        assert_eq!(std::slice::from_raw_parts(bytes, len), b"abcd");
+        assert_eq!(ft_acquired_frame_release(&mut frame), FT_STATUS_OK);
+        assert!(matches!(
+            producer.advance_reconfiguration().unwrap(),
+            ReconfigurationStatus::Ready { .. }
+        ));
+        ft_acquisition_consumer_destroy(&mut consumer);
+    }
+}
+
 #[test]
 fn c_frames_keep_independent_credit_and_survive_consumer_destruction() {
     let mut producer = producer();

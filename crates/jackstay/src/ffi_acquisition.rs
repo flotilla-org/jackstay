@@ -11,8 +11,8 @@ use std::{
 
 use crate::{
     acquisition::arena::{
-        AcquireOutcome, ArenaConsumer, ArenaError, Cancellation, ConsumerGrant, ConsumerReleaseTimeline, FrameDescriptor, FrameLease,
-        GrantDescriptor, WaitEvents, WaitInterest, WaitOutcome,
+        AcquireOutcome, ArenaConsumer, ArenaError, Cancellation, ConfigurationDescriptor, ConfigurationGrant, ConfigurationInstall,
+        ConsumerGrant, ConsumerReleaseTimeline, FrameDescriptor, FrameLease, GrantDescriptor, WaitEvents, WaitInterest, WaitOutcome,
     },
     ffi::*,
 };
@@ -124,9 +124,9 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
         Ok(descriptor) => descriptor,
         Err(_) => return FT_STATUS_INVALID_ARGUMENT,
     };
+    let is_cpu = descriptor.payload_capacity != 0;
     // SAFETY: these are the intended process's single-use mappings from the
     // conforming producer required by this function's caller contract.
-    let is_cpu = descriptor.payload_capacity != 0;
     let result = unsafe { ConsumerGrant::from_parts(descriptor, owned) }.and_then(|grant| {
         if !is_cpu {
             return Err(ArenaError::Configuration("CPU import requires inline storage"));
@@ -140,6 +140,71 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
         }
         Err(error) => status(error),
     }
+}
+
+/// Install a single-use CPU replacement offer without changing incarnation or
+/// holding credit. Stale offers are disposed and return FT_STATUS_STALE.
+///
+/// # Safety
+/// The producer, recipient and mapping lifetime must obey
+/// ConfigurationGrant::from_parts. No replay, forwarding, fork or other FD
+/// copies are allowed. `consumer` must be live and exclusively accessed; `json`
+/// must reference `len` readable bytes and `fd` must point to one exclusively
+/// owned live FD. All arguments must be non-aliasing. After basic validation the
+/// FD is consumed on every outcome and its caller-visible value becomes -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_acquisition_install_cpu_configuration(
+    consumer: *mut FtAcquisitionConsumer,
+    json: *const u8,
+    len: usize,
+    fd: *mut i32,
+) -> FtStatus {
+    if json.is_null() || len == 0 || len > 1024 * 1024 {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: validity, exclusivity and non-aliasing are caller obligations.
+    let (Some(consumer), Some(fd)) = (unsafe { consumer.as_mut() }, unsafe { fd.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if *fd < 0 {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: sole ownership of this live FD is transferred exactly once.
+    let owned = unsafe { OwnedFd::from_raw_fd(std::mem::replace(fd, -1)) };
+    // SAFETY: caller guarantees the readable byte range; length is bounded above.
+    let bytes = unsafe { std::slice::from_raw_parts(json, len) };
+    let descriptor: ConfigurationDescriptor = match serde_json::from_slice(bytes) {
+        Ok(descriptor) => descriptor,
+        Err(_) => return FT_STATUS_INVALID_ARGUMENT,
+    };
+    let is_cpu = descriptor.payload_capacity != 0;
+    // SAFETY: this consumer is the intended recipient of the conforming
+    // producer's single-use replacement as required by the caller contract.
+    let result = unsafe { ConfigurationGrant::from_parts(&consumer.0, descriptor, owned) }.and_then(|grant| {
+        if !is_cpu {
+            return Err(ArenaError::Configuration("CPU replacement requires inline storage"));
+        }
+        consumer.0.install_configuration(grant)
+    });
+    match result {
+        Ok(ConfigurationInstall::Installed) => FT_STATUS_OK,
+        Ok(ConfigurationInstall::Stale) => FT_STATUS_STALE,
+        Err(error) => status(error),
+    }
+}
+
+/// Relinquish unleased configuration storage, preserving leases and admission.
+///
+/// # Safety
+/// `consumer` must be null or a live handle with exclusive access.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_acquisition_relinquish_configuration(consumer: *mut FtAcquisitionConsumer) -> FtStatus {
+    // SAFETY: caller guarantees live handle and exclusive access.
+    let Some(consumer) = (unsafe { consumer.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    consumer.0.relinquish_configuration();
+    FT_STATUS_OK
 }
 
 /// Acquire latest/next after `cursor`, or exactly `cursor`. Miss and gap ranges

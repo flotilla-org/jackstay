@@ -83,6 +83,7 @@ pub struct FrameDescriptor {
     pub cursor: u64,
     pub sequence: u64,
     pub timestamp_ns: u64,
+    /// Installed allocation generation, stamped by the arena at publication.
     pub config_generation: u64,
     pub pool_id: u64,
     pub payload_offset: u64,
@@ -717,6 +718,7 @@ impl ArenaProducer {
             let cursor = self.cursor + 1;
             let payload_offset = resources.layout.payload_offset(index);
             descriptor.cursor = cursor;
+            descriptor.config_generation = resources.generation;
             descriptor.payload_offset = payload_offset as u64;
             descriptor.payload_len = bytes.len() as u64;
             // SAFETY: resource is outside history, retired, and unclaimed.

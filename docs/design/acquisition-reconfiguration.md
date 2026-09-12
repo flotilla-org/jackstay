@@ -54,12 +54,15 @@ cancellable wait usable. Once enough old allocations are reclaimable, reserve an
 allocate the replacement before allowing admission again. No temporary allocation
 may exceed the budget.
 
-Limit outstanding configuration offers. Do not begin another replacement while
-an earlier offer remains unacknowledged by a live recipient. A host can retry a
-newer size/format request after the current transition settles; it must not queue
-an unbounded series of replacement pools. Old generations held by actual leases
-remain separately charged and can coexist with later installed generations only
-within the same budget and holding limits.
+Limit each incarnation to one outstanding configuration offer. Later replacements
+may proceed for healthy consumers if the budget covers every retained allocation;
+an unresponsive recipient must not create an unbounded offer queue or an extra
+global acknowledgement barrier. Keep its one older offer charged. When it handles
+a stale offer, it relinquishes that offer's mapping/handles, acknowledges disposal,
+and requests the current generation. Staleness is a normal setup retry; foreign
+identity or contradictory metadata remains an error. Old generations held by
+actual leases or outstanding offers remain charged while later generations are
+installed, within the same byte budget and holding limits.
 
 ## What permits retiring an allocation
 

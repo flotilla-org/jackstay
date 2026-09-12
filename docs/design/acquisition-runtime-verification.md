@@ -56,7 +56,11 @@ named native service. Artifacts: `/tmp/porthole-live-acquisition-qrl79wnm/`.
 Porthole's `docs/2026-09-12-live-acquisition-acceptance.md` records provenance,
 retirement, counters and limitations.
 
-Live resize is still unverified: Simulator rejected AX size writes while both
-capture paths remained at 456×972. A manual resize was requested. The successful
-playback and normal closure do not resolve the submitted-GPU crash quarantine or
-prove process-wide graceful daemon drainage.
+Simulator rejected AX size writes, and a manual resize was requested. Both
+replacement sessions later adopted 912×1944 pixels at scale 2 with unchanged
+logical window bounds. New delayed viewers completed 300 frames each at that
+format, then both sessions closed and the test identity was revoked. No format
+transition was observed while those delayed viewers were running, so live
+reconfiguration with held frames remains unverified. The successful playback
+and normal closure do not resolve the submitted-GPU crash quarantine or prove
+process-wide graceful daemon drainage.

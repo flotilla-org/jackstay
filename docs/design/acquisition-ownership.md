@@ -440,6 +440,9 @@ arena through the Unix setup boundary. The old daemon shadow-ring validation and
 per-frame socket lease API have been removed. See
 [CPU setup](acquisition-cpu-setup.md) for the host limits, cancellation and
 retirement behavior, C ABI 0.4 client entry points and remaining live acceptance.
-The offline in-process `ft_producer`/`ft_consumer` API still uses `VideoSlotManager`
-and remains a separate migration item; it does not establish common-acquisition
-acceptance for the reference viewer's standalone synthetic mode.
+The standalone API has since moved to the same arena through ABI 0.5's
+`ft_cpu_producer` functions. The legacy `VideoSlotManager` and C wrappers are
+removed. Standalone and Porthole CPU viewing now share a render/acquire loop.
+The C producer retains ownership when destruction reports draining or recovery
+required. See [the C boundary](acquisition-c-boundary.md#cpu-producers) for its
+explicit limits and replacement operations. Live acceptance is still outstanding.

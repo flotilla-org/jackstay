@@ -20,9 +20,9 @@ line tools supply the Objective-C and Metal frameworks. On Linux, the optional
 ./scripts/smoke-viewer.sh
 ```
 
-The SDL viewer creates an in-process synthetic producer, registers a video track,
-publishes generated frames through the C API, acquires and checks them through the
-consumer API, and renders 30 frames before shutting down. It prints
+The SDL viewer creates a bounded in-process CPU arena, reserves two frame holds,
+publishes generated frames through the C API, and renders 30 frames through the
+same acquisition and rendering loop used for Porthole CPU sessions. It prints
 `acquired_frames=30` and fails if publishing, acquisition, payload validation or
 rendering fails. No porthole daemon, desktop capture permission or second checkout
 is required. To run the same check without a display:
@@ -31,8 +31,11 @@ is required. To run the same check without a display:
 SDL_VIDEODRIVER=dummy ./scripts/smoke-viewer.sh
 ```
 
-The synthetic example exercises the in-process producer/consumer interface; it
-does not claim cross-process handle-transfer or live-capture verification.
+The synthetic example exercises common acquisition and checks that producer
+storage drains before destruction. It does not prove cross-process handle
+transfer or live capture. The [C producer API](docs/design/acquisition-c-boundary.md#cpu-producers)
+exposes admission limits, dropped publication, byte-budgeted replacement and
+retained destruction directly.
 
 Build just the Rust library with `cargo build --workspace --locked`. For macOS
 native capture consumers, add `--features backend-macos`; for Linux native

@@ -1,7 +1,7 @@
 # Acquisition across Rust and C
 
 The common arena now has an ownership boundary in `ffi_acquisition.rs`, declared
-in `capture_transfer.h` under ABI 0.4. It uses `ArenaConsumer`, `FrameLease`,
+in `capture_transfer.h` under ABI 0.5. It uses `ArenaConsumer`, `FrameLease`,
 `Cancellation` and `ConsumerReleaseTimeline` directly. It has no C lease book.
 
 ## Setup and ownership
@@ -107,3 +107,34 @@ arena's process-bound grants and replacement maps without per-frame messages.
 Its Rust client returns `ArenaConsumer` directly. Connecting it to Porthole's
 authorization/routing and the CPU Rust/C consumers is the next integration step;
 the new transport alone does not fix the older daemon path.
+
+
+## CPU producers
+
+`ffi_acquisition::producer` exposes one `ArenaProducer` per stream. The host
+chooses sources and tracks; the C boundary maintains no parallel registry or
+lease table. `ft_cpu_producer_config` requires resource capacity, history,
+producer reserve, maximum incarnations, payload capacity, total memory budget
+and drain timeout. A fresh `ft_cpu_producer_attach` negotiates a holding limit
+and returns the same `ft_acquisition_consumer` as other setup paths.
+
+`ft_cpu_producer_publish` copies BGRA/RGBA bytes and stamps CPU-copy readiness.
+It returns a publication cursor or a distinct dropped result. Replacement and
+idle advancement expose either the installed generation or the pending byte
+requirement and available capacity. Configuration installation checks producer
+and claim scopes before checking whether the consumer is already current.
+
+`ft_cpu_producer_destroy` stops acquisition and publication, then checks actual
+retirement. Success destroys and clears the handle. Draining or recovery-required
+leaves ownership with the caller, which must finish outstanding use, destroy its
+consumers, continue cleanup and retry. No timeout forces destruction. These
+in-process handles and mappings must not cross a fork or be forwarded to another
+process; remote recipients use the process-bound setup APIs.
+
+ABI 0.5 removes the old `ft_producer`/`ft_consumer` API and its descriptor/event
+wrappers. Rust removes `video::VideoSlotManager`; callers use the common arena.
+The standalone SDL mode now publishes to this C producer and uses the same
+consumer/render loop as a Porthole CPU session. Tests cover duplicate holding
+credit, history wrap, refused destruction, timeout recovery, old/new allocation
+budgeting and foreign consumer rejection. These remain synthetic CPU checks;
+the contract's authorized live CPU/GPU acceptance is still required.

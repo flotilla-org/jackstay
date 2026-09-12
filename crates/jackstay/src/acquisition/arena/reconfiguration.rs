@@ -275,6 +275,28 @@ impl ArenaProducer {
         Ok(())
     }
 
+    /// Install this producer's current CPU allocation on an already admitted
+    /// local consumer. No admission or frame ownership changes are implied.
+    pub fn configure_consumer(&mut self, consumer: &mut ArenaConsumer) -> Result<Option<ConfigurationInstall>, ArenaError> {
+        if self.control.scope != consumer.control.scope
+            || self
+                .claims
+                .get(&consumer.incarnation())
+                .is_none_or(|claims| claims.scope != consumer.lifetime.claims.scope)
+        {
+            return Err(ArenaError::Configuration("consumer belongs to another producer"));
+        }
+        if consumer.is_closed() {
+            return Err(ArenaError::Closed);
+        }
+        if consumer.is_configured() {
+            return Ok(None);
+        }
+        self.configuration_offer(consumer.incarnation())?
+            .map(|offer| consumer.install_configuration(offer))
+            .transpose()
+    }
+
     pub fn configuration_offer(&mut self, incarnation: IncarnationId) -> Result<Option<ConfigurationGrant>, ArenaError> {
         let claims = self.claims.get(&incarnation).ok_or(AdmissionError::UnknownIncarnation)?;
         if claims.word(ACTIVE).load(SeqCst) == 0 {

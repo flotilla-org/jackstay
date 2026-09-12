@@ -139,6 +139,7 @@ acquisitions with a typed ring-overrun error at the shadow metadata read.
 A deterministic socket-consumer regression reproduces the post-lease case:
 a two-entry metadata ring advances to cursor 3 before the response for leased
 cursor 1 is read. Cursor 1's payload remains available, but the current client
-fails its shadow check. The regression is present locally; no runtime fix has
-been applied. A complete implementation must also handle loss before acquisition,
+fails its shadow check. That regression covered the previous daemon path, which has now been removed.
+Its replacement uses common frame leases; the session tests retain a frame
+through 100 subsequent publications and destruction of the connection/consumer. A complete implementation must also handle loss before acquisition,
 rather than only suppressing the observed post-acquisition failure.

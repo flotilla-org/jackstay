@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 4
+#define FT_ABI_VERSION_MINOR 5
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -40,6 +40,11 @@ uint32_t ft_abi_version(void);
 #define FT_STATUS_GAP 11
 #define FT_STATUS_CANCELLED 12
 #define FT_STATUS_STALE 13
+#define FT_STATUS_DRAINING 14
+#define FT_STATUS_DROPPED 15
+#define FT_STATUS_PAUSED_CAPACITY 16
+#define FT_STATUS_CAPACITY 17
+#define FT_STATUS_RECOVERY_REQUIRED 18
 
 #define FT_SOURCE_KIND_WINDOW 1
 #define FT_SOURCE_KIND_DISPLAY 2
@@ -82,8 +87,6 @@ typedef int32_t ft_status;
 typedef uint64_t ft_source_id;
 typedef uint64_t ft_track_id;
 
-typedef struct ft_producer ft_producer;
-typedef struct ft_consumer ft_consumer;
 
 #if defined(__unix__) || defined(__APPLE__)
 /* Common acquisition ownership (Unix shared arena). Import a host's CPU grant,
@@ -253,6 +256,40 @@ ft_status ft_acquired_frame_macos_resources(const ft_acquired_frame *, void **ou
 void ft_acquisition_macos_connection_destroy(ft_macos_acquisition_connection **);
 #endif
 
+/* In-process single-stream CPU producer. Source/track selection belongs to
+ * the host. Serialize producer calls; consumer/frame lifetimes are independent.
+ * Local handles/maps must not be forked or forwarded into another process. */
+typedef struct ft_cpu_producer ft_cpu_producer;
+typedef struct ft_cpu_producer_config {
+  uint32_t resource_capacity, retained_history, producer_reserve, max_incarnations;
+  uint64_t payload_capacity, memory_budget, drain_timeout_ns;
+} ft_cpu_producer_config;
+typedef struct ft_cpu_reconfiguration {
+  uint64_t generation, requested_bytes, available_bytes;
+} ft_cpu_reconfiguration;
+
+/* Handle outputs start NULL and are set only on success. No hidden defaults:
+ * config includes all resource, byte-budget and incarnation limits. */
+ft_status ft_cpu_producer_create(const ft_cpu_producer_config *, ft_cpu_producer **out);
+ft_status ft_cpu_producer_attach(ft_cpu_producer *, uint32_t holding, ft_acquisition_consumer **out);
+/* Input bytes are copied before return; descriptor/output/bytes are disjoint.
+ * Only BGRA/RGBA CPU frames with consistent dimensions/stride/length are accepted.
+ * The copy stamps CPU readiness and clears native fences/modifier. Arena identity,
+ * cursor, payload location and configuration generation are stamped by publication.
+ * OK returns a nonzero cursor; DROPPED returns zero without acquiring storage. */
+ft_status ft_cpu_producer_publish(ft_cpu_producer *, const ft_acquired_frame_descriptor *,
+                                  const uint8_t *bytes, size_t len, uint64_t *out_cursor);
+/* PAUSED_CAPACITY reports the pending transition's overlap budget. CAPACITY
+ * rejects a proposal that cannot fit after old resources retire. */
+ft_status ft_cpu_producer_reconfigure(ft_cpu_producer *, uint64_t payload_capacity, ft_cpu_reconfiguration *out);
+ft_status ft_cpu_producer_advance(ft_cpu_producer *, ft_cpu_reconfiguration *out);
+ft_status ft_cpu_producer_configure_consumer(ft_cpu_producer *, ft_acquisition_consumer *);
+ft_status ft_cpu_producer_poll_cleanup(ft_cpu_producer *);
+/* Stops acquisition/publication. DRAINING/RECOVERY_REQUIRED leave the producer
+ * handle owned by the caller: release work, continue maintenance and retry.
+ * Only OK destroys/clears it; timeout never permits forced reclamation. */
+ft_status ft_cpu_producer_destroy(ft_cpu_producer **);
+
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(ft_acquired_frame_descriptor) == 144, "acquired descriptor size");
 _Static_assert(offsetof(ft_acquired_frame_descriptor, fence_value) == 72, "acquired readiness packing");
@@ -260,23 +297,10 @@ _Static_assert(offsetof(ft_acquired_frame_descriptor, width) == 96, "acquired di
 _Static_assert(offsetof(ft_acquired_frame_descriptor, flags) == 140, "acquired flags packing");
 _Static_assert(sizeof(ft_acquisition_range) == 16, "acquisition range size");
 _Static_assert(sizeof(ft_acquisition_events) == 32, "acquisition events size");
+_Static_assert(sizeof(ft_cpu_producer_config) == 40, "CPU producer config size");
+_Static_assert(sizeof(ft_cpu_reconfiguration) == 24, "CPU reconfiguration size");
 #endif
 #endif
-
-/*
- * Threading: v1 handles are single-threaded. Do not call capture-transfer C ABI
- * functions concurrently on the same ft_producer or ft_consumer. External
- * synchronization is required if a host application moves handles across
- * threads.
- */
-
-typedef struct ft_producer_options {
-  uint32_t reserved;
-} ft_producer_options;
-
-typedef struct ft_consumer_options {
-  ft_producer *producer;
-} ft_consumer_options;
 
 typedef struct ft_synthetic_session {
   char session_id[64];
@@ -285,114 +309,8 @@ typedef struct ft_synthetic_session {
   char fd_socket_path[4096];
 } ft_synthetic_session;
 
-typedef struct ft_source_desc {
-  uint32_t kind;
-  const char *label;
-} ft_source_desc;
-
-typedef struct ft_video_track_desc {
-  uint32_t width;
-  uint32_t height;
-  uint32_t pixel_format;
-} ft_video_track_desc;
-
-typedef struct ft_track_desc {
-  uint32_t track_type;
-  ft_video_track_desc video;
-} ft_track_desc;
-
-typedef struct ft_video_frame_desc {
-  uint64_t sequence;
-  uint64_t timestamp_ns;
-  uint32_t width;
-  uint32_t height;
-  uint32_t stride;
-  uint32_t pixel_format;
-  /* Pool ids are unique forever (never reused); no generation needed. */
-  uint64_t pool_id;
-  uint32_t slot_id;
-  uint64_t payload_offset;
-  uint64_t payload_len;
-  uint64_t payload_map_len;
-  uint32_t clock_domain;
-  uint32_t color_space;
-  uint32_t sync_kind;
-  uint32_t damage_kind;
-  uint64_t damage_base_sequence;
-  uint32_t dropped_before_publish;
-  uint64_t producer_drop_count;
-  uint64_t evicted_count;
-  uint64_t consumer_skipped_count;
-  /* Native-handle descriptor: payload_kind selects cpu-shm vs IOSurface/
-   * dmabuf/D3D; native frames carry no in-band payload and are sampled
-   * after waiting for fence_value on the stream's fence_id. */
-  uint32_t payload_kind;
-  uint64_t modifier;
-  uint64_t fence_id;
-  uint64_t fence_value;
-  uint32_t flags;
-} ft_video_frame_desc;
-
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-/*
- * Pin the ABI of ft_video_frame_desc. The mirror lives in the Rust
- * FtVideoFrameDesc (#[repr(C)]); these asserts and the matching
- * const _: () block in src/ffi.rs must agree. Narrowing a field or
- * appending to the tail without updating both sides is the trap this
- * guards against.
- */
-_Static_assert(sizeof(ft_video_frame_desc) == 168, "frame desc size");
-_Static_assert(offsetof(ft_video_frame_desc, pool_id) == 32, "frame desc packing");
-_Static_assert(offsetof(ft_video_frame_desc, slot_id) == 40, "slot_id narrowed to u32");
-_Static_assert(offsetof(ft_video_frame_desc, dropped_before_publish) == 96, "dropped_before_publish narrowed to u32");
-_Static_assert(offsetof(ft_video_frame_desc, payload_kind) == 128, "native-handle tail begins");
-_Static_assert(offsetof(ft_video_frame_desc, modifier) == 136, "native-handle tail packing");
-_Static_assert(offsetof(ft_video_frame_desc, fence_id) == 144, "native-handle tail packing");
-_Static_assert(offsetof(ft_video_frame_desc, fence_value) == 152, "native-handle tail packing");
-_Static_assert(offsetof(ft_video_frame_desc, flags) == 160, "native-handle tail packing");
-#endif
-
-typedef struct ft_event {
-  uint32_t kind;
-  ft_source_id source_id;
-  ft_track_id track_id;
-  uint32_t track_type;
-  uint32_t width;
-  uint32_t height;
-  uint32_t pixel_format;
-} ft_event;
-
-typedef struct ft_video_frame {
-  ft_video_frame_desc desc;
-  const void *data;
-  size_t len;
-  void *handle;
-} ft_video_frame;
-
-ft_status ft_producer_create(const ft_producer_options *options, ft_producer **out);
-ft_status ft_producer_register_source(ft_producer *producer,
-                                      const ft_source_desc *desc,
-                                      ft_source_id *out_source_id);
-ft_status ft_producer_register_track(ft_producer *producer,
-                                     ft_source_id source_id,
-                                     const ft_track_desc *desc,
-                                     ft_track_id *out_track_id);
-ft_status ft_producer_publish_video_frame(ft_producer *producer,
-                                          ft_track_id track_id,
-                                          const ft_video_frame_desc *desc,
-                                          const void *pixels,
-                                          size_t len);
-void ft_producer_destroy(ft_producer *producer);
-
-ft_status ft_consumer_connect(const ft_consumer_options *options, ft_consumer **out);
 ft_status ft_create_synthetic_session(const char *control_socket_path,
                                       ft_synthetic_session *out);
-ft_status ft_consumer_poll_event(ft_consumer *consumer, ft_event *out_event);
-ft_status ft_consumer_acquire_latest_video_frame(ft_consumer *consumer,
-                                                 ft_track_id track_id,
-                                                 ft_video_frame *out_frame);
-void ft_consumer_release_video_frame(ft_consumer *consumer, ft_video_frame *frame);
-void ft_consumer_destroy(ft_consumer *consumer);
 
 /* Native handle path. This is intentionally a low-level C ABI:
  *

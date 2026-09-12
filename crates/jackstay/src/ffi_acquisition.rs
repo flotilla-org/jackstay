@@ -26,6 +26,8 @@ pub const FT_WAIT_ALL: u32 = 3;
 
 pub struct FtAcquisitionConsumer(ArenaConsumer);
 
+pub mod producer;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod session;
 

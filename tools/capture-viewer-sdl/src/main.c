@@ -21,15 +21,6 @@ typedef struct viewer_options {
   const char *token;
 } viewer_options;
 
-typedef struct stream_state {
-  ft_producer *producer;
-  ft_consumer *consumer;
-  ft_track_id track_id;
-  uint32_t width;
-  uint32_t height;
-  uint32_t stride;
-} stream_state;
-
 static void fill_frame(uint8_t *pixels, uint64_t sequence) {
   for (uint32_t y = 0; y < HEIGHT; y++) {
     for (uint32_t x = 0; x < WIDTH; x++) {
@@ -225,14 +216,16 @@ static int run_native(const viewer_options *options) {
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
-static int run_cpu_session(const viewer_options *options) {
+static int run_cpu(const viewer_options *options) {
   ft_synthetic_session synthetic = {0};
   const char *session_id = options->session_id;
-  if (session_id == NULL) {
+  if (options->porthole_socket != NULL && session_id == NULL) {
     if (require_ok(ft_create_synthetic_session(options->porthole_socket, &synthetic), "ft_create_synthetic_session")) return 1;
     session_id = synthetic.session_id;
   }
   ft_cpu_acquisition_connection *connection = NULL;
+  ft_cpu_producer *producer = NULL;
+  uint8_t *pixels = NULL;
   ft_acquisition_consumer *consumer = NULL;
   ft_acquisition_cancellation *cancellation = NULL;
   uint64_t track = 0, acquired = 0, requested_epoch = 0;
@@ -241,10 +234,22 @@ static int run_cpu_session(const viewer_options *options) {
   SDL_Window *window = NULL;
   SDL_Renderer *renderer = NULL;
   SDL_Texture *texture = NULL;
-  if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
-                    options->token != NULL ? options->token : getenv("PORTHOLE_AGENT_TOKEN"), 2,
-                    &connection, &consumer, &track), "ft_acquisition_cpu_connect_session") ||
-      require_ok(ft_acquisition_cancellation_create(&cancellation), "ft_acquisition_cancellation_create")) goto cleanup;
+  if (options->porthole_socket != NULL) {
+    if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
+                      options->token != NULL ? options->token : getenv("PORTHOLE_AGENT_TOKEN"), 2,
+                      &connection, &consumer, &track), "ft_acquisition_cpu_connect_session")) goto cleanup;
+  } else {
+    ft_cpu_producer_config config = {
+      .resource_capacity = 6, .retained_history = 2, .producer_reserve = 1,
+      .max_incarnations = 2, .payload_capacity = STRIDE * HEIGHT,
+      .memory_budget = 8 * 1024 * 1024, .drain_timeout_ns = 5 * UINT64_C(1000000000),
+    };
+    if (require_ok(ft_cpu_producer_create(&config, &producer), "ft_cpu_producer_create") ||
+        require_ok(ft_cpu_producer_attach(producer, 2, &consumer), "ft_cpu_producer_attach")) goto cleanup;
+    pixels = malloc((size_t)STRIDE * HEIGHT);
+    if (pixels == NULL) { fprintf(stderr, "synthetic pixel allocation failed\n"); goto cleanup; }
+  }
+  if (require_ok(ft_acquisition_cancellation_create(&cancellation), "ft_acquisition_cancellation_create")) goto cleanup;
   if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL init: %s\n", SDL_GetError()); goto cleanup; }
   sdl_started = 1;
   window = SDL_CreateWindow("capture-viewer-sdl", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
@@ -258,6 +263,18 @@ static int run_cpu_session(const viewer_options *options) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) running = 0;
     if (!running) break;
+    uint64_t published_cursor = 0;
+    if (producer != NULL) {
+      fill_frame(pixels, acquired + 1);
+      ft_acquired_frame_descriptor descriptor = {
+        .sequence = acquired + 1, .timestamp_ns = (acquired + 1) * UINT64_C(16666667),
+        .width = WIDTH, .height = HEIGHT, .stride = STRIDE, .pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM,
+      };
+      ft_status publication = ft_cpu_producer_publish(producer, &descriptor, pixels, (size_t)STRIDE * HEIGHT, &published_cursor);
+      if (publication != FT_STATUS_OK && publication != FT_STATUS_DROPPED) {
+        fprintf(stderr, "CPU publication: %d\n", publication); failed = 1; break;
+      }
+    }
     ft_acquisition_events before = {0};
     if (require_ok(ft_acquisition_snapshot(consumer, &before), "ft_acquisition_snapshot")) { failed = 1; break; }
     ft_acquired_frame *frame = NULL;
@@ -272,6 +289,12 @@ static int run_cpu_session(const viewer_options *options) {
       size_t len = 0;
       if (require_ok(ft_acquired_frame_describe(frame, &desc), "ft_acquired_frame_describe") ||
           require_ok(ft_acquired_frame_bytes(frame, &bytes, &len), "ft_acquired_frame_bytes")) {
+        ft_acquired_frame_release(&frame); failed = 1; break;
+      }
+      if (producer != NULL && published_cursor != 0 &&
+          (desc.cursor != published_cursor || desc.sequence != acquired + 1 ||
+           len != (size_t)STRIDE * HEIGHT || memcmp(bytes, pixels, len) != 0)) {
+        fprintf(stderr, "synthetic acquisition payload/sequence mismatch\n");
         ft_acquired_frame_release(&frame); failed = 1; break;
       }
       uint32_t pixel_format = desc.pixel_format == FT_PIXEL_FORMAT_BGRA8_UNORM ? SDL_PIXELFORMAT_BGRA32 :
@@ -305,7 +328,8 @@ static int run_cpu_session(const viewer_options *options) {
       if (!requested_configuration || requested_epoch != before.reconfiguration_epoch) {
         requested_configuration = 1; requested_epoch = before.reconfiguration_epoch;
         if (require_ok(ft_acquisition_relinquish_configuration(consumer), "ft_acquisition_relinquish_configuration")) { failed = 1; break; }
-        status = ft_acquisition_cpu_install_configuration(connection, consumer);
+        status = producer != NULL ? ft_cpu_producer_configure_consumer(producer, consumer) :
+                                   ft_acquisition_cpu_install_configuration(connection, consumer);
         if (status == FT_STATUS_OK) continue;
         if (status == FT_STATUS_CLOSED) break;
         if (status != FT_STATUS_EMPTY && status != FT_STATUS_STALE) { fprintf(stderr, "CPU configuration: %d\n", status); failed = 1; break; }
@@ -330,10 +354,12 @@ cleanup:
   ft_acquisition_cancellation_destroy(&cancellation);
   ft_acquisition_consumer_destroy(&consumer);
   ft_acquisition_cpu_connection_destroy(&connection);
+  free(pixels);
+  if (require_ok(ft_cpu_producer_destroy(&producer), "ft_cpu_producer_destroy")) failed = 1;
   return failed ? 1 : 0;
 }
 #else
-static int run_cpu_session(const viewer_options *options) {
+static int run_cpu(const viewer_options *options) {
   (void)options;
   fprintf(stderr, "CPU session transport requires macOS or Linux\n");
   return 1;
@@ -346,231 +372,5 @@ int main(int argc, char **argv) {
     return 1;
   }
   viewer_options options = parse_options(argc, argv);
-
-  if (options.native) {
-    return run_native(&options);
-  }
-  if (options.porthole_socket != NULL) return run_cpu_session(&options);
-
-  stream_state stream = {
-      .producer = NULL,
-      .consumer = NULL,
-      .track_id = 0,
-      .width = WIDTH,
-      .height = HEIGHT,
-      .stride = STRIDE,
-  };
-
-  {
-    ft_producer_options producer_options = {0};
-    if (require_ok(ft_producer_create(&producer_options, &stream.producer), "ft_producer_create")) {
-      return 1;
-    }
-
-    ft_source_id source_id = 0;
-    ft_source_desc source_desc = {
-        .kind = FT_SOURCE_KIND_WINDOW,
-        .label = "synthetic",
-    };
-    if (require_ok(ft_producer_register_source(stream.producer, &source_desc, &source_id),
-                   "ft_producer_register_source")) {
-      ft_producer_destroy(stream.producer);
-      return 1;
-    }
-
-    ft_track_desc track_desc = {
-        .track_type = FT_TRACK_TYPE_VIDEO,
-        .video = {.width = WIDTH, .height = HEIGHT, .pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM},
-    };
-    if (require_ok(ft_producer_register_track(stream.producer, source_id, &track_desc, &stream.track_id),
-                   "ft_producer_register_track")) {
-      ft_producer_destroy(stream.producer);
-      return 1;
-    }
-
-    ft_consumer_options consumer_options = {.producer = stream.producer};
-    if (require_ok(ft_consumer_connect(&consumer_options, &stream.consumer), "ft_consumer_connect")) {
-      ft_producer_destroy(stream.producer);
-      return 1;
-    }
-  }
-
-  ft_event event;
-  while (ft_consumer_poll_event(stream.consumer, &event) == FT_STATUS_OK) {
-    if (event.kind == FT_EVENT_TRACK_REGISTERED && event.track_type == FT_TRACK_TYPE_VIDEO) {
-      stream.track_id = event.track_id;
-      stream.width = event.width;
-      stream.height = event.height;
-      stream.stride = event.width * 4;
-    }
-  }
-  if (stream.track_id == 0) {
-    fprintf(stderr, "no video track registered\n");
-    ft_consumer_destroy(stream.consumer);
-    if (stream.producer != NULL) {
-      ft_producer_destroy(stream.producer);
-    }
-    return 1;
-  }
-
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-    fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-    ft_consumer_destroy(stream.consumer);
-    if (stream.producer != NULL) {
-      ft_producer_destroy(stream.producer);
-    }
-    return 1;
-  }
-
-  int window_width = stream.width < WIDTH ? WIDTH : (int)stream.width;
-  int window_height = stream.height < HEIGHT ? HEIGHT : (int)stream.height;
-  SDL_Window *window = SDL_CreateWindow("capture-viewer-sdl", SDL_WINDOWPOS_CENTERED,
-                                        SDL_WINDOWPOS_CENTERED, window_width, window_height,
-                                        SDL_WINDOW_SHOWN);
-  SDL_Renderer *renderer = NULL;
-  SDL_Texture *texture = NULL;
-  if (window != NULL) {
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (renderer == NULL) {
-      renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    }
-  }
-  if (renderer != NULL) {
-    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA32, SDL_TEXTUREACCESS_STREAMING,
-                                stream.width, stream.height);
-  }
-  if (window == NULL || renderer == NULL || texture == NULL) {
-    fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
-    if (texture != NULL) {
-      SDL_DestroyTexture(texture);
-    }
-    if (renderer != NULL) {
-      SDL_DestroyRenderer(renderer);
-    }
-    if (window != NULL) {
-      SDL_DestroyWindow(window);
-    }
-    SDL_Quit();
-    ft_consumer_destroy(stream.consumer);
-    if (stream.producer != NULL) {
-      ft_producer_destroy(stream.producer);
-    }
-    return 1;
-  }
-
-  uint8_t *pixels = malloc((size_t)STRIDE * HEIGHT);
-  if (pixels == NULL) {
-    fprintf(stderr, "pixel allocation failed\n");
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    ft_consumer_destroy(stream.consumer);
-    ft_producer_destroy(stream.producer);
-    return 1;
-  }
-
-  int running = 1;
-  int failed = 0;
-  uint64_t acquired_frames = 0;
-  uint64_t sequence = 1;
-  while (running && (options.max_frames <= 0 || sequence <= (uint64_t)options.max_frames)) {
-    SDL_Event sdl_event;
-    while (SDL_PollEvent(&sdl_event)) {
-      if (sdl_event.type == SDL_QUIT) {
-        running = 0;
-      }
-    }
-
-    {
-      fill_frame(pixels, sequence);
-      ft_video_frame_desc frame_desc = {
-          .sequence = sequence,
-          .timestamp_ns = sequence * 16666667,
-          .width = WIDTH,
-          .height = HEIGHT,
-          .stride = STRIDE,
-          .pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM,
-      };
-      if (require_ok(ft_producer_publish_video_frame(stream.producer, stream.track_id, &frame_desc, pixels,
-                                                     (size_t)STRIDE * HEIGHT),
-                     "ft_producer_publish_video_frame")) {
-        failed = 1;
-        break;
-      }
-    }
-
-    while (ft_consumer_poll_event(stream.consumer, &event) == FT_STATUS_OK) {
-      if (event.kind == FT_EVENT_TRACK_UPDATED && event.track_id == stream.track_id &&
-          event.track_type == FT_TRACK_TYPE_VIDEO) {
-        stream.width = event.width;
-        stream.height = event.height;
-        stream.stride = event.width * 4;
-      }
-    }
-
-    ft_video_frame frame = {0};
-    ft_status acquire_status = ft_consumer_acquire_latest_video_frame(stream.consumer, stream.track_id, &frame);
-    if (acquire_status == FT_STATUS_OK) {
-      if ((frame.desc.sequence != sequence ||
-          frame.data == NULL || frame.len != (size_t)STRIDE * HEIGHT ||
-          memcmp(frame.data, pixels, (size_t)STRIDE * HEIGHT) != 0)) {
-        fprintf(stderr, "synthetic frame payload/sequence mismatch\n");
-        ft_consumer_release_video_frame(stream.consumer, &frame);
-        failed = 1;
-        break;
-      }
-      if (frame.desc.width != stream.width || frame.desc.height != stream.height) {
-        SDL_Texture *resized_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA32,
-                                                         SDL_TEXTUREACCESS_STREAMING,
-                                                         frame.desc.width, frame.desc.height);
-        if (resized_texture == NULL) {
-          fprintf(stderr, "SDL resize texture failed: %s\n", SDL_GetError());
-          ft_consumer_release_video_frame(stream.consumer, &frame);
-          failed = 1;
-          break;
-        }
-        SDL_DestroyTexture(texture);
-        texture = resized_texture;
-        SDL_SetWindowSize(window, frame.desc.width < WIDTH ? WIDTH : (int)frame.desc.width,
-                          frame.desc.height < HEIGHT ? HEIGHT : (int)frame.desc.height);
-        stream.width = frame.desc.width;
-        stream.height = frame.desc.height;
-      }
-      stream.stride = frame.desc.stride;
-      if (SDL_UpdateTexture(texture, NULL, frame.data, (int)frame.desc.stride) != 0 ||
-          SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, NULL, NULL) != 0) {
-        fprintf(stderr, "SDL render failed: %s\n", SDL_GetError());
-        ft_consumer_release_video_frame(stream.consumer, &frame);
-        failed = 1;
-        break;
-      }
-      SDL_RenderPresent(renderer);
-      ft_consumer_release_video_frame(stream.consumer, &frame);
-      acquired_frames++;
-    } else {
-      fprintf(stderr, "acquire frame failed with status %d\n", acquire_status);
-      failed = 1;
-      break;
-    }
-
-    sequence++;
-    SDL_Delay(16);
-  }
-
-  if (options.max_frames > 0 && acquired_frames != (uint64_t)options.max_frames) {
-    fprintf(stderr, "expected %d synthetic frames, acquired %" PRIu64 "\n", options.max_frames, acquired_frames);
-    failed = 1;
-  }
-  printf("acquired_frames=%" PRIu64 "\n", acquired_frames);
-  free(pixels);
-  SDL_DestroyTexture(texture);
-  SDL_DestroyRenderer(renderer);
-  SDL_DestroyWindow(window);
-  SDL_Quit();
-  ft_consumer_destroy(stream.consumer);
-  if (stream.producer != NULL) {
-    ft_producer_destroy(stream.producer);
-  }
-  return failed ? 1 : 0;
+  return options.native ? run_native(&options) : run_cpu(&options);
 }

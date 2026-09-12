@@ -855,6 +855,83 @@ mod tests {
     }
 
     #[test]
+    fn c_abi_session_forwards_authorization_before_acquiring_live_frame() {
+        use std::{ffi::CString, ptr, time::Duration};
+
+        use crate::ffi::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let control_path = directory.path().join("control.sock");
+        let transfer_path = directory.path().join("transfer.sock");
+        let control = UnixListener::bind(&control_path).unwrap();
+        let transfer = UnixListener::bind(&transfer_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = control.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "GET /capture-sessions/session-1 HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = serde_json::json!({
+                "session_id": "session-1", "source_id": 1, "track_id": 7,
+                "width": 2, "height": 1, "stride": 8, "pixel_format": "bgra8_unorm",
+                "fd_socket_path": transfer_path,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            drop(reader);
+            drop(stream);
+
+            let (stream, _) = transfer.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert_authorize_request(&mut reader, "session-1", "test-live-token");
+            assert_latest_request(&mut reader, "session-1", 7);
+            let file = tempfile_file_with_contents(b"abcdefgh");
+            writeln!(stream.try_clone().unwrap(), "{}", latest_frame_json(11, 1, 8)).unwrap();
+            fdpass::send_fd(&stream, file.as_raw_fd()).unwrap();
+            assert_release_request(&mut reader, 11);
+        });
+        let control_path = CString::new(control_path.to_str().unwrap()).unwrap();
+        let session_id = CString::new("session-1").unwrap();
+        let token = CString::new("test-live-token").unwrap();
+        let descriptor = FtSessionDescriptor {
+            control_socket_path: control_path.as_ptr(),
+            session_id: session_id.as_ptr(),
+            bearer_token: token.as_ptr(),
+        };
+        // SAFETY: descriptor strings and output storage are live for connect;
+        // acquired handles are released once, before destroying the consumer.
+        unsafe {
+            let mut consumer = ptr::null_mut();
+            assert_eq!(ft_consumer_connect_session(&descriptor, &mut consumer), FT_STATUS_OK);
+            drop(token); // The consumer must own its copy.
+            let mut frame = FtVideoFrame::default();
+            let status = ft_consumer_acquire_latest_video_frame(consumer, 7, &mut frame);
+            if status == FT_STATUS_OK {
+                assert_eq!(std::slice::from_raw_parts(frame.data.cast::<u8>(), frame.len), b"abcdefgh");
+                ft_consumer_release_video_frame(consumer, &mut frame);
+            }
+            ft_consumer_destroy(consumer);
+            server.join().unwrap();
+            assert_eq!(status, FT_STATUS_OK);
+        }
+    }
+
+    #[test]
     fn daemon_consumer_reuses_connection_and_releases_by_lease_id() {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("capture-fd.sock");

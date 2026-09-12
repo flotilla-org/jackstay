@@ -284,6 +284,10 @@ static int run_native(const viewer_options *options) {
 #endif
 
 int main(int argc, char **argv) {
+  if (ft_abi_version() != FT_ABI_VERSION) {
+    fprintf(stderr, "Jackstay ABI mismatch: rebuild the viewer and library together\n");
+    return 1;
+  }
   viewer_options options = parse_options(argc, argv);
 
   if (options.native) {
@@ -313,6 +317,7 @@ int main(int argc, char **argv) {
     ft_session_descriptor descriptor = {
         .control_socket_path = options.porthole_socket,
         .session_id = session_id,
+        .bearer_token = getenv("PORTHOLE_AGENT_TOKEN"),
     };
     if (require_ok(ft_consumer_connect_session(&descriptor, &stream.consumer),
                    "ft_consumer_connect_session")) {

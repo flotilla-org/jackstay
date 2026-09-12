@@ -151,6 +151,26 @@ fn producer_shutdown_preserves_held_payload_and_closes_new_acquisitions() {
 }
 
 #[test]
+fn stopped_producer_waits_for_both_consumer_mapping_and_frame_retirement() {
+    let mut producer = ArenaProducer::new(config()).unwrap();
+    let consumer = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    assert!(!producer.poll_shutdown_ready().unwrap());
+    producer.stop();
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Closed));
+    assert!(producer.attach(1).is_err());
+    assert!(!producer.poll_shutdown_ready().unwrap());
+    drop(consumer);
+    assert!(!producer.poll_shutdown_ready().unwrap());
+    assert_eq!(frame.bytes(), b"abcd");
+    drop(frame);
+    assert!(producer.poll_shutdown_ready().unwrap());
+}
+
+#[test]
 fn ordered_delivery_reports_a_published_gap_and_exact_selection_never_substitutes() {
     let mut producer = ArenaProducer::new(config()).unwrap();
     let consumer = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();

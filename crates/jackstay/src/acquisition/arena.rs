@@ -531,7 +531,9 @@ pub struct ArenaProducer {
 }
 
 impl ArenaProducer {
-    pub(crate) fn stop(&mut self) {
+    /// Stop publication/admission and close acquisition. Existing leases and
+    /// mappings must still drain; this is not permission to reclaim their bytes.
+    pub fn stop(&mut self) {
         self.control.word(TERMINAL).store(1, SeqCst);
         for claims in self.claims.values() {
             claims.close();
@@ -546,6 +548,29 @@ impl ArenaProducer {
     }
 
     fn create(config: ArenaConfig, external_bytes: u64, native_resources: bool) -> Result<Self, ArenaError> {
+        let (layout, admission) = Self::prepare(config, external_bytes)?;
+        let control = Arc::new(ControlMap::new(layout.history)?);
+        let resources = Arc::new(ResourceMap::new(layout, control.scope, 1)?);
+        Ok(Self {
+            resources: Some(resources),
+            retired: Vec::new(),
+            pending_layout: None,
+            control,
+            admission,
+            claims: BTreeMap::new(),
+            cursor: 0,
+            next_slot: 0,
+            cleanup: cleanup::CleanupRegistry::default(),
+            native_resources,
+            drain_timeout: config.drain_timeout,
+        })
+    }
+
+    pub(crate) fn validate_external_allocation(config: ArenaConfig, external_bytes: u64) -> Result<(), ArenaError> {
+        Self::prepare(config, external_bytes).map(|_| ())
+    }
+
+    fn prepare(config: ArenaConfig, external_bytes: u64) -> Result<(ResourceLayout, AdmissionBook), ArenaError> {
         if config.drain_timeout.is_zero() || std::time::Instant::now().checked_add(config.drain_timeout).is_none() {
             return Err(ArenaError::Configuration("drain interval must be positive and representable"));
         }
@@ -566,21 +591,15 @@ impl ArenaProducer {
             memory_budget: config.memory_budget,
             max_incarnations: config.max_incarnations,
         })?;
-        let control = Arc::new(ControlMap::new(layout.history)?);
-        let resources = Arc::new(ResourceMap::new(layout, control.scope, 1)?);
-        Ok(Self {
-            resources: Some(resources),
-            retired: Vec::new(),
-            pending_layout: None,
-            control,
-            admission,
-            claims: BTreeMap::new(),
-            cursor: 0,
-            next_slot: 0,
-            cleanup: cleanup::CleanupRegistry::default(),
-            native_resources,
-            drain_timeout: config.drain_timeout,
-        })
+        Ok((layout, admission))
+    }
+
+    /// Poll shutdown without inferring retirement from closure or timeout.
+    /// True means all admitted mappings, leases and retired allocations have
+    /// drained. The owner can then destroy this arena's remaining allocation.
+    pub fn poll_shutdown_ready(&mut self) -> Result<bool, ArenaError> {
+        self.poll_cleanup()?;
+        Ok(self.control.word(TERMINAL).load(SeqCst) != 0 && self.claims.is_empty() && self.retired.is_empty())
     }
 
     pub fn attach(&mut self, holding: u32) -> Result<ConsumerGrant, ArenaError> {

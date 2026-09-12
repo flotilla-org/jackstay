@@ -2,10 +2,9 @@
 
 The acquisition arena now has a macOS setup path in
 `native/macos/xpc/arena.rs`, with object transfer in
-`native/macos_acquisition_xpc_shim.m`. The existing viewer still uses the legacy
-`XpcAttachClient` path. That caller and the C ABI must migrate before the old path
-can be removed; this is staging for the acquisition contract, not a compatibility
-promise.
+`native/macos_acquisition_xpc_shim.m`. The C bridge and native reference viewer
+use this path. Porthole integration is in progress; the legacy CPU/session path
+still needs migration before its ownership code can be removed.
 
 `XpcArenaServer` serves one native arena. The host supplies its authorization
 token policy and either a launchd Mach service name or an anonymous listener.
@@ -125,3 +124,27 @@ acceptance is still unverified while shared-event allocation is unavailable.
 
 Viewer runtime verification, host resumption of paused transitions, Porthole
 integration, full-suite gates, and live capture acceptance remain outstanding.
+
+## Producer allocation and teardown boundary
+
+`NativeArenaProducer::new` preflights the native pool's allocation bound together
+with the arena's metadata charge before allocating surfaces or a readiness
+event. Hosts supplying an existing pool can continue to use
+`from_allocated_parts`; they own that initial allocation decision.
+
+`stop` closes publication and admission and wakes consumers with terminal state.
+It does not reclaim their frames. `poll_shutdown_ready` first drains common
+claims, mapping offers and retired allocations, then checks the native producer's
+actual submitted-write completion. A backend publication failure reports
+`RecoveryRequired`: the last known fence cannot prove that a failed submission
+left no unresolved work. Expiring a host deadline does not change this result.
+
+After readiness, the host must release every remaining producer/setup owner
+before counting the allocation as destroyed. In particular, XPC listener and
+in-flight session callbacks can retain an `Arc` after listener invalidation.
+
+The CPU shutdown test verifies that both a consumer mapping and its held frame
+must retire. The macOS initial-budget test passes with real native layout
+preflight. A new native shutdown test gates actual producer GPU work, drops all
+consumer ownership, then opens the gate and expects shutdown to finish. It
+compiles but awaits the shared-event recovery described above for execution.

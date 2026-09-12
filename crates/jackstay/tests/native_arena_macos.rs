@@ -72,6 +72,93 @@ fn captured(seed: u8) -> MacosCapturedFrame {
 }
 
 #[test]
+fn native_creation_rejects_the_total_byte_charge_before_allocating_a_fence() {
+    use jackstay::acquisition::{AdmissionError, arena::ArenaError};
+    let backend = MacosFrameBackend::new().unwrap();
+    let params = NativeStreamParams {
+        width: 16,
+        height: 16,
+        pixel_format: PixelFormat::Bgra8Unorm,
+        color_space: ColorSpace::Srgb,
+        clock_domain: ClockDomain::HostTime,
+        modifier: 0,
+    };
+    // Enough for all native surfaces, but not the separately charged arena
+    // metadata. This must fail preflight, before shared-event creation.
+    let memory_budget = backend.pool_allocation_upper_bound(&params, 6).unwrap();
+    let config = ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 0,
+        memory_budget,
+        max_incarnations: 1,
+        drain_timeout: std::time::Duration::from_secs(5),
+    };
+    assert!(matches!(
+        NativeArenaProducer::new(backend, params, config),
+        Err(ArenaError::Admission(AdmissionError::InvalidLimits(
+            "existing allocation exceeds the memory budget"
+        )))
+    ));
+}
+
+#[test]
+fn stopped_native_producer_waits_for_gpu_writes_and_consumer_mappings() {
+    use jackstay::acquisition::arena::{ArenaError, PublishOutcome};
+    let params = NativeStreamParams {
+        width: 16,
+        height: 16,
+        pixel_format: PixelFormat::Bgra8Unorm,
+        color_space: ColorSpace::Srgb,
+        clock_domain: ClockDomain::HostTime,
+        modifier: 0,
+    };
+    let backend = MacosFrameBackend::new().unwrap();
+    let gate = ConsumerFence::new(backend.metal()).unwrap();
+    struct OpenOnDrop<'a>(&'a ConsumerFence);
+    impl Drop for OpenOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.signal_cpu(1);
+        }
+    }
+    let _open_on_unwind = OpenOnDrop(&gate);
+    backend.metal().enqueue_wait(&gate, 1).unwrap();
+    let config = ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 0,
+        memory_budget: 1024 * 1024,
+        max_incarnations: 1,
+        drain_timeout: std::time::Duration::from_secs(5),
+    };
+    let mut producer = NativeArenaProducer::new(backend, params.clone(), config).unwrap();
+    let consumer = producer.attach(1).unwrap().into_consumer().unwrap();
+    let source = captured(29);
+    assert!(matches!(producer.publish(&source, 1).unwrap(), PublishOutcome::Published { .. }));
+    let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    producer.stop();
+    assert!(matches!(producer.publish(&source, 2), Err(ArenaError::Closed)));
+    assert!(matches!(producer.reconfigure(params), Err(ArenaError::Closed)));
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Closed));
+    assert!(!producer.poll_shutdown_ready().unwrap());
+    // Neither this consumer nor its frame ever starts GPU use. Their immediate
+    // release is valid, but it does not prove the producer's GPU write finished.
+    drop(held);
+    drop(consumer);
+    assert!(!producer.poll_shutdown_ready().unwrap());
+    gate.signal_cpu(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !producer.poll_shutdown_ready().unwrap() {
+        assert!(std::time::Instant::now() < deadline, "producer writes did not drain");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
 fn native_reconfiguration_retains_old_pixels_and_shares_holding_credit_with_the_new_pool() {
     use jackstay::acquisition::arena::{ConfigurationInstall, ReconfigurationStatus};
     let mut producer = producer(1);

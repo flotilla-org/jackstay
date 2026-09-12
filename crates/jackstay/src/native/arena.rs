@@ -176,12 +176,26 @@ pub struct NativeArenaProducer<B: ArenaNativeBackend> {
     dropped: u64,
     pending_drops: u32,
     faulted: bool,
+    stopped: bool,
 }
 
 impl<B: ArenaNativeBackend> NativeArenaProducer<B>
 where
     B::SurfacePool: Send + 'static,
 {
+    /// Create a bounded native pool after validating the arena geometry and
+    /// complete initial byte charge against the configured budget.
+    pub fn new(mut backend: B, params: NativeStreamParams, config: ArenaConfig) -> Result<Self, ArenaError> {
+        if config.payload_capacity != 0 {
+            return Err(ArenaError::Configuration("native arena has no inline payload"));
+        }
+        let bound = backend.pool_allocation_upper_bound(&params, config.resource_capacity)?;
+        ArenaProducer::validate_external_allocation(config, bound)?;
+        let pool = backend.allocate_surface_pool_bounded(&params, config.resource_capacity, bound)?;
+        let fence = backend.create_fence()?;
+        Self::from_allocated_parts(backend, pool, fence, params, config)
+    }
+
     /// Admit an existing native allocation. Pool byte accounting is checked
     /// before allocating arena metadata or admitting consumers. Negotiated
     /// pools can be supplied by their compositor; authority stays with the host.
@@ -213,6 +227,7 @@ where
             dropped: 0,
             pending_drops: 0,
             faulted: false,
+            stopped: false,
         })
     }
 
@@ -247,7 +262,7 @@ where
     }
 
     pub fn reconfigure(&mut self, params: NativeStreamParams) -> Result<ReconfigurationStatus, ArenaError> {
-        if self.faulted {
+        if self.faulted || self.stopped {
             return Err(ArenaError::Closed);
         }
         if self.pending_params.is_some() {
@@ -267,7 +282,7 @@ where
     }
 
     pub fn advance_reconfiguration(&mut self) -> Result<ReconfigurationStatus, ArenaError> {
-        if self.faulted {
+        if self.faulted || self.stopped {
             return Err(ArenaError::Closed);
         }
         let Some((params, bound)) = &self.pending_params else {
@@ -303,7 +318,7 @@ where
     }
 
     pub fn publish(&mut self, frame: &B::CapturedFrame, timestamp_ns: u64) -> Result<PublishOutcome, ArenaError> {
-        if self.faulted {
+        if self.faulted || self.stopped {
             return Err(ArenaError::Closed);
         }
         let result = self.publish_frame(frame, timestamp_ns);
@@ -397,5 +412,26 @@ where
 
     pub fn close(&mut self, incarnation: IncarnationId) -> Result<(), ArenaError> {
         self.arena.close(incarnation)
+    }
+
+    /// End publication and acquisition while preserving all unresolved use.
+    pub fn stop(&mut self) {
+        self.stopped = true;
+        self.arena.stop();
+    }
+
+    /// The host may dispose the producer only after consumer ownership and
+    /// actual producer writes have drained. It must also relinquish all its
+    /// other producer/setup owners before treating the allocation as destroyed.
+    pub fn poll_shutdown_ready(&mut self) -> Result<bool, ArenaError> {
+        if self.faulted {
+            return Err(ArenaError::RecoveryRequired {
+                reason: "native producer failed; backend use may be unresolved".to_owned(),
+            });
+        }
+        if !self.stopped || !self.arena.poll_shutdown_ready()? {
+            return Ok(false);
+        }
+        Ok(self.backend.completed_producer_value(&self.fence)? >= self.fence_value)
     }
 }

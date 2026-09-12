@@ -28,6 +28,9 @@ cmake --build build/viewer
 ctest --test-dir build/viewer --output-on-failure
 ```
 
+The viewer requires an exact header/library ABI version match during 0.x and
+exits before connecting when they differ. Rebuild both together after an ABI change.
+
 Linux uses `libjackstay.so`. The CTest smoke checks 30 generated frames through
 the C ABI and SDL software renderer. It fails on missing/corrupt frames or renderer
 failure. The library and viewer support synthetic operation on macOS/Linux; the
@@ -41,7 +44,10 @@ needed to build or test the standalone example.
 
 `--porthole-socket PATH` creates a porthole synthetic capture session; adding
 `--session-id ID` attaches to an existing CPU session instead. The library's
-optional porthole client uses `PORTHOLE_AGENT_TOKEN` when applicable. The host
+viewer reads `PORTHOLE_AGENT_TOKEN` and passes it explicitly through the C session
+descriptor for protected CPU sessions. Use the identity that created the capture
+session; inheriting a token alone does not grant access. The library does not
+read the environment or approve requests. The host
 remains responsible for capture permission, source selection and session cleanup.
 
 For a real macOS native capture session, keep porthole running as its installed

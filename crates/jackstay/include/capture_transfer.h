@@ -17,11 +17,11 @@ extern "C" {
  * below).
  *
  * Major 0 means pre-stabilization: layouts may still change freely, with a
- * minor bump as the only signal. The 1.0 stamp waits until an external
+ * minor bump as the only signal. Require an exact version match at major 0. The 1.0 stamp waits until an external
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 1
+#define FT_ABI_VERSION_MINOR 2
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -97,6 +97,8 @@ typedef struct ft_consumer_options {
 typedef struct ft_session_descriptor {
   const char *control_socket_path;
   const char *session_id;
+  /* Optional; copied during connect. NULL for public/synthetic sessions. */
+  const char *bearer_token;
 } ft_session_descriptor;
 
 typedef struct ft_synthetic_session {

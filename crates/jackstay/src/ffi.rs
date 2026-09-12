@@ -25,7 +25,7 @@ pub type FtStatus = i32;
 /// pre-stabilization: layouts may still change freely, with a minor bump as
 /// the only signal; 1.0 waits until an external consumer needs the promise.
 pub const FT_ABI_VERSION_MAJOR: u32 = 0;
-pub const FT_ABI_VERSION_MINOR: u32 = 1;
+pub const FT_ABI_VERSION_MINOR: u32 = 2;
 pub const FT_ABI_VERSION: u32 = (FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR;
 
 /// Report the linked library's ABI version.
@@ -97,6 +97,8 @@ pub struct FtConsumerOptions {
 pub struct FtSessionDescriptor {
     pub control_socket_path: *const c_char,
     pub session_id: *const c_char,
+    /// Optional authorization token, copied during connect; null for public sessions.
+    pub bearer_token: *const c_char,
 }
 
 #[repr(C)]
@@ -492,9 +494,19 @@ pub unsafe extern "C" fn ft_consumer_connect_session(descriptor: *const FtSessio
         return FT_STATUS_INVALID_ARGUMENT;
     };
 
-    let Ok(info) = daemon::get_session(&control_socket_path, &session_id) else {
+    let bearer_token = if descriptor.bearer_token.is_null() {
+        None
+    } else {
+        // SAFETY: non-null descriptor strings must be valid for this call.
+        let Some(token) = (unsafe { c_string_to_string(descriptor.bearer_token) }) else {
+            return FT_STATUS_INVALID_ARGUMENT;
+        };
+        Some(token)
+    };
+    let Ok(mut info) = daemon::get_session(&control_socket_path, &session_id) else {
         return FT_STATUS_ERROR;
     };
+    info.bearer_token = bearer_token;
     let events = vec![
         FtEvent {
             kind: FT_EVENT_SOURCE_REGISTERED,
@@ -941,7 +953,7 @@ mod tests {
         assert_eq!(define("FT_ABI_VERSION_MAJOR"), super::FT_ABI_VERSION_MAJOR);
         assert_eq!(define("FT_ABI_VERSION_MINOR"), super::FT_ABI_VERSION_MINOR);
         assert_eq!(super::ft_abi_version(), super::FT_ABI_VERSION);
-        assert_eq!(super::FT_ABI_VERSION, 0x0000_0001);
+        assert_eq!(super::FT_ABI_VERSION, 0x0000_0002);
     }
 
     #[test]

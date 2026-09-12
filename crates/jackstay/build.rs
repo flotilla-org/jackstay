@@ -17,6 +17,7 @@ fn main() {
 fn build_macos_shim() {
     println!("cargo:rerun-if-changed=src/native/macos_shim.m");
     println!("cargo:rerun-if-changed=src/native/macos_xpc_shim.m");
+    println!("cargo:rerun-if-changed=src/native/macos_acquisition_xpc_shim.m");
     println!("cargo:rerun-if-changed=include/capture_transfer.h");
     println!("cargo:rerun-if-changed=src/native/c_abi_header_smoke.c");
     cc::Build::new()
@@ -27,6 +28,7 @@ fn build_macos_shim() {
         .include("include")
         .file("src/native/macos_shim.m")
         .file("src/native/macos_xpc_shim.m")
+        .file("src/native/macos_acquisition_xpc_shim.m")
         .flag("-fobjc-arc")
         .flag("-mmacosx-version-min=13.0")
         .compile("porthole_native_macos");

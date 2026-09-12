@@ -874,6 +874,11 @@ impl ArenaConsumer {
         self.lifetime.claims.incarnation
     }
 
+    #[cfg(all(target_os = "macos", feature = "backend-macos"))]
+    pub(crate) fn claim_scope(&self) -> [u8; 16] {
+        self.lifetime.claims.scope
+    }
+
     pub fn acquire_latest(&self, after: u64) -> Result<AcquireOutcome, ArenaError> {
         let cursor = self.control.word(LATEST).load(SeqCst);
         if self.is_closed() {

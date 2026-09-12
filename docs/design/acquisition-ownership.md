@@ -385,14 +385,12 @@ handles and release events transferred through process-bound setup. Paused
 transitions require an explicit host retry for now.
 Host/C integration, full-suite gates, and live acceptance remain outstanding.
 
-The next setup change belongs in the existing macOS XPC transport
-(`native/macos/xpc.rs` and `native/macos_xpc_shim.m`). Its current grant still
-transfers a legacy ring FD and caller-selected consumer ID; it does not expose
-the connection's peer PID to Rust. The acquisition setup must instead bind
-`attach_process` to the PID obtained from the accepted `NSXPCConnection`, transfer
-the versioned grant metadata and five FDs with the typed surface/event objects,
-and use one-FD replacement offers for that same incarnation. Release registration
-must transfer the consumer's real shared-event handle so both sides observe the
-same completion source. Connection invalidation closes acquisition without
-pretending to prove process death or GPU completion. These are setup operations;
-frame acquisition and deferred-release handoff remain on the shared maps.
+The new [XPC acquisition setup](acquisition-native-setup.md) binds `attach_process`
+to the connection's actual peer PID, transfers five initial mapping/notification
+FDs and typed native handles, installs one-FD replacement offers, and imports
+consumer GPU release events. It rejects foreign claim scopes even when numeric
+incarnation IDs match. EOF closes acquisition without claiming process death or
+GPU completion. Invalidation serializes with requests so a queued request cannot
+recreate a closed session. Five real XPC/Metal tests pass, but keep both endpoints
+in the same OS process. Separate-process GPU crash evidence is next. The legacy
+setup remains in use by the C/viewer path until those callers migrate.

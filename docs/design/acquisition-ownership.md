@@ -298,6 +298,17 @@ subprocess helpers. The three native arena tests and three concurrency tests
 passed on macOS. Workspace build, default and macOS-feature all-targets clippy,
 and pinned formatting passed. The old host regression remains unresolved.
 
+Allocation accounting now distinguishes persistent control bytes, claim pages,
+and individually identified resource generations. The admission book pauses new
+admission from proposal through installation, reserves replacement bytes before
+allocation, retains old-generation charges until cleanup, and preserves the pause
+through allocation failure/retry. Two further admission tests cover overlap and
+insufficient-overlap scenarios, bringing the admission suite to six tests. These
+and the arena tests pass on macOS and Linux; the cleanup/release/wait and native
+tests remain green, as do build, default and macOS clippy, and pinned formatting.
+The arena uses the new initial byte breakdown but does not yet invoke runtime
+transitions. Accounting acknowledgement is not mapping-retirement proof.
+
 Process-bound cleanup now uses kqueue on macOS and pidfds on Linux. Remote grants
 are export-only and mandatory for setup FD transfer; local grants use ordinary
 Rust ownership. The process-exit, failure, and native quarantine rules and source

@@ -513,9 +513,9 @@ impl ArenaProducer {
             retained_history: config.retained_history,
             producer_reserve: config.producer_reserve,
             allocated_bytes: (layout.len as u64)
-                .checked_add(control_len as u64)
-                .and_then(|bytes| bytes.checked_add(external_bytes))
+                .checked_add(external_bytes)
                 .ok_or(ArenaError::Configuration("allocation byte total overflow"))?,
+            fixed_bytes: control_len as u64,
             memory_budget: config.memory_budget,
             max_incarnations: config.max_incarnations,
         })?;

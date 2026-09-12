@@ -1,7 +1,8 @@
 # Bounded acquisition reconfiguration
 
-Status: the control/resource and consumer-lifetime split is implemented. The
-transition, retirement, and allocation accounting below remain to be implemented.
+Status: the control/resource and consumer-lifetime split and admission-book
+allocation accounting are implemented. Runtime transition and retirement remain
+to be implemented.
 
 ## Separate control lifetime from resource lifetime
 
@@ -90,8 +91,18 @@ that a delivered-but-unapplied offer was discarded merely from its current-map
 field. Unresolved native claims keep the corresponding allocation charged and
 continue to report recovery failure.
 
-The accounting ledger tracks fixed control bytes, claim mappings, current and
-retired resource generations, and pending allocation commitments. Native staging
+The admission book now tracks fixed control bytes, claim mappings, current and
+retired resource allocations, and a pending allocation commitment. A transition
+closes admission before reservation; insufficient overlap capacity leaves it
+pending. Installation releases only the unused portion of a conservative size
+bound. Retired allocations stay charged until explicit cleanup acknowledgement;
+allocation failure can return its reservation while keeping admission paused for
+retry. Allocation IDs are never reused. Like incarnation cleanup, the accounting
+acknowledgement supplies no lifetime proof itself.
+
+The arena uses the split byte accounting for its initial allocation. Its runtime
+still has one fixed resource map: calling the book's transition methods from the
+arena requires the publication, grant, and retirement protocol below. Native staging
 needs an allocation upper bound before creating a replacement pool; checking its
 actual size only after allocation would permit a temporary budget violation.
 The macOS backend's allocation contract must establish that bound, then validate

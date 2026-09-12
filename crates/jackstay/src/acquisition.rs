@@ -11,6 +11,9 @@ use thiserror::Error;
 #[cfg(unix)]
 pub mod arena;
 
+mod allocation;
+pub use allocation::AllocationId;
+
 /// One admitted lifetime, scoped to its producer's admission book. A name or
 /// authorization identity is deliberately not part of this identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,8 +25,10 @@ pub struct AdmissionLimits {
     pub resource_capacity: u32,
     pub retained_history: u32,
     pub producer_reserve: u32,
-    /// Bytes already allocated for resource pools and producer control data.
+    /// Bytes already allocated for the initial resource generation.
     pub allocated_bytes: u64,
+    /// Persistent producer control data, independent of resource generations.
+    pub fixed_bytes: u64,
     /// Total allocation budget, including consumer claim mappings.
     pub memory_budget: u64,
     /// Includes closing incarnations until their cleanup has completed.
@@ -77,6 +82,18 @@ pub enum AdmissionError {
     UnknownIncarnation,
     #[error("an active incarnation cannot complete cleanup")]
     StillActive,
+    #[error("a configuration replacement is pending; admission is paused")]
+    ReconfigurationPending,
+    #[error("there is no pending configuration replacement")]
+    NoReconfiguration,
+    #[error("replacement allocation has not been reserved")]
+    AllocationNotReserved,
+    #[error("allocation is unknown or its cleanup already completed")]
+    UnknownAllocation,
+    #[error("the current or pending allocation cannot complete cleanup")]
+    AllocationInUse,
+    #[error("actual allocation size must be nonzero and no greater than its reserved upper bound")]
+    InvalidAllocationSize,
 }
 
 #[derive(Debug)]
@@ -94,6 +111,10 @@ pub struct AdmissionBook {
     reservations: BTreeMap<IncarnationId, IncarnationRecord>,
     reserved_frames: u32,
     committed_bytes: u64,
+    allocations: BTreeMap<AllocationId, u64>,
+    current_allocation: Option<AllocationId>,
+    next_allocation: u64,
+    pending_allocation: Option<allocation::PendingAllocation>,
 }
 
 impl AdmissionBook {
@@ -107,7 +128,11 @@ impl AdmissionBook {
                 "resource capacity must cover history and a nonzero producer reserve",
             ));
         }
-        if limits.allocated_bytes > limits.memory_budget {
+        let committed_bytes = limits
+            .allocated_bytes
+            .checked_add(limits.fixed_bytes)
+            .ok_or(AdmissionError::InvalidLimits("initial allocation byte total overflows"))?;
+        if committed_bytes > limits.memory_budget {
             return Err(AdmissionError::InvalidLimits("existing allocation exceeds the memory budget"));
         }
         if limits.max_incarnations == 0 {
@@ -118,7 +143,11 @@ impl AdmissionBook {
             next_incarnation: 1,
             reservations: BTreeMap::new(),
             reserved_frames: 0,
-            committed_bytes: limits.allocated_bytes,
+            committed_bytes,
+            allocations: BTreeMap::from([(AllocationId(1), limits.allocated_bytes)]),
+            current_allocation: Some(AllocationId(1)),
+            next_allocation: 2,
+            pending_allocation: None,
         })
     }
 
@@ -127,6 +156,9 @@ impl AdmissionBook {
     /// with the smaller available resource count rather than silently shrinking
     /// the requested reservation.
     pub fn admit(&mut self, request: HoldingRequest) -> Result<HoldingReservation, AdmissionError> {
+        if self.pending_allocation.is_some() {
+            return Err(AdmissionError::ReconfigurationPending);
+        }
         if request.frames == 0 || request.claim_bytes == 0 {
             return Err(AdmissionError::InvalidRequest);
         }

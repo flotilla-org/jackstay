@@ -27,9 +27,8 @@ failure. No timeout or process-exit observation was treated as GPU completion.
 
 These tests allocate real IOSurfaces and execute Metal work, but their pixels are
 generated fixtures. They do not prove the required live ScreenCaptureKit CPU/GPU
-capture, long playback, delayed consumer or host resize acceptance. Those remain
-outstanding. The installed Porthole daemon still serves an existing user capture;
-updating that installation would interrupt it.
+capture, long playback, delayed consumer or host resize acceptance. The separate
+live runs below supply playback evidence; live host resize remains pending.
 
 The delayed reference-viewer check also passed on 2026-09-12. It completed eight
 BGRA frames normally and eight RGBA frames with a 250 ms hold before each GPU
@@ -39,4 +38,25 @@ non-ignored macOS backend suite passed in
 `/tmp/jackstay-delayed-full-native-tests.log`; the required default gates passed
 on macOS and Linux, as did each platform's backend Clippy check. The two offline
 SDL CTests passed, including the CPU delay option. These remain generated-fixture
-checks; live acceptance is still outstanding.
+checks; see the separate live results below.
+
+## Live Simulator capture
+
+After an authorized install/restart of Porthole `67fa206`, the CPU and native
+viewers each completed 10,000 live frames from the existing iPhone Simulator
+window. Runtime was 178.59 s for CPU and 179.60 s for native. Concurrent delayed
+consumers completed 800 frames each with 250 ms holds in 231.16 s and 217.02 s,
+respectively. All four exited successfully with empty stderr. CPU held-byte
+comparisons found no mutations; viewer screenshots showed the Simulator clock
+advancing. These runs used the installed ScreenCaptureKit host, not fixture pixels.
+
+Explicit session close reached `closed` for both paths. Replacement sessions and
+new viewer processes then completed eight frames each, including reuse of the
+named native service. Artifacts: `/tmp/porthole-live-acquisition-qrl79wnm/`.
+Porthole's `docs/2026-09-12-live-acquisition-acceptance.md` records provenance,
+retirement, counters and limitations.
+
+Live resize is still unverified: Simulator rejected AX size writes while both
+capture paths remained at 456×972. A manual resize was requested. The successful
+playback and normal closure do not resolve the submitted-GPU crash quarantine or
+prove process-wide graceful daemon drainage.

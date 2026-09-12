@@ -7,7 +7,6 @@ pub mod daemon {
     use crate::{
         error::{CaptureTransferError, Result},
         model::PixelFormat,
-        video::VideoFrameDesc,
     };
 
     #[derive(Debug, Clone)]
@@ -44,60 +43,6 @@ pub mod daemon {
                 .field("fd_socket_path", &self.fd_socket_path)
                 .field("bearer_token", &self.bearer_token.as_deref().map(|_| "<redacted>"))
                 .finish()
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct DaemonFrame {
-        pub desc: VideoFrameDesc,
-        pub producer_cursor: u64,
-        pub len: usize,
-    }
-
-    impl DaemonFrame {
-        #[must_use]
-        pub fn bytes(&self) -> &[u8] {
-            &[]
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct DaemonFrameUnavailable {
-        pub track_id: u64,
-        pub after_producer_cursor: u64,
-        pub oldest_available_cursor: u64,
-        pub latest_available_cursor: u64,
-        pub skipped_count: u64,
-        pub reason: String,
-    }
-
-    #[derive(Debug)]
-    pub enum DaemonFrameAcquire {
-        Frame(DaemonFrame),
-        Unavailable(DaemonFrameUnavailable),
-    }
-
-    #[derive(Debug)]
-    pub struct DaemonConsumer {
-        _info: SessionInfo,
-    }
-
-    impl DaemonConsumer {
-        pub fn connect(info: SessionInfo) -> Result<Self> {
-            let _ = info;
-            Err(unsupported())
-        }
-
-        pub fn latest_frame(&mut self, _track_id: u64) -> Result<DaemonFrame> {
-            Err(unsupported())
-        }
-
-        pub fn next_frame_after(&mut self, _track_id: u64, _after_producer_cursor: u64) -> Result<DaemonFrameAcquire> {
-            Err(unsupported())
-        }
-
-        pub fn release_frame(&mut self, _frame: DaemonFrame) -> Result<()> {
-            Err(unsupported())
         }
     }
 

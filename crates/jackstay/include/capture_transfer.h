@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 3
+#define FT_ABI_VERSION_MINOR 4
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -207,6 +207,20 @@ void ft_acquisition_cancellation_destroy(ft_acquisition_cancellation **);
  * All destroy functions accept NULL or *handle=NULL and clear live handles. */
 void ft_acquisition_consumer_destroy(ft_acquisition_consumer **);
 
+#if defined(__APPLE__) || defined(__linux__)
+/* Select a trusted host session, authorize it with an optional token and admit
+ * the requested holding capacity. Strings are UTF-8 and copied during setup.
+ * Both output handles start NULL; track is set on success. Never fork, forward
+ * or replay these mappings. Connection, consumer and frames are separate owners. */
+typedef struct ft_cpu_acquisition_connection ft_cpu_acquisition_connection;
+ft_status ft_acquisition_cpu_connect_session(const char *control_path, const char *session_id,
+                                             const char *token, uint32_t holding,
+                                             ft_cpu_acquisition_connection **out_connection,
+                                             ft_acquisition_consumer **out_consumer, uint64_t *out_track);
+ft_status ft_acquisition_cpu_install_configuration(ft_cpu_acquisition_connection *, ft_acquisition_consumer *);
+void ft_acquisition_cpu_connection_destroy(ft_cpu_acquisition_connection **);
+#endif
+
 #if defined(__APPLE__)
 /* Requires a library built with backend-macos. The host-selected Mach service
  * must obey the common acquisition protocol; the optional client token does
@@ -263,13 +277,6 @@ typedef struct ft_producer_options {
 typedef struct ft_consumer_options {
   ft_producer *producer;
 } ft_consumer_options;
-
-typedef struct ft_session_descriptor {
-  const char *control_socket_path;
-  const char *session_id;
-  /* Optional; copied during connect. NULL for public/synthetic sessions. */
-  const char *bearer_token;
-} ft_session_descriptor;
 
 typedef struct ft_synthetic_session {
   char session_id[64];
@@ -380,8 +387,6 @@ void ft_producer_destroy(ft_producer *producer);
 ft_status ft_consumer_connect(const ft_consumer_options *options, ft_consumer **out);
 ft_status ft_create_synthetic_session(const char *control_socket_path,
                                       ft_synthetic_session *out);
-ft_status ft_consumer_connect_session(const ft_session_descriptor *descriptor,
-                                      ft_consumer **out);
 ft_status ft_consumer_poll_event(ft_consumer *consumer, ft_event *out_event);
 ft_status ft_consumer_acquire_latest_video_frame(ft_consumer *consumer,
                                                  ft_track_id track_id,

@@ -26,6 +26,9 @@ pub const FT_WAIT_ALL: u32 = 3;
 
 pub struct FtAcquisitionConsumer(ArenaConsumer);
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod session;
+
 impl FtAcquisitionConsumer {
     /// Transfer an admitted consumer to C. Destroy with
     /// `ft_acquisition_consumer_destroy`; outstanding frames remain valid.

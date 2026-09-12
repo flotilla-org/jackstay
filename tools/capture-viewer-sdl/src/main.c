@@ -1,5 +1,6 @@
 #include <SDL.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +28,6 @@ typedef struct stream_state {
   uint32_t width;
   uint32_t height;
   uint32_t stride;
-  int daemon_mode;
 } stream_state;
 
 static void fill_frame(uint8_t *pixels, uint64_t sequence) {
@@ -224,6 +224,122 @@ static int run_native(const viewer_options *options) {
 }
 #endif
 
+#if defined(__APPLE__) || defined(__linux__)
+static int run_cpu_session(const viewer_options *options) {
+  ft_synthetic_session synthetic = {0};
+  const char *session_id = options->session_id;
+  if (session_id == NULL) {
+    if (require_ok(ft_create_synthetic_session(options->porthole_socket, &synthetic), "ft_create_synthetic_session")) return 1;
+    session_id = synthetic.session_id;
+  }
+  ft_cpu_acquisition_connection *connection = NULL;
+  ft_acquisition_consumer *consumer = NULL;
+  ft_acquisition_cancellation *cancellation = NULL;
+  uint64_t track = 0, acquired = 0, requested_epoch = 0;
+  int failed = 1, sdl_started = 0, running = 1, requested_configuration = 0;
+  uint32_t width = 0, height = 0, format = 0;
+  SDL_Window *window = NULL;
+  SDL_Renderer *renderer = NULL;
+  SDL_Texture *texture = NULL;
+  if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
+                    options->token != NULL ? options->token : getenv("PORTHOLE_AGENT_TOKEN"), 2,
+                    &connection, &consumer, &track), "ft_acquisition_cpu_connect_session") ||
+      require_ok(ft_acquisition_cancellation_create(&cancellation), "ft_acquisition_cancellation_create")) goto cleanup;
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL init: %s\n", SDL_GetError()); goto cleanup; }
+  sdl_started = 1;
+  window = SDL_CreateWindow("capture-viewer-sdl", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
+  if (window != NULL) {
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (renderer == NULL) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+  }
+  if (renderer == NULL) { fprintf(stderr, "SDL setup: %s\n", SDL_GetError()); goto cleanup; }
+  failed = 0;
+  while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) running = 0;
+    if (!running) break;
+    ft_acquisition_events before = {0};
+    if (require_ok(ft_acquisition_snapshot(consumer, &before), "ft_acquisition_snapshot")) { failed = 1; break; }
+    ft_acquired_frame *frame = NULL;
+    ft_acquisition_range range = {0};
+    // Repeated presentations may acquire the same latest frame. This also
+    // supports the daemon's static synthetic session with a bounded frame count.
+    ft_status status = ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &frame, &range);
+    uint32_t interest = FT_WAIT_DATA;
+    if (status == FT_STATUS_OK) {
+      ft_acquired_frame_descriptor desc = {0};
+      const uint8_t *bytes = NULL;
+      size_t len = 0;
+      if (require_ok(ft_acquired_frame_describe(frame, &desc), "ft_acquired_frame_describe") ||
+          require_ok(ft_acquired_frame_bytes(frame, &bytes, &len), "ft_acquired_frame_bytes")) {
+        ft_acquired_frame_release(&frame); failed = 1; break;
+      }
+      uint32_t pixel_format = desc.pixel_format == FT_PIXEL_FORMAT_BGRA8_UNORM ? SDL_PIXELFORMAT_BGRA32 :
+                              desc.pixel_format == FT_PIXEL_FORMAT_RGBA8_UNORM ? SDL_PIXELFORMAT_RGBA32 : 0;
+      if (!pixel_format || !desc.width || !desc.height || desc.width > INT_MAX || desc.height > INT_MAX ||
+          desc.stride > INT_MAX || (uint64_t)desc.width * 4 > desc.stride || (uint64_t)desc.stride * desc.height != len) {
+        fprintf(stderr, "invalid CPU frame layout\n"); ft_acquired_frame_release(&frame); failed = 1; break;
+      }
+      if (desc.width != width || desc.height != height || format != pixel_format) {
+        SDL_Texture *replacement = SDL_CreateTexture(renderer, pixel_format, SDL_TEXTUREACCESS_STREAMING, (int)desc.width, (int)desc.height);
+        if (!replacement) { fprintf(stderr, "SDL texture: %s\n", SDL_GetError()); ft_acquired_frame_release(&frame); failed = 1; break; }
+        SDL_DestroyTexture(texture); texture = replacement;
+        width = desc.width; height = desc.height; format = pixel_format;
+        SDL_SetWindowSize(window, width < WIDTH ? WIDTH : (int)width, height < HEIGHT ? HEIGHT : (int)height);
+      }
+      int updated = SDL_UpdateTexture(texture, NULL, bytes, (int)desc.stride);
+      // SDL_UpdateTexture copies the CPU bytes. Subsequent rendering uses SDL's
+      // texture, so no submitted GPU work retains this acquisition mapping.
+      if (require_ok(ft_acquired_frame_release(&frame), "ft_acquired_frame_release") || updated != 0 ||
+          SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, NULL, NULL) != 0) {
+        fprintf(stderr, "SDL render: %s\n", SDL_GetError()); failed = 1; break;
+      }
+      SDL_RenderPresent(renderer);
+      acquired++;
+      SDL_Delay(16);
+      continue;
+    }
+    if (status == FT_STATUS_CLOSED) break;
+    if (status == FT_STATUS_RECONFIGURATION) {
+      interest = FT_WAIT_ALL;
+      if (!requested_configuration || requested_epoch != before.reconfiguration_epoch) {
+        requested_configuration = 1; requested_epoch = before.reconfiguration_epoch;
+        if (require_ok(ft_acquisition_relinquish_configuration(consumer), "ft_acquisition_relinquish_configuration")) { failed = 1; break; }
+        status = ft_acquisition_cpu_install_configuration(connection, consumer);
+        if (status == FT_STATUS_OK) continue;
+        if (status == FT_STATUS_CLOSED) break;
+        if (status != FT_STATUS_EMPTY && status != FT_STATUS_STALE) { fprintf(stderr, "CPU configuration: %d\n", status); failed = 1; break; }
+      }
+    } else if (status == FT_STATUS_HOLDING_LIMIT) {
+      interest = FT_WAIT_CAPACITY;
+    } else if (status != FT_STATUS_EMPTY && status != FT_STATUS_MISS) {
+      fprintf(stderr, "CPU acquisition: %d\n", status); failed = 1; break;
+    }
+    ft_acquisition_events after = {0};
+    status = ft_acquisition_wait(consumer, &before, interest, cancellation, 16 * 1000 * 1000, &after);
+    if (status == FT_STATUS_CLOSED || status == FT_STATUS_CANCELLED) break;
+    if (status != FT_STATUS_OK && status != FT_STATUS_TIMEOUT) { fprintf(stderr, "CPU wait: %d\n", status); failed = 1; break; }
+  }
+  if (options->max_frames > 0 && acquired != (uint64_t)options->max_frames) failed = 1;
+  printf("acquired_frames=%" PRIu64 "\n", acquired);
+cleanup:
+  SDL_DestroyTexture(texture);
+  SDL_DestroyRenderer(renderer);
+  SDL_DestroyWindow(window);
+  if (sdl_started) SDL_Quit();
+  ft_acquisition_cancellation_destroy(&cancellation);
+  ft_acquisition_consumer_destroy(&consumer);
+  ft_acquisition_cpu_connection_destroy(&connection);
+  return failed ? 1 : 0;
+}
+#else
+static int run_cpu_session(const viewer_options *options) {
+  (void)options;
+  fprintf(stderr, "CPU session transport requires macOS or Linux\n");
+  return 1;
+}
+#endif
+
 int main(int argc, char **argv) {
   if (ft_abi_version() != FT_ABI_VERSION) {
     fprintf(stderr, "Jackstay ABI mismatch: rebuild the viewer and library together\n");
@@ -234,6 +350,7 @@ int main(int argc, char **argv) {
   if (options.native) {
     return run_native(&options);
   }
+  if (options.porthole_socket != NULL) return run_cpu_session(&options);
 
   stream_state stream = {
       .producer = NULL,
@@ -242,29 +359,9 @@ int main(int argc, char **argv) {
       .width = WIDTH,
       .height = HEIGHT,
       .stride = STRIDE,
-      .daemon_mode = options.porthole_socket != NULL,
   };
 
-  ft_synthetic_session synthetic_session = {0};
-  if (stream.daemon_mode) {
-    const char *session_id = options.session_id;
-    if (session_id == NULL) {
-      if (require_ok(ft_create_synthetic_session(options.porthole_socket, &synthetic_session),
-                     "ft_create_synthetic_session")) {
-        return 1;
-      }
-      session_id = synthetic_session.session_id;
-    }
-    ft_session_descriptor descriptor = {
-        .control_socket_path = options.porthole_socket,
-        .session_id = session_id,
-        .bearer_token = getenv("PORTHOLE_AGENT_TOKEN"),
-    };
-    if (require_ok(ft_consumer_connect_session(&descriptor, &stream.consumer),
-                   "ft_consumer_connect_session")) {
-      return 1;
-    }
-  } else {
+  {
     ft_producer_options producer_options = {0};
     if (require_ok(ft_producer_create(&producer_options, &stream.producer), "ft_producer_create")) {
       return 1;
@@ -361,8 +458,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  uint8_t *pixels = stream.daemon_mode ? NULL : malloc((size_t)STRIDE * HEIGHT);
-  if (!stream.daemon_mode && pixels == NULL) {
+  uint8_t *pixels = malloc((size_t)STRIDE * HEIGHT);
+  if (pixels == NULL) {
     fprintf(stderr, "pixel allocation failed\n");
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
@@ -385,7 +482,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (!stream.daemon_mode) {
+    {
       fill_frame(pixels, sequence);
       ft_video_frame_desc frame_desc = {
           .sequence = sequence,
@@ -415,7 +512,7 @@ int main(int argc, char **argv) {
     ft_video_frame frame = {0};
     ft_status acquire_status = ft_consumer_acquire_latest_video_frame(stream.consumer, stream.track_id, &frame);
     if (acquire_status == FT_STATUS_OK) {
-      if (!stream.daemon_mode && (frame.desc.sequence != sequence ||
+      if ((frame.desc.sequence != sequence ||
           frame.data == NULL || frame.len != (size_t)STRIDE * HEIGHT ||
           memcmp(frame.data, pixels, (size_t)STRIDE * HEIGHT) != 0)) {
         fprintf(stderr, "synthetic frame payload/sequence mismatch\n");
@@ -451,7 +548,7 @@ int main(int argc, char **argv) {
       SDL_RenderPresent(renderer);
       ft_consumer_release_video_frame(stream.consumer, &frame);
       acquired_frames++;
-    } else if (!stream.daemon_mode || acquire_status != FT_STATUS_EMPTY) {
+    } else {
       fprintf(stderr, "acquire frame failed with status %d\n", acquire_status);
       failed = 1;
       break;
@@ -461,7 +558,7 @@ int main(int argc, char **argv) {
     SDL_Delay(16);
   }
 
-  if (!stream.daemon_mode && options.max_frames > 0 && acquired_frames != (uint64_t)options.max_frames) {
+  if (options.max_frames > 0 && acquired_frames != (uint64_t)options.max_frames) {
     fprintf(stderr, "expected %d synthetic frames, acquired %" PRIu64 "\n", options.max_frames, acquired_frames);
     failed = 1;
   }

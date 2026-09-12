@@ -6,7 +6,7 @@ The source audit below describes commit `6eeaf04` (and Porthole's tracked tree
 at `bf371e6`). The protocol is specified here before changing the data path.
 It does not yet constitute live acceptance or a completed implementation.
 
-## Current ownership paths
+## Ownership paths at the baseline
 
 | Path | Acquisition and reuse | Disconnect / outstanding work |
 | --- | --- | --- |
@@ -431,3 +431,15 @@ test and macOS CPU/SDL smoke pass. The named-service BGRA/RGBA viewer acceptance
 test compiles but awaits working shared events. Linux viewer verification awaits
 CMake/SDL2 development dependencies on paneer. Porthole host migration and live
 capture acceptance remain outstanding.
+
+
+## CPU host and consumer migration
+
+The coordinated Porthole CPU host and reference consumers now use the common
+arena through the Unix setup boundary. The old daemon shadow-ring validation and
+per-frame socket lease API have been removed. See
+[CPU setup](acquisition-cpu-setup.md) for the host limits, cancellation and
+retirement behavior, C ABI 0.4 client entry points and remaining live acceptance.
+The offline in-process `ft_producer`/`ft_consumer` API still uses `VideoSlotManager`
+and remains a separate migration item; it does not establish common-acquisition
+acceptance for the reference viewer's standalone synthetic mode.

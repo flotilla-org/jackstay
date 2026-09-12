@@ -1,16 +1,17 @@
 # CPU acquisition setup over Unix sockets
 
 `acquisition::socket` supplies the setup boundary for the common CPU arena on
-macOS and Linux. It is the transport needed to replace the older daemon
-acquire/release protocol. Porthole and the CPU reference viewer have not yet
-switched to it; the existing daemon shadow-ring regression remains unresolved.
+macOS and Linux. Porthole's CPU host, recorder and SDL reference viewer now
+use it in the coordinated worktree. The old daemon acquire/release protocol and
+its Rust/C frame wrappers have been removed. Successful frames no longer depend
+on the diagnostic ring entry remaining readable.
 
 ## Host and transport responsibilities
 
 The host chooses and authorizes a producer before handing the connection to
-`serve_cpu`. Jackstay does not interpret Porthole session IDs, track IDs, agent
-tokens or desktop permissions. A standalone producer can serve a connection
-directly; Porthole can first perform its own routing/authorization exchange.
+`serve_cpu`. The transport core does not interpret Porthole session IDs, track
+IDs, agent tokens or desktop permissions. A standalone producer can serve a
+connection directly. Porthole first performs its routing/authorization exchange.
 Those preface reads must not buffer bytes belonging to the subsequent setup
 protocol. Only the setup object may then use the stream.
 
@@ -71,16 +72,44 @@ admission. Transport tests reject oversized messages and an FD transfer missing
 its completion marker. A capacity-pause test holds the old frame until the host
 can allocate the replacement and the same connection resumes acquisition.
 
-All four integration cases and both transport unit tests pass on macOS and
-Linux. Workspace build, default/macOS Clippy, Linux Clippy and pinned formatting
-pass; the offline SDL smoke acquires 30 frames. The macOS full suite passes every
-integration binary and reports 126 passing library tests with the one known
-daemon shadow-ring regression failing. The log is
-`/tmp/jackstay-acquisition-socket-workspace-tests.log`. The XPC current-generation
-check compiles, but its native runtime tests still await Metal shared-event
-recovery on kiwi.
+## Porthole clients and host lifetime
 
-Remaining integration work is to publish Porthole CPU frames into the arena,
-replace its per-frame socket handler with authorized setup, and migrate the
-daemon Rust/C consumers, recorder and SDL viewer. Their live acceptance and
-the macOS native acceptance blocked by shared-event allocation are still required.
+`daemon::ConnectedSession::connect(info, holding)` sends a bounded JSON preface:
+`open_cpu_acquisition`, session ID, track ID and optional bearer token. Porthole
+checks session ownership and lifecycle before replying `cpu_opened` and handing
+the socket to `serve_cpu`. No grant is transferred on rejection. Exact preface
+reads leave the subsequent binary setup message intact.
+
+C ABI 0.4 adds `ft_acquisition_cpu_connect_session`, configuration installation
+and setup destruction. It returns the same common consumer/frame handles as
+raw CPU import. It removes `ft_consumer_connect_session` and its descriptor.
+Rust removes `DaemonConsumer` and `DaemonFrame`; callers use `ArenaConsumer`
+and `FrameLease` through `ConnectedSession`.
+
+Porthole publishes copied CPU frames into an arena with eight resources, two
+history positions, one producer reserve, four maximum incarnations and a
+512 MiB allocation budget. The host retains a teardown owner after close and
+runs cleanup and paused-reconfiguration advancement while capture is idle.
+Draining waits for claims, mappings and setup owners; the five-second deadline
+reports recovery required without force-reclaiming them. A cancelled startup
+aborts its capture task. Status keeps a source failure after allocation retirement
+and advertises the installed format while a replacement is pending.
+
+The CPU viewer reserves two holds and releases its frame after `SDL_UpdateTexture`
+returns. Presentation then uses SDL's texture. It handles empty acquisition,
+reconfiguration, capacity and closure with common wait notifications and bounded
+waits for its SDL event loop. The recorder reserves one hold, copies through its
+movie writer before release, and waits against a snapshot taken before selection.
+Ordered gaps retain the existing strict/best-effort recording behavior. Because
+the movie writer has fixed settings, a configuration change ends the recording
+with an explicit error requesting a new recording.
+
+`acquisition_session` tests the authorized session preface, host rejection, history
+wrap with a held frame, C configuration replacement and frames surviving both
+API owners. The Porthole tests cover startup cancellation, retained failure
+status, duplicate holding credit, consumer restart, recorder waits and gaps.
+The separately invoked `cpu_viewer_e2e` test runs a built SDL viewer in two child
+processes against an in-memory Porthole host and checks final retirement. These
+are synthetic checks. Live CPU playback, delayed-consumer capture and native GPU
+acceptance remain required. Metal shared-event allocation on kiwi remains the
+recorded blocker for native runtime acceptance.

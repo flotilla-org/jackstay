@@ -1,7 +1,7 @@
 # Acquisition across Rust and C
 
 The common arena now has an ownership boundary in `ffi_acquisition.rs`, declared
-in `capture_transfer.h` under ABI 0.3. It uses `ArenaConsumer`, `FrameLease`,
+in `capture_transfer.h` under ABI 0.4. It uses `ArenaConsumer`, `FrameLease`,
 `Cancellation` and `ConsumerReleaseTimeline` directly. It has no C lease book.
 
 ## Setup and ownership

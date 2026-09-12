@@ -57,6 +57,11 @@ permissions. Network streaming is future work: a bridge could consume a stream
 here and publish another local stream on the receiving host. No Tender dependency
 or requirements follow from this extraction.
 
+The agreed next acquisition contract is recorded in
+[ADR-0001](docs/adr/0001-acquisition-leases-and-reservations.md), with
+[implementation slices](docs/specs/acquisition-lifetime-contract.md) and a
+[glossary](CONTEXT.md). These describe work not yet implemented.
+
 ## Linking and verification
 
 Rust consumers depend on package `jackstay`. The shared library is

@@ -246,10 +246,25 @@ and new frames under shared holding credit; a capacity pause retaining old pixel
 dropping incoming frames during that pause; and 100 replacements under a budget
 too small for two pools. The existing gated GPU test now installs a replacement
 while actual consumer commands still wait on a GPU event, then verifies old pixels
-and deferred credit return after completion. Nine native arena tests pass, along
-with the seven existing macOS backend tests. Producer-side delayed GPU completion,
-native process-exit/reconfiguration combinations, and the real setup/C/host path
-still need acceptance evidence. These remain offscreen tests, not live capture.
+and deferred credit return after completion.
+
+A further test submits an actual GPU wait ahead of the producer blit on its Metal
+queue. Apple documents this ordering in
+[Setting up a command structure](https://developer.apple.com/documentation/metal/setting-up-a-command-structure)
+and the GPU dependency in
+[encodeWaitForEvent](https://developer.apple.com/documentation/metal/mtlcommandbuffer/encodewaitforevent(_:value:)).
+The test has no consumer claims or mappings. A budget too small for two pools
+still pauses replacement until the producer readiness event completes, then
+permits replacement and samples the new frame. `MetalContext::enqueue_wait`
+submits this dependency without blocking the calling thread.
+
+The real-process crash test now also resizes while the crashed incarnation is
+quarantined. A healthy consumer installs and samples the replacement, while the
+quarantined incarnation remains charged and blocks new admission. This child
+still acquires metadata without submitting GPU commands; proving crash cleanup
+after actual consumer GPU submission requires the process-bound native setup
+transport. Ten native arena tests pass. These remain offscreen tests, not live
+capture, and do not establish the real setup/C/host path.
 
 The CPU arena, cleanup, release, retirement, wait, and reconfiguration suites pass
 on macOS and Linux after this change. The three deterministic concurrency tests,

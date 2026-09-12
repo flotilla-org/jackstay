@@ -35,6 +35,7 @@ mod ffi {
 
         pub fn porthole_native_metal_create(out_metal: *mut *mut c_void) -> *mut c_char;
         pub fn porthole_native_metal_destroy(metal: *mut c_void);
+        pub fn porthole_native_metal_enqueue_wait(metal: *mut c_void, event: *mut c_void, value: u64) -> *mut c_char;
 
         pub fn porthole_native_surface_create(
             width: u32,
@@ -183,6 +184,16 @@ impl MetalContext {
         check("metal-create", unsafe { ffi::porthole_native_metal_create(&mut raw) })?;
         Ok(Self {
             raw: NonNull::new(raw).expect("shim returned NULL metal context without error"),
+        })
+    }
+
+    /// Submit a GPU wait ahead of subsequent work on this context's queue.
+    /// Returns after submission, without blocking the calling thread. The
+    /// event must be compatible with this context's Metal device, and its
+    /// signal must not depend on later work on this same queue.
+    pub fn enqueue_wait(&self, event: &ConsumerFence, value: u64) -> Result<()> {
+        check("metal-enqueue-wait", unsafe {
+            ffi::porthole_native_metal_enqueue_wait(self.raw.as_ptr(), event.raw.as_ptr(), value)
         })
     }
 }

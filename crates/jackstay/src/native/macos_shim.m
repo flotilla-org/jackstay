@@ -60,6 +60,18 @@ void porthole_native_metal_destroy(void *metalPtr) {
   (void)(__bridge_transfer PortholeNativeMetal *)metalPtr;
 }
 
+char *porthole_native_metal_enqueue_wait(void *metalPtr, void *eventPtr, uint64_t value) {
+  PortholeNativeMetal *metal = (__bridge PortholeNativeMetal *)metalPtr;
+  id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
+  id<MTLCommandBuffer> commandBuffer = [metal.queue commandBuffer];
+  if (commandBuffer == nil) {
+    return porthole_native_copy_error(@"failed to create Metal wait command buffer");
+  }
+  [commandBuffer encodeWaitForEvent:event value:value];
+  [commandBuffer commit];
+  return NULL;
+}
+
 // ---- IOSurface utilities ---------------------------------------------------
 
 typedef struct {

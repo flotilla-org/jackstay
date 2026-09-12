@@ -372,11 +372,27 @@ and handle installation is atomic, including disposal ordering on rejected offer
 Initial setup uses the same ownership path. The readiness timeline stays monotonic
 across configuration generations.
 
-Nine native arena tests now pass: the added tests exercise allocation bounds,
+Ten native arena tests now pass: the added tests exercise allocation bounds,
 size/format replacement with both generations held, a capacity pause, and 100
 replacements under a budget too small for overlapping pools. The gated GPU test
 also retains a deferred frame through pool replacement. Seven existing macOS
-backend tests pass. The CPU suites remain green on macOS and Linux. Delayed
-producer GPU completion and native crash/reconfiguration combinations still need
-dedicated evidence; paused transitions require an explicit host retry for now.
+backend tests pass. The CPU suites remain green on macOS and Linux. A real GPU
+queue dependency now proves that delayed producer writes retain the old pool's
+charge even without any consumers. The crash test now also samples a replacement
+through a healthy consumer while preserving the crashed incarnation's quarantine.
+The child still does not submit GPU work; that remaining crash proof needs native
+handles and release events transferred through process-bound setup. Paused
+transitions require an explicit host retry for now.
 Host/C integration, full-suite gates, and live acceptance remain outstanding.
+
+The next setup change belongs in the existing macOS XPC transport
+(`native/macos/xpc.rs` and `native/macos_xpc_shim.m`). Its current grant still
+transfers a legacy ring FD and caller-selected consumer ID; it does not expose
+the connection's peer PID to Rust. The acquisition setup must instead bind
+`attach_process` to the PID obtained from the accepted `NSXPCConnection`, transfer
+the versioned grant metadata and five FDs with the typed surface/event objects,
+and use one-FD replacement offers for that same incarnation. Release registration
+must transfer the consumer's real shared-event handle so both sides observe the
+same completion source. Connection invalidation closes acquisition without
+pretending to prove process death or GPU completion. These are setup operations;
+frame acquisition and deferred-release handoff remain on the shared maps.

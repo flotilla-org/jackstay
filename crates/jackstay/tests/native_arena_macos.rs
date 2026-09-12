@@ -120,6 +120,80 @@ fn native_reconfiguration_retains_old_pixels_and_shares_holding_credit_with_the_
 }
 
 #[test]
+fn pending_producer_gpu_writes_keep_a_retired_pool_charged_without_any_consumer_claims() {
+    use jackstay::acquisition::arena::ReconfigurationStatus;
+    let params = NativeStreamParams {
+        width: 16,
+        height: 16,
+        pixel_format: PixelFormat::Bgra8Unorm,
+        color_space: ColorSpace::Srgb,
+        clock_domain: ClockDomain::HostTime,
+        modifier: 0,
+    };
+    let mut backend = MacosFrameBackend::new().unwrap();
+    let bound = backend.pool_allocation_upper_bound(&params, 6).unwrap();
+    let pool = backend.allocate_surface_pool_bounded(&params, 6, bound).unwrap();
+    let fence = backend.create_fence().unwrap();
+    let readiness = ConsumerFence::from_handle(backend.metal(), &backend.export_sync_handle(&fence).unwrap()).unwrap();
+    let gate = ConsumerFence::new(backend.metal()).unwrap();
+    struct OpenOnDrop<'a>(&'a ConsumerFence);
+    impl Drop for OpenOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.signal_cpu(1);
+        }
+    }
+    let _open_on_unwind = OpenOnDrop(&gate);
+    // This is an actual GPU dependency ahead of staging on the producer queue.
+    // The producer can submit and publish, but its blit cannot finish yet.
+    backend.metal().enqueue_wait(&gate, 1).unwrap();
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let config = ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 0,
+        memory_budget: bound + 3 * page,
+        max_incarnations: 1,
+        drain_timeout: std::time::Duration::from_secs(5),
+    };
+    let mut producer = NativeArenaProducer::from_allocated_parts(backend, pool, fence, params.clone(), config).unwrap();
+    assert!(matches!(
+        producer.publish(&captured(27), 1).unwrap(),
+        jackstay::acquisition::arena::PublishOutcome::Published { .. }
+    ));
+    assert!(!readiness.wait(1, 20), "the producer blit escaped its GPU dependency");
+    // No consumer has ever attached. Only the producer's unfinished GPU write
+    // can justify keeping the old pool charged after this replacement starts.
+    assert!(matches!(
+        producer.reconfigure(params).unwrap(),
+        ReconfigurationStatus::PausedCapacity { .. }
+    ));
+    assert!(matches!(
+        producer.advance_reconfiguration().unwrap(),
+        ReconfigurationStatus::PausedCapacity { .. }
+    ));
+    gate.signal_cpu(1);
+    assert!(readiness.wait(1, 5000), "producer readiness did not complete");
+    assert!(matches!(
+        producer.advance_reconfiguration().unwrap(),
+        ReconfigurationStatus::Ready { .. }
+    ));
+    let consumer = producer.attach(1).unwrap().into_consumer().unwrap();
+    producer.publish(&captured(94), 2).unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("replacement failed to resume")
+    };
+    let native = frame.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+    let metal = MetalContext::new().unwrap();
+    assert_eq!(
+        readiness
+            .sample_offscreen(&metal, native.surface, frame.descriptor().fence_value, 16, 16)
+            .unwrap(),
+        vec![94; 16 * 16 * 4]
+    );
+}
+
+#[test]
 fn native_replacement_waits_for_old_storage_and_reclaims_repeated_pool_generations() {
     use jackstay::acquisition::arena::{ConfigurationInstall, PublishOutcome, ReconfigurationStatus};
     let mut params = NativeStreamParams {
@@ -398,7 +472,7 @@ fn a_crashed_native_consumer_without_completion_evidence_keeps_its_iosurface_qua
     use jackstay::fdpass;
     let mut producer = producer(2);
     let healthy_grant = producer.attach(1).unwrap();
-    let healthy = ArenaConsumer::from_grant(healthy_grant.consumer).unwrap();
+    let mut healthy = healthy_grant.into_consumer().unwrap();
     producer.publish(&captured(7), 1).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("native-crash.sock");
@@ -472,6 +546,43 @@ fn a_crashed_native_consumer_without_completion_evidence_keeps_its_iosurface_qua
         panic!("healthy consumer stopped progressing")
     };
     assert!(latest.cursor() > 4, "the ring did not wrap");
+    assert!(matches!(
+        producer
+            .reconfigure(NativeStreamParams {
+                width: 17,
+                height: 19,
+                pixel_format: PixelFormat::Rgba8Unorm,
+                color_space: ColorSpace::Srgb,
+                clock_domain: ClockDomain::HostTime,
+                modifier: 0,
+            })
+            .unwrap(),
+        jackstay::acquisition::arena::ReconfigurationStatus::Ready { .. }
+    ));
+    let offer = producer.configuration_offer(healthy.incarnation()).unwrap().unwrap();
+    assert_eq!(
+        offer.install(&mut healthy).unwrap(),
+        jackstay::acquisition::arena::ConfigurationInstall::Installed
+    );
+    let surface = IoSurface::allocate(17, 19, PixelFormat::Rgba8Unorm).unwrap();
+    surface.write_pixels(&vec![43; 17 * 19 * 4]).unwrap();
+    producer.publish(&MacosCapturedFrame { surface }, 101).unwrap();
+    assert!(matches!(healthy.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
+    drop(latest);
+    let AcquireOutcome::Frame(resized) = healthy.acquire_latest(0).unwrap() else {
+        panic!("healthy consumer did not resume after reconfiguration")
+    };
+    let native = resized.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+    let readiness = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
+    assert_eq!(
+        readiness
+            .sample_offscreen(&metal, native.surface, resized.descriptor().fence_value, 17, 19)
+            .unwrap(),
+        vec![43; 17 * 19 * 4]
+    );
+    producer.poll_cleanup().unwrap();
+    assert!(producer.cleanup_failures().iter().any(|failure| failure.incarnation == dead));
+    assert!(producer.attach(1).is_err(), "resize discarded the quarantined incarnation");
 }
 
 #[test]

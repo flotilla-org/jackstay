@@ -23,8 +23,8 @@ class State:
     producer_pc: int = 0
     producer_cycle: int = 0
     observed_claim: bool = False
-    active: bool = True
-    closed: bool = False
+    active: tuple = (True, True)
+    closed: tuple = (False, False)
 
 
 def changed(values, index, value):
@@ -45,7 +45,7 @@ def transitions(state, mode, with_close):
             next_state = replace(next_state, validated=changed(state.validated, index, valid))
             label += f"validate resource ({valid})"
         elif pc == 2:
-            admitted = state.active and state.validated[index]
+            admitted = state.active[index] and state.validated[index]
             next_state = replace(next_state, admitted=changed(state.admitted, index, admitted))
             if not admitted or mode == "early-release":
                 next_state = replace(next_state, claims=changed(state.claims, index, 0))
@@ -60,8 +60,12 @@ def transitions(state, mode, with_close):
             label += "release after use"
         yield label, next_state
 
-    if with_close and not state.closed:
-        yield "close incarnation (keep claims)", replace(state, active=False, closed=True)
+    if with_close:
+        for index, closed in enumerate(state.closed):
+            if not closed:
+                yield f"close incarnation {index} (keep claims)", replace(
+                    state, active=changed(state.active, index, False), closed=changed(state.closed, index, True)
+                )
 
     if state.producer_cycle == 2:
         return

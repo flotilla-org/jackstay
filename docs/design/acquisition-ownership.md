@@ -161,7 +161,7 @@ model supplements those tests; it is not evidence about compiled atomics or an
 OS backend. Live CPU/GPU checks remain required by the contract.
 
 `python3 scripts/check-acquisition-model.py` explored 1,658 states without
-closure and 4,726 with closure, for two consumers and two producer reuse
+closure and 9,236 with independent incarnation closure, for two consumers and two producer reuse
 attempts, with no unsafe read. Negative controls found counterexamples for
 scanning before retirement, reusing generation IDs, and releasing before use
 completes. These are bounded SC checks, not a weak-memory or liveness proof.
@@ -169,8 +169,22 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | Slice | Status / next evidence |
 | --- | --- |
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
-| 2: admission/incarnations | Pending. |
+| 2: admission/incarnations | `acquisition::AdmissionBook` implements worst-case holding reservations, memory and incarnation-table limits, fresh IDs, and retention of capacity until cleanup acknowledgement. Four public-boundary tests pass. Shared claim integration and actual deferred-release credit remain pending. |
 | 3: CPU shared acquisition/waits | Pending; existing slow-consumer regression still fails. |
 | 4: existing GPU | macOS selected; readiness encoding exists, acquisition/completion integration pending. |
 | 5: cleanup/reconfiguration | Pending; GPU process-death proof remains open. |
 | 6: ABI/host/live acceptance | Pending. |
+
+Admission-layer validation: `cargo test --locked --test acquisition_admission`,
+workspace build, all-targets clippy with warnings denied, and pinned formatting
+passed. The full suite is not claimed clean: the deliberately failing existing
+socket/shadow regression is still present, awaiting the data-path replacement.
+The admission book's cleanup acknowledgement is accounting only; it must be
+called by the future arena cleanup owner after actual resource and mapping
+reclamation, never directly on disconnect.
+
+Next: implement mapped claim slots and resource-generation validation under the
+ordering above. Exercise duplicate/overlapping leases and deferred-release credit
+through actual claims, then join admission, publication, and acquisition in the
+shared CPU/native arena. Do not add a per-frame broker update just to keep the
+admission book informed; reserved claim slots are the holding credit.

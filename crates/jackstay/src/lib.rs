@@ -1,3 +1,4 @@
+pub mod acquisition;
 pub mod control_page;
 #[cfg(unix)]
 pub mod daemon;

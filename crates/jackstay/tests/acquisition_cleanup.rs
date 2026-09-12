@@ -91,6 +91,46 @@ fn cpu_process_crash_reclaims_only_that_incarnation_and_never_treats_connection_
 }
 
 #[test]
+fn a_cpu_process_crash_retires_its_old_mapping_and_unblocks_a_capacity_paused_replacement() {
+    use jackstay::acquisition::arena::ReconfigurationStatus;
+    let mut producer = ArenaProducer::new(ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 32 * 1024,
+        memory_budget: 512 * 1024,
+        max_incarnations: 1,
+        drain_timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let (mut child, incarnation) = spawn_consumer(&mut producer, None);
+    assert!(matches!(
+        producer.reconfigure_cpu(64 * 1024).unwrap(),
+        ReconfigurationStatus::PausedCapacity { .. }
+    ));
+    producer.close(incarnation).unwrap();
+    assert!(matches!(
+        producer.advance_reconfiguration().unwrap(),
+        ReconfigurationStatus::PausedCapacity { .. }
+    ));
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert!(matches!(
+        producer.advance_reconfiguration().unwrap(),
+        ReconfigurationStatus::Ready { .. }
+    ));
+    let restarted = ArenaConsumer::from_grant(producer.attach(1).unwrap()).unwrap();
+    assert_ne!(restarted.incarnation(), incarnation);
+    producer.publish(FrameDescriptor::default(), b"replacement").unwrap();
+    let AcquireOutcome::Frame(frame) = restarted.acquire_latest(0).unwrap() else {
+        panic!("no replacement frame")
+    };
+    assert_eq!(frame.bytes(), b"replacement");
+}
+
+#[test]
 #[ignore = "subprocess helper invoked by cpu_process_crash_reclaims_only_that_incarnation_and_never_treats_connection_eof_as_exit"]
 fn mapped_crash_child() {
     let mut stream = UnixStream::connect(std::env::var("JACKSTAY_CRASH_TEST_SOCKET").unwrap()).unwrap();

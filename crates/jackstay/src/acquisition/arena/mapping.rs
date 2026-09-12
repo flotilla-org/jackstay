@@ -9,8 +9,8 @@ use std::{
 };
 
 use super::{
-    ArenaError, FrameDescriptor, HEADER_LEN, LATEST, RECONFIGURATION_EPOCH, ResourceRecord, TERMINAL, VERSION, checked_add, checked_mul,
-    page_rounded,
+    ArenaError, CONFIGURATION, FIRST_CURSOR, FrameDescriptor, HEADER_LEN, LATEST, RECONFIGURATION_EPOCH, ResourceRecord, TERMINAL, VERSION,
+    checked_add, checked_mul, page_rounded,
 };
 use crate::shm::SharedMemorySegment;
 const RESOURCE_MAGIC: u64 = u64::from_le_bytes(*b"JSRES001");
@@ -21,6 +21,7 @@ const CONTROL_MAGIC: u64 = u64::from_le_bytes(*b"JSCTL001");
 struct ResourceHeader {
     magic: u64,
     version: u64,
+    generation: u64,
     resources: u64,
     history: u64,
     payload_capacity: u64,
@@ -73,14 +74,16 @@ impl ResourceLayout {
 pub(super) struct ResourceMap {
     pub(super) storage: SharedMemorySegment,
     pub(super) layout: ResourceLayout,
+    pub(super) generation: u64,
 }
 
 impl ResourceMap {
-    pub(super) fn new(layout: ResourceLayout, scope: [u8; 16]) -> Result<Self, ArenaError> {
+    pub(super) fn new(layout: ResourceLayout, scope: [u8; 16], generation: u64) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::new(layout.len)?;
         let header = ResourceHeader {
             magic: RESOURCE_MAGIC,
             version: VERSION,
+            generation,
             resources: layout.resources as u64,
             history: layout.history as u64,
             payload_capacity: layout.payload_capacity as u64,
@@ -105,15 +108,21 @@ impl ResourceMap {
                     });
             }
         }
-        Ok(Self { storage, layout })
+        Ok(Self {
+            storage,
+            layout,
+            generation,
+        })
     }
 
-    pub(super) fn map(fd: OwnedFd, expected: ResourceLayout, scope: [u8; 16]) -> Result<Self, ArenaError> {
+    pub(super) fn map(fd: OwnedFd, expected: ResourceLayout, scope: [u8; 16], generation: u64) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::map_read_only(fd, expected.len)?;
         // SAFETY: the opaque grant names an initialized arena. ResourceHeader bytes
         // are immutable after creation; no mutable atomic fields are copied.
         let header = unsafe { storage.as_ptr().cast::<ResourceHeader>().read() };
-        if header.magic != RESOURCE_MAGIC
+        if header.generation != generation
+            || generation == 0
+            || header.magic != RESOURCE_MAGIC
             || header.scope != scope
             || header.version != VERSION
             || header.map_len != expected.len as u64
@@ -125,7 +134,11 @@ impl ResourceMap {
         {
             return Err(ArenaError::Mapping("arena header disagrees with grant"));
         }
-        Ok(Self { storage, layout: expected })
+        Ok(Self {
+            storage,
+            layout: expected,
+            generation,
+        })
     }
 
     fn word(&self, offset: usize) -> &AtomicU64 {
@@ -191,8 +204,19 @@ impl ControlMap {
                 map_len: storage.len() as u64,
                 scope,
             });
-            for offset in [LATEST, TERMINAL, RECONFIGURATION_EPOCH] {
-                storage.as_ptr().add(offset).cast_mut().cast::<AtomicU64>().write(AtomicU64::new(0));
+            for (offset, value) in [
+                (LATEST, 0),
+                (TERMINAL, 0),
+                (RECONFIGURATION_EPOCH, 0),
+                (CONFIGURATION, 1),
+                (FIRST_CURSOR, 1),
+            ] {
+                storage
+                    .as_ptr()
+                    .add(offset)
+                    .cast_mut()
+                    .cast::<AtomicU64>()
+                    .write(AtomicU64::new(value));
             }
             for index in 0..history {
                 storage

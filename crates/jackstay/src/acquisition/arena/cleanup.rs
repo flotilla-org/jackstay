@@ -129,6 +129,9 @@ impl ObservationState {
         // The watch was bound before this remote grant escaped. The OS event
         // proves no admitted process thread can still read or publish a claim.
         self.claims.acknowledge_quiescent();
+        for index in 0..self.claims.frames + 2 {
+            self.claims.mapping_slot(index).store(0, SeqCst);
+        }
         for index in 0..self.claims.frames {
             if self.claims.slot(index).load(SeqCst) == 0 {
                 continue;
@@ -148,7 +151,9 @@ impl ObservationState {
     }
 
     fn drained(&self) -> bool {
-        self.claims.word(QUIESCENT).load(SeqCst) != 0 && (0..self.claims.frames).all(|index| self.claims.slot(index).load(SeqCst) == 0)
+        self.claims.word(QUIESCENT).load(SeqCst) != 0
+            && !self.claims.has_mappings()
+            && (0..self.claims.frames).all(|index| self.claims.slot(index).load(SeqCst) == 0)
     }
 
     fn observe_deadline(&mut self) {
@@ -458,6 +463,7 @@ impl ArenaProducer {
             released = released.saturating_add(std::mem::take(&mut state.released));
         }
         self.collect_quiescent();
+        self.collect_retired_allocations();
         Ok(released)
     }
 }

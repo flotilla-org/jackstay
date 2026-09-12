@@ -181,7 +181,7 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | --- | --- |
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
 | 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-bound remote grants now reclaim ordinary CPU claims on verified exit; asynchronous claims still require completion evidence. |
-| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, and cancellable notification waits are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Reconfiguration events await the transition implementation. Host integration remains pending; the old socket/shadow regression still fails. |
+| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, cancellable notification waits, and local CPU reconfiguration are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Replacement-offer FD transfer and host integration remain pending; the old socket/shadow regression still fails. |
 | 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Completion observation wakes capacity waits while publication is idle. Replacement of the existing host path remains pending. |
 | 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished drains now report recovery failure without revocation; bounded reconfiguration and real GPU command retirement after process death remain pending. |
 | 6: ABI/host/live acceptance | Pending. |
@@ -211,12 +211,12 @@ an older frame. Hooks exist only in the test build, and assertions use public
 publication/acquisition outcomes. These tests do not establish GPU safety or
 unexpected-process-death reclamation.
 
-The arena is currently a fixed allocation, with inline CPU payloads or external
-native resources. `native::arena::NativeArenaProducer` uses the same retirement
+The arena supports local CPU replacement; external native resources still use a
+fixed allocation. `native::arena::NativeArenaProducer` uses the same retirement
 and claim scan before staging into an IOSurface; it also checks producer GPU
 completion before reusing a staging target. Actual IOSurface allocation sizes
 count against the arena byte budget. The old host/native and C paths have not
-yet been replaced. The new setup descriptor (version 5)
+yet been replaced. The new setup descriptor (version 6)
 carries five FDs: control, resources, claim page, notification reader,
 notification writer. Control and resource headers carry an arena scope; the
 claim header has an independent incarnation scope. Import rejects mappings
@@ -280,7 +280,7 @@ macOS-feature all-targets clippy, and pinned formatting passed during this slice
 The eleven existing macOS backend/XPC tests passed before adding automatic
 observation; their existing sampling wrapper was unchanged by that addition.
 
-Next: implement [bounded reconfiguration](acquisition-reconfiguration.md),
+Next: finish [bounded reconfiguration](acquisition-reconfiguration.md),
 then replace the existing CPU/native acquisition paths with the shared arena. Do not add a
 per-frame broker update to keep admission informed; reserved claim slots are the
 holding credit.
@@ -306,8 +306,21 @@ through allocation failure/retry. Two further admission tests cover overlap and
 insufficient-overlap scenarios, bringing the admission suite to six tests. These
 and the arena tests pass on macOS and Linux; the cleanup/release/wait and native
 tests remain green, as do build, default and macOS clippy, and pinned formatting.
-The arena uses the new initial byte breakdown but does not yet invoke runtime
-transitions. Accounting acknowledgement is not mapping-retirement proof.
+The subsequent CPU transition implementation now invokes the ledger at runtime.
+Consumer mapping-reference slots provide retirement acknowledgements separately
+from frame claims; each map is destroyed before its acknowledgement. Outstanding
+offers remain charged and limited to one per incarnation. Allocation reclamation
+requires both the mapping references and frame claims to be clear.
+
+Four local CPU transition tests pass on macOS and Linux, along with a real-process
+crash that unblocks an exhausted replacement. They cover retained descriptors and
+bytes, shared holding credit, overlap pause/retry, cancellation, published cursor
+gaps, and repeated healthy changes while a stale offer remains outstanding. The
+existing acquisition suites, three concurrency tests, three native GPU tests,
+workspace build, default/macOS clippy, and pinned formatting remain green.
+Cross-process replacement grants, native replacement, and deferred consumer-side
+mapping/handle retention still need implementation. The full suite and live
+acceptance are not claimed complete.
 
 Process-bound cleanup now uses kqueue on macOS and pidfds on Linux. Remote grants
 are export-only and mandatory for setup FD transfer; local grants use ordinary

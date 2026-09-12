@@ -1,8 +1,8 @@
 # Bounded acquisition reconfiguration
 
-Status: the control/resource and consumer-lifetime split and admission-book
-allocation accounting are implemented. Runtime transition and retirement remain
-to be implemented.
+Status: local CPU transitions, mapping retirement, and admission-book accounting
+are implemented. Cross-process replacement setup, deferred consumer mapping/handle
+retention, and native pool replacement remain unfinished.
 
 ## Separate control lifetime from resource lifetime
 
@@ -100,9 +100,24 @@ allocation failure can return its reservation while keeping admission paused for
 retry. Allocation IDs are never reused. Like incarnation cleanup, the accounting
 acknowledgement supplies no lifetime proof itself.
 
-The arena uses the split byte accounting for its initial allocation. Its runtime
-still has one fixed resource map: calling the book's transition methods from the
-arena requires the publication, grant, and retirement protocol below. Native staging
+The CPU arena now uses this ledger through `reconfigure_cpu` and
+`advance_reconfiguration`. A pending transition drops incoming publications.
+The host retries advancement after retirement; allocation failure leaves the
+proposal paused for retry. `configuration_offer` supplies an opaque local setup
+grant, and `install_configuration` or dropping the grant disposes that offer.
+Cross-process export/import of replacement offers still needs implementation.
+
+Claim maps contain `H + 2` mapping-reference slots: at most H generations retained
+by leases, one current mapping, and one outstanding offer. A resource owner keeps
+its slot until it has unmapped; an abandoned offer closes its FD before clearing
+its slot. The producer reclaims a retired allocation only after no mapping slot
+or resource claim names it, and destroys its own mapping before returning bytes.
+Process-exit proof clears mapping references; unresolved asynchronous claims still
+prevent allocation reclamation. Initial setup uses the same bookkeeping. Setup
+version 6 adds the resource generation and mapping slot to its descriptor and
+binds the resource header to that generation.
+
+Native staging
 needs an allocation upper bound before creating a replacement pool; checking its
 actual size only after allocation would permit a temporary budget violation.
 The macOS backend's allocation contract must establish that bound, then validate
@@ -111,9 +126,15 @@ verification against the native API.
 
 ## Implementation evidence required
 
-First split control and resource lifetime without changing acquisition semantics;
-retain the existing mapped, cross-process, SC-interleaving, wait, and native tests.
-Then exercise the transition through the agreed producer and consumer seams:
+The existing mapped, cross-process, SC-interleaving, wait, and native tests remain
+green. Four CPU transition tests pass on macOS and Linux: old/new frame retention
+under shared holding credit; exhausted overlap capacity and cancellation; cursor
+gaps before and after replacement publication; and 100 healthy replacements while
+another consumer retains one stale offer. A separate real-process crash test
+unblocks a capacity-paused CPU replacement after process-exit proof. These tests
+do not cover deferred consumer mapping retention or native pool replacement.
+
+Complete the remaining transition evidence through the agreed seams:
 
 - Acquire old CPU and native frames, install a new size/format, and verify both
   old descriptors/pixels and new delivery. Old and new leases share holding credit.

@@ -10,7 +10,7 @@ use std::{
     cell::UnsafeCell,
     collections::BTreeMap,
     io::Read,
-    mem::{align_of, size_of},
+    mem::{ManuallyDrop, align_of, size_of},
     os::fd::OwnedFd,
     sync::{
         Arc,
@@ -22,8 +22,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{AdmissionBook, AdmissionError, AdmissionLimits, HoldingRequest, IncarnationId};
+use super::{AdmissionBook, AdmissionError, AdmissionLimits, AllocationId, HoldingRequest, IncarnationId};
 use crate::{CaptureTransferError, shm::SharedMemorySegment};
+
+mod reconfiguration;
+pub use reconfiguration::{ConfigurationGrant, ConfigurationInstall, ReconfigurationStatus};
 
 mod mapping;
 use mapping::{ControlMap, ResourceLayout, ResourceMap};
@@ -35,15 +38,18 @@ mod process;
 pub use cleanup::{CleanupFailure, RejectedDeferredRelease, ReleaseNotification, ReleaseTimeline, ReleaseTimelineRegistration};
 
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
-const VERSION: u64 = 5;
+const VERSION: u64 = 6;
 const HEADER_LEN: usize = 256;
 const LATEST: usize = 128;
 const TERMINAL: usize = 136;
 const RECONFIGURATION_EPOCH: usize = 144;
+const CONFIGURATION: usize = 152;
+const FIRST_CURSOR: usize = 160;
 const ACTIVE: usize = 128;
 const QUIESCENT: usize = 136;
 const CAPACITY_EPOCH: usize = 144;
 const WAIT_INTEREST: usize = 152;
+const OFFERED_GENERATION: usize = 160;
 const MAX_GENERATION: u64 = u64::MAX >> 1;
 const CLAIM_SLOT_LEN: usize = 32;
 const RELEASE_ID: usize = 8;
@@ -156,6 +162,7 @@ pub enum AcquireOutcome {
     Miss { cursor: u64 },
     Gap { first: u64, last: u64 },
     HoldingLimit,
+    Reconfiguration,
     Closed,
 }
 
@@ -206,7 +213,10 @@ impl ClaimMap {
     fn allocation_len(frames: u32) -> Result<usize, ArenaError> {
         // Each holding slot has claim/release words and one bounded timeline
         // registration entry. All words are initialized before fd transfer.
-        page_rounded(checked_add(HEADER_LEN, checked_mul(frames as usize, CLAIM_SLOT_LEN + 8)?)?)
+        page_rounded(checked_add(
+            checked_add(HEADER_LEN, checked_mul(frames as usize, CLAIM_SLOT_LEN + 8)?)?,
+            checked_mul(frames as usize + 2, 8)?,
+        )?)
     }
 
     fn new(
@@ -230,7 +240,13 @@ impl ClaimMap {
                 scope,
                 recipient_pid: u64::from(recipient_pid),
             });
-            for (offset, value) in [(ACTIVE, 1), (QUIESCENT, 0), (CAPACITY_EPOCH, 0), (WAIT_INTEREST, 0)] {
+            for (offset, value) in [
+                (ACTIVE, 1),
+                (QUIESCENT, 0),
+                (CAPACITY_EPOCH, 0),
+                (WAIT_INTEREST, 0),
+                (OFFERED_GENERATION, 0),
+            ] {
                 storage
                     .as_ptr()
                     .add(offset)
@@ -238,7 +254,7 @@ impl ClaimMap {
                     .cast::<AtomicU64>()
                     .write(AtomicU64::new(value));
             }
-            for index in 0..frames as usize * (CLAIM_SLOT_LEN / 8 + 1) {
+            for index in 0..frames as usize * (CLAIM_SLOT_LEN / 8 + 1) + frames as usize + 2 {
                 storage
                     .as_ptr()
                     .add(HEADER_LEN + index * 8)
@@ -327,6 +343,8 @@ pub struct ConsumerGrant {
     claim_fd: Option<OwnedFd>,
     reader_fd: Option<OwnedFd>,
     layout: ResourceLayout,
+    generation: u64,
+    mapping_slot: usize,
     claims: Arc<ClaimMap>,
     consumed: bool,
 }
@@ -352,6 +370,8 @@ impl RemoteConsumerGrant {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantDescriptor {
     pub version: u64,
+    pub generation: u64,
+    pub mapping_slot: u32,
     pub incarnation: u64,
     pub resources: u32,
     pub history: u32,
@@ -377,6 +397,8 @@ impl ConsumerGrant {
         self.consumed = true;
         let descriptor = GrantDescriptor {
             version: VERSION,
+            generation: self.generation,
+            mapping_slot: self.mapping_slot as u32,
             incarnation: self.claims.incarnation.0,
             resources: self.layout.resources as u32,
             history: self.layout.history as u32,
@@ -416,7 +438,7 @@ impl ConsumerGrant {
         if descriptor.recipient_pid != std::process::id() {
             return Err(ArenaError::Mapping("grant belongs to a different recipient process"));
         }
-        if descriptor.version != VERSION || descriptor.incarnation == 0 || descriptor.holding == 0 {
+        if descriptor.version != VERSION || descriptor.generation == 0 || descriptor.incarnation == 0 || descriptor.holding == 0 {
             return Err(ArenaError::Mapping("invalid grant version or incarnation reservation"));
         }
         let payload_capacity =
@@ -443,6 +465,12 @@ impl ConsumerGrant {
             Arc::new(wait::Wake::from_fd(reader_fd.try_clone()?)?),
             descriptor.recipient_pid,
         )?);
+        if descriptor.mapping_slot as usize >= claims.frames + 2
+            || claims.mapping_slot(descriptor.mapping_slot as usize).load(SeqCst) != descriptor.generation
+            || claims.word(OFFERED_GENERATION).load(SeqCst) != descriptor.generation
+        {
+            return Err(ArenaError::Mapping("initial configuration offer disagrees with claim page"));
+        }
         if claims.scope != descriptor.claim_scope {
             return Err(ArenaError::Mapping("claim scope disagrees with grant"));
         }
@@ -453,6 +481,8 @@ impl ConsumerGrant {
             claim_fd: Some(claim_fd),
             reader_fd: Some(reader_fd),
             layout,
+            generation: descriptor.generation,
+            mapping_slot: descriptor.mapping_slot as usize,
             claims,
             consumed: false,
         })
@@ -462,6 +492,9 @@ impl ConsumerGrant {
 impl Drop for ConsumerGrant {
     fn drop(&mut self) {
         if !self.consumed {
+            drop(self.resource_fd.take());
+            self.claims.mapping_slot(self.mapping_slot).store(0, SeqCst);
+            self.claims.word(OFFERED_GENERATION).store(0, SeqCst);
             self.claims.close();
             self.claims.acknowledge_quiescent();
         }
@@ -472,7 +505,9 @@ impl Drop for ConsumerGrant {
 /// resource retirement, and publication; consumer operations require no call
 /// into this object and run through separate shared mappings.
 pub struct ArenaProducer {
-    resources: Arc<ResourceMap>,
+    resources: Option<Arc<ResourceMap>>,
+    retired: Vec<(AllocationId, Arc<ResourceMap>)>,
+    pending_layout: Option<ResourceLayout>,
     control: Arc<ControlMap>,
     admission: AdmissionBook,
     claims: BTreeMap<IncarnationId, Arc<ClaimMap>>,
@@ -520,9 +555,11 @@ impl ArenaProducer {
             max_incarnations: config.max_incarnations,
         })?;
         let control = Arc::new(ControlMap::new(layout.history)?);
-        let resources = Arc::new(ResourceMap::new(layout, control.scope)?);
+        let resources = Arc::new(ResourceMap::new(layout, control.scope, 1)?);
         Ok(Self {
-            resources,
+            resources: Some(resources),
+            retired: Vec::new(),
+            pending_layout: None,
             control,
             admission,
             claims: BTreeMap::new(),
@@ -568,15 +605,20 @@ impl ArenaProducer {
             let release_wake = Arc::new(wait::Wake::from_fd(receiver.fd()?)?);
             let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake, release_wake, recipient_pid)?);
             let control_fd = self.control.storage.try_clone_fd()?;
-            let resource_fd = self.resources.storage.try_clone_fd()?;
+            let resources = self.resources.as_ref().expect("admission requires installed allocation");
+            let resource_fd = resources.storage.try_clone_fd()?;
             let claim_fd = claims.storage.try_clone_fd()?;
+            claims.mapping_slot(0).store(resources.generation, SeqCst);
+            claims.word(OFFERED_GENERATION).store(resources.generation, SeqCst);
             let grant = ConsumerGrant {
                 control_fd: Some(control_fd),
                 arena_scope: self.control.scope,
                 resource_fd: Some(resource_fd),
                 claim_fd: Some(claim_fd),
                 reader_fd: Some(receiver.into_fd()),
-                layout: self.resources.layout,
+                layout: resources.layout,
+                generation: resources.generation,
+                mapping_slot: 0,
                 claims,
                 consumed: false,
             };
@@ -611,7 +653,11 @@ impl ArenaProducer {
         &mut self,
         prepare: impl FnMut(u32, u64) -> Result<Option<FrameDescriptor>, ArenaError>,
     ) -> Result<PublishOutcome, ArenaError> {
-        if self.resources.layout.payload_capacity != 0 {
+        if self
+            .resources
+            .as_ref()
+            .is_some_and(|resources| resources.layout.payload_capacity != 0)
+        {
             return Err(ArenaError::Configuration("native resources require no inline CPU storage"));
         }
         self.publish_prepared(&[], prepare)
@@ -622,7 +668,14 @@ impl ArenaProducer {
         bytes: &[u8],
         mut prepare: impl FnMut(u32, u64) -> Result<Option<FrameDescriptor>, ArenaError>,
     ) -> Result<PublishOutcome, ArenaError> {
-        if bytes.len() > self.resources.layout.payload_capacity {
+        if self.control.word(TERMINAL).load(SeqCst) != 0 {
+            return Err(ArenaError::Closed);
+        }
+        self.poll_cleanup()?;
+        let Some(resources) = self.resources.as_ref() else {
+            return Ok(PublishOutcome::Dropped);
+        };
+        if bytes.len() > resources.layout.payload_capacity {
             return Err(ArenaError::PayloadTooLarge);
         }
         if self.cursor == MAX_GENERATION {
@@ -632,18 +685,17 @@ impl ArenaProducer {
             }
             return Err(ArenaError::GenerationsExhausted);
         }
-        self.poll_cleanup()?;
-        let oldest = self.cursor.saturating_sub(self.resources.layout.history as u64 - 1).max(1);
-        for offset in 0..self.resources.layout.resources {
-            let index = (self.next_slot + offset) % self.resources.layout.resources;
-            let state = self.resources.state(index).load(SeqCst);
+        let oldest = self.cursor.saturating_sub(resources.layout.history as u64 - 1).max(1);
+        for offset in 0..resources.layout.resources {
+            let index = (self.next_slot + offset) % resources.layout.resources;
+            let state = resources.state(index).load(SeqCst);
             let generation = state >> 1;
             if generation != 0 && generation >= oldest {
                 continue;
             }
             // Retire BEFORE scanning claims. Repeated attempts leave the
             // generation retired, so no new successful acquisitions can pin it.
-            self.resources.state(index).store(generation << 1, SeqCst);
+            resources.state(index).store(generation << 1, SeqCst);
             if generation != 0 && self.claims.values().any(|claims| claims.contains(generation)) {
                 continue;
             }
@@ -651,7 +703,7 @@ impl ArenaProducer {
                 continue;
             };
             let cursor = self.cursor + 1;
-            let payload_offset = self.resources.layout.payload_offset(index);
+            let payload_offset = resources.layout.payload_offset(index);
             descriptor.cursor = cursor;
             descriptor.payload_offset = payload_offset as u64;
             descriptor.payload_len = bytes.len() as u64;
@@ -662,16 +714,16 @@ impl ArenaProducer {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
-                    self.resources.storage.as_ptr().add(payload_offset).cast_mut(),
+                    resources.storage.as_ptr().add(payload_offset).cast_mut(),
                     bytes.len(),
                 );
-                self.resources.descriptor_ptr(index).write(descriptor);
+                resources.descriptor_ptr(index).write(descriptor);
             }
-            self.resources.state(index).store((cursor << 1) | 1, SeqCst);
+            resources.state(index).store((cursor << 1) | 1, SeqCst);
             self.control.ring(cursor).store(index as u64 + 1, SeqCst);
             self.control.word(LATEST).store(cursor, SeqCst);
             self.cursor = cursor;
-            self.next_slot = (index + 1) % self.resources.layout.resources;
+            self.next_slot = (index + 1) % resources.layout.resources;
             for claims in self.claims.values() {
                 claims.signal(wait::DATA)?;
             }
@@ -691,7 +743,10 @@ impl ArenaProducer {
 
     fn collect_quiescent(&mut self) {
         self.claims.retain(|incarnation, claims| {
-            if claims.word(QUIESCENT).load(SeqCst) == 0 || (0..claims.frames).any(|index| claims.slot(index).load(SeqCst) != 0) {
+            if claims.word(QUIESCENT).load(SeqCst) == 0
+                || claims.has_mappings()
+                || (0..claims.frames).any(|index| claims.slot(index).load(SeqCst) != 0)
+            {
                 return true;
             }
             // QUIESCENT proves no more consumer-side claim-map access. Pending
@@ -718,7 +773,8 @@ struct ConsumerLifetime {
 
 #[derive(Debug)]
 struct ConsumerResources {
-    map: ResourceMap,
+    map: ManuallyDrop<ResourceMap>,
+    mapping_slot: usize,
     lifetime: Arc<ConsumerLifetime>,
 }
 
@@ -735,7 +791,7 @@ impl Drop for ConsumerLifetime {
 pub struct ArenaConsumer {
     control: Arc<ControlMap>,
     lifetime: Arc<ConsumerLifetime>,
-    resources: Arc<ConsumerResources>,
+    resources: Option<Arc<ConsumerResources>>,
     receiver: wait::Receiver,
 }
 
@@ -746,7 +802,12 @@ impl ArenaConsumer {
             grant.layout.history,
             grant.arena_scope,
         )?;
-        let map = ResourceMap::map(grant.resource_fd.take().expect("single-use grant"), grant.layout, control.scope)?;
+        let map = ResourceMap::map(
+            grant.resource_fd.take().expect("single-use grant"),
+            grant.layout,
+            control.scope,
+            grant.generation,
+        )?;
         let claims = ClaimMap::map(
             grant.claim_fd.take().expect("single-use grant"),
             grant.claims.incarnation,
@@ -758,14 +819,16 @@ impl ArenaConsumer {
         )?;
         let receiver = wait::Receiver::from_fd(grant.reader_fd.take().expect("single-use grant"))?;
         grant.consumed = true;
+        grant.claims.word(OFFERED_GENERATION).store(0, SeqCst);
         let lifetime = Arc::new(ConsumerLifetime { claims });
         Ok(Self {
             receiver,
             control: Arc::new(control),
-            resources: Arc::new(ConsumerResources {
-                map,
+            resources: Some(Arc::new(ConsumerResources {
+                map: ManuallyDrop::new(map),
+                mapping_slot: grant.mapping_slot,
                 lifetime: Arc::clone(&lifetime),
-            }),
+            })),
             lifetime,
         })
     }
@@ -780,7 +843,10 @@ impl ArenaConsumer {
         if self.is_closed() {
             return Ok(AcquireOutcome::Closed);
         }
-        if cursor == 0 || cursor <= after {
+        if !self.is_configured() {
+            return Ok(AcquireOutcome::Reconfiguration);
+        }
+        if cursor == 0 || cursor <= after || cursor < self.control.word(FIRST_CURSOR).load(SeqCst) {
             return Ok(AcquireOutcome::Empty);
         }
         self.acquire(cursor)
@@ -794,16 +860,24 @@ impl ArenaConsumer {
         if self.is_closed() {
             return Ok(AcquireOutcome::Closed);
         }
+        if !self.is_configured() {
+            return Ok(AcquireOutcome::Reconfiguration);
+        }
         if latest == 0 || after >= latest {
             return Ok(AcquireOutcome::Empty);
         }
-        let oldest = latest.saturating_sub(self.resources.map.layout.history as u64 - 1).max(1);
+        let oldest = latest
+            .saturating_sub(self.control.history as u64 - 1)
+            .max(self.control.word(FIRST_CURSOR).load(SeqCst));
         let cursor = if after == 0 { oldest } else { after + 1 };
         if cursor < oldest {
             return Ok(AcquireOutcome::Gap {
                 first: cursor,
                 last: oldest - 1,
             });
+        }
+        if cursor > latest {
+            return Ok(AcquireOutcome::Empty);
         }
         self.acquire(cursor)
     }
@@ -818,14 +892,25 @@ impl ArenaConsumer {
         if self.is_closed() {
             return Ok(AcquireOutcome::Closed);
         }
+        if !self.is_configured() {
+            return Ok(AcquireOutcome::Reconfiguration);
+        }
         if cursor > latest {
             return Ok(AcquireOutcome::Empty);
         }
-        let oldest = latest.saturating_sub(self.resources.map.layout.history as u64 - 1).max(1);
+        let oldest = latest
+            .saturating_sub(self.control.history as u64 - 1)
+            .max(self.control.word(FIRST_CURSOR).load(SeqCst));
         if cursor < oldest {
             return Ok(AcquireOutcome::Miss { cursor });
         }
         self.acquire(cursor)
+    }
+
+    fn is_configured(&self) -> bool {
+        self.resources
+            .as_ref()
+            .is_some_and(|resources| resources.map.generation == self.control.word(CONFIGURATION).load(SeqCst))
     }
 
     fn is_closed(&self) -> bool {
@@ -833,7 +918,8 @@ impl ArenaConsumer {
     }
 
     fn acquire(&self, cursor: u64) -> Result<AcquireOutcome, ArenaError> {
-        let map = &self.resources.map;
+        let resources = self.resources.as_ref().expect("configuration checked");
+        let map = &resources.map;
         let advertised = self.control.ring(cursor).load(SeqCst);
         if advertised == 0 || advertised > map.layout.resources as u64 {
             return Err(ArenaError::Mapping("advertised resource index is invalid"));
@@ -847,7 +933,7 @@ impl ArenaConsumer {
             return Ok(AcquireOutcome::HoldingLimit);
         };
         let claim = Claim {
-            owner: Arc::clone(&self.resources),
+            owner: Arc::clone(resources),
             slot: claim_slot,
             release_on_drop: true,
         };
@@ -863,6 +949,9 @@ impl ArenaConsumer {
         concurrency_tests::run_hook(concurrency_tests::Phase::Validated);
         if self.is_closed() {
             return Ok(AcquireOutcome::Closed);
+        }
+        if !self.is_configured() {
+            return Ok(AcquireOutcome::Reconfiguration);
         }
         // SAFETY: claim publication and generation validation precede the copy.
         // A retiring producer must see the held claim before writing this slot.

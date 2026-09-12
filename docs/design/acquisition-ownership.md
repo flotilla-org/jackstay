@@ -392,5 +392,8 @@ consumer GPU release events. It rejects foreign claim scopes even when numeric
 incarnation IDs match. EOF closes acquisition without claiming process death or
 GPU completion. Invalidation serializes with requests so a queued request cannot
 recreate a closed session. Five real XPC/Metal tests pass, but keep both endpoints
-in the same OS process. Separate-process GPU crash evidence is next. The legacy
+in the same OS process. An initial named-service run also passed across separate
+processes, with GPU release and replacement. The subsequent crash harness is
+currently unverified because shared-event creation fails even in a standalone
+Metal program; see the setup document for diagnostics and rerun commands. The legacy
 setup remains in use by the C/viewer path until those callers migrate.

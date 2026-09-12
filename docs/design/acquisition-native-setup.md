@@ -59,9 +59,32 @@ foreign claim-scope rejection when numeric incarnation IDs match. All pass.
 The four existing XPC tests and ten native arena tests also pass, along with
 workspace build, default/macOS clippy, and pinned formatting.
 
-These tests keep producer and consumer in the same OS process. The next required
-evidence is a named service with a separate consumer that submits GPU work and
-exits before completion. Named-service lifecycle and real cross-process event
-transfer must be exercised there. The C ABI, reference viewer, host resumption of
-paused transitions, Porthole integration, full-suite gates, and live capture
-acceptance remain outstanding.
+The five ordinary tests keep producer and consumer in the same OS process.
+`native_arena_xpc_process.rs` adds explicit, ignored acceptance runs using a
+unique launchd Mach service and the test executable as its producer. A temporary
+directory contains the job plist, control socket, and logs. Normal teardown
+verifies bootout removed the job; failed runs retain diagnostics while removing
+the job. These tests require a GUI bootstrap session and Metal device:
+
+```
+cargo test -p jackstay --locked --features backend-macos --test native_arena_xpc_process -- --ignored --exact named_xpc_transfers_frames_replacements_and_gpu_release_across_processes --nocapture
+cargo test -p jackstay --locked --features backend-macos --test native_arena_xpc_process -- --ignored --exact a_crashed_xpc_consumer_keeps_its_submitted_gpu_lease_until_completion_or_visible_quarantine --nocapture
+```
+
+The first cross-process run passed on 2026-09-12, including old/new GPU sampling,
+GPU-signalled deferred release, and verified service removal. The crash harness
+was then added: a separate consumer submits sampling behind a real GPU event,
+hands off deferred release, and is killed after publication wraps. It requires
+the producer to retain its reservation through process exit and drain timeout,
+then records actual late completion or explicit continuing quarantine.
+
+The crash attempt on `kiwi` could not reach that experiment. Producer event creation began
+returning `nil`; an existing backend test and a standalone Metal-only program
+failed the same way after all test jobs/processes were gone. Diagnostics are at
+`/tmp/jsxpc-weUTlB/README.md`. The harness compiles, but the current revision needs
+both acceptance commands rerun after shared-event allocation recovers. The cause
+of that device-wide allocation failure has not been established, and no crash
+cleanup outcome is claimed from this attempt.
+
+The C ABI, reference viewer, host resumption of paused transitions, Porthole
+integration, full-suite gates, and live capture acceptance remain outstanding.

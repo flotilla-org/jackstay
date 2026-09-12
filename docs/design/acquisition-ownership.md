@@ -2,9 +2,10 @@
 
 This is the implementation design for the
 [acquisition lifetime contract](../specs/acquisition-lifetime-contract.md).
-The source audit below describes commit `6eeaf04` (and Porthole's tracked tree
-at `bf371e6`). The protocol is specified here before changing the data path.
-It does not yet constitute live acceptance or a completed implementation.
+The source audit below describes the original baseline, commit `6eeaf04` and
+Porthole at `bf371e6`. The protocol was specified before changing the data path.
+The status table records the current implementation; the subsequent notes retain
+the history of individual slices. Live acceptance remains incomplete.
 
 ## Ownership paths at the baseline
 
@@ -177,14 +178,32 @@ attempts, with no unsafe read. Negative controls found counterexamples for
 scanning before retirement, reusing generation IDs, and releasing before use
 completes. These are bounded SC checks, not a weak-memory or liveness proof.
 
-| Slice | Status / next evidence |
+| Slice | Current evidence and remaining work |
 | --- | --- |
-| 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
-| 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-bound remote grants now reclaim ordinary CPU claims on verified exit; asynchronous claims still require completion evidence. |
-| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, cancellable notification waits, and local CPU reconfiguration are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Replacement-offer FD transfer is implemented; host integration remains pending; the old socket/shadow regression still fails. |
-| 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Completion observation wakes capacity waits while publication is idle. Replacement of the existing host path remains pending. |
-| 5: cleanup/reconfiguration | CPU process-exit cleanup and native quarantine implemented; see the [process cleanup design](acquisition-process-cleanup.md). Unfinished drains now report recovery failure without revocation; CPU reconfiguration and deferred consumer mapping retirement are implemented. Native pool replacement and real GPU command retirement after process death remain pending. |
-| 6: ABI/host/live acceptance | Pending. |
+| 1: ownership and protocol | Baseline audit, SC ordering argument and bounded model checks are recorded above. Compiled arena tests exercise selection, claim publication, validation and reuse separately. The model is not a weak-memory proof. |
+| 2: admission/incarnations | Separate claim pages, independent duplicate holds, overlapping storage, deferred-release credit and fresh admission after restart are implemented and tested. CPU process-exit cleanup and unresolved native reservations remain distinct. |
+| 3: CPU shared acquisition/waits | The common arena implements latest, ordered gaps, exact misses, holding limits, cancellation and configuration replacement. Unix setup binds grants to the peer process. Standalone C producers, Porthole sessions, the recorder and CPU viewer now use this path; the socket/shadow path has been removed. |
+| 4: existing GPU | macOS uses common claims, IOSurface storage and Metal events for readiness and deferred completion. Native arena, anonymous/named XPC and the reference viewer checks passed with real GPU work. The delayed viewer test holds RGBA frames for 250 ms while publication continues. Pixels in these tests are generated fixtures. |
+| 5: cleanup/reconfiguration | CPU crash reclamation, budgeted CPU/native replacement, retained mappings and pending producer writes are tested. The submitted-GPU crash test demonstrated visible quarantine, not reclaimed capacity. Completion after process death remains a backend recovery limitation. See the [runtime record](acquisition-runtime-verification.md). |
+| 6: ABI/host/live acceptance | Rust/C clients and Porthole use common acquisition at C ABI 0.5. Required macOS/Linux gates pass at Jackstay `f482a5c` and Porthole `67fa206`; relevant native and SDL checks also pass. Live CPU/GPU long playback, delayed desktop consumers and host resize acceptance remain outstanding. |
+
+Porthole `67fa206` also retains native cleanup in a dedicated worker after session
+and async-runtime teardown. A regression reproduced the old aborted cleanup; a
+real gated Metal write then verified retention until completion and final owner
+release. The run is recorded in `/tmp/porthole-native-owner-retirement-metal.log`.
+It establishes cleanup within a surviving process, not completion after daemon
+process death.
+
+These rows do not claim the contract complete. Live capture must still exercise
+the installed Porthole host, and no timeout, EOF or daemon restart may be counted
+as proof of GPU completion. Porthole's process-wide graceful drain API remains
+open; its session cleanup and process-exit guarantees must be kept separate.
+
+### Historical implementation notes
+
+The notes below record evidence and open work at each implementation milestone.
+Statements about pending migrations, failing old regressions or unavailable Metal
+events are historical; use the table and runtime record for current status.
 
 Admission-layer validation: `cargo test --locked --test acquisition_admission`,
 workspace build, all-targets clippy with warnings denied, and pinned formatting

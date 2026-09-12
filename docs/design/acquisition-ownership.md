@@ -143,11 +143,22 @@ can consume it. Insufficient capacity produces a visible paused condition.
 
 Notifications carry no frame ownership. Each consumer gets a coalescing kernel
 wakeup channel; shared epochs distinguish data, capacity, reconfiguration, and
-terminal changes. The wait operation drains notifications, checks relevant
-epochs and its predicate again, then waits on notification and cancellation
-handles together. Updates publish state before signaling. If notification finds
-a full nonblocking channel, a wakeup is already pending. One wait reader owns a
-channel; multiple application waiters must serialize or have distinct channels.
+terminal changes. Before sleeping, the waiter publishes its interest mask,
+drains notifications, and rechecks the relevant epochs. A writer updates state
+before reading the interest mask and signaling. With SC operations, either the
+writer observes the arm, or its state update precedes the waiter's recheck. If
+notification finds a full nonblocking channel, a wakeup is already pending.
+The waiter polls notification and cancellation handles together. One wait reader
+owns a channel (`&mut ArenaConsumer`); separate incarnations have separate
+channels. A capacity-only wait does not arm notifications for each new frame.
+Closure and reconfiguration always interrupt a wait because a paused transition
+may require old frames to be released before new data can arrive.
+
+Callers take `events()` before evaluating the acquisition predicate, and pass
+that snapshot to `wait` if needed. `WaitInterest::DATA` suits an empty/latest
+miss; `CAPACITY` suits holding-limit recovery. A one-way `Cancellation` can be
+shared with another thread and multiple waiters. Its notification is never
+drained, so cancellation remains visible. It does not release held frames.
 No per-frame request/reply is required for CPU or GPU acquisition or immediate
 release. Deferred GPU signal registration remains a setup/control operation.
 
@@ -170,7 +181,7 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | --- | --- |
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
 | 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Actual deferred-release credit and process-exit cleanup remain pending. |
-| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, and holding-limit outcomes are implemented. Mapped and cross-process tests pass. Cancellable notification waits and host integration remain pending; the old socket/shadow regression still fails. |
+| 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, and cancellable notification waits are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Reconfiguration events await the transition implementation. Host integration remains pending; the old socket/shadow regression still fails. |
 | 4: existing GPU | macOS selected; readiness encoding exists, acquisition/completion integration pending. |
 | 5: cleanup/reconfiguration | Pending; GPU process-death proof remains open. |
 | 6: ABI/host/live acceptance | Pending. |
@@ -184,26 +195,34 @@ called by the future arena cleanup owner after actual resource and mapping
 reclamation, never directly on disconnect.
 
 The first arena implementation has seven integration tests (one invokes an
-ignored child-process helper explicitly), plus two deterministic concurrency
+ignored child-process helper explicitly), plus three deterministic concurrency
 tests. They hold CPU bytes across 100 publications; distinguish duplicate and
 overlapping leases; exercise closure with a surviving lease, fresh restart after
 acknowledged cleanup, and producer shutdown; report ordered gaps and exact misses;
 and transfer setup FDs to a separate process with no per-frame broker exchange.
 Scheduler hooks force publication after selection, after claim publication, and
 after successful generation validation. They also close an incarnation during
-acquisition. Hooks exist only in the test build, and assertions use public
+acquisition. Another hook injects data, release, closure, or cancellation after
+the final predicate check and immediately before `poll`. Four wait integration
+tests cover publication before sleeping, capacity interest filtering, closure,
+and persistent cancellation without lease release. The child-process test also
+waits for publication through transferred notification handles while retaining
+an older frame. Hooks exist only in the test build, and assertions use public
 publication/acquisition outcomes. These tests do not establish GPU safety or
 unexpected-process-death reclamation.
 
 The initial arena is a fixed allocation with inline CPU payloads. It is not yet
 wired into `VideoSlotManager`, Porthole, or the native producer. The descriptor
 includes native readiness fields, but native write-target selection and release
-completion are still to be connected. The new setup descriptor currently carries
-the arena and claim-page FDs. Its version/layout and eventual notification handles
-must be included in the Rust/C ABI update; this is not the old control-page ABI.
+completion are still to be connected. The new setup descriptor (version 2)
+carries four FDs: arena, claim page, notification reader, notification writer.
+Both the producer and the consumer's release path can notify that consumer.
+Its version/layout and handles must be included in the Rust/C ABI update; this
+is not the old control-page ABI. The memory budget covers resource/control
+mappings; kernel notification buffers and bookkeeping are additionally bounded
+by the incarnation limit, rather than described as a process RSS limit.
 
-Next: add efficient cancellable waits using coalesced notification handles and
-state epochs, then connect deferred GPU completion to the same claim slots.
+Next: connect deferred GPU completion to the same claim slots.
 Extend the arena with bounded reconfiguration and verified process-exit cleanup,
 and replace the existing CPU/native acquisition paths with it. Do not add a
 per-frame broker update to keep admission informed; reserved claim slots are the

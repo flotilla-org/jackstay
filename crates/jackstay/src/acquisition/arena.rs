@@ -23,14 +23,20 @@ use thiserror::Error;
 use super::{AdmissionBook, AdmissionError, AdmissionLimits, HoldingRequest, IncarnationId};
 use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
+mod wait;
+pub use wait::{Cancellation, WaitEvents, WaitInterest, WaitOutcome};
+
 const MAGIC: u64 = u64::from_le_bytes(*b"JSACQ001");
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 const HEADER_LEN: usize = 256;
 const LATEST: usize = 128;
 const TERMINAL: usize = 136;
+const RECONFIGURATION_EPOCH: usize = 144;
 const ACTIVE: usize = 128;
 const QUIESCENT: usize = 136;
+const CAPACITY_EPOCH: usize = 144;
+const WAIT_INTEREST: usize = 152;
 const MAX_GENERATION: u64 = u64::MAX >> 1;
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +121,8 @@ const _: () = {
 
 #[derive(Debug, Error)]
 pub enum ArenaError {
+    #[error("acquisition notification failed: {0}")]
+    Notification(#[from] std::io::Error),
     #[error(transparent)]
     Admission(#[from] AdmissionError),
     #[error(transparent)]
@@ -125,6 +133,8 @@ pub enum ArenaError {
     Mapping(&'static str),
     #[error("frame generations exhausted")]
     GenerationsExhausted,
+    #[error("the acquisition arena is closed")]
+    Closed,
     #[error("payload exceeds resource capacity")]
     PayloadTooLarge,
 }
@@ -232,7 +242,7 @@ impl ArenaMap {
         // aligned, bounded by Layout, and initialized before any fd transfer.
         unsafe {
             storage.as_ptr().cast_mut().cast::<Header>().write(header);
-            for offset in [LATEST, TERMINAL] {
+            for offset in [LATEST, TERMINAL, RECONFIGURATION_EPOCH] {
                 storage.as_ptr().add(offset).cast_mut().cast::<AtomicU64>().write(AtomicU64::new(0));
             }
             for index in 0..layout.history {
@@ -303,6 +313,7 @@ struct ClaimMap {
     storage: SharedMemorySegment,
     incarnation: IncarnationId,
     frames: usize,
+    wake: Arc<wait::Wake>,
 }
 
 impl ClaimMap {
@@ -310,7 +321,7 @@ impl ClaimMap {
         page_rounded(checked_add(HEADER_LEN, checked_mul(frames as usize, 8)?)?)
     }
 
-    fn new(incarnation: IncarnationId, frames: u32, len: usize) -> Result<Self, ArenaError> {
+    fn new(incarnation: IncarnationId, frames: u32, len: usize, wake: Arc<wait::Wake>) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::new(len)?;
         // SAFETY: initialized while the new writable map is exclusively owned.
         unsafe {
@@ -321,7 +332,7 @@ impl ClaimMap {
                 frames: frames as u64,
                 map_len: len as u64,
             });
-            for (offset, value) in [(ACTIVE, 1), (QUIESCENT, 0)] {
+            for (offset, value) in [(ACTIVE, 1), (QUIESCENT, 0), (CAPACITY_EPOCH, 0), (WAIT_INTEREST, 0)] {
                 storage
                     .as_ptr()
                     .add(offset)
@@ -342,10 +353,11 @@ impl ClaimMap {
             storage,
             incarnation,
             frames: frames as usize,
+            wake,
         })
     }
 
-    fn map(fd: OwnedFd, incarnation: IncarnationId, frames: usize, len: usize) -> Result<Self, ArenaError> {
+    fn map(fd: OwnedFd, incarnation: IncarnationId, frames: usize, len: usize, wake: Arc<wait::Wake>) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::map_read_write(fd, len)?;
         // SAFETY: grant owns this initialized incarnation's map; header never changes.
         let header = unsafe { storage.as_ptr().cast::<ClaimHeader>().read() };
@@ -361,6 +373,7 @@ impl ClaimMap {
             storage,
             incarnation,
             frames,
+            wake,
         })
     }
 
@@ -381,6 +394,7 @@ impl ClaimMap {
 
     fn close(&self) {
         self.word(ACTIVE).store(0, SeqCst);
+        let _ = self.signal(wait::CLOSED);
     }
 }
 
@@ -389,13 +403,14 @@ impl ClaimMap {
 pub struct ConsumerGrant {
     arena_fd: Option<OwnedFd>,
     claim_fd: Option<OwnedFd>,
+    reader_fd: Option<OwnedFd>,
     layout: Layout,
     claims: Arc<ClaimMap>,
     consumed: bool,
 }
 
-/// Setup-channel descriptor; the two accompanying FDs are the arena and this
-/// incarnation's claim mapping, in that order. Never resend a consumed grant.
+/// Setup-channel descriptor. Accompanying FDs: arena, claim mapping, notification
+/// reader, notification writer, in that order. Never resend a consumed grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantDescriptor {
     pub version: u64,
@@ -409,7 +424,8 @@ pub struct GrantDescriptor {
 }
 
 impl ConsumerGrant {
-    pub fn into_parts(mut self) -> (GrantDescriptor, OwnedFd, OwnedFd) {
+    pub fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 4]), ArenaError> {
+        let writer_fd = self.claims.wake.fd()?;
         self.consumed = true;
         let descriptor = GrantDescriptor {
             version: VERSION,
@@ -421,11 +437,15 @@ impl ConsumerGrant {
             holding: self.claims.frames as u32,
             claim_map_len: self.claims.storage.len() as u64,
         };
-        (
+        Ok((
             descriptor,
-            self.arena_fd.take().expect("single-use grant"),
-            self.claim_fd.take().expect("single-use grant"),
-        )
+            [
+                self.arena_fd.take().expect("single-use grant"),
+                self.claim_fd.take().expect("single-use grant"),
+                self.reader_fd.take().expect("single-use grant"),
+                writer_fd,
+            ],
+        ))
     }
 
     /// Reconstruct a single-use grant received over an authorized setup channel.
@@ -436,7 +456,8 @@ impl ConsumerGrant {
     /// the sole recipient of this incarnation's claim grant. It must not fork
     /// or pass that grant on after mapping it. Length/header checks cannot prove
     /// another process follows a shared-memory lifetime protocol.
-    pub unsafe fn from_parts(descriptor: GrantDescriptor, arena_fd: OwnedFd, claim_fd: OwnedFd) -> Result<Self, ArenaError> {
+    pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 4]) -> Result<Self, ArenaError> {
+        let [arena_fd, claim_fd, reader_fd, writer_fd] = fds;
         if descriptor.version != VERSION || descriptor.incarnation == 0 || descriptor.holding == 0 {
             return Err(ArenaError::Mapping("invalid grant version or incarnation reservation"));
         }
@@ -457,10 +478,12 @@ impl ConsumerGrant {
             IncarnationId(descriptor.incarnation),
             descriptor.holding as usize,
             claim_len,
+            Arc::new(wait::Wake::from_fd(writer_fd)?),
         )?);
         Ok(Self {
             arena_fd: Some(arena_fd),
             claim_fd: Some(claim_fd),
+            reader_fd: Some(reader_fd),
             layout,
             claims,
             consumed: false,
@@ -513,6 +536,9 @@ impl ArenaProducer {
     }
 
     pub fn attach(&mut self, holding: u32) -> Result<ConsumerGrant, ArenaError> {
+        if self.map.word(TERMINAL).load(SeqCst) != 0 {
+            return Err(ArenaError::Closed);
+        }
         self.collect_quiescent();
         let len = ClaimMap::allocation_len(holding)?;
         let reservation = self.admission.admit(HoldingRequest {
@@ -521,12 +547,14 @@ impl ArenaProducer {
         })?;
         let incarnation = reservation.incarnation();
         let result = (|| {
-            let claims = Arc::new(ClaimMap::new(incarnation, holding, len)?);
+            let (wake, receiver) = wait::channel()?;
+            let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake)?);
             let arena_fd = self.map.storage.try_clone_fd()?;
             let claim_fd = claims.storage.try_clone_fd()?;
             Ok(ConsumerGrant {
                 arena_fd: Some(arena_fd),
                 claim_fd: Some(claim_fd),
+                reader_fd: Some(receiver.into_fd()),
                 layout: self.map.layout,
                 claims,
                 consumed: false,
@@ -553,6 +581,9 @@ impl ArenaProducer {
         }
         if self.cursor == MAX_GENERATION {
             self.map.word(TERMINAL).store(1, SeqCst);
+            for claims in self.claims.values() {
+                claims.close();
+            }
             return Err(ArenaError::GenerationsExhausted);
         }
         self.collect_quiescent();
@@ -592,6 +623,9 @@ impl ArenaProducer {
             self.map.word(LATEST).store(cursor, SeqCst);
             self.cursor = cursor;
             self.next_slot = (index + 1) % self.map.layout.resources;
+            for claims in self.claims.values() {
+                claims.signal(wait::DATA)?;
+            }
             return Ok(PublishOutcome::Published { cursor });
         }
         Ok(PublishOutcome::Dropped)
@@ -648,6 +682,7 @@ impl Drop for ConsumerInner {
 #[derive(Debug)]
 pub struct ArenaConsumer {
     inner: Arc<ConsumerInner>,
+    receiver: wait::Receiver,
 }
 
 impl ArenaConsumer {
@@ -658,9 +693,12 @@ impl ArenaConsumer {
             grant.claims.incarnation,
             grant.claims.frames,
             grant.claims.storage.len(),
+            Arc::clone(&grant.claims.wake),
         )?;
+        let receiver = wait::Receiver::from_fd(grant.reader_fd.take().expect("single-use grant"))?;
         grant.consumed = true;
         Ok(Self {
+            receiver,
             inner: Arc::new(ConsumerInner {
                 map: Arc::new(map),
                 claims,
@@ -789,6 +827,10 @@ struct Claim {
 impl Drop for Claim {
     fn drop(&mut self) {
         self.owner.claims.slot(self.slot).store(0, SeqCst);
+        if self.owner.claims.word(CAPACITY_EPOCH).fetch_add(1, SeqCst) == u64::MAX {
+            self.owner.claims.close();
+        }
+        let _ = self.owner.claims.signal(wait::CAPACITY);
     }
 }
 
@@ -838,6 +880,7 @@ mod concurrency_tests {
         Selected,
         Claimed,
         Validated,
+        BeforeSleep,
     }
 
     type Hook = (Phase, Box<dyn FnOnce()>);
@@ -938,5 +981,52 @@ mod concurrency_tests {
             producer.borrow_mut().publish(FrameDescriptor::default(), b"wxyz").unwrap();
         }
         assert_eq!(held.bytes(), b"abcd");
+    }
+
+    #[test]
+    fn data_release_closure_and_cancellation_cannot_be_lost_after_the_final_wait_recheck() {
+        use std::time::Duration;
+        for event in 0..4 {
+            let producer = Rc::new(RefCell::new(ArenaProducer::new(config()).unwrap()));
+            let mut consumer = ArenaConsumer::from_grant(producer.borrow_mut().attach(1).unwrap()).unwrap();
+            producer.borrow_mut().publish(FrameDescriptor::default(), b"abcd").unwrap();
+            let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
+                panic!("no frame")
+            };
+            let observed = consumer.events();
+            let cancel = Cancellation::new().unwrap();
+            let cancelling = cancel.clone();
+            let changing = Rc::clone(&producer);
+            let incarnation = consumer.incarnation();
+            let _reset = schedule(Phase::BeforeSleep, move || {
+                match event {
+                    0 => {
+                        changing.borrow_mut().publish(FrameDescriptor::default(), b"wxyz").unwrap();
+                    }
+                    1 => {}
+                    2 => {
+                        changing.borrow_mut().close(incarnation).unwrap();
+                    }
+                    3 => {
+                        cancelling.cancel().unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                drop(held);
+            });
+            let interest = match event {
+                0 => WaitInterest::DATA,
+                1 => WaitInterest::CAPACITY,
+                _ => WaitInterest::ALL,
+            };
+            let outcome = consumer.wait(observed, interest, &cancel, Some(Duration::from_secs(2))).unwrap();
+            match (event, outcome) {
+                (0, WaitOutcome::Changed(events)) => assert_eq!(events.data_cursor, 2),
+                (1, WaitOutcome::Changed(events)) => assert_eq!(events.capacity_epoch, 1),
+                (2, WaitOutcome::Changed(events)) => assert!(events.closed),
+                (3, WaitOutcome::Cancelled) => {}
+                (_, result) => panic!("lost wakeup: {result:?}"),
+            }
+        }
     }
 }

@@ -11,7 +11,10 @@ use std::{
 };
 
 use jackstay::{
-    acquisition::arena::{AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, ConsumerGrant, FrameDescriptor, PublishOutcome},
+    acquisition::arena::{
+        AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, Cancellation, ConsumerGrant, FrameDescriptor, PublishOutcome,
+        WaitInterest, WaitOutcome,
+    },
     fdpass,
 };
 
@@ -190,7 +193,7 @@ fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange
     let listener = UnixListener::bind(&socket).unwrap();
     let mut producer = ArenaProducer::new(config()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
-    let (descriptor, arena_fd, claims_fd) = producer.attach(2).unwrap().into_parts();
+    let (descriptor, fds) = producer.attach(2).unwrap().into_parts().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "mapped_arena_child", "--nocapture"])
         .env("JACKSTAY_ARENA_TEST_SOCKET", &socket)
@@ -201,7 +204,7 @@ fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange
     let json = serde_json::to_vec(&descriptor).unwrap();
     stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
     stream.write_all(&json).unwrap();
-    fdpass::send_fds(&stream, &[arena_fd.as_raw_fd(), claims_fd.as_raw_fd()]).unwrap();
+    fdpass::send_fds(&stream, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
     let mut ready = [0];
     stream.read_exact(&mut ready).unwrap();
     assert_eq!(ready, [1]);
@@ -222,6 +225,17 @@ fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange
     // Test barrier only: no frame metadata, acquire, or release message crosses
     // this channel after setup. The child's next acquire is shared-memory only.
     stream.write_all(&[2]).unwrap();
+    stream.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [3]);
+    producer
+        .publish(
+            FrameDescriptor {
+                sequence: 101,
+                ..FrameDescriptor::default()
+            },
+            b"next",
+        )
+        .unwrap();
     assert!(child.wait().unwrap().success());
 }
 
@@ -235,11 +249,11 @@ fn mapped_arena_child() {
     let mut bytes = vec![0; u32::from_le_bytes(len) as usize];
     stream.read_exact(&mut bytes).unwrap();
     let descriptor = serde_json::from_slice(&bytes).unwrap();
-    let mut fds = fdpass::recv_fds(&stream, 2).unwrap().into_iter();
+    let fds = fdpass::recv_fds(&stream, 4).unwrap().try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer; this process is the
     // only recipient of the single-use grant and does not fork its mappings.
-    let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds.next().unwrap(), fds.next().unwrap()) }.unwrap();
-    let consumer = ArenaConsumer::from_grant(grant).unwrap();
+    let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
+    let mut consumer = ArenaConsumer::from_grant(grant).unwrap();
     let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
         panic!("child missing initial frame")
     };
@@ -253,4 +267,20 @@ fn mapped_arena_child() {
     };
     assert_eq!(latest.bytes(), b"wxyz");
     assert_eq!(latest.descriptor().sequence, 100);
+    drop(latest);
+    let observed = consumer.events();
+    stream.write_all(&[3]).unwrap();
+    let cancel = Cancellation::new().unwrap();
+    let WaitOutcome::Changed(events) = consumer
+        .wait(observed, WaitInterest::DATA, &cancel, Some(Duration::from_secs(2)))
+        .unwrap()
+    else {
+        panic!("cross-process publication wake was lost")
+    };
+    assert_eq!(events.data_cursor, 101);
+    assert_eq!(held.bytes(), b"abcd");
+    let AcquireOutcome::Frame(next) = consumer.acquire_latest(100).unwrap() else {
+        panic!("child missing frame after wait")
+    };
+    assert_eq!(next.bytes(), b"next");
 }

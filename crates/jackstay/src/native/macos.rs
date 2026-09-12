@@ -50,6 +50,7 @@ mod ffi {
         pub fn porthole_native_surface_in_use(surface: *mut c_void) -> i32;
         pub fn porthole_native_surface_width(surface: *mut c_void) -> u32;
         pub fn porthole_native_surface_height(surface: *mut c_void) -> u32;
+        pub fn porthole_native_surface_allocation_size(surface: *mut c_void) -> u64;
         pub fn porthole_native_surface_write(surface: *mut c_void, pixels: *const u8, len: usize) -> *mut c_char;
         pub fn porthole_native_surface_read(surface: *mut c_void, pixels: *mut u8, len: usize) -> *mut c_char;
 
@@ -73,6 +74,7 @@ mod ffi {
         pub fn porthole_native_object_release(object: *mut c_void);
         pub fn porthole_native_event_from_handle(metal: *mut c_void, handle: *mut c_void, out_event: *mut *mut c_void) -> *mut c_char;
         pub fn porthole_native_event_signaled_value(event: *mut c_void) -> u64;
+        pub fn porthole_native_event_signal_cpu(event: *mut c_void, value: u64);
         pub fn porthole_native_event_wait(event: *mut c_void, value: u64, timeout_ms: u64) -> i32;
 
         pub fn porthole_native_stage_blit(
@@ -94,6 +96,22 @@ mod ffi {
             height: u32,
             out_pixels: *mut u8,
             out_len: usize,
+        ) -> *mut c_char;
+        pub fn porthole_native_consumer_sample_ordered(
+            metal: *mut c_void,
+            event: *mut c_void,
+            value: u64,
+            surface: *mut c_void,
+            width: u32,
+            height: u32,
+            pixels: *mut u8,
+            len: usize,
+            release_event: *mut c_void,
+            release_value: u64,
+            gate_event: *mut c_void,
+            gate_value: u64,
+            submitted_event: *mut c_void,
+            submitted_value: u64,
         ) -> *mut c_char;
     }
 }
@@ -514,10 +532,68 @@ pub struct ConsumerFence {
     raw: NonNull<c_void>,
 }
 
+/// GPU completion and optional synchronization for the offscreen diagnostic
+/// sampler. Submission notification is CPU-side and deliberately separate from
+/// the GPU-encoded release event.
+pub struct SampleCompletion<'a> {
+    pub release: (&'a ConsumerFence, u64),
+    pub before_sample: Option<(&'a ConsumerFence, u64)>,
+    pub submitted: Option<(&'a ConsumerFence, u64)>,
+}
+
+impl crate::acquisition::arena::ReleaseTimeline for ConsumerFence {
+    fn completed_value(&self) -> Result<u64> {
+        Ok(self.signaled_value())
+    }
+}
+
+impl super::arena::ArenaNativeBackend for MacosFrameBackend {
+    fn allocated_pool_bytes(&self, pool: &MacosSurfacePool) -> Result<u64> {
+        self.export_surface_handles(pool)?.iter().try_fold(0_u64, |total, surface| {
+            // SAFETY: each handle is a retained IOSurface exported by this pool.
+            let bytes = unsafe { ffi::porthole_native_surface_allocation_size(surface.as_raw()) };
+            total.checked_add(bytes).ok_or_else(|| CaptureTransferError::NativeBackend {
+                operation: "native-pool-footprint",
+                message: "IOSurface allocation total overflow".to_owned(),
+            })
+        })
+    }
+
+    fn completed_producer_value(&self, fence: &MacosFence) -> Result<u64> {
+        // SAFETY: the backend owns the live event created for this fence.
+        Ok(unsafe { ffi::porthole_native_event_signaled_value(fence.raw.as_ptr()) })
+    }
+}
+
 unsafe impl Send for ConsumerFence {}
 unsafe impl Sync for ConsumerFence {}
 
 impl ConsumerFence {
+    pub fn new(metal: &MetalContext) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        check("create-consumer-event", unsafe {
+            ffi::porthole_native_event_create(metal.raw.as_ptr(), &mut raw)
+        })?;
+        Ok(Self {
+            raw: NonNull::new(raw).expect("successful event creation returned null"),
+        })
+    }
+
+    pub fn export_handle(&self) -> Result<SharedEventHandle> {
+        let raw = unsafe { ffi::porthole_native_event_copy_handle(self.raw.as_ptr()) };
+        let raw = NonNull::new(raw).ok_or_else(|| CaptureTransferError::NativeBackend {
+            operation: "export-consumer-event",
+            message: "shared event handle creation failed".to_owned(),
+        })?;
+        Ok(unsafe { SharedEventHandle::from_retained(raw) })
+    }
+
+    /// Signal CPU completion or open a CPU-controlled gate. For a release
+    /// timeline, all work covered by `value` must have finished before calling.
+    pub fn signal_cpu(&self, value: u64) {
+        unsafe { ffi::porthole_native_event_signal_cpu(self.raw.as_ptr(), value) };
+    }
+
     pub fn from_handle(metal: &MetalContext, handle: &SharedEventHandle) -> Result<Self> {
         let mut raw: *mut c_void = std::ptr::null_mut();
         check("fence-from-handle", unsafe {
@@ -570,6 +646,43 @@ impl ConsumerFence {
                 height,
                 pixels.as_mut_ptr(),
                 pixels.len(),
+            )
+        })?;
+        Ok(pixels)
+    }
+
+    pub fn sample_offscreen_with_completion(
+        &self,
+        metal: &MetalContext,
+        surface: &IoSurface,
+        fence_value: u64,
+        dimensions: (u32, u32),
+        completion: SampleCompletion<'_>,
+    ) -> Result<Vec<u8>> {
+        let (width, height) = dimensions;
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        let (gate, gate_value) = completion
+            .before_sample
+            .map_or((std::ptr::null_mut(), 0), |(event, value)| (event.raw.as_ptr(), value));
+        let (submitted, submitted_value) = completion
+            .submitted
+            .map_or((std::ptr::null_mut(), 0), |(event, value)| (event.raw.as_ptr(), value));
+        check("consumer-sample-completion", unsafe {
+            ffi::porthole_native_consumer_sample_ordered(
+                metal.raw.as_ptr(),
+                self.raw.as_ptr(),
+                fence_value,
+                surface.as_raw(),
+                width,
+                height,
+                pixels.as_mut_ptr(),
+                pixels.len(),
+                completion.release.0.raw.as_ptr(),
+                completion.release.1,
+                gate,
+                gate_value,
+                submitted,
+                submitted_value,
             )
         })?;
         Ok(pixels)

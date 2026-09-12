@@ -96,6 +96,10 @@ void porthole_native_surface_hold(void *surface) {
   IOSurfaceIncrementUseCount((IOSurfaceRef)surface);
 }
 
+uint64_t porthole_native_surface_allocation_size(void *surface) {
+  return (uint64_t)IOSurfaceGetAllocSize((IOSurfaceRef)surface);
+}
+
 void porthole_native_surface_unhold(void *surface) {
   IOSurfaceDecrementUseCount((IOSurfaceRef)surface);
 }
@@ -268,6 +272,11 @@ uint64_t porthole_native_event_signaled_value(void *eventPtr) {
   return event.signaledValue;
 }
 
+void porthole_native_event_signal_cpu(void *eventPtr, uint64_t value) {
+  id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
+  event.signaledValue = value;
+}
+
 int32_t porthole_native_event_wait(void *eventPtr, uint64_t value, uint64_t timeoutMs) {
   id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
   return [event waitUntilSignaledValue:value timeoutMS:timeoutMs] ? 1 : 0;
@@ -362,8 +371,11 @@ void porthole_native_stage_destroy(void *stagePtr) {
 // `metalPtr` is the consumer's own device (distinct from the producer's, as
 // in a real viewer); `srcSurfacePtr` is a borrowed IOSurfaceRef; `outPixels`
 // must hold width*height*4 bytes (BGRA8).
-char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t fenceValue, void *srcSurfacePtr,
-                                      uint32_t width, uint32_t height, uint8_t *outPixels, size_t outLen) {
+char *porthole_native_consumer_sample_ordered(void *metalPtr, void *eventPtr, uint64_t fenceValue, void *srcSurfacePtr,
+                                      uint32_t width, uint32_t height, uint8_t *outPixels, size_t outLen,
+                                      void *releaseEventPtr, uint64_t releaseValue,
+                                      void *gateEventPtr, uint64_t gateValue,
+                                      void *submittedEventPtr, uint64_t submittedValue) {
   PortholeNativeMetal *metal = (__bridge PortholeNativeMetal *)metalPtr;
   id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
   IOSurfaceRef src = (IOSurfaceRef)srcSurfacePtr;
@@ -397,10 +409,22 @@ char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t f
   // GPU-side wait: nothing in this buffer samples the surface until the
   // producer's timeline reaches fenceValue.
   [commandBuffer encodeWaitForEvent:event value:fenceValue];
+  if (gateEventPtr != NULL) {
+    [commandBuffer encodeWaitForEvent:(__bridge id<MTLSharedEvent>)gateEventPtr value:gateValue];
+  }
   id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
   [blit copyFromTexture:srcTexture toTexture:offscreen];
   [blit endEncoding];
+  if (releaseEventPtr != NULL) {
+    [commandBuffer encodeSignalEvent:(__bridge id<MTLSharedEvent>)releaseEventPtr value:releaseValue];
+  }
   [commandBuffer commit];
+  // Test/diagnostic notification only. This is deliberately NOT the release
+  // event: commit means submission, while release is encoded after GPU use.
+  if (submittedEventPtr != NULL) {
+    id<MTLSharedEvent> submitted = (__bridge id<MTLSharedEvent>)submittedEventPtr;
+    submitted.signaledValue = submittedValue;
+  }
   [commandBuffer waitUntilCompleted];
 
   if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
@@ -412,4 +436,10 @@ char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t f
            fromRegion:MTLRegionMake2D(0, 0, width, height)
           mipmapLevel:0];
   return NULL;
+}
+
+char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t fenceValue, void *srcSurfacePtr,
+                                      uint32_t width, uint32_t height, uint8_t *outPixels, size_t outLen) {
+  return porthole_native_consumer_sample_ordered(metalPtr, eventPtr, fenceValue, srcSurfacePtr,
+      width, height, outPixels, outLen, NULL, 0, NULL, 0, NULL, 0);
 }

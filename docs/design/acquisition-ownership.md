@@ -180,9 +180,9 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | Slice | Status / next evidence |
 | --- | --- |
 | 1: ownership and protocol | Source audit, ordering argument and bounded SC interleaving checks recorded. Compiled atomic/mapping tests follow in slice 3. |
-| 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Actual deferred-release credit and process-exit cleanup remain pending. |
+| 2: admission/incarnations | Admission now allocates a separate mapped claim page with exactly the holding reservation. Duplicate acquisitions consume independent slots; overlapping consumers share storage without sharing credit. Closing retains reservations until the last library owner finishes. Deferred-release claims retain credit until registered completion is observed. Process-exit cleanup remains pending. |
 | 3: CPU shared acquisition/waits | `acquisition::arena` publishes complete descriptors and inline CPU storage under the SC claim protocol. Latest, ordered gaps, exact misses, holding-limit outcomes, and cancellable notification waits are implemented. Mapped, cross-process, and deterministic missed-wakeup tests pass. Reconfiguration events await the transition implementation. Host integration remains pending; the old socket/shadow regression still fails. |
-| 4: existing GPU | macOS selected; readiness encoding exists, acquisition/completion integration pending. |
+| 4: existing GPU | The new native arena uses shared claims for IOSurface selection and imported Metal events for readiness and deferred release. Two real offscreen GPU tests pass. Automatic completion observation while idle and replacement of the existing host path remain pending. |
 | 5: cleanup/reconfiguration | Pending; GPU process-death proof remains open. |
 | 6: ABI/host/live acceptance | Pending. |
 
@@ -211,10 +211,12 @@ an older frame. Hooks exist only in the test build, and assertions use public
 publication/acquisition outcomes. These tests do not establish GPU safety or
 unexpected-process-death reclamation.
 
-The initial arena is a fixed allocation with inline CPU payloads. It is not yet
-wired into `VideoSlotManager`, Porthole, or the native producer. The descriptor
-includes native readiness fields, but native write-target selection and release
-completion are still to be connected. The new setup descriptor (version 2)
+The arena is currently a fixed allocation, with inline CPU payloads or external
+native resources. `native::arena::NativeArenaProducer` uses the same retirement
+and claim scan before staging into an IOSurface; it also checks producer GPU
+completion before reusing a staging target. Actual IOSurface allocation sizes
+count against the arena byte budget. The old host/native and C paths have not
+yet been replaced. The new setup descriptor (version 3)
 carries four FDs: arena, claim page, notification reader, notification writer.
 Both the producer and the consumer's release path can notify that consumer.
 Its version/layout and handles must be included in the Rust/C ABI update; this
@@ -222,7 +224,24 @@ is not the old control-page ABI. The memory budget covers resource/control
 mappings; kernel notification buffers and bookkeeping are additionally bounded
 by the incarnation limit, rather than described as a process RSS limit.
 
-Next: connect deferred GPU completion to the same claim slots.
+Four deferred-release tests cover storage/credit retention, shutdown with pending
+GPU work, registrations scoped to an arena and incarnation, and failed observer
+isolation with explicit cleanup retry. The producer retains imported timeline
+handles and pending claims after consumer shutdown. A failed observer closes only
+its incarnation and reports a persistent recovery failure; it does not clear
+claims or block healthy incarnations. Polling currently runs on publication,
+admission, or an explicit call; automatic observation while idle is next.
+
+Two macOS tests use actual IOSurfaces and Metal commands. The first retains a
+lease across ring wrap and samples after producer readiness. The second proves
+submission occurred, blocks sampling behind a GPU gate while further publications
+wrap the ring, and retains holding credit until the GPU samples the original
+pixels and signals the registered release event. These are offscreen tests using
+synthetic pixels, not live desktop acceptance. All four release tests, arena and
+wait tests, both native arena tests, eleven existing macOS backend/XPC tests,
+all-targets macOS-feature clippy, and pinned formatting passed at this checkpoint.
+
+Next: observe deferred GPU completion while publication is idle.
 Extend the arena with bounded reconfiguration and verified process-exit cleanup,
 and replace the existing CPU/native acquisition paths with it. Do not add a
 per-frame broker update to keep admission informed; reserved claim slots are the

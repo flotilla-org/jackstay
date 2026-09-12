@@ -9,6 +9,7 @@
 use std::{
     cell::UnsafeCell,
     collections::BTreeMap,
+    io::Read,
     mem::{align_of, size_of},
     os::fd::OwnedFd,
     sync::{
@@ -25,10 +26,12 @@ use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
 mod wait;
 pub use wait::{Cancellation, WaitEvents, WaitInterest, WaitOutcome};
+mod release;
+pub use release::{RejectedDeferredRelease, ReleaseRecoveryFailure, ReleaseTimeline, ReleaseTimelineRegistration};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"JSACQ001");
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
-const VERSION: u64 = 2;
+const VERSION: u64 = 3;
 const HEADER_LEN: usize = 256;
 const LATEST: usize = 128;
 const TERMINAL: usize = 136;
@@ -38,6 +41,10 @@ const QUIESCENT: usize = 136;
 const CAPACITY_EPOCH: usize = 144;
 const WAIT_INTEREST: usize = 152;
 const MAX_GENERATION: u64 = u64::MAX >> 1;
+const CLAIM_SLOT_LEN: usize = 32;
+const RELEASE_ID: usize = 8;
+const RELEASE_VALUE: usize = 16;
+const RELEASE_PENDING: usize = 24;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ArenaConfig {
@@ -109,6 +116,7 @@ struct ClaimHeader {
     incarnation: u64,
     frames: u64,
     map_len: u64,
+    scope: [u8; 16],
 }
 
 const _: () = {
@@ -313,16 +321,26 @@ struct ClaimMap {
     storage: SharedMemorySegment,
     incarnation: IncarnationId,
     frames: usize,
+    scope: [u8; 16],
     wake: Arc<wait::Wake>,
 }
 
 impl ClaimMap {
     fn allocation_len(frames: u32) -> Result<usize, ArenaError> {
-        page_rounded(checked_add(HEADER_LEN, checked_mul(frames as usize, 8)?)?)
+        // Each holding slot has claim/release words and one bounded timeline
+        // registration entry. All words are initialized before fd transfer.
+        page_rounded(checked_add(HEADER_LEN, checked_mul(frames as usize, CLAIM_SLOT_LEN + 8)?)?)
     }
 
     fn new(incarnation: IncarnationId, frames: u32, len: usize, wake: Arc<wait::Wake>) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::new(len)?;
+        let mut scope = [0; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut scope))
+            .map_err(|error| CaptureTransferError::SharedMemory {
+                operation: "claim-scope",
+                message: error.to_string(),
+            })?;
         // SAFETY: initialized while the new writable map is exclusively owned.
         unsafe {
             storage.as_ptr().cast_mut().cast::<ClaimHeader>().write(ClaimHeader {
@@ -331,6 +349,7 @@ impl ClaimMap {
                 incarnation: incarnation.0,
                 frames: frames as u64,
                 map_len: len as u64,
+                scope,
             });
             for (offset, value) in [(ACTIVE, 1), (QUIESCENT, 0), (CAPACITY_EPOCH, 0), (WAIT_INTEREST, 0)] {
                 storage
@@ -340,7 +359,7 @@ impl ClaimMap {
                     .cast::<AtomicU64>()
                     .write(AtomicU64::new(value));
             }
-            for index in 0..frames as usize {
+            for index in 0..frames as usize * (CLAIM_SLOT_LEN / 8 + 1) {
                 storage
                     .as_ptr()
                     .add(HEADER_LEN + index * 8)
@@ -353,6 +372,7 @@ impl ClaimMap {
             storage,
             incarnation,
             frames: frames as usize,
+            scope,
             wake,
         })
     }
@@ -373,6 +393,7 @@ impl ClaimMap {
             storage,
             incarnation,
             frames,
+            scope: header.scope,
             wake,
         })
     }
@@ -385,7 +406,7 @@ impl ClaimMap {
 
     fn slot(&self, index: usize) -> &AtomicU64 {
         assert!(index < self.frames);
-        self.word(HEADER_LEN + index * 8)
+        self.word(HEADER_LEN + index * CLAIM_SLOT_LEN)
     }
 
     fn contains(&self, generation: u64) -> bool {
@@ -509,10 +530,21 @@ pub struct ArenaProducer {
     claims: BTreeMap<IncarnationId, Arc<ClaimMap>>,
     cursor: u64,
     next_slot: usize,
+    releases: release::ReleaseRegistry,
 }
 
 impl ArenaProducer {
+    pub(crate) fn stop(&mut self) {
+        self.map.word(TERMINAL).store(1, SeqCst);
+        for claims in self.claims.values() {
+            claims.close();
+        }
+    }
     pub fn new(config: ArenaConfig) -> Result<Self, ArenaError> {
+        Self::with_external_allocation(config, 0)
+    }
+
+    pub(crate) fn with_external_allocation(config: ArenaConfig, external_bytes: u64) -> Result<Self, ArenaError> {
         let layout = Layout::new(
             config.resource_capacity as usize,
             config.retained_history as usize,
@@ -522,7 +554,9 @@ impl ArenaProducer {
             resource_capacity: config.resource_capacity,
             retained_history: config.retained_history,
             producer_reserve: config.producer_reserve,
-            allocated_bytes: layout.len as u64,
+            allocated_bytes: (layout.len as u64)
+                .checked_add(external_bytes)
+                .ok_or(ArenaError::Configuration("allocation byte total overflow"))?,
             memory_budget: config.memory_budget,
             max_incarnations: config.max_incarnations,
         })?;
@@ -532,6 +566,7 @@ impl ArenaProducer {
             claims: BTreeMap::new(),
             cursor: 0,
             next_slot: 0,
+            releases: release::ReleaseRegistry::default(),
         })
     }
 
@@ -539,7 +574,7 @@ impl ArenaProducer {
         if self.map.word(TERMINAL).load(SeqCst) != 0 {
             return Err(ArenaError::Closed);
         }
-        self.collect_quiescent();
+        self.poll_release_completions()?;
         let len = ClaimMap::allocation_len(holding)?;
         let reservation = self.admission.admit(HoldingRequest {
             frames: holding,
@@ -575,7 +610,29 @@ impl ArenaProducer {
         }
     }
 
-    pub fn publish(&mut self, mut descriptor: FrameDescriptor, bytes: &[u8]) -> Result<PublishOutcome, ArenaError> {
+    pub fn publish(&mut self, descriptor: FrameDescriptor, bytes: &[u8]) -> Result<PublishOutcome, ArenaError> {
+        self.publish_prepared(bytes, |_, _| Ok(Some(descriptor)))
+    }
+
+    /// Prepare an external resource only after it is retired and unclaimed.
+    /// The callback may reject a target whose backend work has not completed.
+    /// Published metadata must name producer-readiness synchronization for any
+    /// writes that remain asynchronous when the callback returns.
+    pub(crate) fn publish_resource(
+        &mut self,
+        prepare: impl FnMut(u32, u64) -> Result<Option<FrameDescriptor>, ArenaError>,
+    ) -> Result<PublishOutcome, ArenaError> {
+        if self.map.layout.payload_capacity != 0 {
+            return Err(ArenaError::Configuration("native resources require no inline CPU storage"));
+        }
+        self.publish_prepared(&[], prepare)
+    }
+
+    fn publish_prepared(
+        &mut self,
+        bytes: &[u8],
+        mut prepare: impl FnMut(u32, u64) -> Result<Option<FrameDescriptor>, ArenaError>,
+    ) -> Result<PublishOutcome, ArenaError> {
         if bytes.len() > self.map.layout.payload_capacity {
             return Err(ArenaError::PayloadTooLarge);
         }
@@ -586,7 +643,7 @@ impl ArenaProducer {
             }
             return Err(ArenaError::GenerationsExhausted);
         }
-        self.collect_quiescent();
+        self.poll_release_completions()?;
         let oldest = self.cursor.saturating_sub(self.map.layout.history as u64 - 1).max(1);
         for offset in 0..self.map.layout.resources {
             let index = (self.next_slot + offset) % self.map.layout.resources;
@@ -601,6 +658,9 @@ impl ArenaProducer {
             if generation != 0 && self.claims.values().any(|claims| claims.contains(generation)) {
                 continue;
             }
+            let Some(mut descriptor) = prepare(index as u32, generation)? else {
+                continue;
+            };
             let cursor = self.cursor + 1;
             let payload_offset = self.map.layout.payload_offset(index);
             descriptor.cursor = cursor;
@@ -642,14 +702,15 @@ impl ArenaProducer {
 
     fn collect_quiescent(&mut self) {
         self.claims.retain(|incarnation, claims| {
-            if claims.word(QUIESCENT).load(SeqCst) == 0 {
+            if claims.word(QUIESCENT).load(SeqCst) == 0 || (0..claims.frames).any(|index| claims.slot(index).load(SeqCst) != 0) {
                 return true;
             }
-            // QUIESCENT is written by the last library owner only after all
-            // its claims and in-progress methods are gone. Process-exit cleanup
-            // requires separate OS proof and does not manufacture this flag.
+            // QUIESCENT proves no more consumer-side claim-map access. Pending
+            // GPU claims can outlive that acknowledgement, hence the separate
+            // empty-claim check above. Process-exit cleanup needs OS proof.
             self.admission.close(*incarnation).expect("tracked incarnation");
             self.admission.complete_cleanup(*incarnation).expect("closed incarnation");
+            self.releases.remove(*incarnation);
             false
         });
     }
@@ -657,10 +718,7 @@ impl ArenaProducer {
 
 impl Drop for ArenaProducer {
     fn drop(&mut self) {
-        self.map.word(TERMINAL).store(1, SeqCst);
-        for claims in self.claims.values() {
-            claims.close();
-        }
+        self.stop();
     }
 }
 
@@ -673,8 +731,8 @@ struct ConsumerInner {
 impl Drop for ConsumerInner {
     fn drop(&mut self) {
         self.claims.close();
-        // Every frame keeps this owner alive; all claim clears precede this
-        // final store, and no method can still have a reference to the owner.
+        // No consumer method can still access this mapping. Deferred claims
+        // may remain producer-owned; their completion is checked separately.
         self.claims.word(QUIESCENT).store(1, SeqCst);
     }
 }
@@ -785,6 +843,7 @@ impl ArenaConsumer {
         let claim = Claim {
             owner: Arc::clone(&self.inner),
             slot: claim_slot,
+            release_on_drop: true,
         };
         #[cfg(test)]
         concurrency_tests::run_hook(concurrency_tests::Phase::Claimed);
@@ -822,15 +881,14 @@ impl Drop for ArenaConsumer {
 struct Claim {
     owner: Arc<ConsumerInner>,
     slot: usize,
+    release_on_drop: bool,
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        self.owner.claims.slot(self.slot).store(0, SeqCst);
-        if self.owner.claims.word(CAPACITY_EPOCH).fetch_add(1, SeqCst) == u64::MAX {
-            self.owner.claims.close();
+        if self.release_on_drop {
+            self.owner.claims.return_credit(self.slot);
         }
-        let _ = self.owner.claims.signal(wait::CAPACITY);
     }
 }
 

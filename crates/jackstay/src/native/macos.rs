@@ -54,6 +54,13 @@ mod ffi {
         pub fn porthole_native_surface_write(surface: *mut c_void, pixels: *const u8, len: usize) -> *mut c_char;
         pub fn porthole_native_surface_read(surface: *mut c_void, pixels: *mut u8, len: usize) -> *mut c_char;
 
+        pub fn porthole_native_pool_allocation_bound(
+            width: u32,
+            height: u32,
+            bytes_per_element: u32,
+            slot_count: u32,
+            out_bytes: *mut u64,
+        ) -> *mut c_char;
         pub fn porthole_native_pool_create(
             metal: *mut c_void,
             width: u32,
@@ -62,6 +69,7 @@ mod ffi {
             bytes_per_element: u32,
             mtl_pixel_format: u64,
             slot_count: u32,
+            reserved_bytes: u64,
             out_pool: *mut *mut c_void,
         ) -> *mut c_char;
         pub fn porthole_native_pool_destroy(pool: *mut c_void);
@@ -415,31 +423,7 @@ impl NativeFrameBackend for MacosFrameBackend {
     }
 
     fn allocate_surface_pool(&mut self, params: &NativeStreamParams, slot_count: u32) -> Result<MacosSurfacePool> {
-        if slot_count == 0 {
-            return Err(CaptureTransferError::NativeBackend {
-                operation: "allocate-surface-pool",
-                message: "slot count must be non-zero".to_string(),
-            });
-        }
-        let (fourcc, bytes_per_element, mtl_format) = format_desc(params.pixel_format)?;
-        let mut raw: *mut c_void = std::ptr::null_mut();
-        check("allocate-surface-pool", unsafe {
-            ffi::porthole_native_pool_create(
-                self.metal.raw.as_ptr(),
-                params.width,
-                params.height,
-                fourcc,
-                bytes_per_element,
-                mtl_format,
-                slot_count,
-                &mut raw,
-            )
-        })?;
-        Ok(MacosSurfacePool {
-            raw: NonNull::new(raw).expect("shim returned NULL pool without error"),
-            pool_id: next_unique_id(&NEXT_POOL_ID),
-            slot_count,
-        })
+        super::arena::ArenaNativeBackend::allocate_surface_pool_bounded(self, params, slot_count, u64::MAX)
     }
 
     fn pool_id(&self, pool: &MacosSurfacePool) -> u64 {
@@ -582,6 +566,43 @@ impl crate::acquisition::arena::ReleaseTimeline for ConsumerFence {
 }
 
 impl super::arena::ArenaNativeBackend for MacosFrameBackend {
+    fn pool_allocation_upper_bound(&self, params: &NativeStreamParams, slot_count: u32) -> Result<u64> {
+        let (_, bytes_per_element, _) = format_desc(params.pixel_format)?;
+        let mut bytes = 0;
+        check("native-pool-preflight", unsafe {
+            ffi::porthole_native_pool_allocation_bound(params.width, params.height, bytes_per_element, slot_count, &mut bytes)
+        })?;
+        Ok(bytes)
+    }
+
+    fn allocate_surface_pool_bounded(
+        &mut self,
+        params: &NativeStreamParams,
+        slot_count: u32,
+        reserved_bytes: u64,
+    ) -> Result<MacosSurfacePool> {
+        let (fourcc, bytes_per_element, mtl_format) = format_desc(params.pixel_format)?;
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        check("allocate-surface-pool", unsafe {
+            ffi::porthole_native_pool_create(
+                self.metal.raw.as_ptr(),
+                params.width,
+                params.height,
+                fourcc,
+                bytes_per_element,
+                mtl_format,
+                slot_count,
+                reserved_bytes,
+                &mut raw,
+            )
+        })?;
+        Ok(MacosSurfacePool {
+            raw: NonNull::new(raw).expect("shim returned NULL pool without error"),
+            pool_id: next_unique_id(&NEXT_POOL_ID),
+            slot_count,
+        })
+    }
+
     fn allocated_pool_bytes(&self, pool: &MacosSurfacePool) -> Result<u64> {
         self.export_surface_handles(pool)?.iter().try_fold(0_u64, |total, surface| {
             // SAFETY: each handle is a retained IOSurface exported by this pool.

@@ -149,12 +149,22 @@ version 7 retains the resource generation and mapping slot, carries the consumer
 drain interval, and changes deferred-release state to require local retirement.
 The resource header remains bound to its generation.
 
-Native staging
-needs an allocation upper bound before creating a replacement pool; checking its
-actual size only after allocation would permit a temporary budget violation.
-The macOS backend's allocation contract must establish that bound, then validate
-actual IOSurface bytes against it. This preflight mechanism still needs technical
-verification against the native API.
+Native staging now exposes `pool_allocation_upper_bound` and
+`allocate_surface_pool_bounded` through `ArenaNativeBackend`. The macOS shim
+uses checked arithmetic and `IOSurfaceAlignProperty` for the row stride and total
+allocation size, then supplies both properties explicitly to `IOSurfaceCreate`.
+Apple defines [the allocation property](https://developer.apple.com/documentation/iosurface/kiosurfaceallocsize)
+as the buffer's total allocation size and provides
+[native property alignment](https://developer.apple.com/documentation/iosurface/iosurfacealignproperty(_:_:)).
+This bound covers IOSurface backing storage; the arena charges its maps separately.
+It is not an estimate of driver object overhead or process resident memory.
+
+Bounded allocation computes the layout once, rejects a total above the reserved
+bytes before creating any surfaces, and uses that layout for every slot. This
+also rejects an increased native alignment requirement between preflight and
+allocation. Each returned surface's actual allocation size must match the explicit
+request. A partial pool is destroyed on error. This mechanism still needs to be
+connected to the arena's replacement reservation and old-pool retirement.
 
 ## Implementation evidence required
 
@@ -206,3 +216,8 @@ and deferred GPU-completion tests now consume native setup into the common
 resource owner too. All five native tests pass, along with the existing CPU
 suites, workspace build, default/macOS clippy, and pinned formatting. These remain
 offscreen synthetic tests, not live capture acceptance.
+
+Two allocation tests additionally cover preflight versus actual IOSurface bytes,
+one-byte-short reservations, padded-row pixel round trips for both supported
+formats, and invalid/overflowing layouts. All seven native tests pass. These
+establish allocation preflight, not native replacement or live capture acceptance.

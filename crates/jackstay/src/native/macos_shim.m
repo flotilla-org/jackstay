@@ -62,21 +62,74 @@ void porthole_native_metal_destroy(void *metalPtr) {
 
 // ---- IOSurface utilities ---------------------------------------------------
 
+typedef struct {
+  size_t bytesPerRow;
+  size_t allocationSize;
+} PortholeNativeSurfaceLayout;
+
+// Use the same explicit layout for preflight and IOSurfaceCreate. These are
+// single-plane, uncompressed formats. IOSurface chooses the native alignments;
+// checked arithmetic rejects overflow before any backing storage is allocated.
+static bool porthole_native_surface_layout(uint32_t width, uint32_t height,
+                                           uint32_t bytesPerElement,
+                                           PortholeNativeSurfaceLayout *outLayout) {
+  size_t rowBytes, imageBytes;
+  if (width == 0 || height == 0 || bytesPerElement == 0 ||
+      __builtin_mul_overflow((size_t)width, (size_t)bytesPerElement, &rowBytes)) {
+    return false;
+  }
+  size_t stride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, rowBytes);
+  if (stride < rowBytes || __builtin_mul_overflow(stride, (size_t)height, &imageBytes)) {
+    return false;
+  }
+  size_t allocationSize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, imageBytes);
+  if (allocationSize < imageBytes) {
+    return false;
+  }
+  *outLayout = (PortholeNativeSurfaceLayout){stride, allocationSize};
+  return true;
+}
+
+char *porthole_native_pool_allocation_bound(uint32_t width, uint32_t height,
+                                           uint32_t bytesPerElement, uint32_t slotCount,
+                                           uint64_t *outBytes) {
+  *outBytes = 0;
+  PortholeNativeSurfaceLayout layout;
+  if (slotCount == 0 || !porthole_native_surface_layout(width, height, bytesPerElement, &layout) ||
+      __builtin_mul_overflow((uint64_t)layout.allocationSize, (uint64_t)slotCount, outBytes)) {
+    return porthole_native_copy_error(@"invalid or overflowing native pool dimensions");
+  }
+  return NULL;
+}
+
 static IOSurfaceRef porthole_native_create_surface(uint32_t width, uint32_t height, uint32_t fourcc,
-                                                   uint32_t bytesPerElement) {
+                                                   uint32_t bytesPerElement,
+                                                   PortholeNativeSurfaceLayout layout) {
   NSDictionary *properties = @{
     (__bridge NSString *)kIOSurfaceWidth : @(width),
     (__bridge NSString *)kIOSurfaceHeight : @(height),
     (__bridge NSString *)kIOSurfacePixelFormat : @(fourcc),
     (__bridge NSString *)kIOSurfaceBytesPerElement : @(bytesPerElement),
+    (__bridge NSString *)kIOSurfaceBytesPerRow : @(layout.bytesPerRow),
+    (__bridge NSString *)kIOSurfaceAllocSize : @(layout.allocationSize),
   };
-  return IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+  IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+  // Verify the returned object obeys the requested allocation contract too.
+  if (surface != NULL && IOSurfaceGetAllocSize(surface) != layout.allocationSize) {
+    CFRelease(surface);
+    return NULL;
+  }
+  return surface;
 }
 
 char *porthole_native_surface_create(uint32_t width, uint32_t height, uint32_t fourcc,
                                      uint32_t bytesPerElement, void **outSurface) {
   *outSurface = NULL;
-  IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement);
+  PortholeNativeSurfaceLayout layout;
+  if (!porthole_native_surface_layout(width, height, bytesPerElement, &layout)) {
+    return porthole_native_copy_error(@"invalid or overflowing native surface dimensions");
+  }
+  IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement, layout);
   if (surface == NULL) {
     return porthole_native_copy_error(@"IOSurfaceCreate failed");
   }
@@ -172,8 +225,17 @@ static IOSurfaceRef porthole_native_pool_surface(PortholeNativePool *pool, uint3
 
 char *porthole_native_pool_create(void *metalPtr, uint32_t width, uint32_t height, uint32_t fourcc,
                                   uint32_t bytesPerElement, uint64_t mtlPixelFormat,
-                                  uint32_t slotCount, void **outPool) {
+                                  uint32_t slotCount, uint64_t reservedBytes, void **outPool) {
   *outPool = NULL;
+  PortholeNativeSurfaceLayout layout;
+  uint64_t totalBytes;
+  if (slotCount == 0 || !porthole_native_surface_layout(width, height, bytesPerElement, &layout) ||
+      __builtin_mul_overflow((uint64_t)layout.allocationSize, (uint64_t)slotCount, &totalBytes)) {
+    return porthole_native_copy_error(@"invalid or overflowing native pool dimensions");
+  }
+  if (totalBytes > reservedBytes) {
+    return porthole_native_copy_error(@"native pool exceeds reserved allocation bytes");
+  }
   PortholeNativeMetal *metal = (__bridge PortholeNativeMetal *)metalPtr;
   PortholeNativePool *pool = [[PortholeNativePool alloc] init];
   pool.textures = [NSMutableArray arrayWithCapacity:slotCount];
@@ -189,7 +251,7 @@ char *porthole_native_pool_create(void *metalPtr, uint32_t width, uint32_t heigh
   descriptor.storageMode = MTLStorageModeShared;
 
   for (uint32_t slot = 0; slot < slotCount; slot++) {
-    IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement);
+    IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement, layout);
     if (surface == NULL) {
       return porthole_native_copy_error(
           [NSString stringWithFormat:@"IOSurfaceCreate failed for pool slot %u", slot]);

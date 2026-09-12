@@ -8,10 +8,62 @@ use jackstay::{
     model::{ClockDomain, ColorSpace, PixelFormat},
     native::{
         NativeFrameBackend, NativeStreamParams,
-        arena::NativeArenaProducer,
+        arena::{ArenaNativeBackend, NativeArenaProducer},
         macos::{ConsumerFence, IoSurface, MacosCapturedFrame, MacosFrameBackend, MetalContext, SampleCompletion, SharedEventHandle},
     },
 };
+
+#[test]
+fn native_pool_preflight_bounds_actual_storage_and_preserves_odd_sized_pixels() {
+    let mut backend = MacosFrameBackend::new().unwrap();
+    for format in [PixelFormat::Bgra8Unorm, PixelFormat::Rgba8Unorm] {
+        for (width, height, slots) in [(1, 1, 1), (17, 19, 3), (65, 33, 2)] {
+            let params = NativeStreamParams {
+                width,
+                height,
+                pixel_format: format,
+                color_space: ColorSpace::Srgb,
+                clock_domain: ClockDomain::HostTime,
+                modifier: 0,
+            };
+            let bound = backend.pool_allocation_upper_bound(&params, slots).unwrap();
+            assert!(backend.allocate_surface_pool_bounded(&params, slots, bound - 1).is_err());
+            let pool = backend.allocate_surface_pool_bounded(&params, slots, bound).unwrap();
+            let actual = backend.allocated_pool_bytes(&pool).unwrap();
+            assert!(actual > 0 && actual <= bound, "actual {actual}, reserved {bound}");
+            let pixels: Vec<_> = (0..width * height * 4).map(|index| (index % 251) as u8).collect();
+            for surface in backend.export_surface_handles(&pool).unwrap() {
+                surface.write_pixels(&pixels).unwrap();
+                let mut readback = vec![0; pixels.len()];
+                surface.read_pixels(&mut readback).unwrap();
+                assert_eq!(readback, pixels);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_pool_preflight_rejects_empty_unsupported_and_overflowing_layouts() {
+    let backend = MacosFrameBackend::new().unwrap();
+    let mut params = NativeStreamParams {
+        width: 1,
+        height: 1,
+        pixel_format: PixelFormat::Bgra8Unorm,
+        color_space: ColorSpace::Srgb,
+        clock_domain: ClockDomain::HostTime,
+        modifier: 0,
+    };
+    assert!(backend.pool_allocation_upper_bound(&params, 0).is_err());
+    for (width, height, slots) in [(0, 1, 1), (1, 0, 1), (u32::MAX, u32::MAX, 1), (1, u32::MAX, u32::MAX)] {
+        params.width = width;
+        params.height = height;
+        assert!(backend.pool_allocation_upper_bound(&params, slots).is_err());
+    }
+    params.width = 1;
+    params.height = 1;
+    params.pixel_format = PixelFormat::Unknown;
+    assert!(backend.pool_allocation_upper_bound(&params, 1).is_err());
+}
 
 fn captured(seed: u8) -> MacosCapturedFrame {
     let surface = IoSurface::allocate(16, 16, PixelFormat::Bgra8Unorm).unwrap();

@@ -19,6 +19,18 @@ use crate::{
 /// pool supplies its actual byte footprint; producer writes need completion
 /// evidence independently of consumer release timelines.
 pub trait ArenaNativeBackend: NativeFrameBackend {
+    /// Backing-storage bytes to reserve before allocating a pool. Includes
+    /// native row/allocation alignment; excludes the arena's separate maps.
+    fn pool_allocation_upper_bound(&self, params: &NativeStreamParams, slot_count: u32) -> crate::Result<u64>;
+    /// Allocate only if the native layout fits the already reserved bound.
+    /// Revalidate before creating storage, including if native alignment has
+    /// changed since preflight. Any partial allocation is destroyed on error.
+    fn allocate_surface_pool_bounded(
+        &mut self,
+        params: &NativeStreamParams,
+        slot_count: u32,
+        reserved_bytes: u64,
+    ) -> crate::Result<Self::SurfacePool>;
     fn allocated_pool_bytes(&self, pool: &Self::SurfacePool) -> crate::Result<u64>;
     fn completed_producer_value(&self, fence: &Self::Fence) -> crate::Result<u64>;
 }

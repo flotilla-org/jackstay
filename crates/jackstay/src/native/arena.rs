@@ -8,8 +8,9 @@ use crate::{
     acquisition::{
         IncarnationId,
         arena::{
-            ArenaConfig, ArenaConsumer, ArenaError, ArenaProducer, ConsumerGrant, FrameDescriptor, FrameLease, PublishOutcome,
-            ReleaseTimeline, ReleaseTimelineRegistration, RemoteConsumerGrant, ResourceAttachment,
+            ArenaConfig, ArenaConsumer, ArenaError, ArenaProducer, ConfigurationGrant, ConfigurationInstall, ConsumerGrant,
+            FrameDescriptor, FrameLease, PublishOutcome, ReconfigurationStatus, ReleaseTimeline, ReleaseTimelineRegistration,
+            RemoteConsumerGrant, ResourceAttachment, RetiredResource,
         },
     },
     model::{DamageKind, FrameSyncKind},
@@ -33,15 +34,23 @@ pub trait ArenaNativeBackend: NativeFrameBackend {
     ) -> crate::Result<Self::SurfacePool>;
     fn allocated_pool_bytes(&self, pool: &Self::SurfacePool) -> crate::Result<u64>;
     fn completed_producer_value(&self, fence: &Self::Fence) -> crate::Result<u64>;
+    /// An independently retained view of actual producer completion. Retired
+    /// pools keep this proof source even after a replacement becomes current.
+    fn producer_completion_timeline(&self, fence: &Self::Fence) -> crate::Result<Arc<dyn ReleaseTimeline>>;
 }
 
 pub struct NativeArenaGrant<S, Y, G = ConsumerGrant> {
-    pub consumer: G,
     pub pool_id: u64,
     pub surface_handles: Vec<S>,
     pub fence_id: u64,
     pub sync_handle: Y,
+    // Field order matters: unconsumed native handles drop before the grant
+    // acknowledges mapping retirement to the producer.
+    pub consumer: G,
 }
+
+pub type NativeConfigurationGrant<B> =
+    NativeArenaGrant<<B as NativeFrameBackend>::SurfaceHandle, <B as NativeFrameBackend>::SyncHandle, ConfigurationGrant>;
 
 #[derive(Debug)]
 struct RetainedNativeResources<S, Y> {
@@ -82,9 +91,9 @@ where
     /// Consume setup into the common consumer. The resource generation owns
     /// its native handles through all acquired and deferred frame lifetimes.
     pub fn into_consumer(self) -> Result<ArenaConsumer, ArenaError> {
-        let mut consumer = ArenaConsumer::from_grant(self.consumer)?;
         let slots = self.surface_handles.len();
-        consumer.retain_native_resources(
+        ArenaConsumer::from_native_grant(
+            self.consumer,
             slots,
             Box::new(RetainedNativeResources {
                 pool_id: self.pool_id,
@@ -92,8 +101,40 @@ where
                 fence_id: self.fence_id,
                 sync_handle: self.sync_handle,
             }),
-        )?;
-        Ok(consumer)
+        )
+    }
+}
+
+impl<S, Y> NativeArenaGrant<S, Y, ConfigurationGrant>
+where
+    S: std::fmt::Debug + Send + Sync + 'static,
+    Y: std::fmt::Debug + Send + Sync + 'static,
+{
+    /// Install the resource map and native handles as one generation. On every
+    /// rejection, destroy handles before acknowledging the disposed offer.
+    pub fn install(self, consumer: &mut ArenaConsumer) -> Result<ConfigurationInstall, ArenaError> {
+        consumer.install_native_configuration(
+            self.consumer,
+            self.surface_handles.len(),
+            Box::new(RetainedNativeResources {
+                pool_id: self.pool_id,
+                surfaces: self.surface_handles,
+                fence_id: self.fence_id,
+                sync_handle: self.sync_handle,
+            }),
+        )
+    }
+}
+
+struct RetiredNativePool<P> {
+    _pool: P,
+    readiness: Arc<dyn ReleaseTimeline>,
+    submitted: u64,
+}
+
+impl<P: Send> RetiredResource for RetiredNativePool<P> {
+    fn ready(&self) -> Result<bool, ArenaError> {
+        Ok(self.readiness.completed_value()? >= self.submitted)
     }
 }
 
@@ -124,9 +165,11 @@ impl FrameLease {
 pub struct NativeArenaProducer<B: ArenaNativeBackend> {
     arena: ArenaProducer,
     backend: B,
-    pool: B::SurfacePool,
+    pool: Option<B::SurfacePool>,
     fence: B::Fence,
     params: NativeStreamParams,
+    pending_params: Option<(NativeStreamParams, u64)>,
+    generation: u64,
     submitted: Vec<u64>,
     sequence: u64,
     fence_value: u64,
@@ -135,7 +178,10 @@ pub struct NativeArenaProducer<B: ArenaNativeBackend> {
     faulted: bool,
 }
 
-impl<B: ArenaNativeBackend> NativeArenaProducer<B> {
+impl<B: ArenaNativeBackend> NativeArenaProducer<B>
+where
+    B::SurfacePool: Send + 'static,
+{
     /// Admit an existing native allocation. Pool byte accounting is checked
     /// before allocating arena metadata or admitting consumers. Negotiated
     /// pools can be supplied by their compositor; authority stays with the host.
@@ -156,9 +202,11 @@ impl<B: ArenaNativeBackend> NativeArenaProducer<B> {
         Ok(Self {
             arena,
             backend,
-            pool,
+            pool: Some(pool),
             fence,
             params,
+            pending_params: None,
+            generation: 1,
             submitted: vec![0; config.resource_capacity as usize],
             sequence: 0,
             fence_value: 0,
@@ -183,13 +231,75 @@ impl<B: ArenaNativeBackend> NativeArenaProducer<B> {
     }
 
     fn grant<G>(&self, consumer: G) -> Result<NativeArenaGrant<B::SurfaceHandle, B::SyncHandle, G>, ArenaError> {
+        let pool = self.pool.as_ref().ok_or(ArenaError::Configuration("native allocation is paused"))?;
+        // On export failure, local handle owners must drop before the grant
+        // acknowledges its mapping reference. Do not move the grant into a
+        // partially evaluated struct initializer before these fallible calls.
+        let surface_handles = self.backend.export_surface_handles(pool)?;
+        let sync_handle = self.backend.export_sync_handle(&self.fence)?;
         Ok(NativeArenaGrant {
             consumer,
-            pool_id: self.backend.pool_id(&self.pool),
-            surface_handles: self.backend.export_surface_handles(&self.pool)?,
+            pool_id: self.backend.pool_id(pool),
+            surface_handles,
             fence_id: self.backend.fence_id(&self.fence),
-            sync_handle: self.backend.export_sync_handle(&self.fence)?,
+            sync_handle,
         })
+    }
+
+    pub fn reconfigure(&mut self, params: NativeStreamParams) -> Result<ReconfigurationStatus, ArenaError> {
+        if self.faulted {
+            return Err(ArenaError::Closed);
+        }
+        if self.pending_params.is_some() {
+            return Err(crate::acquisition::AdmissionError::ReconfigurationPending.into());
+        }
+        let bound = self.backend.pool_allocation_upper_bound(&params, self.submitted.len() as u32)?;
+        let readiness = self.backend.producer_completion_timeline(&self.fence)?;
+        self.arena.begin_native_reconfiguration(bound, || {
+            self.pending_params = Some((params, bound));
+            Box::new(RetiredNativePool {
+                _pool: self.pool.take().expect("installed native pool"),
+                readiness,
+                submitted: self.fence_value,
+            })
+        })?;
+        self.advance_reconfiguration()
+    }
+
+    pub fn advance_reconfiguration(&mut self) -> Result<ReconfigurationStatus, ArenaError> {
+        if self.faulted {
+            return Err(ArenaError::Closed);
+        }
+        let Some((params, bound)) = &self.pending_params else {
+            return Ok(ReconfigurationStatus::Ready {
+                generation: self.generation,
+            });
+        };
+        let (status, pool) = self.arena.advance_with_allocation(|| {
+            let pool = self
+                .backend
+                .allocate_surface_pool_bounded(params, self.submitted.len() as u32, *bound)?;
+            let bytes = self.backend.allocated_pool_bytes(&pool)?;
+            Ok((pool, bytes))
+        })?;
+        if let Some(pool) = pool {
+            self.pool = Some(pool);
+            self.params = self.pending_params.take().expect("installed native proposal").0;
+            self.submitted.fill(0);
+            let ReconfigurationStatus::Ready { generation } = status else {
+                unreachable!("installed pool")
+            };
+            self.generation = generation;
+            self.arena.signal_reconfiguration()?;
+        }
+        Ok(status)
+    }
+
+    pub fn configuration_offer(&mut self, incarnation: IncarnationId) -> Result<Option<NativeConfigurationGrant<B>>, ArenaError> {
+        self.arena
+            .configuration_offer(incarnation)?
+            .map(|consumer| self.grant(consumer))
+            .transpose()
     }
 
     pub fn publish(&mut self, frame: &B::CapturedFrame, timestamp_ns: u64) -> Result<PublishOutcome, ArenaError> {
@@ -208,7 +318,9 @@ impl<B: ArenaNativeBackend> NativeArenaProducer<B> {
         self.sequence = self.sequence.checked_add(1).ok_or(ArenaError::GenerationsExhausted)?;
         let ready = self.backend.completed_producer_value(&self.fence)?;
         let hint = self.backend.frame_slot_hint(frame);
+        let pool = &mut self.pool;
         let result = self.arena.publish_resource(|slot, previous_cursor| {
+            let pool = pool.as_mut().expect("installed arena has a native pool");
             if hint.is_some_and(|hint| hint != slot) || self.submitted[slot as usize] > ready {
                 return Ok(None);
             }
@@ -216,22 +328,22 @@ impl<B: ArenaNativeBackend> NativeArenaProducer<B> {
                 slot_id: slot,
                 last_cursor: previous_cursor,
             };
-            match self.backend.claim_reusable_slot(&mut self.pool, &[candidate])? {
+            match self.backend.claim_reusable_slot(pool, &[candidate])? {
                 SlotClaim::WouldBlock => return Ok(None),
                 SlotClaim::Ready { slot_id } if slot_id != slot => {
                     return Err(ArenaError::Mapping("backend selected an unclaimed native slot"));
                 }
                 SlotClaim::Ready { .. } => {}
             }
-            self.backend.stage_frame(&mut self.pool, slot, frame)?;
+            self.backend.stage_frame(pool, slot, frame)?;
             self.fence_value = self.fence_value.checked_add(1).ok_or(ArenaError::GenerationsExhausted)?;
             self.submitted[slot as usize] = self.fence_value;
             self.backend.signal_fence(&mut self.fence, self.fence_value)?;
             Ok(Some(FrameDescriptor {
                 sequence: self.sequence,
                 timestamp_ns,
-                config_generation: 1,
-                pool_id: self.backend.pool_id(&self.pool),
+                config_generation: self.generation,
+                pool_id: self.backend.pool_id(pool),
                 slot_id: slot,
                 width: self.params.width,
                 height: self.params.height,

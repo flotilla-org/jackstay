@@ -71,6 +71,137 @@ fn captured(seed: u8) -> MacosCapturedFrame {
     MacosCapturedFrame { surface }
 }
 
+#[test]
+fn native_reconfiguration_retains_old_pixels_and_shares_holding_credit_with_the_new_pool() {
+    use jackstay::acquisition::arena::{ConfigurationInstall, ReconfigurationStatus};
+    let mut producer = producer(1);
+    let mut consumer = producer.attach(2).unwrap().into_consumer().unwrap();
+    producer.publish(&captured(31), 1).unwrap();
+    let AcquireOutcome::Frame(old) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing old frame")
+    };
+    let original = *old.descriptor();
+    let params = NativeStreamParams {
+        width: 17,
+        height: 19,
+        pixel_format: PixelFormat::Rgba8Unorm,
+        color_space: ColorSpace::Srgb,
+        clock_domain: ClockDomain::HostTime,
+        modifier: 0,
+    };
+    let ReconfigurationStatus::Ready { generation } = producer.reconfigure(params).unwrap() else {
+        panic!("replacement should fit")
+    };
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Reconfiguration));
+    let offer = producer.configuration_offer(consumer.incarnation()).unwrap().unwrap();
+    assert_eq!(offer.install(&mut consumer).unwrap(), ConfigurationInstall::Installed);
+    let surface = IoSurface::allocate(17, 19, PixelFormat::Rgba8Unorm).unwrap();
+    surface.write_pixels(&vec![83; 17 * 19 * 4]).unwrap();
+    producer.publish(&MacosCapturedFrame { surface }, 2).unwrap();
+    let AcquireOutcome::Frame(new) = consumer.acquire_latest(original.cursor).unwrap() else {
+        panic!("missing replacement frame")
+    };
+    assert_eq!(new.descriptor().config_generation, generation);
+    assert_ne!(new.descriptor().pool_id, original.pool_id);
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
+    drop(consumer);
+    producer.poll_cleanup().unwrap();
+    let metal = MetalContext::new().unwrap();
+    for (frame, expected) in [(&old, vec![31; 16 * 16 * 4]), (&new, vec![83; 17 * 19 * 4])] {
+        let native = frame.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+        let fence = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
+        let descriptor = frame.descriptor();
+        let pixels = fence
+            .sample_offscreen(&metal, native.surface, descriptor.fence_value, descriptor.width, descriptor.height)
+            .unwrap();
+        assert_eq!(pixels, expected);
+    }
+    assert_eq!(old.descriptor(), &original);
+}
+
+#[test]
+fn native_replacement_waits_for_old_storage_and_reclaims_repeated_pool_generations() {
+    use jackstay::acquisition::arena::{ConfigurationInstall, PublishOutcome, ReconfigurationStatus};
+    let mut params = NativeStreamParams {
+        width: 16,
+        height: 16,
+        pixel_format: PixelFormat::Bgra8Unorm,
+        color_space: ColorSpace::Srgb,
+        clock_domain: ClockDomain::HostTime,
+        modifier: 0,
+    };
+    let mut backend = MacosFrameBackend::new().unwrap();
+    let bound = backend.pool_allocation_upper_bound(&params, 6).unwrap();
+    // One native pool plus control/resource/claim pages and one spare page.
+    // This can replace a retired pool but cannot overlap two native pools.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let config = ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 0,
+        memory_budget: bound + 4 * page,
+        max_incarnations: 1,
+        drain_timeout: std::time::Duration::from_secs(5),
+    };
+    let pool = backend.allocate_surface_pool_bounded(&params, 6, bound).unwrap();
+    let fence = backend.create_fence().unwrap();
+    let mut producer = NativeArenaProducer::from_allocated_parts(backend, pool, fence, params.clone(), config).unwrap();
+    let mut consumer = producer.attach(1).unwrap().into_consumer().unwrap();
+    producer.publish(&captured(61), 1).unwrap();
+    let AcquireOutcome::Frame(old) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing old frame")
+    };
+    params.width = 17;
+    assert!(matches!(
+        producer.reconfigure(params.clone()).unwrap(),
+        ReconfigurationStatus::PausedCapacity { .. }
+    ));
+    assert!(producer.attach(1).is_err(), "transition admitted another consumer");
+    assert!(producer.configuration_offer(consumer.incarnation()).unwrap().is_none());
+    assert_eq!(producer.publish(&captured(99), 2).unwrap(), PublishOutcome::Dropped);
+    consumer.relinquish_configuration();
+    assert!(matches!(
+        producer.advance_reconfiguration().unwrap(),
+        ReconfigurationStatus::PausedCapacity { .. }
+    ));
+    {
+        let native = old.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+        let metal = MetalContext::new().unwrap();
+        let readiness = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
+        assert_eq!(
+            readiness
+                .sample_offscreen(&metal, native.surface, old.descriptor().fence_value, 16, 16)
+                .unwrap(),
+            vec![61; 16 * 16 * 4]
+        );
+    }
+    drop(old);
+    assert!(matches!(
+        producer.advance_reconfiguration().unwrap(),
+        ReconfigurationStatus::Ready { .. }
+    ));
+    let offer = producer.configuration_offer(consumer.incarnation()).unwrap().unwrap();
+    assert_eq!(offer.install(&mut consumer).unwrap(), ConfigurationInstall::Installed);
+    for _ in 0..100 {
+        consumer.relinquish_configuration();
+        assert!(matches!(
+            producer.reconfigure(params.clone()).unwrap(),
+            ReconfigurationStatus::Ready { .. }
+        ));
+        let offer = producer.configuration_offer(consumer.incarnation()).unwrap().unwrap();
+        assert_eq!(offer.install(&mut consumer).unwrap(), ConfigurationInstall::Installed);
+    }
+    let surface = IoSurface::allocate(17, 16, PixelFormat::Bgra8Unorm).unwrap();
+    surface.write_pixels(&vec![92; 17 * 16 * 4]).unwrap();
+    producer.publish(&MacosCapturedFrame { surface }, 3).unwrap();
+    let AcquireOutcome::Frame(new) = consumer.acquire_latest(0).unwrap() else {
+        panic!("replacement did not resume delivery")
+    };
+    assert_eq!(new.descriptor().width, 17);
+    assert_eq!(new.descriptor().producer_drop_count, 1);
+}
+
 fn producer(max_incarnations: u32) -> NativeArenaProducer<MacosFrameBackend> {
     let params = NativeStreamParams {
         width: 16,
@@ -163,7 +294,7 @@ fn a_shared_native_lease_retains_its_iosurface_through_ring_wrap_and_samples_aft
 }
 
 #[test]
-fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_event() {
+fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_through_pool_replacement() {
     use std::sync::Arc;
     let mut producer = producer(2);
     let grant = producer.attach(1).unwrap();
@@ -185,8 +316,8 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
     let descriptor = *held.descriptor();
     let native = held.native_resources::<IoSurface, SharedEventHandle>().unwrap();
     let readiness = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
-    // The diagnostic sampler owns a reference for its scoped call. It is
-    // dropped before the consumer retires this still-current configuration.
+    // The diagnostic sampler's extra reference drops when its scoped call
+    // returns, before the producer's first post-completion retirement poll.
     let old_surface = native.surface.clone();
     std::thread::scope(|scope| {
         struct OpenOnDrop<'a>(&'a ConsumerFence);
@@ -197,9 +328,10 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
         }
         let _open_on_unwind = OpenOnDrop(&gate);
         let sample = scope.spawn(|| {
+            let surface = old_surface;
             readiness.sample_offscreen_with_completion(
                 &metal,
-                &old_surface,
+                &surface,
                 descriptor.fence_value,
                 (16, 16),
                 SampleCompletion {
@@ -214,6 +346,24 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
         assert_eq!(observed_release.signaled_value(), 0);
         assert_eq!(producer.poll_cleanup().unwrap(), 0);
         assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
+        assert!(matches!(
+            producer
+                .reconfigure(NativeStreamParams {
+                    width: 16,
+                    height: 16,
+                    pixel_format: PixelFormat::Bgra8Unorm,
+                    color_space: ColorSpace::Srgb,
+                    clock_domain: ClockDomain::HostTime,
+                    modifier: 0,
+                })
+                .unwrap(),
+            jackstay::acquisition::arena::ReconfigurationStatus::Ready { .. }
+        ));
+        let offer = producer.configuration_offer(consumer.incarnation()).unwrap().unwrap();
+        assert_eq!(
+            offer.install(&mut consumer).unwrap(),
+            jackstay::acquisition::arena::ConfigurationInstall::Installed
+        );
         for timestamp in 2..=100 {
             producer.publish(&captured(91), timestamp).unwrap();
         }
@@ -231,6 +381,7 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
         let AcquireOutcome::Frame(latest) = consumer.acquire_latest(descriptor.cursor).unwrap() else {
             panic!("credit was not returned")
         };
+        assert_ne!(latest.descriptor().pool_id, descriptor.pool_id);
         assert!(latest.cursor() > 4, "publication did not wrap the retained ring");
     });
 }

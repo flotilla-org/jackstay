@@ -486,7 +486,7 @@ impl ArenaProducer {
             released = released.saturating_add(std::mem::take(&mut state.released));
         }
         self.collect_quiescent();
-        self.collect_retired_allocations();
+        self.collect_retired_allocations()?;
         Ok(released)
     }
 }

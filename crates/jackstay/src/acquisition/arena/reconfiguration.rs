@@ -7,10 +7,21 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ACTIVE, AdmissionError, ArenaConsumer, ArenaError, ArenaProducer, CLAIM_SLOT_LEN, CONFIGURATION, ClaimMap, ConsumerResources,
-    FIRST_CURSOR, HEADER_LEN, IncarnationId, OFFERED_GENERATION, RECONFIGURATION_EPOCH, ResourceLayout, ResourceMap, TERMINAL, VERSION,
-    wait,
+    ACTIVE, AdmissionError, AllocationId, ArenaConsumer, ArenaError, ArenaProducer, CLAIM_SLOT_LEN, CONFIGURATION, ClaimMap,
+    ConsumerResources, FIRST_CURSOR, HEADER_LEN, IncarnationId, OFFERED_GENERATION, RECONFIGURATION_EPOCH, ResourceAttachment,
+    ResourceLayout, ResourceMap, TERMINAL, VERSION, wait,
 };
+
+pub(crate) trait RetiredResource: Send {
+    /// Actual producer completion, independently of the consumer claims.
+    fn ready(&self) -> Result<bool, ArenaError>;
+}
+
+pub(super) struct RetiredAllocation {
+    id: AllocationId,
+    map: Arc<ResourceMap>,
+    native: Option<Box<dyn RetiredResource>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconfigurationStatus {
@@ -137,6 +148,27 @@ impl ArenaProducer {
                 "CPU reconfiguration cannot replace an external native pool",
             ));
         }
+        self.begin_reconfiguration(payload_capacity, 0, || None)?;
+        self.advance_reconfiguration()
+    }
+
+    pub(crate) fn begin_native_reconfiguration(
+        &mut self,
+        external_bytes: u64,
+        retire: impl FnOnce() -> Box<dyn RetiredResource>,
+    ) -> Result<(), ArenaError> {
+        if !self.native_resources {
+            return Err(ArenaError::Configuration("native replacement requires an external pool"));
+        }
+        self.begin_reconfiguration(0, external_bytes, || Some(retire()))
+    }
+
+    fn begin_reconfiguration(
+        &mut self,
+        payload_capacity: usize,
+        external_bytes: u64,
+        retire: impl FnOnce() -> Option<Box<dyn RetiredResource>>,
+    ) -> Result<(), ArenaError> {
         if self.control.word(TERMINAL).load(SeqCst) != 0 {
             return Err(ArenaError::Closed);
         }
@@ -146,36 +178,60 @@ impl ArenaProducer {
         let old = self.resources.as_ref().expect("installed allocation");
         let layout = ResourceLayout::new(old.layout.resources, old.layout.history, payload_capacity)?;
         let old_id = self.admission.current_allocation().expect("installed allocation is charged");
-        self.admission.begin_reconfiguration(layout.len as u64)?;
+        let bytes = (layout.len as u64)
+            .checked_add(external_bytes)
+            .ok_or(ArenaError::Configuration("replacement allocation byte total overflow"))?;
+        self.admission.begin_reconfiguration(bytes)?;
         self.control.word(CONFIGURATION).store(0, SeqCst);
         for index in 0..old.layout.resources {
             let state = old.state(index).load(SeqCst);
             old.state(index).store(state & !1, SeqCst);
         }
-        self.retired
-            .push((old_id, self.resources.take().expect("retired current allocation")));
+        self.retired.push(RetiredAllocation {
+            id: old_id,
+            map: self.resources.take().expect("retired current allocation"),
+            native: retire(),
+        });
         self.pending_layout = Some(layout);
         self.control.word(FIRST_CURSOR).store(self.cursor + 1, SeqCst);
-        self.signal_reconfiguration()?;
-        self.advance_reconfiguration()
+        self.signal_reconfiguration()
     }
 
     /// Retry a capacity-paused transition after old-resource cleanup or a
     /// failed allocation. Publication remains paused until installation.
     pub fn advance_reconfiguration(&mut self) -> Result<ReconfigurationStatus, ArenaError> {
+        if self.native_resources {
+            return Err(ArenaError::Configuration("native replacement requires its pool allocator"));
+        }
+        let (status, installed) = self.advance_with_allocation(|| Ok(((), 0)))?;
+        if installed.is_some() {
+            self.signal_reconfiguration()?;
+        }
+        Ok(status)
+    }
+
+    // Reserve maps and backing storage together. Return the external owner to
+    // the caller before it notifies consumers about the installed generation.
+    pub(crate) fn advance_with_allocation<T>(
+        &mut self,
+        allocate: impl FnOnce() -> Result<(T, u64), ArenaError>,
+    ) -> Result<(ReconfigurationStatus, Option<T>), ArenaError> {
         if self.control.word(TERMINAL).load(SeqCst) != 0 {
             return Err(ArenaError::Closed);
         }
         self.poll_cleanup()?;
         let Some(layout) = self.pending_layout else {
-            return Ok(ReconfigurationStatus::Ready {
-                generation: self.control.word(CONFIGURATION).load(SeqCst),
-            });
+            return Ok((
+                ReconfigurationStatus::Ready {
+                    generation: self.control.word(CONFIGURATION).load(SeqCst),
+                },
+                None,
+            ));
         };
         let allocation = match self.admission.reserve_reconfiguration() {
             Ok(allocation) => allocation,
             Err(AdmissionError::InsufficientMemory { requested, available }) => {
-                return Ok(ReconfigurationStatus::PausedCapacity { requested, available });
+                return Ok((ReconfigurationStatus::PausedCapacity { requested, available }, None));
             }
             Err(error) => return Err(error.into()),
         };
@@ -186,16 +242,32 @@ impl ArenaProducer {
                 return Err(error);
             }
         };
-        self.admission.install_reconfiguration(map.storage.len() as u64)?;
+        let (external, external_bytes) = match allocate() {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                drop(map);
+                self.admission.abandon_reconfiguration_allocation()?;
+                return Err(error);
+            }
+        };
+        let installed = (map.storage.len() as u64)
+            .checked_add(external_bytes)
+            .ok_or(AdmissionError::InvalidAllocationSize)
+            .and_then(|bytes| self.admission.install_reconfiguration(bytes));
+        if let Err(error) = installed {
+            drop(external);
+            drop(map);
+            self.admission.abandon_reconfiguration_allocation()?;
+            return Err(error.into());
+        }
         self.resources = Some(Arc::new(map));
         self.pending_layout = None;
         self.next_slot = 0;
         self.control.word(CONFIGURATION).store(allocation.0, SeqCst);
-        self.signal_reconfiguration()?;
-        Ok(ReconfigurationStatus::Ready { generation: allocation.0 })
+        Ok((ReconfigurationStatus::Ready { generation: allocation.0 }, Some(external)))
     }
 
-    fn signal_reconfiguration(&self) -> Result<(), ArenaError> {
+    pub(crate) fn signal_reconfiguration(&self) -> Result<(), ArenaError> {
         self.control.word(RECONFIGURATION_EPOCH).fetch_add(1, SeqCst);
         for claims in self.claims.values() {
             claims.signal(wait::RECONFIGURATION)?;
@@ -237,10 +309,10 @@ impl ArenaProducer {
         Ok(Some(grant))
     }
 
-    pub(super) fn collect_retired_allocations(&mut self) {
+    pub(super) fn collect_retired_allocations(&mut self) -> Result<(), ArenaError> {
         let mut index = 0;
         while index < self.retired.len() {
-            let (id, map) = &self.retired[index];
+            let RetiredAllocation { id, map, native } = &self.retired[index];
             let retained = self.claims.values().any(|claims| {
                 (0..claims.frames + 2).any(|slot| claims.mapping_slot(slot).load(SeqCst) == map.generation)
                     || (0..map.layout.resources).any(|slot| {
@@ -248,7 +320,7 @@ impl ArenaProducer {
                         cursor != 0 && claims.contains(cursor)
                     })
             });
-            if retained {
+            if retained || !native.as_ref().map(|resource| resource.ready()).transpose()?.unwrap_or(true) {
                 index += 1;
             } else {
                 let id = *id;
@@ -260,11 +332,32 @@ impl ArenaProducer {
                     .expect("retired allocation is charged");
             }
         }
+        Ok(())
     }
 }
 
 impl ArenaConsumer {
-    pub fn install_configuration(&mut self, mut grant: ConfigurationGrant) -> Result<ConfigurationInstall, ArenaError> {
+    pub fn install_configuration(&mut self, grant: ConfigurationGrant) -> Result<ConfigurationInstall, ArenaError> {
+        self.install_with_resources(grant, None)
+    }
+
+    pub(crate) fn install_native_configuration(
+        &mut self,
+        grant: ConfigurationGrant,
+        slots: usize,
+        resources: Box<dyn ResourceAttachment>,
+    ) -> Result<ConfigurationInstall, ArenaError> {
+        if grant.layout.payload_capacity != 0 || grant.layout.resources != slots {
+            return Err(ArenaError::Mapping("native replacement handles disagree with resource layout"));
+        }
+        self.install_with_resources(grant, Some(resources))
+    }
+
+    fn install_with_resources(
+        &mut self,
+        mut grant: ConfigurationGrant,
+        attachment: Option<Box<dyn ResourceAttachment>>,
+    ) -> Result<ConfigurationInstall, ArenaError> {
         if grant.arena_scope != self.control.scope || grant.claims.scope != self.lifetime.claims.scope {
             return Err(ArenaError::Mapping("configuration grant belongs to another arena or incarnation"));
         }
@@ -287,7 +380,7 @@ impl ArenaConsumer {
             map: ManuallyDrop::new(map),
             mapping_slot: grant.mapping_slot,
             claims: Arc::clone(&self.lifetime.claims),
-            attachment: None,
+            attachment,
         }));
         grant.consumed = true;
         grant.claims.word(OFFERED_GENERATION).store(0, SeqCst);

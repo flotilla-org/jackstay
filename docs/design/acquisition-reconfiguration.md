@@ -163,8 +163,28 @@ Bounded allocation computes the layout once, rejects a total above the reserved
 bytes before creating any surfaces, and uses that layout for every slot. This
 also rejects an increased native alignment requirement between preflight and
 allocation. Each returned surface's actual allocation size must match the explicit
-request. A partial pool is destroyed on error. This mechanism still needs to be
-connected to the arena's replacement reservation and old-pool retirement.
+request. A partial pool is destroyed on error.
+
+`NativeArenaProducer::reconfigure` now reserves that bound and the resource map
+through the common admission book before allocating either. An accepted proposal
+retires the old pool alongside its map. The retirement owner retains an imported
+view of the producer's shared event and the last submitted value. Cleanup requires
+that actual value to have completed as well as all consumer claims and mapping
+references to be clear. It destroys the pool and map before returning their bytes.
+The stream keeps one monotonic readiness timeline across pool generations.
+
+Replacement offers carry the resource mapping and native setup handles together.
+`NativeConfigurationGrant::install` installs both in one consumer resource owner;
+held and deferred frames retain their original owner. Rejected, stale, and
+unconsumed offers destroy native handles before acknowledging mapping retirement.
+Initial native setup follows the same disposal order. Publication descriptors name
+the installed generation instead of a constant generation one.
+
+As on the CPU path, a capacity-paused native transition currently requires the
+host to call `advance_reconfiguration` after cleanup can make progress. Automatic
+host resumption, including a producer readiness event completing while idle, still
+needs integration and evidence. An error reading the retirement completion source
+propagates without returning its pool's bytes.
 
 ## Implementation evidence required
 
@@ -174,7 +194,7 @@ under shared holding credit; exhausted overlap capacity and cancellation; cursor
 gaps before and after replacement publication; and 100 healthy replacements while
 another consumer retains one stale offer. A separate real-process crash test
 unblocks a capacity-paused CPU replacement after process-exit proof. These tests
-do not cover native pool replacement. Three further retirement tests now cover
+predate the native replacement evidence below. Three further retirement tests now cover
 the exact consumer address after both API owners are destroyed, deferred use
 blocking an exhausted replacement, and deadline failure with a surviving ordinary
 lease followed by late completion. They pass on macOS and Linux. Existing release
@@ -219,5 +239,20 @@ offscreen synthetic tests, not live capture acceptance.
 
 Two allocation tests additionally cover preflight versus actual IOSurface bytes,
 one-byte-short reservations, padded-row pixel round trips for both supported
-formats, and invalid/overflowing layouts. All seven native tests pass. These
-establish allocation preflight, not native replacement or live capture acceptance.
+formats, and invalid/overflowing layouts.
+
+Two native transition tests cover a size/format change while sampling both old
+and new frames under shared holding credit; a capacity pause retaining old pixels;
+dropping incoming frames during that pause; and 100 replacements under a budget
+too small for two pools. The existing gated GPU test now installs a replacement
+while actual consumer commands still wait on a GPU event, then verifies old pixels
+and deferred credit return after completion. Nine native arena tests pass, along
+with the seven existing macOS backend tests. Producer-side delayed GPU completion,
+native process-exit/reconfiguration combinations, and the real setup/C/host path
+still need acceptance evidence. These remain offscreen tests, not live capture.
+
+The CPU arena, cleanup, release, retirement, wait, and reconfiguration suites pass
+on macOS and Linux after this change. The three deterministic concurrency tests,
+workspace build, default and macOS-feature clippy, and pinned formatting pass too.
+The full suite remains outstanding: the deliberately failing legacy daemon
+ring-wrap regression is still present until the host data path is replaced.

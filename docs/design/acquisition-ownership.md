@@ -319,7 +319,8 @@ bytes, shared holding credit, overlap pause/retry, cancellation, published curso
 gaps, and repeated healthy changes while a stale offer remains outstanding. The
 existing acquisition suites, three concurrency tests, three native GPU tests,
 workspace build, default/macOS clippy, and pinned formatting remain green.
-Native replacement still needs implementation. Native setup handles now follow
+Native replacement now uses the common allocation ledger, as described in
+[acquisition-reconfiguration.md](acquisition-reconfiguration.md). Native setup handles follow
 the shared acquired resource lifetime, as described below. Cross-process replacement grants now transfer a single resource
 FD to the existing process-bound incarnation. A child-process test retains the
 old frame through 100 publications before installing the replacement; another
@@ -347,7 +348,7 @@ Three consumer-retirement tests pass on macOS and Linux, covering the exact raw
 address after both API owners are dropped, exhausted replacement capacity, and
 late completion after deadline failure. The release, cleanup, arena, transition,
 and wait suites remain green; the three concurrency and three native tests,
-workspace build, default/macOS clippy, and pinned formatting also pass. Native reconfiguration, host/C replacement,
+workspace build, default/macOS clippy, and pinned formatting also pass. Remaining native reconfiguration evidence, host/C replacement,
 full-suite gates, and live CPU/GPU acceptance remain outstanding.
 
 
@@ -362,6 +363,20 @@ Two added native tests prove sampling after setup and both API owners are gone,
 and rejection of a contradictory pool identity without leaking a claim. The
 existing actual-GPU ring-wrap and deferred-completion tests use the new ownership
 path. Five native tests, the CPU suites, workspace build, default/macOS clippy,
-and pinned formatting pass. Native replacement still needs allocation preflight,
-old-pool producer GPU completion, and atomic replacement-bundle installation.
-Host/C integration, full-suite checks, and live acceptance remain outstanding.
+and pinned formatting pass.
+
+Native replacement now preflights aligned IOSurface bytes, reserves them with the
+new resource map, and retains old pools in the common retirement owner. That owner
+checks actual producer readiness independently of consumer claims. Native mapping
+and handle installation is atomic, including disposal ordering on rejected offers.
+Initial setup uses the same ownership path. The readiness timeline stays monotonic
+across configuration generations.
+
+Nine native arena tests now pass: the added tests exercise allocation bounds,
+size/format replacement with both generations held, a capacity pause, and 100
+replacements under a budget too small for overlapping pools. The gated GPU test
+also retains a deferred frame through pool replacement. Seven existing macOS
+backend tests pass. The CPU suites remain green on macOS and Linux. Delayed
+producer GPU completion and native crash/reconfiguration combinations still need
+dedicated evidence; paused transitions require an explicit host retry for now.
+Host/C integration, full-suite gates, and live acceptance remain outstanding.

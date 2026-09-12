@@ -618,6 +618,11 @@ impl super::arena::ArenaNativeBackend for MacosFrameBackend {
         // SAFETY: the backend owns the live event created for this fence.
         Ok(unsafe { ffi::porthole_native_event_signaled_value(fence.raw.as_ptr()) })
     }
+
+    fn producer_completion_timeline(&self, fence: &MacosFence) -> Result<std::sync::Arc<dyn crate::acquisition::arena::ReleaseTimeline>> {
+        let handle = self.export_sync_handle(fence)?;
+        Ok(std::sync::Arc::new(ConsumerFence::from_handle(&self.metal, &handle)?))
+    }
 }
 
 unsafe impl Send for ConsumerFence {}

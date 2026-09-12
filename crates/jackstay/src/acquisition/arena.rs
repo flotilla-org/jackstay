@@ -26,6 +26,8 @@ use super::{AdmissionBook, AdmissionError, AdmissionLimits, AllocationId, Holdin
 use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
 mod reconfiguration;
+use reconfiguration::RetiredAllocation;
+pub(crate) use reconfiguration::RetiredResource;
 pub use reconfiguration::{ConfigurationDescriptor, ConfigurationGrant, ConfigurationInstall, ReconfigurationStatus};
 
 mod mapping;
@@ -515,7 +517,7 @@ impl Drop for ConsumerGrant {
 /// into this object and run through separate shared mappings.
 pub struct ArenaProducer {
     resources: Option<Arc<ResourceMap>>,
-    retired: Vec<(AllocationId, Arc<ResourceMap>)>,
+    retired: Vec<RetiredAllocation>,
     pending_layout: Option<ResourceLayout>,
     control: Arc<ControlMap>,
     admission: AdmissionBook,
@@ -812,7 +814,22 @@ pub struct ArenaConsumer {
 }
 
 impl ArenaConsumer {
-    pub fn from_grant(mut grant: ConsumerGrant) -> Result<Self, ArenaError> {
+    pub fn from_grant(grant: ConsumerGrant) -> Result<Self, ArenaError> {
+        Self::from_grant_with_resources(grant, None)
+    }
+
+    pub(crate) fn from_native_grant(
+        grant: ConsumerGrant,
+        slots: usize,
+        resources: Box<dyn ResourceAttachment>,
+    ) -> Result<Self, ArenaError> {
+        if grant.layout.payload_capacity != 0 || grant.layout.resources != slots {
+            return Err(ArenaError::Mapping("native resource setup disagrees with current mapping"));
+        }
+        Self::from_grant_with_resources(grant, Some(resources))
+    }
+
+    fn from_grant_with_resources(mut grant: ConsumerGrant, attachment: Option<Box<dyn ResourceAttachment>>) -> Result<Self, ArenaError> {
         let control = ControlMap::map(
             grant.control_fd.take().expect("single-use grant"),
             grant.layout.history,
@@ -846,7 +863,7 @@ impl ArenaConsumer {
                 map: ManuallyDrop::new(map),
                 mapping_slot: grant.mapping_slot,
                 claims: Arc::clone(&lifetime.claims),
-                attachment: None,
+                attachment,
             })),
             lifetime,
         })
@@ -855,19 +872,6 @@ impl ArenaConsumer {
     #[must_use]
     pub fn incarnation(&self) -> IncarnationId {
         self.lifetime.claims.incarnation
-    }
-
-    pub(crate) fn retain_native_resources(&mut self, slots: usize, resources: Box<dyn ResourceAttachment>) -> Result<(), ArenaError> {
-        let owner = self
-            .resources
-            .as_mut()
-            .ok_or(ArenaError::Configuration("no current resource mapping"))?;
-        let owner = Arc::get_mut(owner).ok_or(ArenaError::Configuration("native resources must be bound before acquisition"))?;
-        if owner.map.layout.payload_capacity != 0 || owner.map.layout.resources != slots || owner.attachment.is_some() {
-            return Err(ArenaError::Mapping("native resource setup disagrees with current mapping"));
-        }
-        owner.attachment = Some(resources);
-        Ok(())
     }
 
     pub fn acquire_latest(&self, after: u64) -> Result<AcquireOutcome, ArenaError> {

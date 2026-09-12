@@ -139,6 +139,8 @@ pub mod error;
 #[cfg(unix)]
 pub mod fdpass;
 pub mod ffi;
+#[cfg(unix)]
+pub mod ffi_acquisition;
 #[cfg(any(
     all(target_os = "macos", feature = "backend-macos"),
     all(target_os = "linux", feature = "backend-linux")

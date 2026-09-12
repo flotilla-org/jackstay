@@ -1,4 +1,28 @@
 #include "capture_transfer.h"
+#include <string.h>
+
+/* Run by acquisition_ffi.rs through this actual C translation unit. The test
+ * producer wraps history and destroys its consumer between take and finish. */
+ft_status jackstay_c_acquisition_take(ft_acquisition_consumer *consumer,
+                                      ft_acquired_frame **out) {
+  if (ft_abi_version() != FT_ABI_VERSION) return FT_STATUS_ERROR;
+  ft_acquisition_range range = {0};
+  return ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, out, &range);
+}
+
+int jackstay_c_acquisition_finish(ft_acquired_frame **frame) {
+  ft_acquired_frame_descriptor descriptor = {0};
+  const uint8_t *bytes = NULL;
+  size_t len = 0;
+  if (ft_acquired_frame_describe(*frame, &descriptor) != FT_STATUS_OK ||
+      ft_acquired_frame_bytes(*frame, &bytes, &len) != FT_STATUS_OK) return 1;
+  int failed = descriptor.sequence != 7 || descriptor.timestamp_ns != 42 ||
+      descriptor.cursor != 1 || descriptor.width != 1 || descriptor.height != 1 ||
+      descriptor.stride != 4 || descriptor.flags != 0x1234 ||
+      len != 4 || bytes == NULL || memcmp(bytes, "abcd", 4) != 0;
+  if (ft_acquired_frame_release(frame) != FT_STATUS_OK || *frame != NULL) return 1;
+  return failed;
+}
 
 int porthole_capture_transfer_c_abi_header_smoke(void) {
   ft_native_attach_descriptor descriptor = {

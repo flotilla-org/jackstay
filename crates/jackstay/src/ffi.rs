@@ -25,7 +25,7 @@ pub type FtStatus = i32;
 /// pre-stabilization: layouts may still change freely, with a minor bump as
 /// the only signal; 1.0 waits until an external consumer needs the promise.
 pub const FT_ABI_VERSION_MAJOR: u32 = 0;
-pub const FT_ABI_VERSION_MINOR: u32 = 2;
+pub const FT_ABI_VERSION_MINOR: u32 = 3;
 pub const FT_ABI_VERSION: u32 = (FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR;
 
 /// Report the linked library's ABI version.
@@ -42,6 +42,11 @@ pub const FT_STATUS_TIMEOUT: FtStatus = 4;
 pub const FT_STATUS_CLOSED: FtStatus = 5;
 pub const FT_STATUS_UNSUPPORTED: FtStatus = 6;
 pub const FT_STATUS_INVALID_STATE: FtStatus = 7;
+pub const FT_STATUS_HOLDING_LIMIT: FtStatus = 8;
+pub const FT_STATUS_RECONFIGURATION: FtStatus = 9;
+pub const FT_STATUS_MISS: FtStatus = 10;
+pub const FT_STATUS_GAP: FtStatus = 11;
+pub const FT_STATUS_CANCELLED: FtStatus = 12;
 
 pub const FT_SOURCE_KIND_WINDOW: u32 = 1;
 pub const FT_SOURCE_KIND_DISPLAY: u32 = 2;
@@ -953,7 +958,7 @@ mod tests {
         assert_eq!(define("FT_ABI_VERSION_MAJOR"), super::FT_ABI_VERSION_MAJOR);
         assert_eq!(define("FT_ABI_VERSION_MINOR"), super::FT_ABI_VERSION_MINOR);
         assert_eq!(super::ft_abi_version(), super::FT_ABI_VERSION);
-        assert_eq!(super::FT_ABI_VERSION, 0x0000_0002);
+        assert_eq!(super::FT_ABI_VERSION, 0x0000_0003);
     }
 
     #[test]

@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 2
+#define FT_ABI_VERSION_MINOR 3
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -34,6 +34,11 @@ uint32_t ft_abi_version(void);
 #define FT_STATUS_CLOSED 5
 #define FT_STATUS_UNSUPPORTED 6
 #define FT_STATUS_INVALID_STATE 7
+#define FT_STATUS_HOLDING_LIMIT 8
+#define FT_STATUS_RECONFIGURATION 9
+#define FT_STATUS_MISS 10
+#define FT_STATUS_GAP 11
+#define FT_STATUS_CANCELLED 12
 
 #define FT_SOURCE_KIND_WINDOW 1
 #define FT_SOURCE_KIND_DISPLAY 2
@@ -78,6 +83,125 @@ typedef uint64_t ft_track_id;
 
 typedef struct ft_producer ft_producer;
 typedef struct ft_consumer ft_consumer;
+
+#if defined(__unix__) || defined(__APPLE__)
+/* Common acquisition ownership (Unix shared arena). Import a host's CPU grant,
+ * or transfer an admitted Rust ArenaConsumer via FtAcquisitionConsumer::into_raw.
+ * Serialize calls on a consumer. Frame handles are independent owners and may
+ * outlive it. Never copy ownership, fork mappings, or call through stale handles.
+ */
+typedef struct ft_acquisition_consumer ft_acquisition_consumer;
+typedef struct ft_acquired_frame ft_acquired_frame;
+typedef struct ft_acquisition_cancellation ft_acquisition_cancellation;
+typedef struct ft_acquisition_release_timeline ft_acquisition_release_timeline;
+
+#define FT_ACQUIRE_LATEST 1
+#define FT_ACQUIRE_NEXT 2
+#define FT_ACQUIRE_EXACT 3
+#define FT_WAIT_DATA 1
+#define FT_WAIT_CAPACITY 2
+#define FT_WAIT_ALL 3
+#define FT_ACQUISITION_WAIT_INFINITE UINT64_MAX
+
+/* Same repr(C) descriptor used by Rust FrameLease. Remains immutable and valid
+ * even when publication history expires or a new configuration is installed. */
+typedef struct ft_acquired_frame_descriptor {
+  uint64_t cursor;
+  uint64_t sequence;
+  uint64_t timestamp_ns;
+  uint64_t config_generation;
+  uint64_t pool_id;
+  uint64_t payload_offset;
+  uint64_t payload_len;
+  uint64_t modifier;
+  uint64_t fence_id;
+  uint64_t fence_value;
+  uint64_t damage_base_sequence;
+  uint64_t producer_drop_count;
+  uint32_t width;
+  uint32_t height;
+  uint32_t stride;
+  uint32_t pixel_format;
+  uint32_t slot_id;
+  uint32_t clock_domain;
+  uint32_t color_space;
+  uint32_t sync_kind;
+  uint32_t payload_kind;
+  uint32_t damage_kind;
+  uint32_t dropped_before_publish;
+  uint32_t flags;
+} ft_acquired_frame_descriptor;
+
+typedef struct ft_acquisition_range {
+  uint64_t first;
+  uint64_t last;
+} ft_acquisition_range;
+
+typedef struct ft_acquisition_events {
+  uint64_t data_cursor;
+  uint64_t capacity_epoch;
+  uint64_t reconfiguration_epoch;
+  uint32_t closed;
+  uint32_t reserved;
+} ft_acquisition_events;
+
+/* Import GrantDescriptor JSON and its five owned setup FDs. The trusted producer
+ * must follow Jackstay's shared-memory protocol and bind the grant to this PID.
+ * Grants are single-use: no replay, forwarding, fork or retained transport FD
+ * copies. JSON length must be 1..1048576; *out must start NULL. Invalid pointers,
+ * lengths, occupied outputs or negative/duplicate FDs reject without transfer.
+ * Once these argument checks pass, all five FDs are consumed and set to -1,
+ * including on malformed JSON or failed mapping. Import CPU grants only; native
+ * resources require the backend setup that retains their handles with leases. */
+ft_status ft_acquisition_import_cpu(const uint8_t *json, size_t len, int32_t fds[5],
+                                   ft_acquisition_consumer **out);
+
+/* Latest/next select after cursor; exact selects cursor (zero is invalid).
+ * *out must start NULL. Success owns one frame, including duplicate acquisitions.
+ * MISS returns [cursor,cursor]; GAP returns an inclusive published range. Other
+ * outcomes clear range. No non-success outcome transfers a frame. All pointer
+ * arguments are required and must not alias. An occupied *out is rejected. */
+ft_status ft_acquisition_acquire(const ft_acquisition_consumer *, uint32_t mode,
+                                uint64_t cursor, ft_acquired_frame **out,
+                                ft_acquisition_range *range);
+ft_status ft_acquired_frame_describe(const ft_acquired_frame *, ft_acquired_frame_descriptor *out);
+/* Borrow bytes through release or declared deferred completion. Satisfy producer
+ * readiness before reading. Native frames return NULL,0; query native resources
+ * through their backend binding. */
+ft_status ft_acquired_frame_bytes(const ft_acquired_frame *, const uint8_t **data, size_t *len);
+/* Immediate release asserts all use (including GPU work) has completed. */
+ft_status ft_acquired_frame_release(ft_acquired_frame **);
+/* Host supplies a registered, consumer-bound timeline. Success clears the frame
+ * handle but keeps storage and credit until completion. Failure preserves the
+ * exact handle and all ownership so the caller can retry. */
+ft_status ft_acquired_frame_defer_release(ft_acquired_frame **,
+                                         const ft_acquisition_release_timeline *, uint64_t value);
+void ft_acquisition_release_timeline_destroy(ft_acquisition_release_timeline **);
+/* Take snapshot BEFORE checking acquisition. Reconfiguration and closure always
+ * wake. Cancellation takes precedence and never releases held frames.
+ * Outputs must not alias inputs. timeout_ns=0 checks once, UINT64_MAX waits
+ * indefinitely. OK/CLOSED supply a new snapshot; other outcomes clear it. */
+ft_status ft_acquisition_snapshot(const ft_acquisition_consumer *, ft_acquisition_events *out);
+ft_status ft_acquisition_wait(ft_acquisition_consumer *, const ft_acquisition_events *observed,
+                             uint32_t interest, const ft_acquisition_cancellation *,
+                             uint64_t timeout_ns, ft_acquisition_events *out);
+ft_status ft_acquisition_cancellation_create(ft_acquisition_cancellation **out);
+/* May run concurrently with wait; destroy only after all callers return. */
+ft_status ft_acquisition_cancellation_cancel(const ft_acquisition_cancellation *);
+void ft_acquisition_cancellation_destroy(ft_acquisition_cancellation **);
+/* Destroys this API handle; acquired/deferred frames keep their own owners.
+ * All destroy functions accept NULL or *handle=NULL and clear live handles. */
+void ft_acquisition_consumer_destroy(ft_acquisition_consumer **);
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(ft_acquired_frame_descriptor) == 144, "acquired descriptor size");
+_Static_assert(offsetof(ft_acquired_frame_descriptor, fence_value) == 72, "acquired readiness packing");
+_Static_assert(offsetof(ft_acquired_frame_descriptor, width) == 96, "acquired dimensions packing");
+_Static_assert(offsetof(ft_acquired_frame_descriptor, flags) == 140, "acquired flags packing");
+_Static_assert(sizeof(ft_acquisition_range) == 16, "acquisition range size");
+_Static_assert(sizeof(ft_acquisition_events) == 32, "acquisition events size");
+#endif
+#endif
 
 /*
  * Threading: v1 handles are single-threaded. Do not call capture-transfer C ABI

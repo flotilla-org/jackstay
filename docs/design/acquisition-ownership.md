@@ -397,3 +397,11 @@ processes, with GPU release and replacement. The subsequent crash harness is
 currently unverified because shared-event creation fails even in a standalone
 Metal program; see the setup document for diagnostics and rerun commands. The legacy
 setup remains in use by the C/viewer path until those callers migrate.
+
+The [common Rust/C ownership boundary](acquisition-c-boundary.md) now exposes
+CPU grant import, independent frame handles, full immutable descriptors, distinct
+selection outcomes, cancellable waits and deferred release through the arena's
+existing retirement owner. ABI 0.3 updates the header and library together. The
+boundary and compiled-C tests pass on macOS and Linux, and the existing SDL ABI smoke still
+acquires 30 frames. The reference viewer and Porthole remain on their legacy
+paths; their migration and the outstanding live acceptance are still required.

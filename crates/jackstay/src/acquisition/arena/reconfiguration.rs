@@ -287,6 +287,7 @@ impl ArenaConsumer {
             map: ManuallyDrop::new(map),
             mapping_slot: grant.mapping_slot,
             claims: Arc::clone(&self.lifetime.claims),
+            attachment: None,
         }));
         grant.consumed = true;
         grant.claims.word(OFFERED_GENERATION).store(0, SeqCst);
@@ -313,6 +314,9 @@ impl ClaimMap {
 
 impl Drop for ConsumerResources {
     fn drop(&mut self) {
+        // Imported surfaces and readiness handles must also be destroyed before
+        // the acknowledgement permits allocation-byte reclamation.
+        drop(self.attachment.take());
         // SAFETY: the last Arc owns this map exclusively. Unmap before the
         // acknowledgement permits the producer to reclaim its allocation bytes.
         unsafe { ManuallyDrop::drop(&mut self.map) };

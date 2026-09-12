@@ -787,6 +787,14 @@ struct ConsumerResources {
     map: ManuallyDrop<ResourceMap>,
     mapping_slot: usize,
     claims: Arc<ClaimMap>,
+    attachment: Option<Box<dyn ResourceAttachment>>,
+}
+
+/// Backend resources share the mapping owner's lifetime and retirement
+/// acknowledgement. No independent native lease table or release path.
+pub(crate) trait ResourceAttachment: std::fmt::Debug + Send + Sync + 'static {
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn validate_descriptor(&self, descriptor: &FrameDescriptor) -> Result<(), ArenaError>;
 }
 
 impl Drop for ConsumerLifetime {
@@ -838,6 +846,7 @@ impl ArenaConsumer {
                 map: ManuallyDrop::new(map),
                 mapping_slot: grant.mapping_slot,
                 claims: Arc::clone(&lifetime.claims),
+                attachment: None,
             })),
             lifetime,
         })
@@ -846,6 +855,19 @@ impl ArenaConsumer {
     #[must_use]
     pub fn incarnation(&self) -> IncarnationId {
         self.lifetime.claims.incarnation
+    }
+
+    pub(crate) fn retain_native_resources(&mut self, slots: usize, resources: Box<dyn ResourceAttachment>) -> Result<(), ArenaError> {
+        let owner = self
+            .resources
+            .as_mut()
+            .ok_or(ArenaError::Configuration("no current resource mapping"))?;
+        let owner = Arc::get_mut(owner).ok_or(ArenaError::Configuration("native resources must be bound before acquisition"))?;
+        if owner.map.layout.payload_capacity != 0 || owner.map.layout.resources != slots || owner.attachment.is_some() {
+            return Err(ArenaError::Mapping("native resource setup disagrees with current mapping"));
+        }
+        owner.attachment = Some(resources);
+        Ok(())
     }
 
     pub fn acquire_latest(&self, after: u64) -> Result<AcquireOutcome, ArenaError> {
@@ -973,6 +995,9 @@ impl ArenaConsumer {
         {
             return Err(ArenaError::Mapping("leased descriptor contradicts resource identity or bounds"));
         }
+        if let Some(attachment) = &resources.attachment {
+            attachment.validate_descriptor(&descriptor)?;
+        }
         Ok(AcquireOutcome::Frame(FrameLease { descriptor, claim }))
     }
 }
@@ -1009,6 +1034,9 @@ pub struct FrameLease {
 }
 
 impl FrameLease {
+    pub(crate) fn retained_resources(&self) -> Option<&dyn ResourceAttachment> {
+        self.claim.owner.as_ref().expect("live frame owns storage").attachment.as_deref()
+    }
     #[must_use]
     pub fn cursor(&self) -> u64 {
         self.descriptor.cursor

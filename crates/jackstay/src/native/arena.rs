@@ -8,8 +8,8 @@ use crate::{
     acquisition::{
         IncarnationId,
         arena::{
-            ArenaConfig, ArenaError, ArenaProducer, ConsumerGrant, FrameDescriptor, PublishOutcome, ReleaseTimeline,
-            ReleaseTimelineRegistration, RemoteConsumerGrant,
+            ArenaConfig, ArenaConsumer, ArenaError, ArenaProducer, ConsumerGrant, FrameDescriptor, FrameLease, PublishOutcome,
+            ReleaseTimeline, ReleaseTimelineRegistration, RemoteConsumerGrant, ResourceAttachment,
         },
     },
     model::{DamageKind, FrameSyncKind},
@@ -29,6 +29,84 @@ pub struct NativeArenaGrant<S, Y, G = ConsumerGrant> {
     pub surface_handles: Vec<S>,
     pub fence_id: u64,
     pub sync_handle: Y,
+}
+
+#[derive(Debug)]
+struct RetainedNativeResources<S, Y> {
+    pool_id: u64,
+    surfaces: Vec<S>,
+    fence_id: u64,
+    sync_handle: Y,
+}
+
+impl<S, Y> ResourceAttachment for RetainedNativeResources<S, Y>
+where
+    S: std::fmt::Debug + Send + Sync + 'static,
+    Y: std::fmt::Debug + Send + Sync + 'static,
+{
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn validate_descriptor(&self, descriptor: &FrameDescriptor) -> Result<(), ArenaError> {
+        if descriptor.pool_id != self.pool_id
+            || descriptor.fence_id != self.fence_id
+            || descriptor.slot_id as usize >= self.surfaces.len()
+            || descriptor.sync_kind != FrameSyncKind::NativeTimeline as u32
+        {
+            return Err(ArenaError::Mapping(
+                "native frame contradicts retained pool, slot, or readiness identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<S, Y> NativeArenaGrant<S, Y>
+where
+    S: std::fmt::Debug + Send + Sync + 'static,
+    Y: std::fmt::Debug + Send + Sync + 'static,
+{
+    /// Consume setup into the common consumer. The resource generation owns
+    /// its native handles through all acquired and deferred frame lifetimes.
+    pub fn into_consumer(self) -> Result<ArenaConsumer, ArenaError> {
+        let mut consumer = ArenaConsumer::from_grant(self.consumer)?;
+        let slots = self.surface_handles.len();
+        consumer.retain_native_resources(
+            slots,
+            Box::new(RetainedNativeResources {
+                pool_id: self.pool_id,
+                surfaces: self.surface_handles,
+                fence_id: self.fence_id,
+                sync_handle: self.sync_handle,
+            }),
+        )?;
+        Ok(consumer)
+    }
+}
+
+/// Borrowed only while the acquired frame still owns its resource generation.
+/// Satisfy the descriptor's readiness value before using the surface.
+pub struct NativeFrameResources<'a, S, Y> {
+    pub surface: &'a S,
+    pub sync_handle: &'a Y,
+}
+
+impl FrameLease {
+    pub fn native_resources<S, Y>(&self) -> Result<NativeFrameResources<'_, S, Y>, ArenaError>
+    where
+        S: std::fmt::Debug + Send + Sync + 'static,
+        Y: std::fmt::Debug + Send + Sync + 'static,
+    {
+        let resources = self
+            .retained_resources()
+            .and_then(|resources| resources.as_any().downcast_ref::<RetainedNativeResources<S, Y>>())
+            .ok_or(ArenaError::Mapping("frame has no retained resources for this native backend"))?;
+        Ok(NativeFrameResources {
+            surface: &resources.surfaces[self.descriptor().slot_id as usize],
+            sync_handle: &resources.sync_handle,
+        })
+    }
 }
 
 pub struct NativeArenaProducer<B: ArenaNativeBackend> {

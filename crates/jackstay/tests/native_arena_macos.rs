@@ -9,7 +9,7 @@ use jackstay::{
     native::{
         NativeFrameBackend, NativeStreamParams,
         arena::NativeArenaProducer,
-        macos::{ConsumerFence, IoSurface, MacosCapturedFrame, MacosFrameBackend, MetalContext, SampleCompletion},
+        macos::{ConsumerFence, IoSurface, MacosCapturedFrame, MacosFrameBackend, MetalContext, SampleCompletion, SharedEventHandle},
     },
 };
 
@@ -44,31 +44,65 @@ fn producer(max_incarnations: u32) -> NativeArenaProducer<MacosFrameBackend> {
 }
 
 #[test]
+fn an_acquired_native_frame_owns_its_surface_and_readiness_after_setup_and_api_teardown() {
+    let mut producer = producer(1);
+    let consumer = producer.attach(1).unwrap().into_consumer().unwrap();
+    producer.publish(&captured(53), 1).unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing frame")
+    };
+    drop(consumer);
+    drop(producer);
+    // The setup grant was consumed, and neither API owner remains. Resolve and
+    // sample using only the successful frame acquisition's retained resources.
+    let native = frame.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+    let metal = MetalContext::new().unwrap();
+    let readiness = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
+    let pixels = readiness
+        .sample_offscreen(&metal, native.surface, frame.descriptor().fence_value, 16, 16)
+        .unwrap();
+    assert_eq!(pixels, vec![53; 16 * 16 * 4]);
+}
+
+#[test]
+fn native_acquisition_rejects_a_descriptor_that_disagrees_with_its_retained_pool() {
+    use jackstay::acquisition::arena::ArenaError;
+    let mut producer = producer(1);
+    let mut grant = producer.attach(1).unwrap();
+    grant.pool_id += 1;
+    let consumer = grant.into_consumer().unwrap();
+    producer.publish(&captured(19), 1).unwrap();
+    assert!(matches!(consumer.acquire_latest(0), Err(ArenaError::Mapping(_))));
+    drop(consumer);
+    let consumer = producer.attach(1).unwrap().into_consumer().unwrap();
+    let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+        panic!("failed acquisition leaked its claim")
+    };
+    assert!(frame.native_resources::<IoSurface, SharedEventHandle>().is_ok());
+}
+
+#[test]
 fn a_shared_native_lease_retains_its_iosurface_through_ring_wrap_and_samples_after_readiness() {
     let mut producer = producer(2);
     let grant = producer.attach(1).unwrap();
-    let consumer = ArenaConsumer::from_grant(grant.consumer).unwrap();
+    let pool_id = grant.pool_id;
+    let consumer = grant.into_consumer().unwrap();
     let metal = MetalContext::new().unwrap();
-    let readiness = ConsumerFence::from_handle(&metal, &grant.sync_handle).unwrap();
     producer.publish(&captured(7), 1).unwrap();
     let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing native lease")
     };
     let descriptor = *held.descriptor();
+    let native = held.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+    let readiness = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
     for timestamp in 2..=100 {
         producer.publish(&captured(91), timestamp).unwrap();
     }
     let pixels = readiness
-        .sample_offscreen(
-            &metal,
-            &grant.surface_handles[descriptor.slot_id as usize],
-            descriptor.fence_value,
-            16,
-            16,
-        )
+        .sample_offscreen(&metal, native.surface, descriptor.fence_value, 16, 16)
         .unwrap();
     assert_eq!(pixels, vec![7; 16 * 16 * 4]);
-    assert_eq!(held.descriptor().pool_id, grant.pool_id);
+    assert_eq!(held.descriptor().pool_id, pool_id);
     drop(held);
     let AcquireOutcome::Frame(latest) = consumer.acquire_latest(descriptor.cursor).unwrap() else {
         panic!("no new native frame")
@@ -81,9 +115,8 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
     use std::sync::Arc;
     let mut producer = producer(2);
     let grant = producer.attach(1).unwrap();
-    let mut consumer = ArenaConsumer::from_grant(grant.consumer).unwrap();
+    let mut consumer = grant.into_consumer().unwrap();
     let metal = MetalContext::new().unwrap();
-    let readiness = ConsumerFence::from_handle(&metal, &grant.sync_handle).unwrap();
     let release = ConsumerFence::new(&metal).unwrap();
     let gate = ConsumerFence::new(&metal).unwrap();
     let submitted = ConsumerFence::new(&metal).unwrap();
@@ -98,7 +131,11 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
         panic!("missing frame")
     };
     let descriptor = *held.descriptor();
-    let old_surface = &grant.surface_handles[descriptor.slot_id as usize];
+    let native = held.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+    let readiness = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
+    // The diagnostic sampler owns a reference for its scoped call. It is
+    // dropped before the consumer retires this still-current configuration.
+    let old_surface = native.surface.clone();
     std::thread::scope(|scope| {
         struct OpenOnDrop<'a>(&'a ConsumerFence);
         impl Drop for OpenOnDrop<'_> {
@@ -110,7 +147,7 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_until_the_gpu_release_eve
         let sample = scope.spawn(|| {
             readiness.sample_offscreen_with_completion(
                 &metal,
-                old_surface,
+                &old_surface,
                 descriptor.fence_value,
                 (16, 16),
                 SampleCompletion {

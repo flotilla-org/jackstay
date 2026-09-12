@@ -319,8 +319,8 @@ bytes, shared holding credit, overlap pause/retry, cancellation, published curso
 gaps, and repeated healthy changes while a stale offer remains outstanding. The
 existing acquisition suites, three concurrency tests, three native GPU tests,
 workspace build, default/macOS clippy, and pinned formatting remain green.
-Native replacement and imported native-resource handle ownership still need
-implementation. Cross-process replacement grants now transfer a single resource
+Native replacement still needs implementation. Native setup handles now follow
+the shared acquired resource lifetime, as described below. Cross-process replacement grants now transfer a single resource
 FD to the existing process-bound incarnation. A child-process test retains the
 old frame through 100 publications before installing the replacement; another
 test rejects a contradictory resource header even when its offer is stale. Both
@@ -347,6 +347,21 @@ Three consumer-retirement tests pass on macOS and Linux, covering the exact raw
 address after both API owners are dropped, exhausted replacement capacity, and
 late completion after deadline failure. The release, cleanup, arena, transition,
 and wait suites remain green; the three concurrency and three native tests,
-workspace build, default/macOS clippy, and pinned formatting also pass. Imported
-native surface/readiness ownership, native reconfiguration, host/C replacement,
+workspace build, default/macOS clippy, and pinned formatting also pass. Native reconfiguration, host/C replacement,
 full-suite gates, and live CPU/GPU acceptance remain outstanding.
+
+
+`NativeArenaGrant::into_consumer` now transfers native surface/readiness handles
+into the common resource owner. Successful frame acquisition checks their
+pool/fence/slot identity, and `FrameLease::native_resources` borrows the particular
+surface and readiness handle from that acquired generation. This uses the same
+owner retained by deferred completion; native handles are destroyed before the
+mapping-retirement acknowledgement. There is no separate native lease book.
+
+Two added native tests prove sampling after setup and both API owners are gone,
+and rejection of a contradictory pool identity without leaking a claim. The
+existing actual-GPU ring-wrap and deferred-completion tests use the new ownership
+path. Five native tests, the CPU suites, workspace build, default/macOS clippy,
+and pinned formatting pass. Native replacement still needs allocation preflight,
+old-pool producer GPU completion, and atomic replacement-bundle installation.
+Host/C integration, full-suite checks, and live acceptance remain outstanding.

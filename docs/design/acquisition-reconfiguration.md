@@ -2,7 +2,8 @@
 
 Status: CPU transitions, local and cross-process replacement setup, mapping
 retirement, admission-book accounting, and deferred CPU mapping retention are
-implemented. Native imported-resource ownership and pool replacement remain unfinished.
+implemented. Native setup handles now share the acquired resource lifetime; native
+pool replacement remains unfinished.
 
 ## Separate control lifetime from resource lifetime
 
@@ -50,9 +51,13 @@ Consumer API shutdown starts its drain deadline even if another ordinary frame
 lease remains alive. Final lifetime teardown and retries do not reset that
 interval. Binding handles expose pending local releases, cleanup failure, and
 explicit retry without keeping completed resources alive. Expiry reports failure
-and retains the mapping; late actual completion still retires it. Native imported
-surface/readiness handle ownership still needs to be attached to the corresponding
-resource generation during native integration.
+and retains the mapping; late actual completion still retires it. Native setup now attaches surface and readiness handles to that same resource
+owner through `NativeArenaGrant::into_consumer`. `FrameLease::native_resources`
+borrows the acquired slot and readiness handle from it. The owner destroys those
+handles before acknowledging mapping retirement, including on the deferred path.
+Acquisition validates the descriptor against the retained pool/fence/slot identity.
+Native replacement must install each replacement bundle atomically with its new
+resource mapping; that transition is still pending.
 
 ## Transition ordering
 
@@ -191,3 +196,13 @@ Complete the remaining transition evidence through the agreed seams:
 The C ABI and Porthole integration follow this implementation; the current viewer
 still uses the old data path. A passing offline transition test is not live
 capture acceptance.
+
+
+Native ownership evidence: a real Metal test consumes setup, acquires a frame,
+destroys both API owners, and then resolves readiness and samples the original
+IOSurface using only the acquired frame. A second test rejects a descriptor that
+names a different retained pool without leaking its claim. The existing ring-wrap
+and deferred GPU-completion tests now consume native setup into the common
+resource owner too. All five native tests pass, along with the existing CPU
+suites, workspace build, default/macOS clippy, and pinned formatting. These remain
+offscreen synthetic tests, not live capture acceptance.

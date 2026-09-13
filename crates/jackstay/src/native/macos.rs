@@ -35,6 +35,7 @@ mod ffi {
 
         pub fn porthole_native_metal_create(out_metal: *mut *mut c_void) -> *mut c_char;
         pub fn porthole_native_metal_destroy(metal: *mut c_void);
+        pub fn porthole_native_metal_enqueue_wait(metal: *mut c_void, event: *mut c_void, value: u64) -> *mut c_char;
 
         pub fn porthole_native_surface_create(
             width: u32,
@@ -50,9 +51,17 @@ mod ffi {
         pub fn porthole_native_surface_in_use(surface: *mut c_void) -> i32;
         pub fn porthole_native_surface_width(surface: *mut c_void) -> u32;
         pub fn porthole_native_surface_height(surface: *mut c_void) -> u32;
+        pub fn porthole_native_surface_allocation_size(surface: *mut c_void) -> u64;
         pub fn porthole_native_surface_write(surface: *mut c_void, pixels: *const u8, len: usize) -> *mut c_char;
         pub fn porthole_native_surface_read(surface: *mut c_void, pixels: *mut u8, len: usize) -> *mut c_char;
 
+        pub fn porthole_native_pool_allocation_bound(
+            width: u32,
+            height: u32,
+            bytes_per_element: u32,
+            slot_count: u32,
+            out_bytes: *mut u64,
+        ) -> *mut c_char;
         pub fn porthole_native_pool_create(
             metal: *mut c_void,
             width: u32,
@@ -61,6 +70,7 @@ mod ffi {
             bytes_per_element: u32,
             mtl_pixel_format: u64,
             slot_count: u32,
+            reserved_bytes: u64,
             out_pool: *mut *mut c_void,
         ) -> *mut c_char;
         pub fn porthole_native_pool_destroy(pool: *mut c_void);
@@ -73,6 +83,14 @@ mod ffi {
         pub fn porthole_native_object_release(object: *mut c_void);
         pub fn porthole_native_event_from_handle(metal: *mut c_void, handle: *mut c_void, out_event: *mut *mut c_void) -> *mut c_char;
         pub fn porthole_native_event_signaled_value(event: *mut c_void) -> u64;
+        pub fn porthole_native_event_signal_cpu(event: *mut c_void, value: u64);
+        pub fn porthole_native_event_notify(
+            event: *mut c_void,
+            value: u64,
+            context: *mut c_void,
+            notify: unsafe extern "C" fn(*mut c_void),
+            destroy: unsafe extern "C" fn(*mut c_void),
+        );
         pub fn porthole_native_event_wait(event: *mut c_void, value: u64, timeout_ms: u64) -> i32;
 
         pub fn porthole_native_stage_blit(
@@ -94,6 +112,22 @@ mod ffi {
             height: u32,
             out_pixels: *mut u8,
             out_len: usize,
+        ) -> *mut c_char;
+        pub fn porthole_native_consumer_sample_ordered(
+            metal: *mut c_void,
+            event: *mut c_void,
+            value: u64,
+            surface: *mut c_void,
+            width: u32,
+            height: u32,
+            pixels: *mut u8,
+            len: usize,
+            release_event: *mut c_void,
+            release_value: u64,
+            gate_event: *mut c_void,
+            gate_value: u64,
+            submitted_event: *mut c_void,
+            submitted_value: u64,
         ) -> *mut c_char;
     }
 }
@@ -150,6 +184,16 @@ impl MetalContext {
         check("metal-create", unsafe { ffi::porthole_native_metal_create(&mut raw) })?;
         Ok(Self {
             raw: NonNull::new(raw).expect("shim returned NULL metal context without error"),
+        })
+    }
+
+    /// Submit a GPU wait ahead of subsequent work on this context's queue.
+    /// Returns after submission, without blocking the calling thread. The
+    /// event must be compatible with this context's Metal device, and its
+    /// signal must not depend on later work on this same queue.
+    pub fn enqueue_wait(&self, event: &ConsumerFence, value: u64) -> Result<()> {
+        check("metal-enqueue-wait", unsafe {
+            ffi::porthole_native_metal_enqueue_wait(self.raw.as_ptr(), event.raw.as_ptr(), value)
         })
     }
 }
@@ -390,31 +434,7 @@ impl NativeFrameBackend for MacosFrameBackend {
     }
 
     fn allocate_surface_pool(&mut self, params: &NativeStreamParams, slot_count: u32) -> Result<MacosSurfacePool> {
-        if slot_count == 0 {
-            return Err(CaptureTransferError::NativeBackend {
-                operation: "allocate-surface-pool",
-                message: "slot count must be non-zero".to_string(),
-            });
-        }
-        let (fourcc, bytes_per_element, mtl_format) = format_desc(params.pixel_format)?;
-        let mut raw: *mut c_void = std::ptr::null_mut();
-        check("allocate-surface-pool", unsafe {
-            ffi::porthole_native_pool_create(
-                self.metal.raw.as_ptr(),
-                params.width,
-                params.height,
-                fourcc,
-                bytes_per_element,
-                mtl_format,
-                slot_count,
-                &mut raw,
-            )
-        })?;
-        Ok(MacosSurfacePool {
-            raw: NonNull::new(raw).expect("shim returned NULL pool without error"),
-            pool_id: next_unique_id(&NEXT_POOL_ID),
-            slot_count,
-        })
+        super::arena::ArenaNativeBackend::allocate_surface_pool_bounded(self, params, slot_count, u64::MAX)
     }
 
     fn pool_id(&self, pool: &MacosSurfacePool) -> u64 {
@@ -514,14 +534,151 @@ pub struct ConsumerFence {
     raw: NonNull<c_void>,
 }
 
+/// GPU completion and optional synchronization for the offscreen diagnostic
+/// sampler. Submission notification is CPU-side and deliberately separate from
+/// the GPU-encoded release event.
+pub struct SampleCompletion<'a> {
+    pub release: (&'a ConsumerFence, u64),
+    pub before_sample: Option<(&'a ConsumerFence, u64)>,
+    pub submitted: Option<(&'a ConsumerFence, u64)>,
+}
+
+impl crate::acquisition::arena::ReleaseTimeline for ConsumerFence {
+    fn completed_value(&self) -> Result<u64> {
+        Ok(self.signaled_value())
+    }
+
+    fn notify_at(&self, value: u64, notification: crate::acquisition::arena::ReleaseNotification) -> Result<()> {
+        use crate::acquisition::arena::ReleaseNotification;
+        unsafe extern "C" fn notify(context: *mut c_void) {
+            // SAFETY: the Objective-C callback owner keeps this Box alive until
+            // its block is destroyed, including throughout callback execution.
+            let notification = unsafe { &*context.cast::<ReleaseNotification>() };
+            let _ = notification.notify();
+        }
+        unsafe extern "C" fn destroy(context: *mut c_void) {
+            // SAFETY: called exactly once by the callback owner's dealloc.
+            drop(unsafe { Box::from_raw(context.cast::<ReleaseNotification>()) });
+        }
+        // SAFETY: event is retained by this registered ConsumerFence. The shim
+        // unconditionally takes the Box and frees it on callback destruction.
+        // Notification code neither blocks nor unwinds across Objective-C.
+        unsafe {
+            ffi::porthole_native_event_notify(
+                self.raw.as_ptr(),
+                value,
+                Box::into_raw(Box::new(notification)).cast(),
+                notify,
+                destroy,
+            );
+        }
+        Ok(())
+    }
+}
+
+impl super::arena::ArenaNativeBackend for MacosFrameBackend {
+    fn pool_allocation_upper_bound(&self, params: &NativeStreamParams, slot_count: u32) -> Result<u64> {
+        let (_, bytes_per_element, _) = format_desc(params.pixel_format)?;
+        let mut bytes = 0;
+        check("native-pool-preflight", unsafe {
+            ffi::porthole_native_pool_allocation_bound(params.width, params.height, bytes_per_element, slot_count, &mut bytes)
+        })?;
+        Ok(bytes)
+    }
+
+    fn allocate_surface_pool_bounded(
+        &mut self,
+        params: &NativeStreamParams,
+        slot_count: u32,
+        reserved_bytes: u64,
+    ) -> Result<MacosSurfacePool> {
+        let (fourcc, bytes_per_element, mtl_format) = format_desc(params.pixel_format)?;
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        check("allocate-surface-pool", unsafe {
+            ffi::porthole_native_pool_create(
+                self.metal.raw.as_ptr(),
+                params.width,
+                params.height,
+                fourcc,
+                bytes_per_element,
+                mtl_format,
+                slot_count,
+                reserved_bytes,
+                &mut raw,
+            )
+        })?;
+        Ok(MacosSurfacePool {
+            raw: NonNull::new(raw).expect("shim returned NULL pool without error"),
+            pool_id: next_unique_id(&NEXT_POOL_ID),
+            slot_count,
+        })
+    }
+
+    fn allocated_pool_bytes(&self, pool: &MacosSurfacePool) -> Result<u64> {
+        self.export_surface_handles(pool)?.iter().try_fold(0_u64, |total, surface| {
+            // SAFETY: each handle is a retained IOSurface exported by this pool.
+            let bytes = unsafe { ffi::porthole_native_surface_allocation_size(surface.as_raw()) };
+            total.checked_add(bytes).ok_or_else(|| CaptureTransferError::NativeBackend {
+                operation: "native-pool-footprint",
+                message: "IOSurface allocation total overflow".to_owned(),
+            })
+        })
+    }
+
+    fn completed_producer_value(&self, fence: &MacosFence) -> Result<u64> {
+        // SAFETY: the backend owns the live event created for this fence.
+        Ok(unsafe { ffi::porthole_native_event_signaled_value(fence.raw.as_ptr()) })
+    }
+
+    fn producer_completion_timeline(&self, fence: &MacosFence) -> Result<std::sync::Arc<dyn crate::acquisition::arena::ReleaseTimeline>> {
+        let handle = self.export_sync_handle(fence)?;
+        Ok(std::sync::Arc::new(ConsumerFence::from_handle(&self.metal, &handle)?))
+    }
+}
+
 unsafe impl Send for ConsumerFence {}
 unsafe impl Sync for ConsumerFence {}
 
 impl ConsumerFence {
+    pub fn new(metal: &MetalContext) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        check("create-consumer-event", unsafe {
+            ffi::porthole_native_event_create(metal.raw.as_ptr(), &mut raw)
+        })?;
+        Ok(Self {
+            raw: NonNull::new(raw).expect("successful event creation returned null"),
+        })
+    }
+
+    pub fn export_handle(&self) -> Result<SharedEventHandle> {
+        let raw = unsafe { ffi::porthole_native_event_copy_handle(self.raw.as_ptr()) };
+        let raw = NonNull::new(raw).ok_or_else(|| CaptureTransferError::NativeBackend {
+            operation: "export-consumer-event",
+            message: "shared event handle creation failed".to_owned(),
+        })?;
+        Ok(unsafe { SharedEventHandle::from_retained(raw) })
+    }
+
+    /// Signal CPU completion or open a CPU-controlled gate. For a release
+    /// timeline, all work covered by `value` must have finished before calling.
+    pub fn signal_cpu(&self, value: u64) {
+        unsafe { ffi::porthole_native_event_signal_cpu(self.raw.as_ptr(), value) };
+    }
+
     pub fn from_handle(metal: &MetalContext, handle: &SharedEventHandle) -> Result<Self> {
+        // SAFETY: the owning handle remains live throughout the import.
+        unsafe { Self::from_borrowed_handle(metal, handle.raw) }
+    }
+
+    /// Import a borrowed MTLSharedEventHandle into an independently owned event.
+    /// The caller may dispose its handle after this call returns.
+    ///
+    /// # Safety
+    /// `handle` must be a valid MTLSharedEventHandle for this call's duration.
+    pub unsafe fn from_borrowed_handle(metal: &MetalContext, handle: NonNull<c_void>) -> Result<Self> {
         let mut raw: *mut c_void = std::ptr::null_mut();
         check("fence-from-handle", unsafe {
-            ffi::porthole_native_event_from_handle(metal.raw.as_ptr(), handle.as_raw(), &mut raw)
+            ffi::porthole_native_event_from_handle(metal.raw.as_ptr(), handle.as_ptr(), &mut raw)
         })?;
         Ok(Self {
             raw: NonNull::new(raw).expect("shim returned NULL event without error"),
@@ -570,6 +727,43 @@ impl ConsumerFence {
                 height,
                 pixels.as_mut_ptr(),
                 pixels.len(),
+            )
+        })?;
+        Ok(pixels)
+    }
+
+    pub fn sample_offscreen_with_completion(
+        &self,
+        metal: &MetalContext,
+        surface: &IoSurface,
+        fence_value: u64,
+        dimensions: (u32, u32),
+        completion: SampleCompletion<'_>,
+    ) -> Result<Vec<u8>> {
+        let (width, height) = dimensions;
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        let (gate, gate_value) = completion
+            .before_sample
+            .map_or((std::ptr::null_mut(), 0), |(event, value)| (event.raw.as_ptr(), value));
+        let (submitted, submitted_value) = completion
+            .submitted
+            .map_or((std::ptr::null_mut(), 0), |(event, value)| (event.raw.as_ptr(), value));
+        check("consumer-sample-completion", unsafe {
+            ffi::porthole_native_consumer_sample_ordered(
+                metal.raw.as_ptr(),
+                self.raw.as_ptr(),
+                fence_value,
+                surface.as_raw(),
+                width,
+                height,
+                pixels.as_mut_ptr(),
+                pixels.len(),
+                completion.release.0.raw.as_ptr(),
+                completion.release.1,
+                gate,
+                gate_value,
+                submitted,
+                submitted_value,
             )
         })?;
         Ok(pixels)

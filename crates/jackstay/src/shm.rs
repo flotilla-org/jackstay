@@ -35,6 +35,12 @@ unsafe impl Sync for SharedMemorySegment {}
 
 #[cfg(unix)]
 impl SharedMemorySegment {
+    /// Raw access for internal typed shared-memory layouts. Unlike `as_slice`,
+    /// this does not construct a plain reference spanning mutable atomic words.
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
     pub fn new(len: usize) -> Result<Self> {
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);

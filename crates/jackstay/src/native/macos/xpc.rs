@@ -13,6 +13,8 @@
 //!
 //! [`attach`]: crate::native::attach
 
+pub mod arena;
+
 use std::{
     collections::HashMap,
     ffi::{CStr, CString, c_char, c_void},

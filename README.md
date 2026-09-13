@@ -20,9 +20,9 @@ line tools supply the Objective-C and Metal frameworks. On Linux, the optional
 ./scripts/smoke-viewer.sh
 ```
 
-The SDL viewer creates an in-process synthetic producer, registers a video track,
-publishes generated frames through the C API, acquires and checks them through the
-consumer API, and renders 30 frames before shutting down. It prints
+The SDL viewer creates a bounded in-process CPU arena, reserves two frame holds,
+publishes generated frames through the C API, and renders 30 frames through the
+same acquisition and rendering loop used for Porthole CPU sessions. It prints
 `acquired_frames=30` and fails if publishing, acquisition, payload validation or
 rendering fails. No porthole daemon, desktop capture permission or second checkout
 is required. To run the same check without a display:
@@ -31,8 +31,18 @@ is required. To run the same check without a display:
 SDL_VIDEODRIVER=dummy ./scripts/smoke-viewer.sh
 ```
 
-The synthetic example exercises the in-process producer/consumer interface; it
-does not claim cross-process handle-transfer or live-capture verification.
+The synthetic example exercises common acquisition and checks that producer
+storage drains before destruction. It does not prove cross-process handle
+transfer or live capture. The [C producer API](docs/design/acquisition-c-boundary.md#cpu-producers)
+exposes admission limits, dropped publication, byte-budgeted replacement and
+retained destruction directly.
+
+For delayed-consumer checks, add `--hold-ms 250` to either CPU or native viewing.
+The viewer keeps each acquired lease for at least that delay before consuming
+it, while still handling window-close events. CPU mode compares the held bytes
+before and after the delay; native mode delays GPU submission and then retains
+the frame until actual completion. Apply the option to an authorized live source
+for capture acceptance; synthetic mode only checks the consumer machinery.
 
 Build just the Rust library with `cargo build --workspace --locked`. For macOS
 native capture consumers, add `--features backend-macos`; for Linux native
@@ -56,6 +66,11 @@ Porthole's installed macOS integration keeps its launchd-owned XPC broker and OS
 permissions. Network streaming is future work: a bridge could consume a stream
 here and publish another local stream on the receiving host. No Tender dependency
 or requirements follow from this extraction.
+
+The agreed next acquisition contract is recorded in
+[ADR-0001](docs/adr/0001-acquisition-leases-and-reservations.md), with
+[implementation slices](docs/specs/acquisition-lifetime-contract.md) and a
+[glossary](CONTEXT.md). These describe work not yet implemented.
 
 ## Linking and verification
 

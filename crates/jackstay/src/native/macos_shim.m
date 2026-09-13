@@ -60,23 +60,88 @@ void porthole_native_metal_destroy(void *metalPtr) {
   (void)(__bridge_transfer PortholeNativeMetal *)metalPtr;
 }
 
+char *porthole_native_metal_enqueue_wait(void *metalPtr, void *eventPtr, uint64_t value) {
+  PortholeNativeMetal *metal = (__bridge PortholeNativeMetal *)metalPtr;
+  id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
+  id<MTLCommandBuffer> commandBuffer = [metal.queue commandBuffer];
+  if (commandBuffer == nil) {
+    return porthole_native_copy_error(@"failed to create Metal wait command buffer");
+  }
+  [commandBuffer encodeWaitForEvent:event value:value];
+  [commandBuffer commit];
+  return NULL;
+}
+
 // ---- IOSurface utilities ---------------------------------------------------
 
+typedef struct {
+  size_t bytesPerRow;
+  size_t allocationSize;
+} PortholeNativeSurfaceLayout;
+
+// Use the same explicit layout for preflight and IOSurfaceCreate. These are
+// single-plane, uncompressed formats. IOSurface chooses the native alignments;
+// checked arithmetic rejects overflow before any backing storage is allocated.
+static bool porthole_native_surface_layout(uint32_t width, uint32_t height,
+                                           uint32_t bytesPerElement,
+                                           PortholeNativeSurfaceLayout *outLayout) {
+  size_t rowBytes, imageBytes;
+  if (width == 0 || height == 0 || bytesPerElement == 0 ||
+      __builtin_mul_overflow((size_t)width, (size_t)bytesPerElement, &rowBytes)) {
+    return false;
+  }
+  size_t stride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, rowBytes);
+  if (stride < rowBytes || __builtin_mul_overflow(stride, (size_t)height, &imageBytes)) {
+    return false;
+  }
+  size_t allocationSize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, imageBytes);
+  if (allocationSize < imageBytes) {
+    return false;
+  }
+  *outLayout = (PortholeNativeSurfaceLayout){stride, allocationSize};
+  return true;
+}
+
+char *porthole_native_pool_allocation_bound(uint32_t width, uint32_t height,
+                                           uint32_t bytesPerElement, uint32_t slotCount,
+                                           uint64_t *outBytes) {
+  *outBytes = 0;
+  PortholeNativeSurfaceLayout layout;
+  if (slotCount == 0 || !porthole_native_surface_layout(width, height, bytesPerElement, &layout) ||
+      __builtin_mul_overflow((uint64_t)layout.allocationSize, (uint64_t)slotCount, outBytes)) {
+    return porthole_native_copy_error(@"invalid or overflowing native pool dimensions");
+  }
+  return NULL;
+}
+
 static IOSurfaceRef porthole_native_create_surface(uint32_t width, uint32_t height, uint32_t fourcc,
-                                                   uint32_t bytesPerElement) {
+                                                   uint32_t bytesPerElement,
+                                                   PortholeNativeSurfaceLayout layout) {
   NSDictionary *properties = @{
     (__bridge NSString *)kIOSurfaceWidth : @(width),
     (__bridge NSString *)kIOSurfaceHeight : @(height),
     (__bridge NSString *)kIOSurfacePixelFormat : @(fourcc),
     (__bridge NSString *)kIOSurfaceBytesPerElement : @(bytesPerElement),
+    (__bridge NSString *)kIOSurfaceBytesPerRow : @(layout.bytesPerRow),
+    (__bridge NSString *)kIOSurfaceAllocSize : @(layout.allocationSize),
   };
-  return IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+  IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+  // Verify the returned object obeys the requested allocation contract too.
+  if (surface != NULL && IOSurfaceGetAllocSize(surface) != layout.allocationSize) {
+    CFRelease(surface);
+    return NULL;
+  }
+  return surface;
 }
 
 char *porthole_native_surface_create(uint32_t width, uint32_t height, uint32_t fourcc,
                                      uint32_t bytesPerElement, void **outSurface) {
   *outSurface = NULL;
-  IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement);
+  PortholeNativeSurfaceLayout layout;
+  if (!porthole_native_surface_layout(width, height, bytesPerElement, &layout)) {
+    return porthole_native_copy_error(@"invalid or overflowing native surface dimensions");
+  }
+  IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement, layout);
   if (surface == NULL) {
     return porthole_native_copy_error(@"IOSurfaceCreate failed");
   }
@@ -94,6 +159,10 @@ void porthole_native_surface_release(void *surface) {
 
 void porthole_native_surface_hold(void *surface) {
   IOSurfaceIncrementUseCount((IOSurfaceRef)surface);
+}
+
+uint64_t porthole_native_surface_allocation_size(void *surface) {
+  return (uint64_t)IOSurfaceGetAllocSize((IOSurfaceRef)surface);
 }
 
 void porthole_native_surface_unhold(void *surface) {
@@ -168,8 +237,17 @@ static IOSurfaceRef porthole_native_pool_surface(PortholeNativePool *pool, uint3
 
 char *porthole_native_pool_create(void *metalPtr, uint32_t width, uint32_t height, uint32_t fourcc,
                                   uint32_t bytesPerElement, uint64_t mtlPixelFormat,
-                                  uint32_t slotCount, void **outPool) {
+                                  uint32_t slotCount, uint64_t reservedBytes, void **outPool) {
   *outPool = NULL;
+  PortholeNativeSurfaceLayout layout;
+  uint64_t totalBytes;
+  if (slotCount == 0 || !porthole_native_surface_layout(width, height, bytesPerElement, &layout) ||
+      __builtin_mul_overflow((uint64_t)layout.allocationSize, (uint64_t)slotCount, &totalBytes)) {
+    return porthole_native_copy_error(@"invalid or overflowing native pool dimensions");
+  }
+  if (totalBytes > reservedBytes) {
+    return porthole_native_copy_error(@"native pool exceeds reserved allocation bytes");
+  }
   PortholeNativeMetal *metal = (__bridge PortholeNativeMetal *)metalPtr;
   PortholeNativePool *pool = [[PortholeNativePool alloc] init];
   pool.textures = [NSMutableArray arrayWithCapacity:slotCount];
@@ -185,7 +263,7 @@ char *porthole_native_pool_create(void *metalPtr, uint32_t width, uint32_t heigh
   descriptor.storageMode = MTLStorageModeShared;
 
   for (uint32_t slot = 0; slot < slotCount; slot++) {
-    IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement);
+    IOSurfaceRef surface = porthole_native_create_surface(width, height, fourcc, bytesPerElement, layout);
     if (surface == NULL) {
       return porthole_native_copy_error(
           [NSString stringWithFormat:@"IOSurfaceCreate failed for pool slot %u", slot]);
@@ -266,6 +344,11 @@ char *porthole_native_event_from_handle(void *metalPtr, void *handlePtr, void **
 uint64_t porthole_native_event_signaled_value(void *eventPtr) {
   id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
   return event.signaledValue;
+}
+
+void porthole_native_event_signal_cpu(void *eventPtr, uint64_t value) {
+  id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
+  event.signaledValue = value;
 }
 
 int32_t porthole_native_event_wait(void *eventPtr, uint64_t value, uint64_t timeoutMs) {
@@ -362,8 +445,11 @@ void porthole_native_stage_destroy(void *stagePtr) {
 // `metalPtr` is the consumer's own device (distinct from the producer's, as
 // in a real viewer); `srcSurfacePtr` is a borrowed IOSurfaceRef; `outPixels`
 // must hold width*height*4 bytes (BGRA8).
-char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t fenceValue, void *srcSurfacePtr,
-                                      uint32_t width, uint32_t height, uint8_t *outPixels, size_t outLen) {
+char *porthole_native_consumer_sample_ordered(void *metalPtr, void *eventPtr, uint64_t fenceValue, void *srcSurfacePtr,
+                                      uint32_t width, uint32_t height, uint8_t *outPixels, size_t outLen,
+                                      void *releaseEventPtr, uint64_t releaseValue,
+                                      void *gateEventPtr, uint64_t gateValue,
+                                      void *submittedEventPtr, uint64_t submittedValue) {
   PortholeNativeMetal *metal = (__bridge PortholeNativeMetal *)metalPtr;
   id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
   IOSurfaceRef src = (IOSurfaceRef)srcSurfacePtr;
@@ -397,10 +483,22 @@ char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t f
   // GPU-side wait: nothing in this buffer samples the surface until the
   // producer's timeline reaches fenceValue.
   [commandBuffer encodeWaitForEvent:event value:fenceValue];
+  if (gateEventPtr != NULL) {
+    [commandBuffer encodeWaitForEvent:(__bridge id<MTLSharedEvent>)gateEventPtr value:gateValue];
+  }
   id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
   [blit copyFromTexture:srcTexture toTexture:offscreen];
   [blit endEncoding];
+  if (releaseEventPtr != NULL) {
+    [commandBuffer encodeSignalEvent:(__bridge id<MTLSharedEvent>)releaseEventPtr value:releaseValue];
+  }
   [commandBuffer commit];
+  // Test/diagnostic notification only. This is deliberately NOT the release
+  // event: commit means submission, while release is encoded after GPU use.
+  if (submittedEventPtr != NULL) {
+    id<MTLSharedEvent> submitted = (__bridge id<MTLSharedEvent>)submittedEventPtr;
+    submitted.signaledValue = submittedValue;
+  }
   [commandBuffer waitUntilCompleted];
 
   if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
@@ -412,4 +510,46 @@ char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t f
            fromRegion:MTLRegionMake2D(0, 0, width, height)
           mipmapLevel:0];
   return NULL;
+}
+
+char *porthole_native_consumer_sample(void *metalPtr, void *eventPtr, uint64_t fenceValue, void *srcSurfacePtr,
+                                      uint32_t width, uint32_t height, uint8_t *outPixels, size_t outLen) {
+  return porthole_native_consumer_sample_ordered(metalPtr, eventPtr, fenceValue, srcSurfacePtr,
+      width, height, outPixels, outLen, NULL, 0, NULL, 0, NULL, 0);
+}
+
+// ---- Bounded deferred-release notifications -------------------------------
+
+// The block owns this token, which owns the Rust wake. No reference from the
+// token to the event or claim mapping creates an event/callback ownership cycle.
+@interface PortholeReleaseNotification : NSObject
+@property(nonatomic, assign) void *context;
+@property(nonatomic, assign) void (*notify)(void *);
+@property(nonatomic, assign) void (*destroy)(void *);
+@end
+@implementation PortholeReleaseNotification
+- (void)dealloc {
+  if (_destroy != NULL) { _destroy(_context); }
+}
+@end
+
+void porthole_native_event_notify(void *eventPtr, uint64_t value, void *context,
+                                  void (*notify)(void *), void (*destroy)(void *)) {
+  static MTLSharedEventListener *listener;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    listener = [[MTLSharedEventListener alloc] init];
+  });
+  PortholeReleaseNotification *token = [[PortholeReleaseNotification alloc] init];
+  token.context = context;
+  token.notify = notify;
+  token.destroy = destroy;
+  id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)eventPtr;
+  // MTLEvent.h guarantees notification at value or higher, including an event
+  // that has already reached the value when this registration races completion.
+  [event notifyListener:listener atValue:value block:^(id<MTLSharedEvent> completed, uint64_t signaled) {
+    (void)completed;
+    (void)signaled;
+    token.notify(token.context);
+  }];
 }

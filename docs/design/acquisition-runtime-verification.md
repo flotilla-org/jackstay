@@ -64,3 +64,23 @@ transition was observed while those delayed viewers were running, so live
 reconfiguration with held frames remains unverified. The successful playback
 and normal closure do not resolve the submitted-GPU crash quarantine or prove
 process-wide graceful daemon drainage.
+
+
+## Window resize does not imply output resize
+
+On 2026-09-13, a live Porthole/TextEdit check separated source-window geometry
+from capture-buffer dimensions. The window resized from 673×439 to 850×560
+logical points at scale 2, while both existing CPU/native streams stayed at
+1346×878 pixels. A probe holding real CPU/native frames observed no allocation
+generation change. Fresh sessions at the larger size produced 1700×1120 pixels
+and retained that buffer size when the window was restored.
+
+Porthole configures ScreenCaptureKit output dimensions only at startup. The
+remaining live pool-replacement test therefore needs an actual output
+configuration change; more manual window resizing alone is insufficient.
+Fixed output with explicit reconfiguration versus automatically following the
+window is now a Porthole policy decision. No new policy is adopted by this note.
+See Porthole's `docs/2026-09-13-capture-output-sizing.md` and local evidence in
+`/tmp/porthole-live-resize-wqbxm8zv/`. Both delayed viewers passed 300 frames at
+250 ms holds; the generation-change probe correctly failed. All test sessions
+and the test document window were closed, and the dedicated identity revoked.

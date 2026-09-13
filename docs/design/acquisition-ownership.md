@@ -185,7 +185,7 @@ completes. These are bounded SC checks, not a weak-memory or liveness proof.
 | 3: CPU shared acquisition/waits | The common arena implements latest, ordered gaps, exact misses, holding limits, cancellation and configuration replacement. Unix setup binds grants to the peer process. Standalone C producers, Porthole sessions, the recorder and CPU viewer now use this path; the socket/shadow path has been removed. |
 | 4: existing GPU | macOS uses common claims, IOSurface storage and Metal events for readiness and deferred completion. Native arena, anonymous/named XPC and the reference viewer checks passed with real GPU work. The delayed viewer test holds RGBA frames for 250 ms while publication continues. Pixels in these tests are generated fixtures. |
 | 5: cleanup/reconfiguration | CPU crash reclamation, budgeted CPU/native replacement, retained mappings and pending producer writes are tested. The submitted-GPU crash test demonstrated visible quarantine, not reclaimed capacity. Completion after process death remains a backend recovery limitation. See the [runtime record](acquisition-runtime-verification.md). |
-| 6: ABI/host/live acceptance | Rust/C clients and Porthole use common acquisition at C ABI 0.5. Required macOS/Linux gates pass at Jackstay `f482a5c` and Porthole `67fa206`; relevant native and SDL checks also pass. Live CPU/GPU long playback and delayed Simulator consumers now pass, followed by session retirement and fresh viewer admission; see the [runtime record](acquisition-runtime-verification.md). Live host resize remains pending. |
+| 6: ABI/host/live acceptance | Rust/C clients and Porthole use common acquisition at C ABI 0.5. Required macOS/Linux gates pass at Jackstay `f482a5c` and Porthole `03594a1`; relevant native and SDL checks also pass. Live CPU/GPU long playback and delayed Simulator consumers pass. Explicit SCK output replacement now passes two transitions with held CPU/native frames, followed by session retirement and fresh viewer admission; see the [runtime record](acquisition-runtime-verification.md). |
 
 Porthole `67fa206` also retains native cleanup in a dedicated worker after session
 and async-runtime teardown. A regression reproduced the old aborted cleanup; a
@@ -194,10 +194,12 @@ release. The run is recorded in `/tmp/porthole-native-owner-retirement-metal.log
 It establishes cleanup within a surviving process, not completion after daemon
 process death.
 
-These rows do not claim the contract complete. Live resize must still exercise
-the installed Porthole host, and no timeout, EOF or daemon restart may be counted
-as proof of GPU completion. Porthole's process-wide graceful drain API remains
-open; its session cleanup and process-exit guarantees must be kept separate.
+The six implementation slices have evidence for the selected CPU/macOS GPU
+acceptance paths. This is not a claim of platform-wide stability or a weak-memory
+proof. No timeout, EOF or daemon restart counts as proof of GPU completion.
+Submitted-GPU consumer death can end in explicit quarantine/recovery failure.
+Porthole's process-wide graceful drain API remains separate work; its session
+cleanup and process-exit guarantees must be kept distinct.
 
 ### Historical implementation notes
 

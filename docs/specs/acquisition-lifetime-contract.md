@@ -1,11 +1,13 @@
 # Acquisition lifetime contract
 
-Status: agreed design; implementation in progress. The bounded design interview
-settled the behavior below. Atomic layouts and backend mechanisms still need
-technical design and verification.
+Status: implemented and verified for the common CPU and macOS GPU acceptance
+paths through 2026-09-13. The bounded design interview settled the behavior
+below. The implementation record covers atomic layouts, backend evidence and
+the supported quarantine outcome for unresolved GPU work after consumer death.
 
 The [ownership audit and implementation design](../design/acquisition-ownership.md)
-tracks the current paths, proposed claim protocol, and verification by slice.
+tracks the current paths, claim protocol, verification by slice and remaining
+backend recovery limitations.
 
 ## Acquisition and publication
 
@@ -123,8 +125,8 @@ ordering so new attachments cannot consume capacity already committed to it.
    playback and deliberately delayed consumers, without replacing live content
    with synthetic content.
 
-The first existing GPU acceptance target is to be selected during the path audit;
-macOS is the currently available live desktop. Preserve working platform paths
+macOS was selected as the first existing GPU acceptance target and supplied the
+live desktop evidence. Preserve working platform paths
 through staging. Windows capture, reverse input routing, network streaming, and
 approval UI are not new requirements of this acquisition work.
 

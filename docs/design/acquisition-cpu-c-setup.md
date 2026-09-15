@@ -36,8 +36,9 @@ requires retaining it through every asynchronous use.
 Porthole-style host session. It returns the same connection/consumer owners and
 can use the same replacement and destruction calls. Its combined selection and
 attachment call returns no handle for cancellation while it is still connecting;
-clients needing that control use the generic create/attach sequence after host
-selection and authorization.
+its shutdown descriptor is allocated before consumer admission. Clients needing
+that control use the generic create/attach sequence after host selection and
+authorization.
 
 ## Ownership, errors and cancellation
 
@@ -61,9 +62,13 @@ null on failure. A failed attachment should be followed by connection destructio
 and a fresh connection if retrying admission.
 
 `ft_acquisition_cpu_connection_cancel` may overlap attach or configuration. It
-permanently shuts down setup I/O; the interrupted call returns CANCELLED. All
-callers must return before connection destruction. Consumer and acquired-frame
-handles have independent lifetimes.
+permanently shuts down setup I/O. A completed operation keeps its result even if
+cancellation arrives before the C call returns: an admitted consumer is returned
+and a completed configuration installation reports its outcome. Cancellation
+cannot roll back those effects. An operation that fails while cancellation is
+active returns CANCELLED, as do subsequent setup calls. All callers must return
+before connection destruction. Consumer and acquired-frame handles have
+independent lifetimes.
 
 `ft_cpu_setup_server_poll` returns DRAINING while the worker runs, OK after an
 orderly protocol EOF, ERROR after setup/protocol failure, or CANCELLED after

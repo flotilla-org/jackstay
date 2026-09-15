@@ -30,48 +30,59 @@ impl ConnectedSession {
     /// remain the sole recipient of the process-bound mappings: do not fork,
     /// forward or replay them. Authorization does not authenticate the producer.
     pub unsafe fn connect(info: SessionInfo, holding: u32) -> Result<Self> {
-        use crate::acquisition::socket::CpuSetupClient;
-        let mut stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-cpu-session", error))?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .map_err(|error| daemon_error("set-setup-timeout", error))?;
-        stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-            .map_err(|error| daemon_error("set-setup-timeout", error))?;
-        let request = serde_json::json!({
-            "op": "open_cpu_acquisition", "session_id": info.session_id,
-            "track_id": info.track_id, "bearer_token": info.bearer_token,
-        });
-        writeln!(stream, "{request}").map_err(|error| daemon_error("open-cpu-session", error))?;
-        let mut reply = Vec::new();
-        loop {
-            if reply.len() == 16 * 1024 {
-                return Err(daemon_error("open-cpu-session", "oversized reply"));
-            }
-            let mut byte = [0];
-            stream
-                .read_exact(&mut byte)
-                .map_err(|error| daemon_error("open-cpu-session", error))?;
-            if byte == *b"\n" {
-                break;
-            }
-            reply.push(byte[0]);
-        }
-        #[derive(Deserialize)]
-        #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-        enum Reply {
-            CpuOpened,
-            Rejected { message: String },
-        }
-        match serde_json::from_slice(&reply).map_err(|error| daemon_error("open-cpu-session", error))? {
-            Reply::CpuOpened => {}
-            Reply::Rejected { message } => return Err(daemon_error("open-cpu-session", message)),
-        }
-        // SAFETY: delegated to this method's sole-producer/process contract.
-        let mut setup = unsafe { CpuSetupClient::from_stream(stream) };
+        // SAFETY: this method's trusted producer/process contract applies.
+        let mut setup = unsafe { open_cpu_setup(&info) }?;
         let consumer = setup.attach(holding).map_err(|error| daemon_error("admit-cpu-session", error))?;
         Ok(Self { setup, consumer, info })
     }
+}
+
+/// Finish host routing/authorization without admitting a consumer yet.
+///
+/// # Safety
+/// The host must be a trusted conforming producer; this process remains the
+/// original peer and sole recipient. Do not fork, forward or replay mappings.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) unsafe fn open_cpu_setup(info: &SessionInfo) -> Result<crate::acquisition::socket::CpuSetupClient> {
+    use crate::acquisition::socket::CpuSetupClient;
+    let mut stream = UnixStream::connect(&info.fd_socket_path).map_err(|error| daemon_error("connect-cpu-session", error))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|error| daemon_error("set-setup-timeout", error))?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|error| daemon_error("set-setup-timeout", error))?;
+    let request = serde_json::json!({
+        "op": "open_cpu_acquisition", "session_id": info.session_id,
+        "track_id": info.track_id, "bearer_token": info.bearer_token,
+    });
+    writeln!(stream, "{request}").map_err(|error| daemon_error("open-cpu-session", error))?;
+    let mut reply = Vec::new();
+    loop {
+        if reply.len() == 16 * 1024 {
+            return Err(daemon_error("open-cpu-session", "oversized reply"));
+        }
+        let mut byte = [0];
+        stream
+            .read_exact(&mut byte)
+            .map_err(|error| daemon_error("open-cpu-session", error))?;
+        if byte == *b"\n" {
+            break;
+        }
+        reply.push(byte[0]);
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+    enum Reply {
+        CpuOpened,
+        Rejected { message: String },
+    }
+    match serde_json::from_slice(&reply).map_err(|error| daemon_error("open-cpu-session", error))? {
+        Reply::CpuOpened => {}
+        Reply::Rejected { message } => return Err(daemon_error("open-cpu-session", message)),
+    }
+    // SAFETY: delegated to this method's sole-producer/process contract.
+    Ok(unsafe { CpuSetupClient::from_stream(stream) })
 }
 
 #[derive(Debug, Clone)]

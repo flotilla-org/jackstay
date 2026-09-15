@@ -225,7 +225,10 @@ typedef struct ft_cpu_acquisition_connection ft_cpu_acquisition_connection;
  * create performs no admission I/O; attach blocks and admits one consumer.
  * Attach/configuration protocol or admission failures return ERROR.
  * Serialize attach/configuration calls. cancel may run concurrently with them;
- * it permanently interrupts setup I/O (CANCELLED), without releasing held frames.
+ * it permanently interrupts setup I/O, without releasing held frames. An already
+ * completed operation keeps its result (including an admitted consumer or an
+ * installed configuration); cancellation never rolls it back. A failed operation
+ * interrupted by cancellation and subsequent setup calls return CANCELLED.
  * A private descriptor duplicate is used only for shutdown, never grant I/O.
  * All calls must return before connection destruction. */
 ft_status ft_acquisition_cpu_connection_create(int32_t *fd, ft_cpu_acquisition_connection **out);

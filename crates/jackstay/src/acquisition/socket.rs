@@ -221,7 +221,9 @@ impl CpuSetupClient {
     /// The peer must be the conforming sole producer of the selected arena.
     /// This process must be the socket's original peer and the sole recipient
     /// of its grants. Do not fork, forward or replay grants/mappings, or retain
-    /// independent transport FD copies. Only this object may use the byte stream.
+    /// independent transport FD copies. The library's private shutdown_handle
+    /// duplicate is an exception: it only interrupts I/O, never reads/writes or
+    /// transfers grants. Only this object may use the byte stream.
     /// The stream must use blocking I/O; read/write timeouts may be set by the host.
     pub unsafe fn from_stream(stream: UnixStream) -> Self {
         Self {

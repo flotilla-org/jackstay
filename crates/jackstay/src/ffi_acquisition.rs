@@ -31,6 +31,9 @@ pub mod producer;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod session;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod setup_server;
+
 impl FtAcquisitionConsumer {
     /// Transfer an admitted consumer to C. Destroy with
     /// `ft_acquisition_consumer_destroy`; outstanding frames remain valid.

@@ -1,7 +1,11 @@
 //! Single-stream CPU producer boundary. Hosts own source/track selection and
 //! serialize producer calls; consumers and frames use the common arena API.
 
-use std::{ptr, time::Duration};
+use std::{
+    ptr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use super::FtAcquisitionConsumer;
 use crate::{
@@ -15,7 +19,7 @@ use crate::{
     ffi::*,
 };
 
-pub struct FtCpuProducer(ArenaProducer);
+pub struct FtCpuProducer(pub(super) Arc<Mutex<ArenaProducer>>);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +83,7 @@ pub unsafe extern "C" fn ft_cpu_producer_create(config: *const FtCpuProducerConf
         drain_timeout: Duration::from_nanos(config.drain_timeout_ns),
     }) {
         Ok(producer) => {
-            *out = Box::into_raw(Box::new(FtCpuProducer(producer)));
+            *out = Box::into_raw(Box::new(FtCpuProducer(Arc::new(Mutex::new(producer)))));
             FT_STATUS_OK
         }
         Err(error) => status(error),
@@ -97,13 +101,16 @@ pub unsafe extern "C" fn ft_cpu_producer_attach(
     out: *mut *mut FtAcquisitionConsumer,
 ) -> FtStatus {
     // SAFETY: caller supplies valid exclusive handles/output storage.
-    let (Some(producer), Some(out)) = (unsafe { producer.as_mut() }, unsafe { out.as_mut() }) else {
+    let (Some(producer), Some(out)) = (unsafe { producer.as_ref() }, unsafe { out.as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
     if !out.is_null() {
         return FT_STATUS_INVALID_ARGUMENT;
     }
-    match producer.0.attach(holding).and_then(ArenaConsumer::from_grant) {
+    let Ok(mut arena) = producer.0.lock() else {
+        return FT_STATUS_ERROR;
+    };
+    match arena.attach(holding).and_then(ArenaConsumer::from_grant) {
         Ok(consumer) => {
             *out = FtAcquisitionConsumer::into_raw(consumer);
             FT_STATUS_OK
@@ -127,7 +134,7 @@ pub unsafe extern "C" fn ft_cpu_producer_publish(
     cursor: *mut u64,
 ) -> FtStatus {
     // SAFETY: pointer validity and non-aliasing are caller obligations.
-    let (Some(producer), Some(descriptor), Some(cursor)) = (unsafe { producer.as_mut() }, unsafe { descriptor.as_ref() }, unsafe {
+    let (Some(producer), Some(descriptor), Some(cursor)) = (unsafe { producer.as_ref() }, unsafe { descriptor.as_ref() }, unsafe {
         cursor.as_mut()
     }) else {
         return FT_STATUS_INVALID_ARGUMENT;
@@ -150,8 +157,11 @@ pub unsafe extern "C" fn ft_cpu_producer_publish(
     descriptor.fence_id = 0;
     descriptor.fence_value = 0;
     descriptor.modifier = 0;
+    let Ok(mut arena) = producer.0.lock() else {
+        return FT_STATUS_ERROR;
+    };
     // SAFETY: caller supplies this readable byte range for the duration of copy.
-    match producer.0.publish(descriptor, unsafe { std::slice::from_raw_parts(bytes, len) }) {
+    match arena.publish(descriptor, unsafe { std::slice::from_raw_parts(bytes, len) }) {
         Ok(PublishOutcome::Published { cursor: published }) => {
             *cursor = published;
             FT_STATUS_OK
@@ -193,13 +203,16 @@ pub unsafe extern "C" fn ft_cpu_producer_reconfigure(
     out: *mut FtCpuReconfiguration,
 ) -> FtStatus {
     // SAFETY: caller supplies valid exclusive handle/output storage.
-    let (Some(producer), Some(out)) = (unsafe { producer.as_mut() }, unsafe { out.as_mut() }) else {
+    let (Some(producer), Some(out)) = (unsafe { producer.as_ref() }, unsafe { out.as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
     let Ok(capacity) = usize::try_from(payload_capacity) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    transition(producer.0.reconfigure_cpu(capacity), out)
+    let Ok(mut arena) = producer.0.lock() else {
+        return FT_STATUS_ERROR;
+    };
+    transition(arena.reconfigure_cpu(capacity), out)
 }
 
 /// Retry a pending replacement while capture is idle. Call after old maps or
@@ -210,10 +223,13 @@ pub unsafe extern "C" fn ft_cpu_producer_reconfigure(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_cpu_producer_advance(producer: *mut FtCpuProducer, out: *mut FtCpuReconfiguration) -> FtStatus {
     // SAFETY: caller supplies valid exclusive handle/output storage.
-    let (Some(producer), Some(out)) = (unsafe { producer.as_mut() }, unsafe { out.as_mut() }) else {
+    let (Some(producer), Some(out)) = (unsafe { producer.as_ref() }, unsafe { out.as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    transition(producer.0.advance_reconfiguration(), out)
+    let Ok(mut arena) = producer.0.lock() else {
+        return FT_STATUS_ERROR;
+    };
+    transition(arena.advance_reconfiguration(), out)
 }
 
 /// Install a replacement on a matching local consumer. Empty means no offer.
@@ -227,10 +243,13 @@ pub unsafe extern "C" fn ft_cpu_producer_configure_consumer(
     consumer: *mut FtAcquisitionConsumer,
 ) -> FtStatus {
     // SAFETY: caller supplies valid exclusive handles.
-    let (Some(producer), Some(consumer)) = (unsafe { producer.as_mut() }, unsafe { consumer.as_mut() }) else {
+    let (Some(producer), Some(consumer)) = (unsafe { producer.as_ref() }, unsafe { consumer.as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    match producer.0.configure_consumer(&mut consumer.0) {
+    let Ok(mut arena) = producer.0.lock() else {
+        return FT_STATUS_ERROR;
+    };
+    match arena.configure_consumer(&mut consumer.0) {
         Ok(Some(ConfigurationInstall::Installed)) => FT_STATUS_OK,
         Ok(Some(ConfigurationInstall::Stale)) => FT_STATUS_STALE,
         Ok(None) => FT_STATUS_EMPTY,
@@ -245,11 +264,14 @@ pub unsafe extern "C" fn ft_cpu_producer_configure_consumer(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_cpu_producer_poll_cleanup(producer: *mut FtCpuProducer) -> FtStatus {
     // SAFETY: caller supplies a valid exclusive handle.
-    let Some(producer) = (unsafe { producer.as_mut() }) else {
+    let Some(producer) = (unsafe { producer.as_ref() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    match producer.0.poll_cleanup() {
-        Ok(_) if producer.0.cleanup_failures().is_empty() => FT_STATUS_OK,
+    let Ok(mut arena) = producer.0.lock() else {
+        return FT_STATUS_ERROR;
+    };
+    match arena.poll_cleanup() {
+        Ok(_) if arena.cleanup_failures().is_empty() => FT_STATUS_OK,
         Ok(_) => FT_STATUS_RECOVERY_REQUIRED,
         Err(error) => status(error),
     }
@@ -269,18 +291,22 @@ pub unsafe extern "C" fn ft_cpu_producer_destroy(producer: *mut *mut FtCpuProduc
         return FT_STATUS_INVALID_ARGUMENT;
     };
     // SAFETY: non-null pointee is exclusively owned and live.
-    let Some(producer) = (unsafe { handle.as_mut() }) else {
+    let Some(producer) = (unsafe { handle.as_ref() }) else {
         return FT_STATUS_OK;
     };
-    producer.0.stop();
-    match producer.0.poll_shutdown_ready() {
-        Ok(true) => {
+    let Ok(mut arena) = producer.0.lock() else {
+        return FT_STATUS_ERROR;
+    };
+    arena.stop();
+    match arena.poll_shutdown_ready() {
+        Ok(true) if Arc::strong_count(&producer.0) == 1 => {
+            drop(arena);
             // SAFETY: successful drainage permits consuming the single owner.
             drop(unsafe { Box::from_raw(std::mem::replace(handle, ptr::null_mut())) });
             FT_STATUS_OK
         }
-        Ok(false) => {
-            if producer.0.cleanup_failures().is_empty() {
+        Ok(_) => {
+            if arena.cleanup_failures().is_empty() {
                 FT_STATUS_DRAINING
             } else {
                 FT_STATUS_RECOVERY_REQUIRED

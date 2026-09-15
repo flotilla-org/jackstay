@@ -1,7 +1,7 @@
 # Acquisition across Rust and C
 
 The common arena now has an ownership boundary in `ffi_acquisition.rs`, declared
-in `capture_transfer.h` under ABI 0.5. It uses `ArenaConsumer`, `FrameLease`,
+in `capture_transfer.h` under ABI 0.6. It uses `ArenaConsumer`, `FrameLease`,
 `Cancellation` and `ConsumerReleaseTimeline` directly. It has no C lease book.
 
 ## Setup and ownership
@@ -138,3 +138,10 @@ consumer/render loop as a Porthole CPU session. Tests cover duplicate holding
 credit, history wrap, refused destruction, timeout recovery, old/new allocation
 budgeting and foreign consumer rejection. These remain synthetic CPU checks;
 the contract's authorized live CPU/GPU acceptance is still required.
+
+
+ABI 0.6 adds [generic C CPU setup](acquisition-cpu-c-setup.md). A C publisher
+serves a host-authorized Unix socket; a C consumer creates a cancellable setup
+connection before attachment. Both reuse the Rust process-bound setup protocol.
+Setup workers retain the producer until they finish, and acquired frames retain
+their independent owners after setup closes.

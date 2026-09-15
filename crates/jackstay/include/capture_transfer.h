@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 5
+#define FT_ABI_VERSION_MINOR 6
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -216,6 +216,25 @@ void ft_acquisition_consumer_destroy(ft_acquisition_consumer **);
  * Both output handles start NULL; track is set on success. Never fork, forward
  * or replay these mappings. Connection, consumer and frames are separate owners. */
 typedef struct ft_cpu_acquisition_connection ft_cpu_acquisition_connection;
+/* Generic setup on a connected, host-authorized Unix SOCK_STREAM. No daemon is
+ * required. The peer must be the conforming sole producer; this process must be
+ * the original peer and sole recipient of grants. No caller descriptor copies,
+ * concurrent stream I/O, fork, forwarding or replay of grants/maps are allowed.
+ * NULL arguments, negative fd or non-NULL *out leave fd unchanged. After these
+ * basic checks, every outcome consumes fd and sets it to -1, even ERROR.
+ * create performs no admission I/O; attach blocks and admits one consumer.
+ * Attach/configuration protocol or admission failures return ERROR.
+ * Serialize attach/configuration calls. cancel may run concurrently with them;
+ * it permanently interrupts setup I/O, without releasing held frames. An already
+ * completed operation keeps its result (including an admitted consumer or an
+ * installed configuration); cancellation never rolls it back. A failed operation
+ * interrupted by cancellation and subsequent setup calls return CANCELLED.
+ * A private descriptor duplicate is used only for shutdown, never grant I/O.
+ * All calls must return before connection destruction. */
+ft_status ft_acquisition_cpu_connection_create(int32_t *fd, ft_cpu_acquisition_connection **out);
+ft_status ft_acquisition_cpu_attach(ft_cpu_acquisition_connection *, uint32_t holding,
+                                   ft_acquisition_consumer **out);
+void ft_acquisition_cpu_connection_cancel(const ft_cpu_acquisition_connection *);
 ft_status ft_acquisition_cpu_connect_session(const char *control_path, const char *session_id,
                                              const char *token, uint32_t holding,
                                              ft_cpu_acquisition_connection **out_connection,
@@ -256,7 +275,7 @@ ft_status ft_acquired_frame_macos_resources(const ft_acquired_frame *, void **ou
 void ft_acquisition_macos_connection_destroy(ft_macos_acquisition_connection **);
 #endif
 
-/* In-process single-stream CPU producer. Source/track selection belongs to
+/* Single-stream CPU producer. Source/track selection belongs to
  * the host. Serialize producer calls; consumer/frame lifetimes are independent.
  * Local handles/maps must not be forked or forwarded into another process. */
 typedef struct ft_cpu_producer ft_cpu_producer;
@@ -287,8 +306,28 @@ ft_status ft_cpu_producer_configure_consumer(ft_cpu_producer *, ft_acquisition_c
 ft_status ft_cpu_producer_poll_cleanup(ft_cpu_producer *);
 /* Stops acquisition/publication. DRAINING/RECOVERY_REQUIRED leave the producer
  * handle owned by the caller: release work, continue maintenance and retry.
+ * Stop/join setup workers too: they retain the producer even before admission.
  * Only OK destroys/clears it; timeout never permits forced reclamation. */
 ft_status ft_cpu_producer_destroy(ft_cpu_producer **);
+
+#if defined(__APPLE__) || defined(__linux__)
+/* One setup worker for one connected, host-authorized Unix SOCK_STREAM. Host
+ * owns listening, authorization and source selection. Same FD-transfer rules as
+ * connection_create above. OK means worker started, not consumer admitted.
+ * Internal arena locking permits the worker to serve alongside serialized host
+ * producer calls; socket I/O never holds that lock. poll is nonblocking: DRAINING
+ * while running, OK after orderly EOF, ERROR after setup/protocol failure,
+ * CANCELLED after explicit cancellation. cancel may run concurrently with poll.
+ * destroy cancels a running worker, joins it, clears the handle and returns its
+ * final status. No other call may overlap destruction. It can wait for a finite
+ * arena operation; shutdown interrupts socket I/O. Close stops new acquisitions;
+ * existing frame ownership survives. EOF is not proof of peer process death. */
+typedef struct ft_cpu_setup_server ft_cpu_setup_server;
+ft_status ft_cpu_producer_serve(ft_cpu_producer *, int32_t *fd, ft_cpu_setup_server **out);
+void ft_cpu_setup_server_cancel(const ft_cpu_setup_server *);
+ft_status ft_cpu_setup_server_poll(ft_cpu_setup_server *);
+ft_status ft_cpu_setup_server_destroy(ft_cpu_setup_server **);
+#endif
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(ft_acquired_frame_descriptor) == 144, "acquired descriptor size");

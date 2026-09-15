@@ -81,3 +81,12 @@ if(NOT APPLE)
   add_test(NAME unsupported_native COMMAND capture-viewer-sdl --native --frames 1)
   set_tests_properties(unsupported_native PROPERTIES WILL_FAIL TRUE TIMEOUT 5)
 endif()
+
+# Uses only the public C ABI and Unix sockets; no SDL calls or host daemon.
+add_executable(cpu-setup-smoke tests/cpu_setup_smoke.c)
+target_include_directories(cpu-setup-smoke PRIVATE "${JACKSTAY_INCLUDE_DIR}")
+target_compile_definitions(cpu-setup-smoke PRIVATE _POSIX_C_SOURCE=200809L _DARWIN_C_SOURCE)
+target_compile_options(cpu-setup-smoke PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(cpu-setup-smoke PRIVATE ${JACKSTAY_LIB})
+add_test(NAME cross_process_cpu_setup COMMAND cpu-setup-smoke)
+set_tests_properties(cross_process_cpu_setup PROPERTIES TIMEOUT 20)

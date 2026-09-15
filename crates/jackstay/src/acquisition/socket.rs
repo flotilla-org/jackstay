@@ -231,6 +231,12 @@ impl CpuSetupClient {
         }
     }
 
+    // The C connection keeps this private duplicate solely to interrupt I/O.
+    // It never reads, writes, exports, or receives grants on this descriptor.
+    pub(crate) fn shutdown_handle(&self) -> std::io::Result<UnixStream> {
+        self.stream.try_clone()
+    }
+
     fn request(&mut self, request: Request) -> Result<(Response, Vec<OwnedFd>), SocketError> {
         if self.failed {
             return Err(SocketError::Protocol("connection failed"));

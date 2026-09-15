@@ -37,6 +37,12 @@ transfer or live capture. The [C producer API](docs/design/acquisition-c-boundar
 exposes admission limits, dropped publication, byte-budgeted replacement and
 retained destruction directly.
 
+[Generic C CPU setup](docs/design/acquisition-cpu-c-setup.md) lets C/Zig hosts
+serve already-authorized Unix connections and clients attach without a daemon.
+After the smoke build, `ctest --test-dir build/viewer --output-on-failure` also
+runs a standalone C producer and a separately executed consumer through resize,
+setup cancellation and process-exit cleanup. Match the ABI 0.6 header and library.
+
 For delayed-consumer checks, add `--hold-ms 250` to either CPU or native viewing.
 The viewer keeps each acquired lease for at least that delay before consuming
 it, while still handling window-close events. CPU mode compares the held bytes

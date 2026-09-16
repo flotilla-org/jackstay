@@ -355,7 +355,7 @@ fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<Atom
     let interval = (timeout / 4).min(Duration::from_secs(1));
     let mut last_seen = Instant::now();
     while !stop.load(Ordering::Acquire) {
-        {
+        let closing = {
             let mut s = state.lock().unwrap();
             // Keep the stream buffer bounded independently of the application queue.
             if wire.queued < MAX_FRAME {
@@ -372,11 +372,12 @@ fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<Atom
                     }
                 }
             }
-        }
+            s.closing
+        };
         // Once Close is queued, stop originating heartbeats. The peer may
         // already have sent its final acknowledgement and closed; writing first
         // would turn that clean close into BrokenPipe before we read the reply.
-        if !state.lock().unwrap().closing && heartbeat.elapsed() >= interval {
+        if !closing && heartbeat.elapsed() >= interval {
             wire.send(Wire::Heartbeat)?;
             heartbeat = Instant::now();
         }

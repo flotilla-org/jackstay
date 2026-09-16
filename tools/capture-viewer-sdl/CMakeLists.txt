@@ -94,3 +94,10 @@ set_tests_properties(cross_process_cpu_setup PROPERTIES TIMEOUT 20)
 add_test(NAME missing_cpu_socket_argument COMMAND capture-viewer-sdl --cpu-socket)
 add_test(NAME conflicting_cpu_source COMMAND capture-viewer-sdl --cpu-socket /unused --porthole-socket /unused)
 set_tests_properties(missing_cpu_socket_argument conflicting_cpu_source PROPERTIES WILL_FAIL TRUE TIMEOUT 5)
+
+add_test(NAME cpu_socket_viewer COMMAND cpu-setup-smoke --viewer $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(cpu_socket_viewer PROPERTIES
+  ENVIRONMENT "SDL_VIDEODRIVER=dummy"
+  PASS_REGULAR_EXPRESSION "acquired_frames=3"
+  TIMEOUT 20
+)

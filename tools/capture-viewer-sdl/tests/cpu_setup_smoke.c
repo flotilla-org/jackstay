@@ -145,11 +145,57 @@ static void host_main(const char *executable, int crash) {
     }
     assert(!"producer did not retire after consumer exit");
 }
+/* Exercise the actual SDL CLI against a producer in a separate process. The
+ * retained frame is available before attach; no scheduling sleeps are needed. */
+static void viewer_main(const char *viewer) {
+    char directory[] = "/tmp/js-viewer-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    char path[80];
+    assert(snprintf(path, sizeof(path), "%s/setup", directory) < (int)sizeof(path));
+    struct sockaddr_un addr = address(path);
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    assert(bind(listener, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    assert(listen(listener, 1) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(listener);
+        execl(viewer, viewer, "--cpu-socket", path, "--frames", "3", (char *)NULL);
+        _exit(127);
+    }
+    ft_cpu_producer *producer = NULL;
+    ft_cpu_producer_config config = {4, 1, 1, 2, 8, 1024 * 1024, 5000000000ULL};
+    assert(ft_cpu_producer_create(&config, &producer) == FT_STATUS_OK);
+    publish(producer, "SDLframe", 2);
+    int32_t fd = accept(listener, NULL, NULL);
+    assert(fd >= 0);
+    close(listener);
+    assert(unlink(path) == 0 && rmdir(directory) == 0);
+    ft_cpu_setup_server *server = NULL;
+    assert(ft_cpu_producer_serve(producer, &fd, &server) == FT_STATUS_OK && fd == -1);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    ft_status stopped = ft_cpu_setup_server_destroy(&server);
+    assert((stopped == FT_STATUS_OK || stopped == FT_STATUS_CANCELLED) && server == NULL);
+    for (int attempt = 0; attempt < 500; ++attempt) {
+        ft_status result = ft_cpu_producer_destroy(&producer);
+        if (result == FT_STATUS_OK) { assert(producer == NULL); return; }
+        assert(result == FT_STATUS_DRAINING);
+        struct timespec delay = {0, 10000000};
+        nanosleep(&delay, NULL);
+    }
+    assert(!"producer did not retire after SDL viewer exit");
+}
 int main(int argc, char **argv) {
     alarm(15);
     assert(ft_abi_version() == FT_ABI_VERSION);
     if (argc == 6 && strcmp(argv[1], "--child") == 0)
         return consumer_main(argv[2], atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
+    if (argc == 3 && strcmp(argv[1], "--viewer") == 0) {
+        viewer_main(argv[2]);
+        return 0;
+    }
     assert(argc == 1);
     host_main(argv[0], 0);
     host_main(argv[0], 1);

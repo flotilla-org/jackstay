@@ -3,6 +3,7 @@
 #endif
 #include <SDL.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdint.h>
@@ -289,6 +290,7 @@ static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **
   int32_t fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) { perror("CPU socket"); return 1; }
   int failed = 1;
+  if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) { perror("CPU socket close-on-exec"); goto cleanup; }
   if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
     perror("CPU socket connect");
     goto cleanup;

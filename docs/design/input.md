@@ -136,3 +136,8 @@ translator; keyboard and pointer fixtures still traverse SDL's queue. This
 checks our input adapter/transport, not SDL's synthetic text-queue implementation.
 Live text continues through ordinary SDL event polling.
 [Upstream conversion](https://github.com/libsdl-org/sdl2-compat/blob/main/src/sdl2_compat.c).
+
+
+ABI 0.8 adds [source bootstrap](source-bootstrap.md): the host can associate and
+authorize media plus optional input through one public endpoint. The input
+protocol and independent execution/cleanup worker remain unchanged.

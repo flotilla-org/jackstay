@@ -120,18 +120,18 @@ uses synthetic native sources; authorized live capture acceptance is separate.
 
 ## Cooperative input reference
 
-ABI 0.7 adds the optional shared input channel. Start the interactive synthetic
-source in a private directory, then connect the existing viewer to both sockets:
+ABI 0.8 bootstraps CPU media and optional shared input through one endpoint.
+Start the interactive synthetic source in a private directory:
 
 ```sh
 demo_dir=$(mktemp -d /tmp/jackstay-input.XXXXXX)
-./build/viewer/capture-input-source "$demo_dir/media" "$demo_dir/input" &
+./build/viewer/capture-input-source "$demo_dir/source" &
 source_pid=$!
-while [ ! -S "$demo_dir/input" ]; do
+while [ ! -S "$demo_dir/source" ]; do
   kill -0 "$source_pid" 2>/dev/null || break
   sleep 0.05
 done
-./build/viewer/capture-viewer-sdl --cpu-socket "$demo_dir/media" --input-socket "$demo_dir/input"
+./build/viewer/capture-viewer-sdl --source-socket "$demo_dir/source"
 wait
 rmdir "$demo_dir"
 ```
@@ -142,9 +142,12 @@ the top strip green; text fills a bottom bar; the pointer becomes red while a
 button is held. The source prints final input counts and held state on exit.
 This is a cooperative target, not native desktop injection.
 
-`--input-socket` explicitly opts into control of a generic CPU publication.
-The host must ensure the media and input endpoints belong to the intended target.
-Without this option the viewer remains observation-only. The reference sender
+`--source-socket` requests optional cooperative input. Use `--observe` to request
+only media, or `--require-input` to fail if control is unavailable. Optional
+refusal is reported while observation continues. The source can withhold input
+with `--observe-only`. The low-level `--cpu-socket` plus `--input-socket` pair
+remains available for independent adapter tests. Without `--input-socket`, that
+low-level CPU connection is observation-only. The reference sender
 uses cooperative key events, separate committed text and source repeat. Focus
 loss clears held state but retains the controller; reconnecting starts empty.
 The input connection has its own heartbeat worker, independent of rendering.
@@ -156,3 +159,5 @@ the same event translator as live SDL input because sdl2-compat cannot translate
 pushed SDL2 text-input events. Native desktop input and live desktop capture are
 separate acceptance work. See [the contract](../../docs/design/input.md) and
 [the C interface](../../crates/jackstay/include/jackstay_input.h).
+
+See [bootstrap ownership and failure semantics](../../docs/design/source-bootstrap.md).

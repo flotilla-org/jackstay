@@ -124,16 +124,16 @@ pub struct FtInputStatus {
     pub clean: u32,
     pub geometry: FtInputGeometry,
 }
-pub struct FtInputTarget(Target);
+pub struct FtInputTarget(pub(crate) Target);
 pub struct FtInputServer {
-    _server: Server,
+    pub(crate) _server: Server,
 }
-pub struct FtInputClient(Client);
+pub struct FtInputClient(pub(crate) Client);
 pub struct FtInputWork {
     target: Target,
     work: Work,
 }
-fn status(e: Error) -> FtStatus {
+pub(crate) fn status(e: Error) -> FtStatus {
     match e {
         Error::Invalid => FT_STATUS_INVALID_ARGUMENT,
         Error::Unsupported => FT_STATUS_UNSUPPORTED,
@@ -147,7 +147,7 @@ fn status(e: Error) -> FtStatus {
 fn result(r: Result<(), Error>) -> FtStatus {
     r.map_or_else(status, |_| FT_STATUS_OK)
 }
-fn mode(v: u32) -> Option<Mode> {
+pub(crate) fn mode(v: u32) -> Option<Mode> {
     match v {
         1 => Some(Mode::Physical),
         2 => Some(Mode::SourceText),

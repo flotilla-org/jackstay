@@ -107,3 +107,11 @@ The [SDL viewer and interactive synthetic source](tools/capture-viewer-sdl/READM
 exercise both ends through `jackstay_input.h` (ABI 0.7). Porthole native desktop
 execution and Katzensteg connector integration are separate consumers of this
 interface; neither is implied by the reference demo.
+
+## One source endpoint
+
+ABI 0.8 adds [shared source bootstrap](docs/design/source-bootstrap.md). Hosts can
+expose one authorized endpoint for CPU media and optional shared input, while
+retaining independent channel ownership and processing. Rust uses `bootstrap`;
+C/Zig clients use `jackstay_bootstrap.h`. The SDL reference source and viewer
+exercise it with `--source-socket`; KS's connector adoption is a separate change.

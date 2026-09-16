@@ -87,6 +87,13 @@ pub fn accept(stream: UnixStream, target: Option<Target>) -> Result<Accepted, Er
     let server = if let Some((server, peer)) = input {
         handshake.ready(libc::POLLOUT)?;
         crate::fdpass::send_fd(&handshake.stream, peer.as_raw_fd())?;
+        // Retain the sending copy until the peer has installed the descriptor.
+        // Parallel macOS bootstrap tests otherwise intermittently see input EOF.
+        let mut receipt = [0];
+        handshake.read(&mut receipt)?;
+        if receipt != [1] {
+            return Err(Error::Protocol("input descriptor not received"));
+        }
         // This copy must not keep the controller channel alive after peer loss.
         drop(peer);
         Some(server)
@@ -137,6 +144,7 @@ pub fn connect(stream: UnixStream, request: InputRequest) -> Result<Connected, E
             if stream.peer_addr().is_err() {
                 return Err(Error::Protocol("input descriptor is not a connected Unix socket"));
             }
+            handshake.write(&[1])?;
             match Client::connect(stream, mode) {
                 Ok(client) => input = Some(client),
                 Err(ConnectError::Admission(error)) => input_error = Some(error),

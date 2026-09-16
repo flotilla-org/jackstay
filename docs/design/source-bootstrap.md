@@ -11,7 +11,10 @@ The bootstrap preserves the original connected Unix stream for CPU setup.
 a server-created socketpair cannot substitute for that connection. Optional
 input is established on a separate socketpair whose client end crosses the
 bootstrap connection via descriptor passing. Its server and client use the
-existing shared input protocol, admission and cleanup implementation.
+existing shared input protocol, admission and cleanup implementation. The sender
+retains its descriptor copy until the receiver acknowledges ownership over the
+bootstrap stream, then closes that copy so it cannot mask controller death.
+This receipt is part of the same five-second bootstrap deadline.
 
 One endpoint therefore establishes two independent channel owners. Media uses
 its existing frame pool and setup stream. Input uses its ordered duplex stream,
@@ -57,7 +60,10 @@ messages. Input admission then has its existing five-second bound. Run these
 calls off GUI/input threads; there is no asynchronous cancellation handle for
 this bounded setup step. The resulting media stream is blocking with its prior
 socket timeouts unchanged. CPU attachment and replacement retain their existing
-cancellable connection API.
+cancellable connection API. Ancillary descriptor transfer currently uses the
+existing one-shot fd-passing helpers: interrupted or failed `sendmsg`/`recvmsg`
+calls fail setup, even when retry might succeed. A caller can establish a fresh
+connection after such a failure; no partially negotiated connection is reused.
 
 Bootstrap is not an atomic media-plus-input attachment. It negotiates independent
 owners before CPU admission. If CPU attach later fails and the host abandons the
@@ -84,6 +90,7 @@ transport or the cross-host bridge.
 
 Public Rust/C tests cover independent channel lifetimes, observer admission,
 optional/required refusal, busy targets, malformed offers, stalled negotiation
-and FD ownership. Separate C source/viewer processes use the single endpoint
+and FD ownership. A concurrent handoff regression exercises descriptor lifetime
+through input admission and event completion. Separate C source/viewer processes use the single endpoint
 for frames, keys, text, graceful cleanup and abrupt controller death. Observation
 cases prove frames remain available without creating an input controller.

@@ -141,6 +141,7 @@ static viewer_options parse_options(int argc, char **argv) {
       (options.input_self_test && !options.input_socket && (!options.source_socket || options.bootstrap_input == FT_BOOTSTRAP_INPUT_NONE))) {
     fprintf(stderr, "input requires a generic CPU socket source; self-test requires input\n"); options.invalid = 1;
   }
+  /* The input self-test cannot succeed with observation-only fallback. */
   if (options.input_self_test && options.source_socket) options.bootstrap_input = FT_BOOTSTRAP_INPUT_REQUIRED;
   return options;
 }

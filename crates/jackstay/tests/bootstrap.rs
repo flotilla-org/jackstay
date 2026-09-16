@@ -14,6 +14,23 @@ use jackstay::{
 
 #[test]
 fn one_connection_bootstraps_input_without_consuming_media_bytes() {
+    exercise_input_roundtrip();
+}
+
+#[test]
+fn concurrent_descriptor_handoffs_keep_input_connected() {
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..25 {
+                    exercise_input_roundtrip();
+                }
+            });
+        }
+    });
+}
+
+fn exercise_input_roundtrip() {
     let target = Target::new(Config::default()).unwrap();
     let (host, peer) = UnixStream::pair().unwrap();
     let host_target = target.clone();

@@ -35,7 +35,7 @@ struct ServerWorker {
 /// Consume a descriptor after basic pointer/value checks performed by the caller.
 /// A wrong socket or setup error still consumes it. The duplicate retained by a
 /// connection owner is private and used only to interrupt synchronous I/O.
-pub(super) unsafe fn take_stream(fd: &mut i32) -> std::io::Result<UnixStream> {
+pub(crate) unsafe fn take_stream(fd: &mut i32) -> std::io::Result<UnixStream> {
     // SAFETY: caller transfers sole ownership of this live descriptor.
     let stream = unsafe { UnixStream::from_raw_fd(std::mem::replace(fd, -1)) };
     let mut kind = 0 as libc::c_int;

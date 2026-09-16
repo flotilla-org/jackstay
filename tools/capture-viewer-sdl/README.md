@@ -117,3 +117,42 @@ JACKSTAY_VIEWER_TEST_BINARY="$PWD/build/viewer/capture-viewer-sdl" \
 
 This test requires a logged-in GUI session and working Metal shared events. It
 uses synthetic native sources; authorized live capture acceptance is separate.
+
+## Cooperative input reference
+
+ABI 0.7 adds the optional shared input channel. Start the interactive synthetic
+source in a private directory, then connect the existing viewer to both sockets:
+
+```sh
+demo_dir=$(mktemp -d /tmp/jackstay-input.XXXXXX)
+./build/viewer/capture-input-source "$demo_dir/media" "$demo_dir/input" &
+source_pid=$!
+while [ ! -S "$demo_dir/input" ]; do
+  kill -0 "$source_pid" 2>/dev/null || break
+  sleep 0.05
+done
+./build/viewer/capture-viewer-sdl --cpu-socket "$demo_dir/media" --input-socket "$demo_dir/input"
+wait
+rmdir "$demo_dir"
+```
+
+Wait for the source's `ready` line before starting the viewer. The source accepts
+one viewer and exits after it disconnects and cleanup finishes. Held keys tint
+the top strip green; text fills a bottom bar; the pointer becomes red while a
+button is held. The source prints final input counts and held state on exit.
+This is a cooperative target, not native desktop injection.
+
+`--input-socket` explicitly opts into control of a generic CPU publication.
+The host must ensure the media and input endpoints belong to the intended target.
+Without this option the viewer remains observation-only. The reference sender
+uses cooperative key events, separate committed text and source repeat. Focus
+loss clears held state but retains the controller; reconnecting starts empty.
+The input connection has its own heartbeat worker, independent of rendering.
+
+`ctest --test-dir build/viewer --output-on-failure` includes separate-process
+cooperative input and viewer-process-death cleanup. `--input-self-test` is a
+fixture for that test, not ordinary interactive behavior. The text fixture feeds
+the same event translator as live SDL input because sdl2-compat cannot translate
+pushed SDL2 text-input events. Native desktop input and live desktop capture are
+separate acceptance work. See [the contract](../../docs/design/input.md) and
+[the C interface](../../crates/jackstay/include/jackstay_input.h).

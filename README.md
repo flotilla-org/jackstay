@@ -41,7 +41,7 @@ retained destruction directly.
 serve already-authorized Unix connections and clients attach without a daemon.
 After the smoke build, `ctest --test-dir build/viewer --output-on-failure` also
 runs a standalone C producer and a separately executed consumer through resize,
-setup cancellation and process-exit cleanup. Match the ABI 0.6 header and library.
+setup cancellation and process-exit cleanup. Match the ABI 0.7 header and library.
 
 For delayed-consumer checks, add `--hold-ms 250` to either CPU or native viewing.
 The viewer keeps each acquired lease for at least that delay before consuming
@@ -98,3 +98,12 @@ Extracted with source history from [porthole](https://github.com/flotilla-org/po
 The Rust package retains the original `MIT OR Apache-2.0` license declaration.
 Original commit authors remain in the filtered history; see
 [source history](docs/source-history.md) for the extraction paths and commit map.
+
+## Shared input
+
+The optional [input interface](docs/design/input.md) supplies ordered controller
+sessions, execution results and cleanup over a host-authorized Unix connection.
+The [SDL viewer and interactive synthetic source](tools/capture-viewer-sdl/README.md#cooperative-input-reference)
+exercise both ends through `jackstay_input.h` (ABI 0.7). Porthole native desktop
+execution and Katzensteg connector integration are separate consumers of this
+interface; neither is implied by the reference demo.

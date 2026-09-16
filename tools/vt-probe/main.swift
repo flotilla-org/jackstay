@@ -497,7 +497,10 @@ case "roundtrip":
     c.codec = (args.count > 1 && args[1] == "h264") ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC
     if args.count > 2 { c.profile = args[2] == "default" ? nil : args[2] }
     if args.count > 3 { c.srcFormat = ["bgra": kCVPixelFormatType_32BGRA, "444f": kCVPixelFormatType_444YpCbCr8BiPlanarFullRange, "420f": kCVPixelFormatType_420YpCbCr8BiPlanarFullRange][args[3]] ?? kCVPixelFormatType_32BGRA }
-    if args.count > 4, args[4].contains("x") { let p = args[4].split(separator: "x"); c.width = Int(p[0]) ?? 1920; c.height = Int(p[1]) ?? 1080 }
+    if args.count > 4 {
+        let p = args[4].split(separator: "x")
+        if p.count == 2 { c.width = Int(p[0]) ?? 1920; c.height = Int(p[1]) ?? 1080 }
+    }
     c.lowLatency = args.contains("--lowlatency"); c.tagColour = !args.contains("--untagged")
     probeRoundtrip(c, chroma444: (c.profile ?? "").contains("444"))
 case "all": probeAll()

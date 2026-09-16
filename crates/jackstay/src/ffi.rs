@@ -12,7 +12,7 @@ pub type FtStatus = i32;
 /// pre-stabilization: layouts may still change freely, with a minor bump as
 /// the only signal; 1.0 waits until an external consumer needs the promise.
 pub const FT_ABI_VERSION_MAJOR: u32 = 0;
-pub const FT_ABI_VERSION_MINOR: u32 = 6;
+pub const FT_ABI_VERSION_MINOR: u32 = 7;
 pub const FT_ABI_VERSION: u32 = (FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR;
 
 /// Report the linked library's ABI version.
@@ -152,6 +152,6 @@ mod tests {
         assert_eq!(define("FT_ABI_VERSION_MAJOR"), super::FT_ABI_VERSION_MAJOR);
         assert_eq!(define("FT_ABI_VERSION_MINOR"), super::FT_ABI_VERSION_MINOR);
         assert_eq!(super::ft_abi_version(), super::FT_ABI_VERSION);
-        assert_eq!(super::FT_ABI_VERSION, 0x0000_0006);
+        assert_eq!(super::FT_ABI_VERSION, 0x0000_0007);
     }
 }

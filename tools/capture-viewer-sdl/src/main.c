@@ -19,14 +19,17 @@
 
 #include "capture_transfer.h"
 #include "metal_present.h"
+#include "viewer_input.h"
 
-enum { WIDTH = 320, HEIGHT = 180, STRIDE = WIDTH * 4 };
+#include "synthetic.h"
 
 typedef struct viewer_options {
   int max_frames;
   uint32_t hold_ms;
   int invalid;
   const char *cpu_socket;
+  const char *input_socket;
+  int input_self_test;
   const char *porthole_socket;
   const char *session_id;
   int native;
@@ -35,22 +38,15 @@ typedef struct viewer_options {
   const char *token;
 } viewer_options;
 
-static void fill_frame(uint8_t *pixels, uint64_t sequence) {
-  for (uint32_t y = 0; y < HEIGHT; y++) {
-    for (uint32_t x = 0; x < WIDTH; x++) {
-      size_t offset = (size_t)y * STRIDE + (size_t)x * 4;
-      pixels[offset + 0] = (uint8_t)((x + sequence * 3) % 256);
-      pixels[offset + 1] = (uint8_t)((y + sequence * 5) % 256);
-      pixels[offset + 2] = (uint8_t)((x + y + sequence * 7) % 256);
-      pixels[offset + 3] = 255;
-    }
-  }
-}
-
 static viewer_options parse_options(int argc, char **argv) {
   viewer_options options = {0};
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--native") == 0) {
+    if (strcmp(argv[i], "--input-self-test") == 0) {
+      options.input_self_test = 1;
+    } else if (strcmp(argv[i], "--input-socket") == 0) {
+      if (++i >= argc || !argv[i][0]) { options.invalid = 1; return options; }
+      options.input_socket = argv[i];
+    } else if (strcmp(argv[i], "--native") == 0) {
       options.native = 1;
     } else if (strcmp(argv[i], "--hold-ms") == 0) {
       if (++i >= argc || argv[i][0] < '0' || argv[i][0] > '9') {
@@ -104,18 +100,22 @@ static viewer_options parse_options(int argc, char **argv) {
     fprintf(stderr, "--cpu-socket cannot be combined with native or Porthole session selection\n");
     options.invalid = 1;
   }
+  if ((options.input_socket && (options.native || !options.cpu_socket)) || (options.input_self_test && !options.input_socket)) {
+    fprintf(stderr, "input requires a generic CPU socket source; self-test requires input\n"); options.invalid = 1;
+  }
   return options;
 }
 
 /* Keep the actual lease while deliberately delaying consumption. Pump events
  * so even a long requested delay can be cancelled by closing this window. */
-static int hold_frame(uint32_t remaining_ms) {
+static int hold_frame(uint32_t remaining_ms, viewer_input *input, SDL_Window *window) {
   while (remaining_ms != 0) {
     uint32_t chunk = remaining_ms < 16 ? remaining_ms : 16;
     SDL_Delay(chunk);
     remaining_ms -= chunk;
     SDL_Event event;
-    while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) return 0;
+    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) return 0; viewer_input_event(input, &event, window); }
+    viewer_input_poll(input);
   }
   return 1;
 }
@@ -191,7 +191,7 @@ static int run_native(const viewer_options *options) {
     ft_status status = ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, last_cursor, &frame, &range);
     uint32_t interest = FT_WAIT_DATA;
     if (status == FT_STATUS_OK) {
-      if (!hold_frame(options->hold_ms)) {
+      if (!hold_frame(options->hold_ms, NULL, window)) {
         ft_acquired_frame_release(&frame);
         break;
       }
@@ -324,6 +324,7 @@ static int run_cpu(const viewer_options *options) {
     if (require_ok(ft_create_synthetic_session(options->porthole_socket, &synthetic), "ft_create_synthetic_session")) return 1;
     session_id = synthetic.session_id;
   }
+  viewer_input input = {0};
   ft_cpu_acquisition_connection *connection = NULL;
   ft_cpu_producer *producer = NULL;
   uint8_t *pixels = NULL;
@@ -361,10 +362,17 @@ static int run_cpu(const viewer_options *options) {
     if (renderer == NULL) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
   }
   if (renderer == NULL) { fprintf(stderr, "SDL setup: %s\n", SDL_GetError()); goto cleanup; }
+  if (options->input_socket && viewer_input_open(&input, options->input_socket) != 0) { fprintf(stderr, "input connection failed\n"); goto cleanup; }
+  int input_test_sent = 0;
   failed = 0;
   while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {
     SDL_Event event;
-    while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) running = 0;
+    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; viewer_input_event(&input, &event, window); }
+    viewer_input_poll(&input);
+    if (input.failed) { failed = 1; break; }
+    if (options->input_self_test && !input_test_sent && acquired >= 2 && !input.resetting) {
+      viewer_input_self_test(&input, window); input_test_sent = 1;
+    }
     if (!running) break;
     uint64_t published_cursor = 0;
     if (producer != NULL) {
@@ -401,7 +409,7 @@ static int run_cpu(const viewer_options *options) {
           ft_acquired_frame_release(&frame); failed = 1; break;
         }
         memcpy(before_hold, bytes, len);
-        int continuing = hold_frame(options->hold_ms);
+        int continuing = hold_frame(options->hold_ms, &input, window);
         int unchanged = memcmp(before_hold, bytes, len) == 0;
         free(before_hold);
         if (!unchanged || !continuing) {
@@ -466,6 +474,7 @@ static int run_cpu(const viewer_options *options) {
   if (options->max_frames > 0 && acquired != (uint64_t)options->max_frames) failed = 1;
   printf("acquired_frames=%" PRIu64 "\n", acquired);
 cleanup:
+  if (viewer_input_close(&input)) failed = 1;
   SDL_DestroyTexture(texture);
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);

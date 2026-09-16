@@ -28,7 +28,7 @@ if(NOT EXISTS "${JACKSTAY_LIB}")
   message(FATAL_ERROR "Build Jackstay first (backend-macos on macOS), or set JACKSTAY_LIB to the built shared library")
 endif()
 
-set(VIEWER_SOURCES src/main.c)
+set(VIEWER_SOURCES src/main.c src/viewer_input.c)
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
   # ft_acquisition_macos_* symbols this viewer links against are present.
@@ -101,3 +101,14 @@ set_tests_properties(cpu_socket_viewer PROPERTIES
   PASS_REGULAR_EXPRESSION "acquired_frames=3"
   TIMEOUT 20
 )
+
+add_executable(capture-input-source src/input_source.c)
+target_include_directories(capture-input-source PRIVATE "${JACKSTAY_INCLUDE_DIR}")
+target_compile_definitions(capture-input-source PRIVATE _DARWIN_C_SOURCE)
+target_compile_options(capture-input-source PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(capture-input-source PRIVATE ${JACKSTAY_LIB})
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME cooperative_input_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/input_processes.py
+  $<TARGET_FILE:capture-input-source> $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(cooperative_input_processes PROPERTIES TIMEOUT 20)

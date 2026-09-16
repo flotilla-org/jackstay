@@ -26,8 +26,15 @@ pub enum HalfEvent {
     Listening { path: String },
     /// Both halves said hello and agreed on a codec.
     Ready { decision: CodecDecision },
-    /// The ingress half's republished publication can be attached to.
-    PublicationUp { service: String, token: Option<String> },
+    /// The ingress half's republished publication can be attached to, natively
+    /// by Mach service and token, and over a generic CPU setup socket when one
+    /// was requested.
+    PublicationUp {
+        service: String,
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_socket: Option<String>,
+    },
     /// The half ended; `report` is its `EgressReport` or `IngressReport`.
     Report { report: serde_json::Value },
     /// The half failed before or after running.
@@ -48,6 +55,8 @@ pub struct HalfStatus {
     pub phase: Option<Phase>,
     pub decision: Option<CodecDecision>,
     pub publication: Option<(String, Option<String>)>,
+    /// The CPU setup socket the ingress also serves, when it does.
+    pub cpu_socket: Option<String>,
     pub report: Option<serde_json::Value>,
     pub failure: Option<String>,
     pub exit_code: Option<i32>,
@@ -61,9 +70,14 @@ impl HalfStatus {
                 self.phase = Some(Phase::Running);
                 self.decision = Some(decision.clone());
             }
-            HalfEvent::PublicationUp { service, token } => {
+            HalfEvent::PublicationUp {
+                service,
+                token,
+                cpu_socket,
+            } => {
                 self.phase = Some(Phase::Running);
                 self.publication = Some((service.clone(), token.clone()));
+                self.cpu_socket = cpu_socket.clone();
             }
             HalfEvent::Report { report } => {
                 self.phase = Some(Phase::Ended);
@@ -121,6 +135,8 @@ pub struct IngressSpec {
     pub viewer_token: Option<String>,
     pub link_token: String,
     pub chroma: ChromaPolicy,
+    /// Also serve a generic CPU setup socket at this path.
+    pub cpu_socket: Option<PathBuf>,
 }
 
 fn chroma_arg(policy: ChromaPolicy) -> &'static str {
@@ -178,6 +194,10 @@ pub fn ingress_arguments(spec: &IngressSpec) -> Vec<String> {
     if let Some(t) = &spec.viewer_token {
         args.push("--viewer-token".to_owned());
         args.push(t.clone());
+    }
+    if let Some(p) = &spec.cpu_socket {
+        args.push("--cpu-socket".to_owned());
+        args.push(p.to_string_lossy().into_owned());
     }
     args
 }
@@ -448,7 +468,26 @@ mod tests {
             viewer_token: None,
             link_token: "L".into(),
             chroma: ChromaPolicy::Any,
+            cpu_socket: Some("/tmp/s".into()),
         });
         assert!(i.contains(&"--service".to_owned()) && !i.contains(&"--viewer-token".to_owned()));
+        assert_eq!(i[i.len() - 2..], ["--cpu-socket", "/tmp/s"]);
+    }
+
+    #[test]
+    fn publication_up_without_a_cpu_socket_still_parses() {
+        let old = r#"{"event":"publication_up","service":"svc","token":null}"#;
+        let mut status = HalfStatus::default();
+        status.apply(&parse_event(old).unwrap());
+        assert_eq!(status.publication, Some(("svc".into(), None)));
+        assert_eq!(status.cpu_socket, None);
+        let new = serde_json::to_string(&HalfEvent::PublicationUp {
+            service: "svc".into(),
+            token: Some("t".into()),
+            cpu_socket: Some("/tmp/s".into()),
+        })
+        .unwrap();
+        status.apply(&parse_event(&new).unwrap());
+        assert_eq!(status.cpu_socket.as_deref(), Some("/tmp/s"));
     }
 }

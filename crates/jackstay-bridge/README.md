@@ -19,4 +19,10 @@ jackstay-bridge egress  --media M --control C --service SOURCE --source-token T 
 jackstay-bridge ingress --media M --control C --service NAME   --viewer-token V --link-token L
 ```
 
+`ingress --cpu-socket PATH` (also accepted by `loopback`) additionally serves the
+republication over a generic CPU setup socket at `PATH`, owner-only and unlinked
+on exit, for consumers without a native attach path: the SDL viewer's
+`--cpu-socket PATH`, katzensteg's `jackstay-source PATH`. Each decoded frame is
+then also read back from the staging surface into a CPU arena.
+
 Without `--features backend-macos` only the wire, clock and policy code builds.

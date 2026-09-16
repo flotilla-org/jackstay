@@ -12,10 +12,15 @@
 //! VideoToolbox's output thread runs the decoder sink, which transfers and
 //! publishes; a control thread sends the target, pings the clock once a second
 //! and relays keyframe requests; a maintenance thread polls arena cleanup.
+//!
+//! With `cpu_socket` set the same decoded frames are also read back into a CPU
+//! arena served over a generic CPU setup socket (see `cpu_publication`), so
+//! consumers without a native attach path can use the republication too.
 
 use std::{
     ffi::c_void,
     os::unix::net::UnixStream,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -40,6 +45,7 @@ use jackstay_graph::{ChromaPolicy, CodecDecision, Target, decide};
 
 use crate::{
     clock::{ClockEstimator, Estimate, Sample},
+    cpu_publication::{CpuPublication, CpuPublicationError},
     vt::{self, DecodedFrame, Decoder, Transfer},
     wire::{self, CodecConfig, FrameBody, Hello, Kind, Message, Op, Role},
 };
@@ -56,6 +62,8 @@ pub enum IngressError {
     Io(#[from] std::io::Error),
     #[error("codec decision: {0}")]
     Decision(#[from] jackstay_graph::DecisionError),
+    #[error("cpu publication: {0}")]
+    Cpu(#[from] CpuPublicationError),
     #[error("peer sent {0:?} where a hello was expected")]
     BadHello(Kind),
     #[error("peer token does not match the export grant")]
@@ -84,6 +92,8 @@ pub struct IngressConfig {
     pub arena: ArenaConfig,
     /// Staging surfaces rotated between decoder output and the pool blit.
     pub staging_depth: usize,
+    /// Also publish over a generic CPU setup socket bound at this path.
+    pub cpu_socket: Option<PathBuf>,
 }
 
 impl Default for IngressConfig {
@@ -105,6 +115,7 @@ impl Default for IngressConfig {
                 drain_timeout: Duration::from_secs(5),
             },
             staging_depth: 4,
+            cpu_socket: None,
         }
     }
 }
@@ -116,6 +127,10 @@ pub struct IngressReport {
     pub frames_decoded: u64,
     pub frames_published: u64,
     pub frames_dropped_by_arena: u64,
+    /// The CPU publication's counts, when one was bound.
+    pub cpu_frames_published: u64,
+    pub cpu_frames_dropped: u64,
+    pub cpu_errors: u64,
     pub decode_errors: u64,
     pub keyframe_requests: u64,
     pub configurations: u64,
@@ -127,9 +142,11 @@ pub struct IngressReport {
 }
 
 type Producer = Arc<Mutex<NativeArenaProducer<MacosFrameBackend>>>;
+type Cpu = Arc<Mutex<CpuPublication>>;
 
 struct Republisher {
     producer: Producer,
+    cpu: Option<Cpu>,
     transfer: Transfer,
     staging: Vec<IoSurface>,
     next_staging: usize,
@@ -163,6 +180,13 @@ impl Republisher {
             .ok()
             .and_then(|c| c.estimate())
             .map_or_else(crate::host_now_ns, |e| e.local_from_remote(descriptor.timestamp_ns));
+        if let Some(cpu) = &self.cpu {
+            let mut cpu = cpu.lock().expect("cpu publication poisoned");
+            if let Err(e) = cpu.publish(staging, descriptor.sequence, timestamp) {
+                eprintln!("ingress: cpu publish failed: {e}");
+                cpu.errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let captured = MacosCapturedFrame { surface: staging.clone() };
         let outcome = self.producer.lock().expect("producer poisoned").publish(&captured, timestamp);
         match outcome {
@@ -257,8 +281,11 @@ fn control_loop(
     let _ = reader_thread.join();
 }
 
-fn maintenance_loop(producer: Producer, stop: Arc<AtomicBool>) {
+fn maintenance_loop(producer: Producer, cpu: Option<Cpu>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
+        if let Some(cpu) = &cpu {
+            cpu.lock().expect("cpu publication poisoned").maintain();
+        }
         {
             let mut guard = producer.lock().expect("producer poisoned");
             if let Err(e) = guard.poll_cleanup() {
@@ -331,6 +358,7 @@ pub fn run(
 
     // 3. the media loop; producer, decoder and republisher appear with the first configuration
     let mut producer: Option<Producer> = None;
+    let mut cpu: Option<Cpu> = None;
     let mut server: Option<XpcArenaServer> = None;
     let mut maintenance: Option<std::thread::JoinHandle<()>> = None;
     let mut republisher: Option<Arc<Mutex<Republisher>>> = None;
@@ -377,18 +405,28 @@ pub fn run(
                                 None
                             }
                         };
+                        if let Some(path) = &config.cpu_socket {
+                            cpu = Some(Arc::new(Mutex::new(CpuPublication::bind(
+                                path,
+                                &config.arena,
+                                cfg.width,
+                                cfg.height,
+                            )?)));
+                        }
                         maintenance = Some({
                             let p = p.clone();
+                            let cpu = cpu.clone();
                             let stop = stop.clone();
                             std::thread::Builder::new()
                                 .name("jackstay-ingress-maintain".into())
-                                .spawn(move || maintenance_loop(p, stop))?
+                                .spawn(move || maintenance_loop(p, cpu, stop))?
                         });
                         let staging = (0..config.staging_depth.max(2))
                             .map(|_| IoSurface::allocate(cfg.width, cfg.height, PixelFormat::Bgra8Unorm).map_err(arena))
                             .collect::<Result<Vec<_>, _>>()?;
                         republisher = Some(Arc::new(Mutex::new(Republisher {
                             producer: p.clone(),
+                            cpu: cpu.clone(),
                             transfer: Transfer::new()?,
                             staging,
                             next_staging: 0,
@@ -494,6 +532,13 @@ pub fn run(
         report.frames_dropped_by_arena = r.dropped.load(Ordering::Relaxed);
         report.decode_errors += r.errors.load(Ordering::Relaxed);
     }
+    if let Some(c) = &cpu {
+        let mut c = c.lock().expect("cpu publication poisoned");
+        c.shutdown();
+        report.cpu_frames_published = c.published.load(Ordering::Relaxed);
+        report.cpu_frames_dropped = c.dropped.load(Ordering::Relaxed);
+        report.cpu_errors = c.errors.load(Ordering::Relaxed);
+    }
     report.clock = clock.lock().ok().and_then(|c| c.estimate());
     if let Some(p) = &producer {
         let mut guard = p.lock().expect("producer poisoned");
@@ -520,5 +565,6 @@ pub fn run(
     }
     drop(server);
     drop(republisher);
+    drop(cpu);
     outcome.map(|()| report)
 }

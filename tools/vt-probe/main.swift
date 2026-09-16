@@ -26,7 +26,7 @@ func fourcc(_ v: OSType) -> String {
 func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
 func percentile(_ xs: [Double], _ p: Double) -> Double {
-    if xs.isEmpty { return .nan }
+    if xs.isEmpty { return -1 } // JSON cannot carry NaN
     let s = xs.sorted()
     let i = min(s.count - 1, max(0, Int(Double(s.count - 1) * p)))
     return s[i]
@@ -94,8 +94,11 @@ func makeSourceBGRA(width: Int, height: Int, frame: Int, tagColour: Bool) -> CVP
     var pb: CVPixelBuffer?
     let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
                                   kCVPixelBufferMetalCompatibilityKey: true]
-    CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb)
-    let p = pb!
+    let status = CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb)
+    guard status == kCVReturnSuccess, let p = pb else {
+        FileHandle.standardError.write("CVPixelBufferCreate failed: \(status)\n".data(using: .utf8)!)
+        exit(3)
+    }
     CVPixelBufferLockBaseAddress(p, [])
     let base = CVPixelBufferGetBaseAddress(p)!
     let bpr = CVPixelBufferGetBytesPerRow(p)
@@ -263,9 +266,16 @@ func runEncode(_ cfg: EncodeConfig) -> EncodeOutcome {
     }
     VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid)
     VTCompressionSessionInvalidate(s)
+    info["frames_out"] = res.samples.count
+    if res.samples.isEmpty {
+        // A session that opens but never produces output (an unsupported
+        // profile or source format on this chip) must not poison the JSON with
+        // NaN statistics; report the failure and let the other probes run.
+        info["encode_failed"] = "no output samples"
+        return EncodeOutcome(ok: false, info: info, result: res, frames: frames)
+    }
     // drop warm-up samples/latencies from the statistics but keep them in the stream
     let lat = Array(res.latenciesMs.dropFirst(warmup))
-    info["frames_out"] = res.samples.count
     info["keyframes"] = res.keyframes
     info["dropped"] = res.dropped
     info["ltr_tokens"] = res.ltrTokens

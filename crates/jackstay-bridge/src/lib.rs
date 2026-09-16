@@ -26,6 +26,9 @@ pub mod egress;
 #[cfg(all(target_os = "macos", feature = "backend-macos"))]
 pub mod ingress;
 
+#[cfg(all(target_os = "macos", feature = "backend-macos"))]
+pub mod cpu_publication;
+
 /// Monotonic nanoseconds on this host, in the clock domain Jackstay's macOS
 /// producers stamp (`mach_absolute_time`, which is also CoreMedia's host clock).
 /// On other platforms a monotonic clock with an arbitrary epoch.

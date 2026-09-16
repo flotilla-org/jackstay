@@ -52,6 +52,24 @@ request on the control connection. Timestamps are remapped with the clock
 estimate; the clock domain value is left as the producer stamped it because the
 model has no remote-mapped domain yet.
 
+With `--cpu-socket PATH` the ingress also serves the republication over the
+transport core's generic CPU setup socket (`acquisition::socket::serve_cpu`),
+for consumers that have no native attach path, such as katzensteg's
+`jackstay-source`. After each frame's transfer into the staging surface the
+same surface is read back, one locked copy, into a CPU arena sized for the
+current frame; a size change reconfigures that arena and drops frames while
+the reconfiguration waits on capacity. On Apple silicon the staging surface is
+in unified memory, so the readback is a memcpy rather than a bus transfer. The
+socket is bound fresh and never replaces an existing path, is owner-only
+(mode 0600, the same rule katzensteg applies to its own endpoints), accepts
+any number of setup connections each served on its own thread, and is unlinked
+at shutdown. The native publication is unaffected: the CPU copy happens before
+the pool blit is queued and the two producers keep separate arenas and
+counters (`cpu_frames_published`, `cpu_frames_dropped`, `cpu_errors` in the
+report). Which kinds a republication offers is the coordinator's choice per
+request; the graph crate carries it as `IngressSpec::cpu_socket` and reports
+the bound path in `publication_up`.
+
 ## Driving the halves from a coordinator
 
 The halves print one JSON object per line on stdout as they progress
@@ -120,6 +138,11 @@ accepted. launchd relaunches an on-demand Mach service each time something
 looks it up, so an ingress whose link died was respawned repeatedly by a
 viewer's connection attempts; the job is removed on interrupt but the
 relaunch behaviour is worth a `LaunchOnlyOnce` or a viewer-side timeout later.
+
+The CPU publication was verified in loopback on kiwi (640x360, 600 frames):
+the ingress published every decoded frame to both arenas, two SDL viewers
+attached in turn on the CPU socket (`--cpu-socket`, 45 and 30 frames), the
+socket was created owner-only and was gone after the run.
 
 The gates (`cargo build`, `test`, `clippy -D warnings`, pinned `fmt`) pass
 with and without `backend-macos`. The `vt` round-trip test runs in the normal

@@ -87,6 +87,8 @@ mod macos {
         link_token: String,
         /// Bind the media and control paths and accept one peer each, instead of connecting.
         listen: bool,
+        /// Also publish the ingress over a generic CPU setup socket at this path.
+        cpu_socket: Option<std::path::PathBuf>,
     }
 
     fn parse() -> Result<Args, Error> {
@@ -106,6 +108,7 @@ mod macos {
             source_token: None,
             link_token: String::new(),
             listen: false,
+            cpu_socket: None,
         };
         let mut frames_given = false;
         let mut it = std::env::args().skip(1);
@@ -139,6 +142,7 @@ mod macos {
                 "--source-token" => args.source_token = Some(value()?),
                 "--link-token" => args.link_token = value()?,
                 "--listen" => args.listen = true,
+                "--cpu-socket" => args.cpu_socket = Some(value()?.into()),
                 other => return Err(format!("unknown argument {other}").into()),
             }
         }
@@ -376,6 +380,12 @@ mod macos {
                 r.decoder_hardware,
                 r.decoder_pool_shared
             );
+            if args.cpu_socket.is_some() {
+                println!(
+                    "ingress cpu: published {} dropped {} errors {}",
+                    r.cpu_frames_published, r.cpu_frames_dropped, r.cpu_errors
+                );
+            }
             if let Some(c) = r.clock {
                 println!(
                     "clock: offset {} ns drift {} ppb rtt-min {} us samples {}",
@@ -405,6 +415,7 @@ mod macos {
             let config = ingress::IngressConfig {
                 chroma_policy: args.chroma,
                 token: token.clone(),
+                cpu_socket: args.cpu_socket.clone(),
                 ..ingress::IngressConfig::default()
             };
             std::thread::Builder::new().name("loopback-ingress".into()).spawn(move || {
@@ -745,16 +756,20 @@ mod macos {
         let config = ingress::IngressConfig {
             chroma_policy: args.chroma,
             token: args.link_token.clone(),
+            cpu_socket: args.cpu_socket.clone(),
             ..ingress::IngressConfig::default()
         };
         let viewer_token = args.viewer_token.clone();
+        let cpu_socket = args.cpu_socket.as_ref().map(|p| p.to_string_lossy().into_owned());
         let announce = format!(
-            "ingress: publication is up; attach with --native --mach-service {service}{}",
-            viewer_token.as_ref().map_or(String::new(), |t| format!(" --token {t}"))
+            "ingress: publication is up; attach with --native --mach-service {service}{}{}",
+            viewer_token.as_ref().map_or(String::new(), |t| format!(" --token {t}")),
+            cpu_socket.as_ref().map_or(String::new(), |p| format!(", or --cpu-socket {p}"))
         );
         let up = jackstay_graph::export::HalfEvent::PublicationUp {
             service: service.clone(),
             token: viewer_token.clone(),
+            cpu_socket,
         };
         let report = ingress::run(
             ingress::Publish::Named {

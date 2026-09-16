@@ -37,6 +37,20 @@ failure. The library and viewer support synthetic operation on macOS/Linux; the
 SDL native presenter uses Metal and rejects `--native` on Linux. Linux native
 import/sync verification lives in the Vulkan reference consumer checks.
 
+## Generic CPU publication
+
+Connect directly to a same-user Jackstay CPU setup socket, such as a Katzensteg
+publication, without Porthole session selection:
+
+```sh
+./build/viewer/capture-viewer-sdl --cpu-socket /tmp/mi2-media.sock
+```
+
+This uses one held-frame reservation and supports configuration replacement when
+the source resizes. The source must have a free consumer reservation. The viewer
+is observation-only; keyboard and mouse input are not sent to the publisher.
+Do not combine `--cpu-socket` with `--native`, `--porthole-socket` or `--session-id`.
+
 ## Optional porthole integration
 
 These modes require a separately installed and authorized porthole. They are not

@@ -113,6 +113,10 @@ usage. Held keys and result queues are bounded too. Motion coalescing is not yet
 implemented; overflow terminates visibly instead of losing transitions.
 
 Each connection has a worker with bounded nonblocking I/O and heartbeat handling.
+After requesting graceful close, the client stops sending heartbeats and keeps
+receiving until it observes the final cleanup result or a transport failure.
+This lets it read the acknowledgement even if the peer has already closed its
+socket; a new write at that point could fail before the result is read.
 The initial implementation polls at 5 ms; readiness/wakeup optimization can follow
 without changing execution semantics. Missing peer traffic expires the controller
 independently of video progress. Application execution may still stall; expiry

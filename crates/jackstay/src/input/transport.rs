@@ -280,7 +280,7 @@ impl Client {
         let flag = stop.clone();
         let shared = state.clone();
         let worker = thread::Builder::new().name("jackstay-input-client".into()).spawn(move || {
-            let _ = drive_client(wire, shared.clone(), flag);
+            let _ = drive_client(wire, shared.clone(), flag, Instant::now());
             let mut s = shared.lock().unwrap();
             if s.alive {
                 s.status.push_back(Status::Closed {
@@ -350,13 +350,12 @@ impl Drop for Client {
         }
     }
 }
-fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<AtomicBool>) -> io::Result<()> {
+fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<AtomicBool>, mut heartbeat: Instant) -> io::Result<()> {
     let timeout = state.lock().unwrap().welcome.config.idle_timeout;
     let interval = (timeout / 4).min(Duration::from_secs(1));
-    let mut heartbeat = Instant::now();
     let mut last_seen = Instant::now();
     while !stop.load(Ordering::Acquire) {
-        {
+        let closing = {
             let mut s = state.lock().unwrap();
             // Keep the stream buffer bounded independently of the application queue.
             if wire.queued < MAX_FRAME {
@@ -373,8 +372,12 @@ fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<Atom
                     }
                 }
             }
-        }
-        if heartbeat.elapsed() >= interval {
+            s.closing
+        };
+        // Once Close is queued, stop originating heartbeats. The peer may
+        // already have sent its final acknowledgement and closed; writing first
+        // would turn that clean close into BrokenPipe before we read the reply.
+        if !closing && heartbeat.elapsed() >= interval {
             wire.send(Wire::Heartbeat)?;
             heartbeat = Instant::now();
         }
@@ -412,4 +415,47 @@ fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<Atom
         thread::sleep(STEP);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_ack_is_read_when_heartbeat_is_due_and_peer_has_closed() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut peer = Framed::new(a).unwrap();
+        let wire = Framed::new(b).unwrap();
+        let closed = Status::Closed {
+            reason: Reason::Disconnect,
+            clean: true,
+        };
+        peer.send(Wire::Reply(closed.clone())).unwrap();
+        peer.flush().unwrap();
+        drop(peer);
+
+        // Resume the real worker after Close was flushed. The peer's final
+        // acknowledgement is readable, but any further write gets BrokenPipe.
+        let state = Arc::new(Mutex::new(ClientState {
+            welcome: Welcome {
+                version: 1,
+                mode: Mode::Cooperative,
+                controller: 1,
+                epoch: 1,
+                config: Config::default(),
+            },
+            sequence: 0,
+            queue: VecDeque::new(),
+            bytes: 0,
+            status: VecDeque::new(),
+            alive: true,
+            closing: true,
+            resetting: false,
+        }));
+        let heartbeat = Instant::now() - Duration::from_secs(2);
+        drive_client(wire, state.clone(), Arc::new(AtomicBool::new(false)), heartbeat).unwrap();
+        let state = state.lock().unwrap();
+        assert!(!state.alive);
+        assert_eq!(state.status.iter().cloned().collect::<Vec<_>>(), vec![closed]);
+    }
 }

@@ -1,4 +1,6 @@
 pub mod acquisition;
+#[cfg(unix)]
+pub mod bootstrap;
 pub mod control_page;
 #[cfg(unix)]
 pub mod daemon;
@@ -86,6 +88,8 @@ pub mod fdpass;
 pub mod ffi;
 #[cfg(unix)]
 pub mod ffi_acquisition;
+#[cfg(unix)]
+pub mod ffi_bootstrap;
 #[cfg(unix)]
 pub mod ffi_input;
 #[cfg(any(

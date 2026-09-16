@@ -1,7 +1,7 @@
 /* Interactive synthetic CPU source. Uses the same pixels as the reference
  * viewer and the public input/media interfaces; no Porthole daemon required. */
 #define _POSIX_C_SOURCE 200809L
-#include "jackstay_input.h"
+#include "jackstay_bootstrap.h"
 #include "synthetic.h"
 #include <assert.h>
 #include <errno.h>
@@ -27,10 +27,15 @@ static int listener(const char *path) {
 }
 static void checked(ft_status status) { if (status != FT_STATUS_OK) { fprintf(stderr, "reference source status=%d\n", status); exit(1); } }
 int main(int argc, char **argv) {
-  if ((argc != 3 && !(argc == 4 && !strcmp(argv[3], "--report-state"))) || ft_abi_version() != FT_ABI_VERSION) { fprintf(stderr, "usage: capture-input-source MEDIA_SOCKET INPUT_SOCKET [--report-state]\n"); return 1; }
+  if (argc < 2 || ft_abi_version() != FT_ABI_VERSION) { fprintf(stderr, "usage: capture-input-source SOURCE_SOCKET [--report-state] [--observe-only]\n"); return 1; }
+  int report_state = 0, observe_only = 0;
+  for (int i = 2; i < argc; i++) {
+    if (!strcmp(argv[i], "--report-state")) report_state = 1;
+    else if (!strcmp(argv[i], "--observe-only")) observe_only = 1;
+    else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 1; }
+  }
   umask(0077);
-  int media_listener = listener(argv[1]); if (media_listener < 0) { perror("media listener"); return 1; }
-  int input_listener = listener(argv[2]); if (input_listener < 0) { perror("input listener"); close(media_listener); unlink(argv[1]); return 1; }
+  int media_listener = listener(argv[1]); if (media_listener < 0) { perror("source listener"); return 1; }
   ft_cpu_producer *producer = NULL; ft_cpu_setup_server *media_server = NULL;
   ft_cpu_producer_config media_config = {6, 2, 1, 2, STRIDE * HEIGHT, 8 * 1024 * 1024, 5000000000ULL};
   checked(ft_cpu_producer_create(&media_config, &producer));
@@ -38,10 +43,11 @@ int main(int argc, char **argv) {
   ft_input_config config; ft_input_config_default(&config); config.independent_contributions = 1; config.interaction_cancel = 1; checked(ft_input_target_create(&config, &target));
   printf("ready\n"); fflush(stdout);
   int32_t media_fd = accept(media_listener, NULL, NULL); if (media_fd < 0) return 1;
+  /* This example authorizes its private same-user endpoint for the selected
+   * synthetic source. Passing NULL intentionally withholds input authority. */
+  checked(ft_source_bootstrap_accept(&media_fd, observe_only ? NULL : target, &input_server));
   checked(ft_cpu_producer_serve(producer, &media_fd, &media_server));
-  int32_t input_fd = accept(input_listener, NULL, NULL); if (input_fd < 0) return 1;
-  checked(ft_input_target_serve(target, &input_fd, &input_server));
-  close(media_listener); close(input_listener); unlink(argv[1]); unlink(argv[2]);
+  close(media_listener); unlink(argv[1]);
   uint8_t *pixels = malloc(STRIDE * HEIGHT); if (!pixels) return 1;
   uint64_t held[256] = {0}; unsigned held_count = 0, buttons = 0, downs = 0, repeats = 0, releases = 0, cleanup = 0;
   size_t text_bytes = 0; double pointer_x = 0, pointer_y = 0; int finished = 0;
@@ -76,11 +82,12 @@ int main(int argc, char **argv) {
         default: outcome = FT_INPUT_UNSUPPORTED;
       }
       checked(ft_input_work_complete(&work, outcome));
-      if (argc == 4) {
+      if (report_state) {
         printf("state downs=%u repeats=%u releases=%u text_bytes=%zu held=%u buttons=%u\n", downs, repeats, releases, text_bytes, held_count, buttons);
         fflush(stdout);
       }
     }
+    if (!input_server && ft_cpu_setup_server_poll(media_server) != FT_STATUS_DRAINING) finished = 1;
     fill_frame(pixels, sequence);
     /* Held keys tint the top strip; committed text fills a bottom progress bar;
      * the pointer is a white square, red while a button is held. */
@@ -100,8 +107,8 @@ int main(int argc, char **argv) {
   }
   /* Wait for the worker to flush the actual completion response and finish. */
   unsigned waits = 0;
-  while (ft_input_server_poll(input_server) == FT_STATUS_EMPTY && waits++ < 3000) pause_ms(1);
-  if (ft_input_server_poll(input_server) != FT_STATUS_OK) { fprintf(stderr, "input reply drain timeout\n"); return 1; }
+  while (input_server && ft_input_server_poll(input_server) == FT_STATUS_EMPTY && waits++ < 3000) pause_ms(1);
+  if (input_server && ft_input_server_poll(input_server) != FT_STATUS_OK) { fprintf(stderr, "input reply drain timeout\n"); return 1; }
   ft_input_server_destroy(&input_server); checked(ft_input_target_destroy(&target));
   ft_status setup = ft_cpu_setup_server_destroy(&media_server);
   if (setup != FT_STATUS_OK && setup != FT_STATUS_CANCELLED) checked(setup);

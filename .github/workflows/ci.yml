@@ -56,6 +56,7 @@ jobs:
       - run: cc -std=c11 -fsyntax-only crates/jackstay/include/capture_transfer.h
       - run: cc -std=c11 -fsyntax-only crates/jackstay/include/jackstay_ring.h
       - run: cc -std=c11 -fsyntax-only crates/jackstay/include/jackstay_input.h
+      - run: cc -std=c11 -fsyntax-only crates/jackstay/include/jackstay_bootstrap.h
       - run: cc -std=c11 -I crates/jackstay/include -fsyntax-only crates/jackstay/src/native/c_abi_header_smoke.c
       - uses: mlugg/setup-zig@v2
         with:
@@ -63,3 +64,4 @@ jobs:
       - run: zig translate-c -lc crates/jackstay/include/capture_transfer.h > /dev/null
       - run: zig translate-c -lc crates/jackstay/include/jackstay_ring.h > /dev/null
       - run: zig translate-c -lc crates/jackstay/include/jackstay_input.h > /dev/null
+      - run: zig translate-c -lc crates/jackstay/include/jackstay_bootstrap.h > /dev/null

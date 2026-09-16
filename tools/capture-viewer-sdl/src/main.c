@@ -20,6 +20,7 @@
 #include "capture_transfer.h"
 #include "metal_present.h"
 #include "viewer_input.h"
+#include "jackstay_bootstrap.h"
 
 #include "synthetic.h"
 
@@ -50,6 +51,9 @@ typedef struct viewer_options {
   uint32_t hold_ms;
   int invalid;
   const char *cpu_socket;
+  const char *source_socket;
+  uint32_t bootstrap_input;
+  int input_policy_set;
   const char *input_socket;
   int input_self_test;
   const char *porthole_socket;
@@ -61,10 +65,17 @@ typedef struct viewer_options {
 } viewer_options;
 
 static viewer_options parse_options(int argc, char **argv) {
-  viewer_options options = {0};
+  viewer_options options = {.bootstrap_input = FT_BOOTSTRAP_INPUT_OPTIONAL};
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--input-self-test") == 0) {
       options.input_self_test = 1;
+    } else if (strcmp(argv[i], "--source-socket") == 0) {
+      if (++i >= argc || !argv[i][0]) { options.invalid = 1; return options; }
+      options.source_socket = argv[i];
+    } else if (strcmp(argv[i], "--observe") == 0) {
+      options.bootstrap_input = FT_BOOTSTRAP_INPUT_NONE; options.input_policy_set = 1;
+    } else if (strcmp(argv[i], "--require-input") == 0) {
+      options.bootstrap_input = FT_BOOTSTRAP_INPUT_REQUIRED; options.input_policy_set = 1;
     } else if (strcmp(argv[i], "--input-socket") == 0) {
       if (++i >= argc || !argv[i][0]) { options.invalid = 1; return options; }
       options.input_socket = argv[i];
@@ -122,9 +133,15 @@ static viewer_options parse_options(int argc, char **argv) {
     fprintf(stderr, "--cpu-socket cannot be combined with native or Porthole session selection\n");
     options.invalid = 1;
   }
-  if ((options.input_socket && (options.native || !options.cpu_socket)) || (options.input_self_test && !options.input_socket)) {
+  if ((options.source_socket && (options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
+      (options.input_policy_set && !options.source_socket)) {
+    fprintf(stderr, "bootstrap input policy requires --source-socket, which selects one source\n"); options.invalid = 1;
+  }
+  if ((options.input_socket && (options.native || !options.cpu_socket)) ||
+      (options.input_self_test && !options.input_socket && (!options.source_socket || options.bootstrap_input == FT_BOOTSTRAP_INPUT_NONE))) {
     fprintf(stderr, "input requires a generic CPU socket source; self-test requires input\n"); options.invalid = 1;
   }
+  if (options.input_self_test && options.source_socket) options.bootstrap_input = FT_BOOTSTRAP_INPUT_REQUIRED;
   return options;
 }
 
@@ -310,7 +327,7 @@ static int run_native(const viewer_options *options) {
 /* Generic CPU setup belongs to the connecting process. Selection and desktop
  * authorization, when needed, remain with the host that supplies this path. */
 static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **connection,
-                              ft_acquisition_consumer **consumer) {
+                              ft_acquisition_consumer **consumer, const viewer_options *options, viewer_input *input) {
   struct sockaddr_un address = {0};
   address.sun_family = AF_UNIX;
   if (strlen(path) >= sizeof(address.sun_path)) {
@@ -343,6 +360,17 @@ static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **
   uid_t uid = credentials.uid;
 #endif
   if (uid != geteuid()) { fprintf(stderr, "CPU socket peer is not the current user\n"); goto cleanup; }
+  if (options->source_socket) {
+    ft_status input_status;
+    uint32_t mode = options->bootstrap_input == FT_BOOTSTRAP_INPUT_NONE ? 0 : FT_INPUT_MODE_COOPERATIVE;
+    if (require_ok(ft_source_bootstrap_connect(&fd, options->bootstrap_input, mode, &input->client, &input_status), "ft_source_bootstrap_connect")) goto cleanup;
+    if (input->client) {
+      uint64_t controller, epoch;
+      if (require_ok(ft_input_client_describe(input->client, &input->config, &controller, &epoch), "ft_input_client_describe")) goto cleanup;
+    } else if (input_status != FT_STATUS_EMPTY) {
+      fprintf(stderr, "source input unavailable: %d; continuing observation\n", input_status);
+    }
+  }
   if (require_ok(ft_acquisition_cpu_connection_create(&fd, connection), "ft_acquisition_cpu_connection_create") ||
       require_ok(ft_acquisition_cpu_attach(*connection, 1, consumer), "ft_acquisition_cpu_attach")) goto cleanup;
   failed = 0;
@@ -370,8 +398,8 @@ static int run_cpu(const viewer_options *options) {
   SDL_Window *window = NULL;
   SDL_Renderer *renderer = NULL;
   SDL_Texture *texture = NULL;
-  if (options->cpu_socket != NULL) {
-    if (connect_cpu_socket(options->cpu_socket, &connection, &consumer)) goto cleanup;
+  if (options->cpu_socket != NULL || options->source_socket != NULL) {
+    if (connect_cpu_socket(options->source_socket ? options->source_socket : options->cpu_socket, &connection, &consumer, options, &input)) goto cleanup;
   } else if (options->porthole_socket != NULL) {
     if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
                       options->token != NULL ? options->token : getenv("PORTHOLE_AGENT_TOKEN"), 2,
@@ -397,6 +425,7 @@ static int run_cpu(const viewer_options *options) {
   }
   if (renderer == NULL) { fprintf(stderr, "SDL setup: %s\n", SDL_GetError()); goto cleanup; }
   if (options->input_socket && viewer_input_open(&input, options->input_socket) != 0) { fprintf(stderr, "input connection failed\n"); goto cleanup; }
+  if (input.client) SDL_StartTextInput();
   int input_test_sent = 0;
   failed = 0;
   while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {

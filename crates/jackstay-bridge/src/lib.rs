@@ -13,6 +13,8 @@
 //! later without change.
 
 pub mod clock;
+/// The framing carries the arena's frame descriptor, and the arena is Unix-only.
+#[cfg(unix)]
 pub mod wire;
 
 #[cfg(all(target_os = "macos", feature = "backend-macos"))]

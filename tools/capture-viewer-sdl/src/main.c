@@ -23,6 +23,28 @@
 
 #include "synthetic.h"
 
+// Sizes the window to the frame's dimensions, scaled down uniformly if the
+// frame is larger than most of the display, so the presented aspect is the
+// frame's. Points, not pixels: SDL windows are sized in points.
+static void fit_window_to_frame(SDL_Window *window, uint32_t frame_width, uint32_t frame_height) {
+  if (window == NULL || frame_width == 0 || frame_height == 0) return;
+  double width = (double)frame_width, height = (double)frame_height;
+  SDL_DisplayMode mode;
+  int display = SDL_GetWindowDisplayIndex(window);
+  if (display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 && mode.w > 0 && mode.h > 0) {
+    double max_width = mode.w * 0.85, max_height = mode.h * 0.85;
+    double scale = 1.0;
+    if (width > max_width) scale = max_width / width;
+    if (height * scale > max_height) scale = max_height / height;
+    width *= scale;
+    height *= scale;
+  }
+  if (width < 64) width = 64;
+  if (height < 64) height = 64;
+  SDL_SetWindowSize(window, (int)width, (int)height);
+}
+
+
 typedef struct viewer_options {
   int max_frames;
   uint32_t hold_ms;
@@ -168,6 +190,7 @@ static int run_native(const viewer_options *options) {
   failed = 0;
   uint64_t submitted = 0;
   uint64_t last_cursor = 0;
+  uint32_t shown_width = 0, shown_height = 0;
   uint64_t requested_configuration_epoch = 0;
   int requested_configuration = 0;
   int running = 1;
@@ -196,8 +219,19 @@ static int run_native(const viewer_options *options) {
         break;
       }
       ft_acquired_frame_descriptor descriptor = {0};
-      if (require_ok(ft_acquired_frame_describe(frame, &descriptor), "ft_acquired_frame_describe") ||
-          mp_present(presenter, &frame) != 0) {
+      if (require_ok(ft_acquired_frame_describe(frame, &descriptor), "ft_acquired_frame_describe")) {
+        if (frame != NULL) ft_acquired_frame_release(&frame);
+        failed = 1;
+        break;
+      }
+      if (descriptor.width != shown_width || descriptor.height != shown_height) {
+        // Follow the frame's aspect: the window starts at the synthetic size and
+        // a captured portrait window would otherwise be squashed into it.
+        fit_window_to_frame(window, descriptor.width, descriptor.height);
+        shown_width = descriptor.width;
+        shown_height = descriptor.height;
+      }
+      if (mp_present(presenter, &frame) != 0) {
         // Presentation failures leave the frame owned here and submit no GPU
         // work. Successful submission transfers it to the completion owner.
         if (frame != NULL) ft_acquired_frame_release(&frame);

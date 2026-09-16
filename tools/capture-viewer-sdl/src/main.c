@@ -1,11 +1,21 @@
+#ifdef __linux__
+#define _GNU_SOURCE
+#endif
 #include <SDL.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 
 #include "capture_transfer.h"
 #include "metal_present.h"
@@ -16,6 +26,7 @@ typedef struct viewer_options {
   int max_frames;
   uint32_t hold_ms;
   int invalid;
+  const char *cpu_socket;
   const char *porthole_socket;
   const char *session_id;
   int native;
@@ -56,6 +67,13 @@ static viewer_options parse_options(int argc, char **argv) {
         return options;
       }
       options.hold_ms = (uint32_t)value;
+    } else if (strcmp(argv[i], "--cpu-socket") == 0) {
+      if (++i >= argc || argv[i][0] == '\0') {
+        fprintf(stderr, "--cpu-socket requires a Unix socket path\n");
+        options.invalid = 1;
+        return options;
+      }
+      options.cpu_socket = argv[i];
     } else if (i + 1 >= argc) {
       continue;
     } else if (strcmp(argv[i], "--frames") == 0) {
@@ -81,6 +99,10 @@ static viewer_options parse_options(int argc, char **argv) {
       options.token = argv[i + 1];
       i++;
     }
+  }
+  if (options.cpu_socket != NULL && (options.native || options.porthole_socket != NULL || options.session_id != NULL)) {
+    fprintf(stderr, "--cpu-socket cannot be combined with native or Porthole session selection\n");
+    options.invalid = 1;
   }
   return options;
 }
@@ -251,6 +273,50 @@ static int run_native(const viewer_options *options) {
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
+/* Generic CPU setup belongs to the connecting process. Selection and desktop
+ * authorization, when needed, remain with the host that supplies this path. */
+static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **connection,
+                              ft_acquisition_consumer **consumer) {
+  struct sockaddr_un address = {0};
+  address.sun_family = AF_UNIX;
+  if (strlen(path) >= sizeof(address.sun_path)) {
+    fprintf(stderr, "CPU socket path is too long\n");
+    return 1;
+  }
+  strcpy(address.sun_path, path);
+#ifdef __APPLE__
+  address.sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1);
+#endif
+  int32_t fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) { perror("CPU socket"); return 1; }
+  int failed = 1;
+  if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) { perror("CPU socket close-on-exec"); goto cleanup; }
+  if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+    perror("CPU socket connect");
+    goto cleanup;
+  }
+#ifdef __APPLE__
+  uid_t uid;
+  gid_t gid;
+  if (getpeereid(fd, &uid, &gid) != 0) { perror("CPU peer identity"); goto cleanup; }
+#else
+  struct ucred credentials;
+  socklen_t size = sizeof(credentials);
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) != 0 || size != sizeof(credentials)) {
+    fprintf(stderr, "CPU peer identity unavailable\n");
+    goto cleanup;
+  }
+  uid_t uid = credentials.uid;
+#endif
+  if (uid != geteuid()) { fprintf(stderr, "CPU socket peer is not the current user\n"); goto cleanup; }
+  if (require_ok(ft_acquisition_cpu_connection_create(&fd, connection), "ft_acquisition_cpu_connection_create") ||
+      require_ok(ft_acquisition_cpu_attach(*connection, 1, consumer), "ft_acquisition_cpu_attach")) goto cleanup;
+  failed = 0;
+cleanup:
+  if (fd >= 0) close(fd);
+  return failed;
+}
+
 static int run_cpu(const viewer_options *options) {
   ft_synthetic_session synthetic = {0};
   const char *session_id = options->session_id;
@@ -269,7 +335,9 @@ static int run_cpu(const viewer_options *options) {
   SDL_Window *window = NULL;
   SDL_Renderer *renderer = NULL;
   SDL_Texture *texture = NULL;
-  if (options->porthole_socket != NULL) {
+  if (options->cpu_socket != NULL) {
+    if (connect_cpu_socket(options->cpu_socket, &connection, &consumer)) goto cleanup;
+  } else if (options->porthole_socket != NULL) {
     if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
                       options->token != NULL ? options->token : getenv("PORTHOLE_AGENT_TOKEN"), 2,
                       &connection, &consumer, &track), "ft_acquisition_cpu_connect_session")) goto cleanup;

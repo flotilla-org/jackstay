@@ -1,0 +1,205 @@
+vt-probe on ["cpu": "Apple M4", "macos": "26.5.1", "host": "comte.local"]
+== caps
+  hw encoder apcn com.apple.videotoolbox.videoencoder.appleproreshw.422
+  hw encoder apch com.apple.videotoolbox.videoencoder.appleproreshw.422hq
+  hw encoder apcs com.apple.videotoolbox.videoencoder.appleproreshw.422lt
+  hw encoder apco com.apple.videotoolbox.videoencoder.appleproreshw.422proxy
+  hw encoder ap4h com.apple.videotoolbox.videoencoder.appleproreshw.4444
+  hw encoder ap4x com.apple.videotoolbox.videoencoder.appleproreshw.4444xq
+  hw encoder deph com.apple.videotoolbox.videoencoder.depth-hevc:com.apple.videotoolbox.videoencoder.ave.hevc
+  hw encoder dish com.apple.videotoolbox.videoencoder.disparity-hevc:com.apple.videotoolbox.videoencoder.ave.hevc
+  hw encoder avc1 com.apple.videotoolbox.videoencoder.ave.avc
+  hw encoder hvc1 com.apple.videotoolbox.videoencoder.ave.hevc
+  hw encoder jpeg com.apple.videotoolbox.videoencoder.jpeg.ajpeg
+  hw encoder muxa com.apple.videotoolbox.videoencoder.hevc-with-alpha:com.apple.videotoolbox.videoencoder.ave.hevc
+  hevc: has_444=true ltr_key=false profiles=["HEVC_Main_AutoLevel", "HEVC_Main10_AutoLevel", "HEVC_Main444_AutoLevel", "HEVC_Main44410_AutoLevel", "HEVC_Main42210_AutoLevel", "HEVC_Monochrome_AutoLevel", "HEVC_Monochrome10_AutoLevel", "HEVC_MainStill_AutoLevel"]
+  h264: has_444=true ltr_key=false profiles=["H264_Baseline_1_3", "H264_Baseline_3_0", "H264_Baseline_3_1", "H264_Baseline_3_2", "H264_Baseline_4_0", "H264_Baseline_4_1", "H264_Baseline_4_2", "H264_Baseline_5_0", "H264_Baseline_5_1", "H264_Baseline_5_2", "H264_Main_3_0", "H264_Main_3_1", "H264_Main_3_2", "H264_Main_4_0", "H264_Main_4_1", "H264_Main_4_2", "H264_Main_5_0", "H264_Main_5_1", "H264_Main_5_2", "H264_High_3_0", "H264_High_3_1", "H264_High_3_2", "H264_High_4_0", "H264_High_4_1", "H264_High_4_2", "H264_High_5_0", "H264_High_5_1", "H264_High_5_2", "H264_Baseline_AutoLevel", "H264_ConstrainedBaseline_AutoLevel", "H264_Main_AutoLevel", "H264_High_AutoLevel", "H264_ConstrainedHigh_AutoLevel", "H264_High422_AutoLevel", "H264_High444Predictive_AutoLevel"]
+  hw decode: ["hevc": true, "av1": true, "h264": true]
+== roundtrip hevc/HEVC_Main444_AutoLevel/BGRA/1920x1080
+  dest_format = 444v
+  encoder_id = com.apple.videotoolbox.videoencoder.ave.hevc
+  using_hw_encoder = 1
+  set_profile_status = 0
+  sps_general_profile_idc = 4
+  fmt_FullRangeVideo = 0
+  fmt_CVImageBufferYCbCrMatrix = ITU_R_709_2
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 12939
+  warmup_first_frame_ms = 25.37
+  encode_ms_p50 = 6.19
+  encode_ms_p90 = 6.47
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 1
+  decode_output_format = 444v
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 3.07
+  decode_ms_p90 = 3.39
+  rgb_roundtrip = ["pixels_err_gt8_pct": 0.14771412037037038, "max_abs_bgr": [28, 16, 28], "mean_abs_bgr": [0.3531809413580247, 0.34273823302469136, 0.30049720293209875]]
+== roundtrip hevc/HEVC_Main444_AutoLevel/BGRA/1920x1080
+  dest_format = 444f
+  encoder_id = com.apple.videotoolbox.videoencoder.ave.hevc
+  using_hw_encoder = 1
+  set_profile_status = 0
+  sps_general_profile_idc = 4
+  fmt_FullRangeVideo = 0
+  fmt_CVImageBufferYCbCrMatrix = ITU_R_709_2
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 12939
+  warmup_first_frame_ms = 22.33
+  encode_ms_p50 = 6.15
+  encode_ms_p90 = 6.73
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 0
+  decode_output_format = 444f
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 14.77
+  decode_ms_p90 = 18.39
+  rgb_roundtrip = ["max_abs_bgr": [28, 16, 28], "mean_abs_bgr": [0.3543653549382716, 0.2685570987654321, 0.3063112461419753], "pixels_err_gt8_pct": 0.1572145061728395]
+== roundtrip hevc/HEVC_Main444_AutoLevel/444f/1920x1080
+  dest_format = 444f
+  encoder_id = com.apple.videotoolbox.videoencoder.ave.hevc
+  using_hw_encoder = 1
+  set_profile_status = 0
+  sps_general_profile_idc = 4
+  fmt_FullRangeVideo = 1
+  fmt_CVImageBufferYCbCrMatrix = ITU_R_709_2
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 12981
+  warmup_first_frame_ms = 20.71
+  encode_ms_p50 = 4.46
+  encode_ms_p90 = 4.71
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 1
+  decode_output_format = 444f
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 3.06
+  decode_ms_p90 = 4.24
+  rgb_roundtrip = ["max_abs_bgr": [28, 13, 23], "pixels_err_gt8_pct": 0.09119405864197531, "mean_abs_bgr": [0.40361448688271606, 0.18418113425925925, 0.32070264274691357]]
+== roundtrip hevc/HEVC_Main444_AutoLevel/BGRA/1920x1080
+  dest_format = 444v
+  encoder_id = com.apple.videotoolbox.videoencoder.ave.hevc
+  using_hw_encoder = 1
+  set_profile_status = 0
+  sps_general_profile_idc = 4
+  fmt_FullRangeVideo = 0
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 12939
+  warmup_first_frame_ms = 25.09
+  encode_ms_p50 = 6.16
+  encode_ms_p90 = 6.4
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 1
+  decode_output_format = 444v
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 3.42
+  decode_ms_p90 = 4.77
+  rgb_roundtrip = ["mean_abs_bgr": [0.3531809413580247, 0.34273823302469136, 0.30049720293209875], "max_abs_bgr": [28, 16, 28], "pixels_err_gt8_pct": 0.14771412037037038]
+== roundtrip hevc/HEVC_Main_AutoLevel/BGRA/1920x1080
+  dest_format = 420v
+  encoder_id = com.apple.videotoolbox.videoencoder.ave.hevc
+  using_hw_encoder = 1
+  set_profile_status = 0
+  sps_general_profile_idc = 1
+  fmt_FullRangeVideo = 0
+  fmt_CVImageBufferYCbCrMatrix = ITU_R_709_2
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 22957
+  warmup_first_frame_ms = 23.08
+  encode_ms_p50 = 6.09
+  encode_ms_p90 = 6.35
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 1
+  decode_output_format = 420v
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 1.48
+  decode_ms_p90 = 2.63
+  rgb_roundtrip = ["max_abs_bgr": [156, 53, 150], "mean_abs_bgr": [1.8119907407407407, 0.8589356674382717, 2.0711482445987652], "pixels_err_gt8_pct": 8.029996141975309]
+== roundtrip h264/H264_High444Predictive_AutoLevel/BGRA/1920x1080
+  dest_format = 444v
+  encoder_id = com.apple.videotoolbox.videoencoder.ave.avc
+  using_hw_encoder = 1
+  set_profile_status = 0
+  sps_profile_idc = 244
+  sps_chroma_format_idc = 3
+  fmt_FullRangeVideo = 0
+  fmt_CVImageBufferYCbCrMatrix = ITU_R_709_2
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 8003
+  warmup_first_frame_ms = 22.78
+  encode_ms_p50 = 7.6
+  encode_ms_p90 = 7.82
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 1
+  decode_output_format = 444v
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 2.77
+  decode_ms_p90 = 4.08
+  rgb_roundtrip = ["mean_abs_bgr": [0.4063483796296296, 0.36724440586419754, 0.3163749035493827], "max_abs_bgr": [36, 33, 35], "pixels_err_gt8_pct": 0.806664737654321]
+== roundtrip hevc-lowlatency/HEVC_Main444_AutoLevel/444f/1920x1080
+  dest_format = 444f
+  encoder_id = com.apple.videotoolbox.videoencoder.hevc.rtvc
+  using_hw_encoder = -1
+  set_profile_status = 0
+  sps_general_profile_idc = 4
+  fmt_FullRangeVideo = 1
+  fmt_CVImageBufferYCbCrMatrix = ITU_R_709_2
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 7682
+  warmup_first_frame_ms = 31.92
+  encode_ms_p50 = 7.74
+  encode_ms_p90 = 8.1
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 1
+  decode_output_format = 444f
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 2.37
+  decode_ms_p90 = 3.64
+  rgb_roundtrip = ["max_abs_bgr": [24, 11, 24], "mean_abs_bgr": [0.35476900077160495, 0.16653645833333333, 0.25014033564814814], "pixels_err_gt8_pct": 0.3203125]
+== roundtrip hevc/HEVC_Main444_AutoLevel/BGRA/2560x1440
+  dest_format = 444v
+  encoder_id = com.apple.videotoolbox.videoencoder.ave.hevc
+  using_hw_encoder = 1
+  set_profile_status = 0
+  sps_general_profile_idc = 4
+  fmt_FullRangeVideo = 0
+  fmt_CVImageBufferYCbCrMatrix = ITU_R_709_2
+  frames_out = 63
+  keyframes = 1
+  dropped = 0
+  kbit_per_s_at_60fps = 12008
+  warmup_first_frame_ms = 26.38
+  encode_ms_p50 = 9.32
+  encode_ms_p90 = 9.85
+  using_hw_decoder = 1
+  decoder_pool_is_shared = 1
+  decode_output_format = 444v
+  decoded_frames = 63
+  decode_errors = 0
+  decode_ms_p50 = 5.88
+  decode_ms_p90 = 7.54
+  rgb_roundtrip = ["mean_abs_bgr": [0.4204047309027778, 0.3864824761284722, 0.3642399088541667], "max_abs_bgr": [53, 35, 56], "pixels_err_gt8_pct": 1.0313585069444444]
+== ltr
+  hevc-lowlatency/HEVC_Main444_AutoLevel/444f/1920x1080: create=0 enable_ltr=0 tokens=1 dropped=0 sps_profile=4 enc_p50=7.89
+  hevc-lowlatency/HEVC_Main_AutoLevel/420f/1920x1080: create=0 enable_ltr=0 tokens=1 dropped=0 sps_profile=1 enc_p50=7.84
+  h264-lowlatency/H264_High_AutoLevel/420f/1920x1080: create=0 enable_ltr=0 tokens=3 dropped=0 sps_profile=100 enc_p50=7.4

@@ -1,0 +1,670 @@
+{
+  "date" : "2026-09-16T11:29:58Z",
+  "machine" : {
+    "cpu" : "Apple M4",
+    "host" : "comte.local",
+    "macos" : "26.5.1"
+  },
+  "results" : [
+    {
+      "encoders" : [
+        {
+          "codec" : "\u0000\u0000\u0000\u0018",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.24rgb",
+          "name" : "Apple 24-bit RGB"
+        },
+        {
+          "codec" : "\u0000\u0000\u0000 ",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.32argb",
+          "name" : "Apple 32-bit ARGB"
+        },
+        {
+          "codec" : "apcn",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.prores-422",
+          "name" : "Apple ProRes 422"
+        },
+        {
+          "codec" : "apch",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.prores-422hq",
+          "name" : "Apple ProRes 422 HQ"
+        },
+        {
+          "codec" : "apcs",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.prores-422lt",
+          "name" : "Apple ProRes 422 LT"
+        },
+        {
+          "codec" : "apco",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.prores-422proxy",
+          "name" : "Apple ProRes 422 Proxy"
+        },
+        {
+          "codec" : "ap4h",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.prores-4444",
+          "name" : "Apple ProRes 4444"
+        },
+        {
+          "codec" : "ap4x",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.prores-4444xq",
+          "name" : "Apple ProRes 4444 XQ"
+        },
+        {
+          "codec" : "apcn",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.appleproreshw.422",
+          "name" : "AppleProResHW 422"
+        },
+        {
+          "codec" : "apch",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.appleproreshw.422hq",
+          "name" : "AppleProResHW 422 HQ"
+        },
+        {
+          "codec" : "apcs",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.appleproreshw.422lt",
+          "name" : "AppleProResHW 422 LT"
+        },
+        {
+          "codec" : "apco",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.appleproreshw.422proxy",
+          "name" : "AppleProResHW 422 Proxy"
+        },
+        {
+          "codec" : "ap4h",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.appleproreshw.4444",
+          "name" : "AppleProResHW 4444"
+        },
+        {
+          "codec" : "ap4x",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.appleproreshw.4444xq",
+          "name" : "AppleProResHW 4444 XQ"
+        },
+        {
+          "codec" : "deph",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.depth-hevc:com.apple.videotoolbox.videoencoder.ave.hevc",
+          "name" : "Apple Depth (HEVC)-Apple HEVC (HW)"
+        },
+        {
+          "codec" : "deph",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.depth-hevc:com.apple.videotoolbox.videoencoder.hevc.vcp",
+          "name" : "Apple Depth (HEVC)-Apple HEVC (SW)"
+        },
+        {
+          "codec" : "dish",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.disparity-hevc:com.apple.videotoolbox.videoencoder.ave.hevc",
+          "name" : "Apple Disparity (HEVC)-Apple HEVC (HW)"
+        },
+        {
+          "codec" : "dish",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.disparity-hevc:com.apple.videotoolbox.videoencoder.hevc.vcp",
+          "name" : "Apple Disparity (HEVC)-Apple HEVC (SW)"
+        },
+        {
+          "codec" : "h263",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.h263",
+          "name" : "Apple H.263 (SW)"
+        },
+        {
+          "codec" : "avc1",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.ave.avc",
+          "name" : "Apple H.264 (HW)"
+        },
+        {
+          "codec" : "avc1",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.h264",
+          "name" : "Apple H.264 (SW)"
+        },
+        {
+          "codec" : "hvc1",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+          "name" : "Apple HEVC (HW)"
+        },
+        {
+          "codec" : "hvc1",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.hevc.vcp",
+          "name" : "Apple HEVC (SW)"
+        },
+        {
+          "codec" : "jpeg",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.jpeg",
+          "name" : "Apple JPEG"
+        },
+        {
+          "codec" : "jpeg",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.jpeg.ajpeg",
+          "name" : "JPEG (HW)"
+        },
+        {
+          "codec" : "muxa",
+          "hw" : true,
+          "id" : "com.apple.videotoolbox.videoencoder.hevc-with-alpha:com.apple.videotoolbox.videoencoder.ave.hevc",
+          "name" : "Apple Muxed Alpha-Apple HEVC (HW)"
+        },
+        {
+          "codec" : "muxa",
+          "hw" : false,
+          "id" : "com.apple.videotoolbox.videoencoder.hevc-with-alpha:com.apple.videotoolbox.videoencoder.hevc.vcp",
+          "name" : "Apple Muxed Alpha-Apple HEVC (SW)"
+        }
+      ],
+      "hw_decode" : {
+        "av1" : true,
+        "h264" : true,
+        "hevc" : true
+      },
+      "hw_encoder_h264" : {
+        "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.avc",
+        "has_444" : true,
+        "profiles" : [
+          "H264_Baseline_1_3",
+          "H264_Baseline_3_0",
+          "H264_Baseline_3_1",
+          "H264_Baseline_3_2",
+          "H264_Baseline_4_0",
+          "H264_Baseline_4_1",
+          "H264_Baseline_4_2",
+          "H264_Baseline_5_0",
+          "H264_Baseline_5_1",
+          "H264_Baseline_5_2",
+          "H264_Main_3_0",
+          "H264_Main_3_1",
+          "H264_Main_3_2",
+          "H264_Main_4_0",
+          "H264_Main_4_1",
+          "H264_Main_4_2",
+          "H264_Main_5_0",
+          "H264_Main_5_1",
+          "H264_Main_5_2",
+          "H264_High_3_0",
+          "H264_High_3_1",
+          "H264_High_3_2",
+          "H264_High_4_0",
+          "H264_High_4_1",
+          "H264_High_4_2",
+          "H264_High_5_0",
+          "H264_High_5_1",
+          "H264_High_5_2",
+          "H264_Baseline_AutoLevel",
+          "H264_ConstrainedBaseline_AutoLevel",
+          "H264_Main_AutoLevel",
+          "H264_High_AutoLevel",
+          "H264_ConstrainedHigh_AutoLevel",
+          "H264_High422_AutoLevel",
+          "H264_High444Predictive_AutoLevel"
+        ],
+        "status" : 0,
+        "supports_enable_ltr" : false,
+        "supports_max_qp" : true
+      },
+      "hw_encoder_hevc" : {
+        "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+        "has_444" : true,
+        "profiles" : [
+          "HEVC_Main_AutoLevel",
+          "HEVC_Main10_AutoLevel",
+          "HEVC_Main444_AutoLevel",
+          "HEVC_Main44410_AutoLevel",
+          "HEVC_Main42210_AutoLevel",
+          "HEVC_Monochrome_AutoLevel",
+          "HEVC_Monochrome10_AutoLevel",
+          "HEVC_MainStill_AutoLevel"
+        ],
+        "status" : 0,
+        "supports_enable_ltr" : false,
+        "supports_max_qp" : true
+      },
+      "probe" : "caps"
+    },
+    {
+      "config" : "hevc\/HEVC_Main444_AutoLevel\/BGRA\/1920x1080",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 3.3100000000000001,
+      "decode_ms_p90" : 4.6600000000000001,
+      "decode_output_format" : "444v",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 1,
+      "dest_format" : "444v",
+      "dropped" : 0,
+      "encode_ms_p50" : 6.1799999999999997,
+      "encode_ms_p90" : 6.7599999999999998,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "0",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 12939,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          28,
+          16,
+          28
+        ],
+        "mean_abs_bgr" : [
+          0.35318094135802469,
+          0.34273823302469136,
+          0.30049720293209875
+        ],
+        "pixels_err_gt8_pct" : 0.14771412037037038
+      },
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 4,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : 1,
+      "warmup_first_frame_ms" : 26.399999999999999
+    },
+    {
+      "config" : "hevc\/HEVC_Main444_AutoLevel\/BGRA\/1920x1080",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 13.23,
+      "decode_ms_p90" : 17.199999999999999,
+      "decode_output_format" : "444f",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 0,
+      "dest_format" : "444f",
+      "dropped" : 0,
+      "encode_ms_p50" : 6.2199999999999998,
+      "encode_ms_p90" : 6.79,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "0",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 12939,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          28,
+          16,
+          28
+        ],
+        "mean_abs_bgr" : [
+          0.35436535493827159,
+          0.2685570987654321,
+          0.3063112461419753
+        ],
+        "pixels_err_gt8_pct" : 0.1572145061728395
+      },
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 4,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : 1,
+      "warmup_first_frame_ms" : 22.969999999999999
+    },
+    {
+      "config" : "hevc\/HEVC_Main444_AutoLevel\/444f\/1920x1080",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 2.9100000000000001,
+      "decode_ms_p90" : 4.4400000000000004,
+      "decode_output_format" : "444f",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 1,
+      "dest_format" : "444f",
+      "dropped" : 0,
+      "encode_ms_p50" : 4.5099999999999998,
+      "encode_ms_p90" : 4.7599999999999998,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "1",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 12981,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          28,
+          13,
+          23
+        ],
+        "mean_abs_bgr" : [
+          0.40361448688271606,
+          0.18418113425925925,
+          0.32070264274691357
+        ],
+        "pixels_err_gt8_pct" : 0.091194058641975315
+      },
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 4,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : 1,
+      "warmup_first_frame_ms" : 21.43
+    },
+    {
+      "config" : "hevc\/HEVC_Main444_AutoLevel\/BGRA\/1920x1080",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 3.0499999999999998,
+      "decode_ms_p90" : 4.1500000000000004,
+      "decode_output_format" : "444v",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 1,
+      "dest_format" : "444v",
+      "dropped" : 0,
+      "encode_ms_p50" : 6.0499999999999998,
+      "encode_ms_p90" : 6.3799999999999999,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+      "fmt_FullRangeVideo" : "0",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 12939,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          28,
+          16,
+          28
+        ],
+        "mean_abs_bgr" : [
+          0.35318094135802469,
+          0.34273823302469136,
+          0.30049720293209875
+        ],
+        "pixels_err_gt8_pct" : 0.14771412037037038
+      },
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 4,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : 1,
+      "warmup_first_frame_ms" : 23.23
+    },
+    {
+      "config" : "hevc\/HEVC_Main_AutoLevel\/BGRA\/1920x1080",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 1.46,
+      "decode_ms_p90" : 2.6499999999999999,
+      "decode_output_format" : "420v",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 1,
+      "dest_format" : "420v",
+      "dropped" : 0,
+      "encode_ms_p50" : 6.0099999999999998,
+      "encode_ms_p90" : 6.21,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "0",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 22957,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          156,
+          53,
+          150
+        ],
+        "mean_abs_bgr" : [
+          1.8119907407407407,
+          0.85893566743827165,
+          2.0711482445987652
+        ],
+        "pixels_err_gt8_pct" : 8.0299961419753085
+      },
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 1,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : 1,
+      "warmup_first_frame_ms" : 21.359999999999999
+    },
+    {
+      "config" : "h264\/H264_High444Predictive_AutoLevel\/BGRA\/1920x1080",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 2.6499999999999999,
+      "decode_ms_p90" : 2.9500000000000002,
+      "decode_output_format" : "444v",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 1,
+      "dest_format" : "444v",
+      "dropped" : 0,
+      "encode_ms_p50" : 7.4900000000000002,
+      "encode_ms_p90" : 7.7999999999999998,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.avc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "0",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 8003,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          36,
+          33,
+          35
+        ],
+        "mean_abs_bgr" : [
+          0.40634837962962961,
+          0.36724440586419754,
+          0.31637490354938269
+        ],
+        "pixels_err_gt8_pct" : 0.80666473765432101
+      },
+      "set_profile_status" : 0,
+      "sps_bit_depth" : 8,
+      "sps_chroma_format_idc" : 3,
+      "sps_profile_idc" : 244,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : 1,
+      "warmup_first_frame_ms" : 23.059999999999999
+    },
+    {
+      "config" : "hevc-lowlatency\/HEVC_Main444_AutoLevel\/444f\/1920x1080",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 2.3999999999999999,
+      "decode_ms_p90" : 3.75,
+      "decode_output_format" : "444f",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 1,
+      "dest_format" : "444f",
+      "dropped" : 0,
+      "encode_ms_p50" : 7.75,
+      "encode_ms_p90" : 8,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.hevc.rtvc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "1",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 7682,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          24,
+          11,
+          24
+        ],
+        "mean_abs_bgr" : [
+          0.35476900077160495,
+          0.16653645833333333,
+          0.25014033564814814
+        ],
+        "pixels_err_gt8_pct" : 0.3203125
+      },
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 4,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : -1,
+      "warmup_first_frame_ms" : 29.34
+    },
+    {
+      "config" : "hevc\/HEVC_Main444_AutoLevel\/BGRA\/2560x1440",
+      "create_status" : 0,
+      "decode_create_status" : 0,
+      "decode_errors" : 0,
+      "decode_ms_p50" : 5.5199999999999996,
+      "decode_ms_p90" : 6.9199999999999999,
+      "decode_output_format" : "444v",
+      "decode_output_iosurface" : true,
+      "decoded_frames" : 63,
+      "decoder_pool_is_shared" : 1,
+      "dest_format" : "444v",
+      "dropped" : 0,
+      "encode_ms_p50" : 9.1500000000000004,
+      "encode_ms_p90" : 9.9000000000000004,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.ave.hevc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "0",
+      "frames_out" : 63,
+      "hw_decode_supported" : true,
+      "kbit_per_s_at_60fps" : 12008,
+      "keyframes" : 1,
+      "ltr_tokens" : 0,
+      "probe" : "roundtrip",
+      "rgb_roundtrip" : {
+        "max_abs_bgr" : [
+          53,
+          35,
+          56
+        ],
+        "mean_abs_bgr" : [
+          0.4204047309027778,
+          0.3864824761284722,
+          0.36423990885416668
+        ],
+        "pixels_err_gt8_pct" : 1.0313585069444444
+      },
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 4,
+      "using_hw_decoder" : 1,
+      "using_hw_encoder" : 1,
+      "warmup_first_frame_ms" : 26.879999999999999
+    },
+    {
+      "config" : "hevc-lowlatency\/HEVC_Main444_AutoLevel\/444f\/1920x1080",
+      "create_status" : 0,
+      "dropped" : 0,
+      "enable_ltr_status" : 0,
+      "encode_ms_p50" : 7.7300000000000004,
+      "encode_ms_p90" : 8.0399999999999991,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.hevc.rtvc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "1",
+      "frames_out" : 123,
+      "kbit_per_s_at_60fps" : 6337,
+      "keyframes" : 1,
+      "ltr_tokens" : 1,
+      "probe" : "ltr",
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 4,
+      "using_hw_encoder" : -1,
+      "warmup_first_frame_ms" : 24.140000000000001
+    },
+    {
+      "config" : "hevc-lowlatency\/HEVC_Main_AutoLevel\/420f\/1920x1080",
+      "create_status" : 0,
+      "dropped" : 0,
+      "enable_ltr_status" : 0,
+      "encode_ms_p50" : 7.7800000000000002,
+      "encode_ms_p90" : 8.0399999999999991,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.hevc.rtvc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "1",
+      "frames_out" : 123,
+      "kbit_per_s_at_60fps" : 19243,
+      "keyframes" : 1,
+      "ltr_tokens" : 1,
+      "probe" : "ltr",
+      "set_profile_status" : 0,
+      "sps_general_profile_idc" : 1,
+      "using_hw_encoder" : -1,
+      "warmup_first_frame_ms" : 33.619999999999997
+    },
+    {
+      "config" : "h264-lowlatency\/H264_High_AutoLevel\/420f\/1920x1080",
+      "create_status" : 0,
+      "dropped" : 0,
+      "enable_ltr_status" : 0,
+      "encode_ms_p50" : 7.4100000000000001,
+      "encode_ms_p90" : 7.7000000000000002,
+      "encoder_id" : "com.apple.videotoolbox.videoencoder.h264.rtvc",
+      "fmt_CVImageBufferColorPrimaries" : "ITU_R_709_2",
+      "fmt_CVImageBufferTransferFunction" : "IEC_sRGB",
+      "fmt_CVImageBufferYCbCrMatrix" : "ITU_R_709_2",
+      "fmt_FullRangeVideo" : "1",
+      "frames_out" : 123,
+      "kbit_per_s_at_60fps" : 19832,
+      "keyframes" : 1,
+      "ltr_tokens" : 3,
+      "probe" : "ltr",
+      "set_profile_status" : 0,
+      "sps_bit_depth" : 8,
+      "sps_chroma_format_idc" : 1,
+      "sps_profile_idc" : 100,
+      "using_hw_encoder" : -1,
+      "warmup_first_frame_ms" : 33.049999999999997
+    }
+  ]
+}

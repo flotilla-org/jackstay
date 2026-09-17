@@ -46,6 +46,7 @@ use jackstay_graph::{ChromaPolicy, CodecDecision, Target, decide};
 use crate::{
     clock::{ClockEstimator, Estimate, Sample},
     cpu_publication::{CpuPublication, CpuPublicationError},
+    input_relay::{InputListener, InputRelay},
     vt::{self, DecodedFrame, Decoder, Transfer},
     wire::{self, CodecConfig, FrameBody, Hello, Kind, Message, Op, Role},
 };
@@ -94,6 +95,9 @@ pub struct IngressConfig {
     pub staging_depth: usize,
     /// Also publish over a generic CPU setup socket bound at this path.
     pub cpu_socket: Option<PathBuf>,
+    /// Accept jackstay input controllers at this path and relay them to the
+    /// producer host over the control connection.
+    pub input_socket: Option<PathBuf>,
 }
 
 impl Default for IngressConfig {
@@ -116,6 +120,7 @@ impl Default for IngressConfig {
             },
             staging_depth: 4,
             cpu_socket: None,
+            input_socket: None,
         }
     }
 }
@@ -131,6 +136,10 @@ pub struct IngressReport {
     pub cpu_frames_published: u64,
     pub cpu_frames_dropped: u64,
     pub cpu_errors: u64,
+    /// Relayed input streams accepted here, and bytes each way.
+    pub input_streams_opened: u64,
+    pub input_bytes_to_link: u64,
+    pub input_bytes_from_link: u64,
     pub decode_errors: u64,
     pub keyframe_requests: u64,
     pub configurations: u64,
@@ -215,18 +224,20 @@ fn params_for(config: &CodecConfig) -> NativeStreamParams {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn control_loop(
-    mut control: UnixStream,
+    mut reader: UnixStream,
+    writer: Arc<Mutex<UnixStream>>,
     target: Target,
     clock: Arc<Mutex<ClockEstimator>>,
     keyframe_requests: mpsc::Receiver<()>,
     keyframes_sent: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    relay: Arc<InputRelay>,
 ) {
-    let Ok(mut reader) = control.try_clone() else { return };
     let mut seq = 0u64;
     if let Ok(m) = wire::json_message(Kind::Target, seq, &target) {
-        if m.write_to(&mut control).is_err() {
+        if m.write_to(&mut *writer.lock().expect("control writer poisoned")).is_err() {
             return;
         }
     }
@@ -237,7 +248,9 @@ fn control_loop(
     let reader_thread = std::thread::spawn(move || {
         while !reader_stop.load(Ordering::Relaxed) {
             let Ok(Some(m)) = Message::read_from(&mut reader) else { break };
-            if m.header.kind == Kind::ClockPong {
+            if m.header.kind == Kind::Input {
+                relay.on_message(&m);
+            } else if m.header.kind == Kind::ClockPong {
                 let t4 = crate::host_now_ns();
                 if let Ok(pong) = wire::ClockPong::decode(&m.body) {
                     let expected = reader_pending.lock().expect("pending poisoned").take();
@@ -262,7 +275,7 @@ fn control_loop(
             *pending.lock().expect("pending poisoned") = Some(t1);
             seq += 1;
             if Message::new(Kind::ClockPing, seq, wire::ClockPing { t1 }.encode())
-                .write_to(&mut control)
+                .write_to(&mut *writer.lock().expect("control writer poisoned"))
                 .is_err()
             {
                 break;
@@ -270,14 +283,17 @@ fn control_loop(
         }
         if keyframe_requests.recv_timeout(Duration::from_millis(50)).is_ok() {
             seq += 1;
-            if Message::new(Kind::KeyframeRequest, seq, Vec::new()).write_to(&mut control).is_err() {
+            if Message::new(Kind::KeyframeRequest, seq, Vec::new())
+                .write_to(&mut *writer.lock().expect("control writer poisoned"))
+                .is_err()
+            {
                 break;
             }
             keyframes_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let _ = control.shutdown(std::net::Shutdown::Both);
+    let _ = writer.lock().expect("control writer poisoned").shutdown(std::net::Shutdown::Both);
     let _ = reader_thread.join();
 }
 
@@ -342,18 +358,25 @@ pub fn run(
     let decision = decide(peer.chroma_policy, peer.capabilities, mine)?;
     report.decision = Some(decision.clone());
 
-    // 2. control thread
+    // 2. control thread, and the input relay sharing its writer
     let clock = Arc::new(Mutex::new(ClockEstimator::default()));
     let (keyframe_tx, keyframe_rx) = mpsc::channel::<()>();
     let keyframes_sent = Arc::new(AtomicU64::new(0));
+    let control_shared = Arc::new(Mutex::new(control.try_clone()?));
+    let relay = InputRelay::new(control_shared.clone(), None, stop.clone());
+    let input_listener = match &config.input_socket {
+        Some(path) => Some(InputListener::bind(path, relay.clone())?),
+        None => None,
+    };
     let control_thread = {
         let clock = clock.clone();
         let stop = stop.clone();
         let keyframes_sent = keyframes_sent.clone();
         let target = config.target;
+        let relay = relay.clone();
         std::thread::Builder::new()
             .name("jackstay-ingress-control".into())
-            .spawn(move || control_loop(control, target, clock, keyframe_rx, keyframes_sent, stop))?
+            .spawn(move || control_loop(control, control_shared, target, clock, keyframe_rx, keyframes_sent, stop, relay))?
     };
 
     // 3. the media loop; producer, decoder and republisher appear with the first configuration
@@ -521,7 +544,12 @@ pub fn run(
         drop(d);
     }
     stop.store(true, Ordering::Relaxed);
+    drop(input_listener);
+    relay.shutdown();
     let _ = control_thread.join();
+    report.input_streams_opened = relay.opened.load(Ordering::Relaxed);
+    report.input_bytes_to_link = relay.bytes_out.load(Ordering::Relaxed);
+    report.input_bytes_from_link = relay.bytes_in.load(Ordering::Relaxed);
     if let Some(m) = maintenance {
         let _ = m.join();
     }

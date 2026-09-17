@@ -36,7 +36,7 @@ mod macos {
         os::unix::net::{UnixListener, UnixStream},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             mpsc,
         },
         time::{Duration, Instant},
@@ -89,6 +89,9 @@ mod macos {
         listen: bool,
         /// Also publish the ingress over a generic CPU setup socket at this path.
         cpu_socket: Option<std::path::PathBuf>,
+        /// Ingress and loopback: accept jackstay input controllers here.
+        /// Egress: the executor socket relayed input streams connect to.
+        input_socket: Option<std::path::PathBuf>,
     }
 
     fn parse() -> Result<Args, Error> {
@@ -109,6 +112,7 @@ mod macos {
             link_token: String::new(),
             listen: false,
             cpu_socket: None,
+            input_socket: None,
         };
         let mut frames_given = false;
         let mut it = std::env::args().skip(1);
@@ -143,6 +147,7 @@ mod macos {
                 "--link-token" => args.link_token = value()?,
                 "--listen" => args.listen = true,
                 "--cpu-socket" => args.cpu_socket = Some(value()?.into()),
+                "--input-socket" => args.input_socket = Some(value()?.into()),
                 other => return Err(format!("unknown argument {other}").into()),
             }
         }
@@ -335,6 +340,102 @@ mod macos {
         })
     }
 
+    /// A jackstay input executor for loopback: it takes each relayed
+    /// controller on a socket of its own, executes every event by printing
+    /// it, and completes cleanups, so the relay can be exercised end to end
+    /// on one machine with the SDL viewer's `--input-socket`.
+    struct ReferenceExecutor {
+        path: std::path::PathBuf,
+        controllers: Arc<AtomicU64>,
+        events: Arc<AtomicU64>,
+        cleanups: Arc<AtomicU64>,
+    }
+
+    impl Drop for ReferenceExecutor {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn reference_executor(width: u32, height: u32, stop: Arc<AtomicBool>) -> Result<ReferenceExecutor, Error> {
+        use jackstay::input::{CAP_ALL, Config, Geometry, Mode, Operation, Outcome, Target, transport::Server};
+        let path = std::env::temp_dir().join(format!("jsb-exec-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        let executor = ReferenceExecutor {
+            path,
+            controllers: Arc::new(AtomicU64::new(0)),
+            events: Arc::new(AtomicU64::new(0)),
+            cleanups: Arc::new(AtomicU64::new(0)),
+        };
+        let (controllers, events, cleanups) = (executor.controllers.clone(), executor.events.clone(), executor.cleanups.clone());
+        std::thread::Builder::new().name("loopback-executor".into()).spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let target = match Target::new(Config {
+                    modes: Mode::Cooperative.bit() | Mode::Physical.bit(),
+                    capabilities: CAP_ALL,
+                    geometry: Geometry {
+                        revision: 1,
+                        width: f64::from(width),
+                        height: f64::from(height),
+                    },
+                    ..Config::default()
+                }) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("executor: target: {e:?}");
+                        continue;
+                    }
+                };
+                let server = match Server::start(target.clone(), stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("executor: server: {e}");
+                        continue;
+                    }
+                };
+                controllers.fetch_add(1, Ordering::Relaxed);
+                eprintln!("executor: controller connected");
+                while !stop.load(Ordering::Relaxed) {
+                    match target.next() {
+                        Some(work) => {
+                            match &work.operation {
+                                Operation::Event(event) => {
+                                    events.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("executor: {event:?}");
+                                }
+                                Operation::Cleanup { scope, reason } => {
+                                    cleanups.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("executor: cleanup {scope:?} ({reason:?})");
+                                }
+                            }
+                            if let Err(e) = target.complete(work.id, Outcome::Executed) {
+                                eprintln!("executor: complete: {e:?}");
+                            }
+                        }
+                        None => {
+                            if server.finished() && target.idle() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                }
+                eprintln!("executor: controller gone");
+            }
+        })?;
+        Ok(executor)
+    }
+
     fn spawn_egress(
         source: egress::Source,
         media: UnixStream,
@@ -342,11 +443,13 @@ mod macos {
         args: &Args,
         token: String,
         stop: Arc<AtomicBool>,
+        input_socket: Option<std::path::PathBuf>,
     ) -> Result<std::thread::JoinHandle<Result<egress::EgressReport, egress::EgressError>>, Error> {
         let config = egress::EgressConfig {
             chroma_policy: args.chroma,
             bitrate_bps: args.bitrate,
             token,
+            input_socket,
             ..egress::EgressConfig::default()
         };
         Ok(std::thread::Builder::new()
@@ -386,6 +489,17 @@ mod macos {
                     r.cpu_frames_published, r.cpu_frames_dropped, r.cpu_errors
                 );
             }
+            if args.input_socket.is_some() {
+                println!(
+                    "input relay: ingress opened {} streams, {} bytes to the link, {} back; egress opened {}, {} bytes to the executor, {} back",
+                    r.input_streams_opened,
+                    r.input_bytes_to_link,
+                    r.input_bytes_from_link,
+                    egress_report.input_streams_opened,
+                    egress_report.input_bytes_from_link,
+                    egress_report.input_bytes_to_link
+                );
+            }
             if let Some(c) = r.clock {
                 println!(
                     "clock: offset {} ns drift {} ppb rtt-min {} us samples {}",
@@ -416,6 +530,7 @@ mod macos {
                 chroma_policy: args.chroma,
                 token: token.clone(),
                 cpu_socket: args.cpu_socket.clone(),
+                input_socket: args.input_socket.clone(),
                 ..ingress::IngressConfig::default()
             };
             std::thread::Builder::new().name("loopback-ingress".into()).spawn(move || {
@@ -432,6 +547,10 @@ mod macos {
             })?
         };
         let source_endpoint = source.endpoint.take().expect("anonymous endpoint");
+        let executor = match &args.input_socket {
+            Some(_) => Some(reference_executor(args.width, args.height, stop.clone())?),
+            None => None,
+        };
         let egress_thread = spawn_egress(
             egress::Source::Endpoint(source_endpoint),
             media_a,
@@ -439,6 +558,7 @@ mod macos {
             args,
             token,
             stop.clone(),
+            executor.as_ref().map(|e| e.path.clone()),
         )?;
 
         let endpoint = ready_rx
@@ -535,6 +655,14 @@ mod macos {
         let egress_report = egress_thread.join().map_err(|_| "egress thread panicked")??;
         let ingress_report = ingress_thread.join().map_err(|_| "ingress thread panicked")??;
         print_reports(published, args, &egress_report, Some(&ingress_report));
+        if let Some(e) = &executor {
+            println!(
+                "executor: controllers {} events {} cleanups {}",
+                e.controllers.load(Ordering::Relaxed),
+                e.events.load(Ordering::Relaxed),
+                e.cleanups.load(Ordering::Relaxed)
+            );
+        }
         println!("verifier: acquired {acquired} verified {verified} mismatched {mismatched} worst-mean-abs-error {worst:.2}");
         if verified == 0 || mismatched > 0 {
             return Err("loopback verification failed".into());
@@ -607,6 +735,7 @@ mod macos {
             args,
             link_token,
             stop.clone(),
+            None,
         )?;
         println!("ingress registered with launchd as {service}");
         println!("attach the reference viewer with:");
@@ -757,19 +886,25 @@ mod macos {
             chroma_policy: args.chroma,
             token: args.link_token.clone(),
             cpu_socket: args.cpu_socket.clone(),
+            input_socket: args.input_socket.clone(),
             ..ingress::IngressConfig::default()
         };
         let viewer_token = args.viewer_token.clone();
         let cpu_socket = args.cpu_socket.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let input_socket = args.input_socket.as_ref().map(|p| p.to_string_lossy().into_owned());
         let announce = format!(
-            "ingress: publication is up; attach with --native --mach-service {service}{}{}",
+            "ingress: publication is up; attach with --native --mach-service {service}{}{}{}",
             viewer_token.as_ref().map_or(String::new(), |t| format!(" --token {t}")),
-            cpu_socket.as_ref().map_or(String::new(), |p| format!(", or --cpu-socket {p}"))
+            cpu_socket.as_ref().map_or(String::new(), |p| format!(", or --cpu-socket {p}")),
+            input_socket
+                .as_ref()
+                .map_or(String::new(), |p| format!("; controllers at --input-socket {p}"))
         );
         let up = jackstay_graph::export::HalfEvent::PublicationUp {
             service: service.clone(),
             token: viewer_token.clone(),
             cpu_socket,
+            input_socket,
         };
         let report = ingress::run(
             ingress::Publish::Named {
@@ -809,6 +944,7 @@ mod macos {
             chroma_policy: args.chroma,
             bitrate_bps: args.bitrate,
             token: args.link_token.clone(),
+            input_socket: args.input_socket.clone(),
             ..egress::EgressConfig::default()
         };
         let report = egress::run(

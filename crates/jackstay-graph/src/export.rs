@@ -34,6 +34,8 @@ pub enum HalfEvent {
         token: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cpu_socket: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_socket: Option<String>,
     },
     /// The half ended; `report` is its `EgressReport` or `IngressReport`.
     Report { report: serde_json::Value },
@@ -57,6 +59,8 @@ pub struct HalfStatus {
     pub publication: Option<(String, Option<String>)>,
     /// The CPU setup socket the ingress also serves, when it does.
     pub cpu_socket: Option<String>,
+    /// The socket the ingress accepts input controllers on, when it does.
+    pub input_socket: Option<String>,
     pub report: Option<serde_json::Value>,
     pub failure: Option<String>,
     pub exit_code: Option<i32>,
@@ -74,10 +78,12 @@ impl HalfStatus {
                 service,
                 token,
                 cpu_socket,
+                input_socket,
             } => {
                 self.phase = Some(Phase::Running);
                 self.publication = Some((service.clone(), token.clone()));
                 self.cpu_socket = cpu_socket.clone();
+                self.input_socket = input_socket.clone();
             }
             HalfEvent::Report { report } => {
                 self.phase = Some(Phase::Ended);
@@ -123,6 +129,9 @@ pub struct EgressSpec {
     pub link_token: String,
     pub chroma: ChromaPolicy,
     pub bitrate_bps: Option<u32>,
+    /// The executor's input socket on the producer host; relayed input
+    /// streams connect here. `None` refuses input.
+    pub input_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +146,8 @@ pub struct IngressSpec {
     pub chroma: ChromaPolicy,
     /// Also serve a generic CPU setup socket at this path.
     pub cpu_socket: Option<PathBuf>,
+    /// Accept input controllers at this path and relay them to the egress.
+    pub input_socket: Option<PathBuf>,
 }
 
 fn chroma_arg(policy: ChromaPolicy) -> &'static str {
@@ -172,6 +183,10 @@ pub fn egress_arguments(spec: &EgressSpec) -> Vec<String> {
         args.push("--bitrate".to_owned());
         args.push(b.to_string());
     }
+    if let Some(p) = &spec.input_socket {
+        args.push("--input-socket".to_owned());
+        args.push(p.to_string_lossy().into_owned());
+    }
     args
 }
 
@@ -197,6 +212,10 @@ pub fn ingress_arguments(spec: &IngressSpec) -> Vec<String> {
     }
     if let Some(p) = &spec.cpu_socket {
         args.push("--cpu-socket".to_owned());
+        args.push(p.to_string_lossy().into_owned());
+    }
+    if let Some(p) = &spec.input_socket {
+        args.push("--input-socket".to_owned());
         args.push(p.to_string_lossy().into_owned());
     }
     args
@@ -439,6 +458,7 @@ mod tests {
             link_token: "L".into(),
             chroma: ChromaPolicy::Require444,
             bitrate_bps: Some(5),
+            input_socket: Some("/x/i".into()),
         });
         assert_eq!(
             e,
@@ -458,7 +478,9 @@ mod tests {
                 "--source-token",
                 "tok",
                 "--bitrate",
-                "5"
+                "5",
+                "--input-socket",
+                "/x/i"
             ]
         );
         let i = ingress_arguments(&IngressSpec {
@@ -469,9 +491,10 @@ mod tests {
             link_token: "L".into(),
             chroma: ChromaPolicy::Any,
             cpu_socket: Some("/tmp/s".into()),
+            input_socket: Some("/tmp/i".into()),
         });
         assert!(i.contains(&"--service".to_owned()) && !i.contains(&"--viewer-token".to_owned()));
-        assert_eq!(i[i.len() - 2..], ["--cpu-socket", "/tmp/s"]);
+        assert_eq!(i[i.len() - 4..], ["--cpu-socket", "/tmp/s", "--input-socket", "/tmp/i"]);
     }
 
     #[test]
@@ -485,9 +508,11 @@ mod tests {
             service: "svc".into(),
             token: Some("t".into()),
             cpu_socket: Some("/tmp/s".into()),
+            input_socket: Some("/tmp/i".into()),
         })
         .unwrap();
         status.apply(&parse_event(&new).unwrap());
         assert_eq!(status.cpu_socket.as_deref(), Some("/tmp/s"));
+        assert_eq!(status.input_socket.as_deref(), Some("/tmp/i"));
     }
 }

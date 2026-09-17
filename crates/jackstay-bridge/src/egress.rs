@@ -33,6 +33,7 @@ use jackstay::{
 use jackstay_graph::{Chroma, ChromaPolicy, CodecCapabilities, CodecDecision, Target, decide};
 
 use crate::{
+    input_relay::InputRelay,
     vt::{self, EncodedFrame, Encoder, EncoderConfig},
     wire::{self, CodecConfig, FrameBody, Hello, Kind, Message, Op, Rect, Role, flags},
 };
@@ -80,6 +81,9 @@ pub struct EgressConfig {
     pub low_latency: bool,
     /// Token both halves were given by the coordinator; empty means trusted link.
     pub token: String,
+    /// The executor's input socket on this host; a relayed input stream the
+    /// peer opens is connected here. `None` refuses input streams.
+    pub input_socket: Option<std::path::PathBuf>,
 }
 
 impl Default for EgressConfig {
@@ -90,6 +94,7 @@ impl Default for EgressConfig {
             bitrate_bps: 20_000_000,
             low_latency: false,
             token: String::new(),
+            input_socket: None,
         }
     }
 }
@@ -107,6 +112,10 @@ pub struct EgressReport {
     pub encoder_errors: u64,
     pub reconfigurations: u64,
     pub bytes_sent: u64,
+    /// Relayed input streams the peer opened, and bytes each way.
+    pub input_streams_opened: u64,
+    pub input_bytes_from_link: u64,
+    pub input_bytes_to_link: u64,
     /// Why the acquisition loop ended: `stopped`, `closed`, `cancelled`.
     pub ended: String,
 }
@@ -200,11 +209,13 @@ struct ControlState {
     keyframe_requested: bool,
 }
 
-fn control_loop(mut control: UnixStream, state: Arc<Mutex<ControlState>>, stop: Arc<AtomicBool>) {
-    let mut reader = match control.try_clone() {
-        Ok(r) => r,
-        Err(_) => return,
-    };
+fn control_loop(
+    mut reader: UnixStream,
+    writer: Arc<Mutex<UnixStream>>,
+    state: Arc<Mutex<ControlState>>,
+    stop: Arc<AtomicBool>,
+    relay: Arc<InputRelay>,
+) {
     let mut seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
         let message = match Message::read_from(&mut reader) {
@@ -224,10 +235,11 @@ fn control_loop(mut control: UnixStream, state: Arc<Mutex<ControlState>>, stop: 
                     t3: crate::host_now_ns(),
                 };
                 let reply = Message::new(Kind::ClockPong, seq, pong.encode());
-                if reply.write_to(&mut control).is_err() {
+                if reply.write_to(&mut *writer.lock().expect("control writer poisoned")).is_err() {
                     break;
                 }
             }
+            Kind::Input => relay.on_message(&message),
             Kind::Target => {
                 if let Ok(target) = wire::json_body::<Target>(&message) {
                     state.lock().expect("control poisoned").max_fps = target.max_fps;
@@ -410,12 +422,15 @@ pub fn run(
             .spawn(move || sender.run(media, &stats))?
     };
     let control_state = Arc::new(Mutex::new(ControlState::default()));
+    let control_shared = Arc::new(Mutex::new(control.try_clone()?));
+    let relay = InputRelay::new(control_shared.clone(), config.input_socket.clone(), stop.clone());
     let control_thread = {
         let state = control_state.clone();
         let stop = stop.clone();
+        let relay = relay.clone();
         std::thread::Builder::new()
             .name("jackstay-egress-control".into())
-            .spawn(move || control_loop(control, state, stop))?
+            .spawn(move || control_loop(control, control_shared, state, stop, relay))?
     };
 
     // 4. the acquisition loop
@@ -585,7 +600,11 @@ pub fn run(
     let _ = stop_watch.join();
     drop(control_reader);
     drop(control_writer);
+    relay.shutdown();
     let _ = control_thread.join();
+    report.input_streams_opened = relay.opened.load(Ordering::Relaxed);
+    report.input_bytes_from_link = relay.bytes_in.load(Ordering::Relaxed);
+    report.input_bytes_to_link = relay.bytes_out.load(Ordering::Relaxed);
     report.frames_encoded = shared.encoded.load(Ordering::Relaxed);
     report.keyframes = shared.keyframes.load(Ordering::Relaxed);
     report.encoder_errors += shared.errors.load(Ordering::Relaxed);

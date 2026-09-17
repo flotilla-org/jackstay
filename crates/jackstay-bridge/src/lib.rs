@@ -17,6 +17,9 @@ pub mod clock;
 #[cfg(unix)]
 pub mod wire;
 
+#[cfg(unix)]
+pub mod input_relay;
+
 #[cfg(all(target_os = "macos", feature = "backend-macos"))]
 pub mod vt;
 

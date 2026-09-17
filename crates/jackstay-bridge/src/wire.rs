@@ -39,7 +39,10 @@ pub enum Kind {
     KeyframeRequest = 5,
     ClockPing = 6,
     ClockPong = 7,
-    /// Reserved for the interaction channel; never sent by this version.
+    /// A relayed jackstay input transport stream, on the control connection.
+    /// `stream_id` names the relayed connection; `flags::INPUT_OPEN` opens it
+    /// and `flags::INPUT_CLOSE` closes it after this body; the body is the
+    /// transport's bytes untouched (see `input_relay`).
     Input = 8,
 }
 
@@ -67,6 +70,10 @@ pub mod flags {
     /// A `CodecConfig` preceded this frame because the configuration changed.
     pub const CONFIG_CHANGED: u16 = 4;
     pub const LAST_CHUNK: u16 = 8;
+    /// An `Input` message opening a relayed input stream (`stream_id`).
+    pub const INPUT_OPEN: u16 = 16;
+    /// An `Input` message closing a relayed input stream after this body.
+    pub const INPUT_CLOSE: u16 = 32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

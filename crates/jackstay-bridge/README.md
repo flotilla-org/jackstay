@@ -25,4 +25,11 @@ on exit, for consumers without a native attach path: the SDL viewer's
 `--cpu-socket PATH`, katzensteg's `jackstay-source PATH`. Each decoded frame is
 then also read back from the staging surface into a CPU arena.
 
+`--input-socket PATH` relays the jackstay input protocol back to the producer
+host. On the ingress (and `loopback`) it is where controllers connect, owner-only
+like the CPU socket; on the egress it is the executor's socket that each relayed
+stream is connected to. `loopback --input-socket PATH` runs a reference executor
+that prints every event, so the SDL viewer with `--cpu-socket` and
+`--input-socket` exercises the relay on one machine.
+
 Without `--features backend-macos` only the wire, clock and policy code builds.

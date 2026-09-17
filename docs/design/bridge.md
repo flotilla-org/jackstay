@@ -70,6 +70,36 @@ report). Which kinds a republication offers is the coordinator's choice per
 request; the graph crate carries it as `IngressSpec::cpu_socket` and reports
 the bound path in `publication_up`.
 
+## The input relay
+
+The return direction carries jackstay's input protocol
+(`jackstay::input::transport`) without changing it. That protocol is a
+length-prefixed byte stream over a connected Unix socket with no credentials,
+descriptor passing or peer checks inside it, so the bridge relays it verbatim
+(`input_relay.rs`). On the consumer host the ingress accepts controller
+connections on `--input-socket PATH` (owner-only, never replacing a path,
+unlinked on exit); each connection becomes one stream on the control
+connection: `Kind::Input` messages whose `stream_id` names the connection,
+`INPUT_OPEN` on the first, the bytes read as bodies, `INPUT_CLOSE` at EOF. On
+the producer host the egress answers an open by connecting to its own
+`--input-socket PATH`, the executor's socket, and relays the same way back.
+
+Two rules follow from the protocol's invariants. The relay never originates
+or absorbs a frame: heartbeats are the two peers' proof of each other's
+liveness and expiry stays end to end, so link latency simply adds to the
+executor's idle timeout, which the coordinator sets accordingly. And a
+relayed stream is one connection, never transparently reconnected: a new
+connection is a new controller incarnation whose disconnect cleanup the
+executor completes before another is admitted, and a second controller while
+one is active receives the server's own `Busy`. Backpressure is the blocking
+write on the control connection; a local peer that stops reading is cut after
+five seconds rather than buffered. Clock pings and keyframe requests share the
+control connection and stay atomic per message.
+
+The executor is the coordinator's: portholed serves the exported session's
+target on the socket it names in `EgressSpec::input_socket`. `loopback` has a
+reference executor that prints events, for the SDL viewer's `--input-socket`.
+
 ## Driving the halves from a coordinator
 
 The halves print one JSON object per line on stdout as they progress

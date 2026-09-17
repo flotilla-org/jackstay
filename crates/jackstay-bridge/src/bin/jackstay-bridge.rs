@@ -370,6 +370,8 @@ mod macos {
             cleanups: Arc::new(AtomicU64::new(0)),
         };
         let (controllers, events, cleanups) = (executor.controllers.clone(), executor.events.clone(), executor.cleanups.clone());
+        // Detached intentionally: the reference executor lives for the whole
+        // loopback and exits with the process when `stop` is set.
         std::thread::Builder::new().name("loopback-executor".into()).spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let stream = match listener.accept() {

@@ -73,12 +73,16 @@ impl InputRelay {
         })
     }
 
-    /// Relays a locally accepted connection as a new stream: sends the open,
-    /// then pumps its bytes until EOF.
+    /// Relays a locally accepted connection as a new stream. The open is
+    /// written before the pump starts, so the peer always registers the
+    /// stream before any data frame can arrive for it: the pump would
+    /// otherwise race the open for the control writer and its first bytes
+    /// (the controller's hello) would be dropped for an unknown stream.
     pub fn attach(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<u32> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.register(id, stream)?;
+        let reader = self.insert(id, stream)?;
         self.send(id, flags::INPUT_OPEN, Vec::new())?;
+        self.spawn_pump(id, reader);
         Ok(id)
     }
 
@@ -90,7 +94,12 @@ impl InputRelay {
                 let _ = self.send(id, flags::INPUT_CLOSE, Vec::new());
                 return;
             };
-            match UnixStream::connect(target).and_then(|s| self.register(id, s)) {
+            // The peer already knows this stream (its open is what we are
+            // handling), so the pump may start at once.
+            match UnixStream::connect(target)
+                .and_then(|s| self.insert(id, s))
+                .map(|reader| self.spawn_pump(id, reader))
+            {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("input relay: open of stream {id} to {} failed: {e}", target.display());
@@ -133,7 +142,9 @@ impl InputRelay {
         }
     }
 
-    fn register(self: &Arc<Self>, id: u32, stream: UnixStream) -> std::io::Result<()> {
+    /// Records `stream` under `id` and returns a reader clone for its pump.
+    /// The pump is started separately so the caller can order the open first.
+    fn insert(&self, id: u32, stream: UnixStream) -> std::io::Result<UnixStream> {
         // macOS accepted sockets inherit the listener's O_NONBLOCK; the pump
         // reads blocking and must not read a spurious WouldBlock as EOF.
         stream.set_nonblocking(false)?;
@@ -141,11 +152,19 @@ impl InputRelay {
         let reader = stream.try_clone()?;
         self.streams.lock().expect("relay streams poisoned").insert(id, stream);
         self.opened.fetch_add(1, Ordering::Relaxed);
+        Ok(reader)
+    }
+
+    fn spawn_pump(self: &Arc<Self>, id: u32, reader: UnixStream) {
         let relay = self.clone();
-        std::thread::Builder::new()
+        // If the pump thread cannot start, the stream simply carries no bytes;
+        // the connection is still closed on shutdown.
+        if let Err(e) = std::thread::Builder::new()
             .name(format!("jackstay-input-relay-{id}"))
-            .spawn(move || relay.pump(id, reader))?;
-        Ok(())
+            .spawn(move || relay.pump(id, reader))
+        {
+            eprintln!("input relay: pump for stream {id} did not start: {e}");
+        }
     }
 
     fn pump(self: Arc<Self>, id: u32, mut reader: UnixStream) {

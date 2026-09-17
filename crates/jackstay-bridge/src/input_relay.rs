@@ -81,7 +81,10 @@ impl InputRelay {
     pub fn attach(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<u32> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let reader = self.insert(id, stream)?;
-        self.send(id, flags::INPUT_OPEN, Vec::new())?;
+        if let Err(e) = self.send(id, flags::INPUT_OPEN, Vec::new()) {
+            self.close_local(id);
+            return Err(e);
+        }
         self.spawn_pump(id, reader);
         Ok(id)
     }
@@ -272,6 +275,30 @@ impl Drop for InputListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stream's open reaches the peer before its data, even when the
+    /// controller's bytes are already waiting: `attach` writes `INPUT_OPEN`
+    /// before the pump exists, so the first framed message on the link is the
+    /// open. Without that ordering the peer drops the data for an unknown
+    /// stream and the controller hangs.
+    #[test]
+    fn the_open_precedes_the_data_on_the_link() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (link_near, mut link_far) = UnixStream::pair().unwrap();
+        let relay = InputRelay::new(Arc::new(Mutex::new(link_near)), None, stop.clone());
+        let (mut controller, controller_far) = UnixStream::pair().unwrap();
+        // The controller's first bytes are already on the socket when attach runs.
+        controller.write_all(b"HELLO-BYTES").unwrap();
+        relay.attach(controller_far).unwrap();
+        let first = Message::read_from(&mut link_far).unwrap().unwrap();
+        assert_eq!(first.header.kind, Kind::Input);
+        assert!(first.header.flags & flags::INPUT_OPEN != 0, "first message must be the open");
+        assert!(first.body.is_empty());
+        let second = Message::read_from(&mut link_far).unwrap().unwrap();
+        assert_eq!(second.header.flags & flags::INPUT_OPEN, 0);
+        assert_eq!(second.body, b"HELLO-BYTES");
+        stop.store(true, Ordering::Relaxed);
+    }
 
     /// Two relays joined by a socket pair standing in for the control link:
     /// bytes pass both ways on an opened stream, and an EOF on one end closes

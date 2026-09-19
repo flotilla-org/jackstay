@@ -40,3 +40,36 @@ the original source. An "export" is the graph-manager operation that creates
 that edge. Tender also uses the word publication, for a published service
 endpoint; a Jackstay publication registered with Tender is one Tender
 publication, so the terms nest. Tender never carries frames.
+
+Addendum, 2026-09-18, on bounding latent sources
+
+The latent-source idea above is open-ended as written: "things that could
+produce content" invites the registry to become a proxy for everything capable
+of producing a Jackstay source, which is unbounded. Two refinements keep it
+small.
+
+First, latency is declared, not inferred. The registry advertises a dormant
+source only when something has explicitly registered it as producible; it never
+lists a source because something is merely capable of producing one. Discovery
+enumerates what was declared, not what is conceivable. An explicit catalog is
+finite by construction; capability inference is not.
+
+Second, what looked like one category is two. Existing windows are running but
+uncaptured, not dormant: they are already enumerable (Porthole's `search`) and
+already activatable (`track`, then a capture session), bounded by the OS window
+list, and need no registry machinery — folding them into "latent" is what made
+the concept feel unbounded. The genuinely dormant, declarable sources — a
+Katzensteg profile set, a launch allowlist of known apps — are the only ones a
+catalog is for. That catalog is small, authored and opt-in.
+
+Activation authority (an open question above) lives in the same place.
+Activating a dormant source is launching the app, which is the privileged act,
+so the catalog entry that declares a source producible is the natural home for
+who may activate it: the entry carries the policy, or names the grant that
+governs it, rather than growing a second authorization system beside Porthole's
+agent grants. The first two open questions then collapse into one bounded
+object: a dormant-source catalog with per-entry activation policy.
+
+Still deferred: whether that catalog is per-host or shared, its schema, and
+remote and credential concerns — now scoped to a small object rather than to
+all of discovery.

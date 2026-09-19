@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/jackstay", "crates/jackstay-graph", "crates/jackstay-bridge"]
+members = ["crates/jackstay", "crates/jackstay-graph"]
 
 [workspace.package]
 edition = "2024"

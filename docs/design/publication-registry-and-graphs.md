@@ -48,7 +48,7 @@ produce content" invites the registry to become a proxy for everything capable
 of producing a Jackstay source, which is unbounded. Two refinements keep it
 small.
 
-First, latency is declared, not inferred. The registry advertises a dormant
+First, dormancy is declared, not inferred. The registry advertises a dormant
 source only when something has explicitly registered it as producible; it never
 lists a source because something is merely capable of producing one. Discovery
 enumerates what was declared, not what is conceivable. An explicit catalog is
@@ -70,6 +70,8 @@ governs it, rather than growing a second authorization system beside Porthole's
 agent grants. The first two open questions then collapse into one bounded
 object: a dormant-source catalog with per-entry activation policy.
 
-Still deferred: whether that catalog is per-host or shared, its schema, and
-remote and credential concerns — now scoped to a small object rather than to
-all of discovery.
+Still deferred, and unchanged by this bounding: registration lifetime and who
+owns the resulting processes (both from the original open-questions list),
+remote bridging and credentials, and — new here — whether the catalog is
+per-host or shared and its schema. These are now scoped to a small object
+rather than to all of discovery.

@@ -24,6 +24,7 @@ use crate::{
         macos::{ConsumerFence, MacosFrameBackend, MetalContext, SharedEventHandle},
     },
 };
+mod named;
 mod wire;
 use wire::{Envelope, Payload, ffi};
 
@@ -166,6 +167,13 @@ impl ServerState {
         }
     }
 
+    fn close_all(&self) {
+        let identities: Vec<_> = self.sessions.lock().expect("XPC acquisition sessions").keys().copied().collect();
+        for identity in identities {
+            self.close(identity);
+        }
+    }
+
     fn close(&self, identity: u64) {
         let mut sessions = self.sessions.lock().expect("XPC acquisition sessions");
         if let Some(Session {
@@ -217,17 +225,23 @@ impl Drop for XpcArenaEndpoint {
 }
 
 /// One host-authorized native track. A named service needs its launchd
-/// MachServices entry; anonymous endpoints can be handed over an existing XPC
-/// connection or directly to another component in the same process.
+/// MachServices entry. Registrations sharing a named service are routed by their
+/// distinct authorization tokens; dropping a registration retires only that track.
+/// An explicit token must match a registration; it never falls back to an
+/// untokened publication.
+///
+/// Anonymous endpoints can be handed over an existing XPC connection or directly
+/// to another component in the same process.
 #[derive(Debug)]
 pub struct XpcArenaServer {
-    raw: NonNull<c_void>,
+    raw: Option<NonNull<c_void>>,
+    _named: Option<named::Registration>,
 }
 unsafe impl Send for XpcArenaServer {}
 impl XpcArenaServer {
     pub fn start_anonymous(token: Option<String>, producer: Producer) -> Result<(Self, XpcArenaEndpoint), ArenaError> {
         let server = Self::start(None, token, producer);
-        let raw = unsafe { ffi::jsa_server_endpoint(server.raw.as_ptr()) };
+        let raw = unsafe { ffi::jsa_server_endpoint(server.raw.expect("anonymous listener").as_ptr()) };
         Ok((
             server,
             XpcArenaEndpoint {
@@ -236,8 +250,10 @@ impl XpcArenaServer {
         ))
     }
     pub fn start_named(name: &str, token: Option<String>, producer: Producer) -> Result<Self, ArenaError> {
-        let name = CString::new(name).map_err(|_| failure("Mach service name contains NUL"))?;
-        Ok(Self::start(Some(&name), token, producer))
+        Ok(Self {
+            raw: None,
+            _named: Some(named::register(name, token, producer)?),
+        })
     }
     fn start(name: Option<&CStr>, token: Option<String>, producer: Producer) -> Self {
         let state = Box::into_raw(Box::new(ServerState {
@@ -255,13 +271,16 @@ impl XpcArenaServer {
             )
         };
         Self {
-            raw: NonNull::new(raw).expect("XPC acquisition listener"),
+            raw: Some(NonNull::new(raw).expect("XPC acquisition listener")),
+            _named: None,
         }
     }
 }
 impl Drop for XpcArenaServer {
     fn drop(&mut self) {
-        unsafe { ffi::jsa_server_stop(self.raw.as_ptr()) };
+        if let Some(raw) = self.raw {
+            unsafe { ffi::jsa_server_stop(raw.as_ptr()) };
+        }
     }
 }
 

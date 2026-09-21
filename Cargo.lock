@@ -77,24 +77,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "jackstay-bridge"
-version = "0.1.0"
-dependencies = [
- "cc",
- "jackstay",
- "jackstay-graph",
- "libc",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "jackstay-graph"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_json",
  "thiserror",
 ]
 

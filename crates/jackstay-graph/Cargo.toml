@@ -9,7 +9,6 @@ description = "Graph-manager vocabulary for Jackstay publications: export reques
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

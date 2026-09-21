@@ -66,6 +66,9 @@ struct Service {
 }
 impl Service {
     fn start() -> Self {
+        Self::start_child("launchd_producer_child")
+    }
+    fn start_child(child: &str) -> Self {
         let directory = tempfile::Builder::new().prefix("jsxpc-").tempdir_in("/tmp").unwrap();
         let name = format!(
             "work.flotilla.jackstay.test.{}.{}",
@@ -89,13 +92,13 @@ impl Service {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>{name}</string>
-<key>ProgramArguments</key><array><string>{executable}</string><string>--ignored</string><string>--exact</string><string>launchd_producer_child</string><string>--nocapture</string></array>
+<key>ProgramArguments</key><array><string>{executable}</string><string>--ignored</string><string>--exact</string><string>{child}</string><string>--nocapture</string></array>
 <key>RunAtLoad</key><true/>
 <key>MachServices</key><dict><key>{name}</key><true/></dict>
 <key>EnvironmentVariables</key><dict><key>JACKSTAY_TEST_SERVICE</key><string>{name}</string><key>JACKSTAY_TEST_CONTROL</key><string>{socket}</string></dict>
 <key>StandardOutPath</key><string>{stdout}</string><key>StandardErrorPath</key><string>{stderr}</string>
 </dict></plist>"#,
-            name=xml(&service.name), executable=xml(executable.to_str().unwrap()), socket=xml(socket.to_str().unwrap()),
+            name=xml(&service.name), child=xml(child), executable=xml(executable.to_str().unwrap()), socket=xml(socket.to_str().unwrap()),
             stdout=xml(directory.join("stdout.log").to_str().unwrap()), stderr=xml(directory.join("stderr.log").to_str().unwrap()))).unwrap();
         let result = Command::new("launchctl").args(["bootstrap", &domain]).arg(&plist).output().unwrap();
         assert!(
@@ -150,6 +153,122 @@ impl Drop for Service {
             if let Some(directory) = self.directory.take() {
                 eprintln!("XPC test diagnostics: {}", directory.keep().display());
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a launchd GUI bootstrap session and Metal; creates and removes an isolated test service"]
+fn named_publications_route_independently_and_retired_connections_cannot_rebind() {
+    let mut service = Service::start_child("launchd_multiple_publications_child");
+    let connect = || {
+        // SAFETY: this test owns the isolated conforming producer service.
+        unsafe { XpcArenaClient::connect_named(&service.name) }.unwrap()
+    };
+    let mut wrong = connect();
+    assert!(wrong.authorize("wrong").is_err());
+    let mut public = connect();
+    let public_consumer = public.attach(1).unwrap();
+    let mut first = connect();
+    first.authorize("first").unwrap();
+    let first_consumer = first.attach(1).unwrap();
+    let mut second = connect();
+    second.authorize("second").unwrap();
+    let second_consumer = second.attach(1).unwrap();
+    let sample = |consumer: &jackstay::acquisition::arena::ArenaConsumer, seed| {
+        let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() else {
+            panic!("missing routed frame");
+        };
+        let metal = MetalContext::new().unwrap();
+        let native = frame.native_resources::<IoSurface, SharedEventHandle>().unwrap();
+        let ready = ConsumerFence::from_handle(&metal, native.sync_handle).unwrap();
+        assert_eq!(
+            ready
+                .sample_offscreen(&metal, native.surface, frame.descriptor().fence_value, 16, 16)
+                .unwrap(),
+            vec![seed; 16 * 16 * 4]
+        );
+    };
+    sample(&public_consumer, 10);
+    sample(&first_consumer, 30);
+    sample(&second_consumer, 70);
+    assert_eq!(service.request(json!({"command":"replace_first"}))["ok"], true);
+    assert!(first.authorize("first").is_err());
+    sample(&second_consumer, 70);
+    // SAFETY: the same test-owned service now has a replacement registration.
+    let mut replacement = unsafe { XpcArenaClient::connect_named(&service.name) }.unwrap();
+    replacement.authorize("first").unwrap();
+    let replacement_consumer = replacement.attach(1).unwrap();
+    sample(&replacement_consumer, 90);
+    drop((public_consumer, first_consumer, second_consumer, replacement_consumer));
+    drop((public, first, second, replacement, wrong));
+    assert_eq!(service.request(json!({"command":"replace_all"}))["ok"], true);
+    // SAFETY: the child retired every registration and recreated this service.
+    let mut restarted = unsafe { XpcArenaClient::connect_named(&service.name) }.unwrap();
+    restarted.authorize("second").unwrap();
+    let restarted_consumer = restarted.attach(1).unwrap();
+    sample(&restarted_consumer, 110);
+    drop((restarted_consumer, restarted));
+    service.stop();
+}
+
+#[test]
+#[ignore = "subprocess helper for named_publications_route_independently_and_retired_connections_cannot_rebind"]
+fn launchd_multiple_publications_child() {
+    let name = std::env::var("JACKSTAY_TEST_SERVICE").unwrap();
+    let register = |token: Option<&str>, seed| {
+        let params = NativeStreamParams {
+            width: 16,
+            height: 16,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            color_space: ColorSpace::Srgb,
+            clock_domain: ClockDomain::HostTime,
+            modifier: 0,
+        };
+        let mut producer = NativeArenaProducer::new(
+            MacosFrameBackend::new().unwrap(),
+            params,
+            ArenaConfig {
+                resource_capacity: 6,
+                retained_history: 2,
+                producer_reserve: 1,
+                payload_capacity: 0,
+                memory_budget: 1024 * 1024,
+                max_incarnations: 2,
+                drain_timeout: Duration::from_millis(250),
+            },
+        )
+        .unwrap();
+        let source = IoSurface::allocate(16, 16, PixelFormat::Bgra8Unorm).unwrap();
+        source.write_pixels(&vec![seed; 16 * 16 * 4]).unwrap();
+        producer.publish(&MacosCapturedFrame { surface: source }, 1).unwrap();
+        XpcArenaServer::start_named(&name, token.map(str::to_owned), Arc::new(Mutex::new(producer))).unwrap()
+    };
+    let mut public = Some(register(None, 10));
+    let mut first = Some(register(Some("first"), 30));
+    let mut second = Some(register(Some("second"), 70));
+    let mut control = UnixStream::connect(std::env::var("JACKSTAY_TEST_CONTROL").unwrap()).unwrap();
+    control.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    send(&mut control, &json!({"pid":std::process::id()}));
+    loop {
+        match receive(&mut control)["command"].as_str().unwrap() {
+            "replace_first" => {
+                drop(first.take());
+                first = Some(register(Some("first"), 90));
+                send(&mut control, &json!({"ok":true}));
+            }
+            "replace_all" => {
+                drop(public.take());
+                drop(first.take());
+                drop(second.take());
+                second = Some(register(Some("second"), 110));
+                send(&mut control, &json!({"ok":true}));
+            }
+            "quit" => {
+                send(&mut control, &json!({"ok":true}));
+                break;
+            }
+            command => panic!("unknown test command: {command}"),
         }
     }
 }

@@ -13,6 +13,10 @@ pub fn send_fd(stream: &UnixStream, fd: RawFd) -> Result<()> {
 }
 
 pub fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> Result<()> {
+    crate::socket_options::suppress_sigpipe(stream).map_err(|error| CaptureTransferError::FdPassing {
+        operation: "suppress SIGPIPE",
+        message: error.to_string(),
+    })?;
     if fds.is_empty() {
         return Err(CaptureTransferError::FdPassing {
             operation: "sendmsg",
@@ -52,7 +56,7 @@ pub fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> Result<()> {
     }
 
     // SAFETY: stream fd is valid and message points to initialized iov/control buffers.
-    let sent = unsafe { libc::sendmsg(stream_fd(stream), &message, 0) };
+    let sent = unsafe { libc::sendmsg(stream_fd(stream), &message, libc::MSG_NOSIGNAL) };
     if sent < 0 {
         return Err(CaptureTransferError::FdPassing {
             operation: "sendmsg",

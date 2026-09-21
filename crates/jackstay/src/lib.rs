@@ -101,6 +101,8 @@ pub mod input;
 pub mod model;
 pub mod native;
 pub mod shm;
+#[cfg(unix)]
+mod socket_options;
 pub mod state;
 pub mod transfer_channel;
 

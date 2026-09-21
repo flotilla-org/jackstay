@@ -174,6 +174,7 @@ struct Handshake {
 }
 impl Handshake {
     fn new(stream: UnixStream) -> io::Result<Self> {
+        crate::socket_options::suppress_sigpipe(&stream)?;
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,

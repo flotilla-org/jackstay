@@ -84,6 +84,7 @@ fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<Option<T
 }
 
 fn write_message<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<(), SocketError> {
+    crate::socket_options::suppress_sigpipe(stream)?;
     let bytes = serde_json::to_vec(value)?;
     if bytes.is_empty() || bytes.len() > MAX_MESSAGE {
         return Err(SocketError::Protocol("message size exceeds limit"));

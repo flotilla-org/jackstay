@@ -46,6 +46,7 @@ struct Framed {
 }
 impl Framed {
     fn new(stream: UnixStream) -> io::Result<Self> {
+        crate::socket_options::suppress_sigpipe(&stream)?;
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,
@@ -420,6 +421,28 @@ fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<Atom
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_peer_is_an_error_with_default_sigpipe() {
+        const CHILD: &str = "JACKSTAY_TEST_DEFAULT_SIGPIPE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "input::transport::tests::closed_peer_is_an_error_with_default_sigpipe"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "C-host signal disposition killed the child: {status}");
+            return;
+        }
+        // Change process-wide state only in this dedicated test subprocess.
+        // Rust normally ignores SIGPIPE at startup; C hosts need not do so.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut wire = Framed::new(stream).unwrap();
+        drop(peer);
+        wire.send(Wire::Reset).unwrap();
+        assert_eq!(wire.flush().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
 
     #[test]
     fn close_ack_is_read_when_heartbeat_is_due_and_peer_has_closed() {

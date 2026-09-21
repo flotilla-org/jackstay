@@ -26,6 +26,7 @@ pub(super) struct Receiver(UnixStream);
 
 pub(super) fn channel() -> io::Result<(Arc<Wake>, Receiver)> {
     let (writer, reader) = UnixStream::pair()?;
+    crate::socket_options::suppress_sigpipe(&writer)?;
     writer.set_nonblocking(true)?;
     reader.set_nonblocking(true)?;
     Ok((Arc::new(Wake(writer)), Receiver(reader)))
@@ -34,6 +35,7 @@ pub(super) fn channel() -> io::Result<(Arc<Wake>, Receiver)> {
 impl Wake {
     pub(super) fn from_fd(fd: OwnedFd) -> io::Result<Self> {
         let stream = UnixStream::from(fd);
+        crate::socket_options::suppress_sigpipe(&stream)?;
         stream.set_nonblocking(true)?;
         Ok(Self(stream))
     }
@@ -43,8 +45,8 @@ impl Wake {
     }
 
     pub(super) fn signal(&self) -> io::Result<()> {
-        // UnixStream writes suppress SIGPIPE, including when this library is
-        // called from a C host: https://doc.rust-lang.org/std/os/unix/net/struct.UnixStream.html#sigpipe
+        // The writer is configured at creation/import so a closed receiver is
+        // an I/O error even when the embedding host has default SIGPIPE handling.
         loop {
             match (&self.0).write(&[1]) {
                 Ok(1) => return Ok(()),

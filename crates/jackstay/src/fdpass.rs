@@ -19,6 +19,12 @@ pub fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> Result<()> {
             message: "at least one fd is required".to_string(),
         });
     }
+    // This public operation borrows arbitrary host sockets, so configure each
+    // call rather than assuming the caller used a Jackstay stream constructor.
+    crate::socket_options::suppress_sigpipe(stream).map_err(|error| CaptureTransferError::FdPassing {
+        operation: "suppress SIGPIPE",
+        message: error.to_string(),
+    })?;
     let byte = [0_u8];
     let mut iov = libc::iovec {
         iov_base: byte.as_ptr().cast_mut().cast(),
@@ -52,7 +58,7 @@ pub fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> Result<()> {
     }
 
     // SAFETY: stream fd is valid and message points to initialized iov/control buffers.
-    let sent = unsafe { libc::sendmsg(stream_fd(stream), &message, 0) };
+    let sent = unsafe { libc::sendmsg(stream_fd(stream), &message, libc::MSG_NOSIGNAL) };
     if sent < 0 {
         return Err(CaptureTransferError::FdPassing {
             operation: "sendmsg",
@@ -191,6 +197,35 @@ mod tests {
     };
 
     use crate::fdpass::{recv_fd, recv_fds, send_fd, send_fds};
+
+    #[test]
+    fn closed_peer_is_an_error_with_default_sigpipe() {
+        const CHILD: &str = "JACKSTAY_TEST_FDPASS_DEFAULT_SIGPIPE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fdpass::tests::closed_peer_is_an_error_with_default_sigpipe"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "descriptor send killed the C-host child: {status}");
+            return;
+        }
+        // SAFETY: only this dedicated subprocess changes its signal disposition.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let file = tempfile_file_with_contents(b"frame-bytes");
+        drop(receiver);
+        // Darwin can reject setsockopt once the peer has closed. Either that
+        // error or a failed send must be returned without terminating the host.
+        let error = send_fd(&sender, file.as_raw_fd()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::CaptureTransferError::FdPassing {
+                operation: "sendmsg" | "suppress SIGPIPE",
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn sends_file_descriptor_over_unix_stream() {

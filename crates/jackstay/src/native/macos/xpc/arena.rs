@@ -227,8 +227,11 @@ impl Drop for XpcArenaEndpoint {
 /// One host-authorized native track. A named service needs its launchd
 /// MachServices entry. Registrations sharing a named service are routed by their
 /// distinct authorization tokens; dropping a registration retires only that track.
-/// Anonymous endpoints can be handed over an existing XPC
-/// connection or directly to another component in the same process.
+/// An explicit token must match a registration; it never falls back to an
+/// untokened publication.
+///
+/// Anonymous endpoints can be handed over an existing XPC connection or directly
+/// to another component in the same process.
 #[derive(Debug)]
 pub struct XpcArenaServer {
     raw: Option<NonNull<c_void>>,

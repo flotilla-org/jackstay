@@ -1,5 +1,19 @@
 # Acquisition runtime verification
 
+On 2026-09-21, kiwi passed the full non-ignored macOS backend suite again after
+the shared-event exhaustion was addressed. The four workspace gates, native
+Clippy and offline SDL smoke also passed.
+
+The ignored `named_publications_route_independently_and_retired_connections_cannot_rebind`
+test passed against a separate launchd producer process. Three publications
+shared one Mach service, including an untokened publication. GPU pixel readback
+distinguished their frames; an unknown explicit token was rejected. Replacing
+one registration preserved the others and rejected reuse of its old connection.
+Dropping every registration and registering again on the same service also
+delivered the new pixels. The test removed its launchd service on completion.
+These are generated native frames; Porthole's bridge validation records desktop
+capture separately.
+
 On 2026-09-12, kiwi's independent Foundation/Metal probe returned
 `device=Apple M4 shared_event=created`. Earlier observations of shared-event
 allocation failure remain recorded in `/tmp/jsxpc-weUTlB/README.md`; the cause of

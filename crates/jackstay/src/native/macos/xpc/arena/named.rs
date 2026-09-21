@@ -27,11 +27,7 @@ impl<T> Routes<T> {
             return Ok(target);
         }
         let key = token.map(str::to_owned);
-        let (key, target) = self
-            .targets
-            .get_key_value(&key)
-            .or_else(|| self.targets.get_key_value(&None))
-            .ok_or_else(|| failure("authorization rejected"))?;
+        let (key, target) = self.targets.get_key_value(&key).ok_or_else(|| failure("authorization rejected"))?;
         let target = target.clone();
         self.connections.insert(identity, (key.clone(), Arc::downgrade(&target)));
         Ok(target)
@@ -167,6 +163,17 @@ extern "C" fn destroy(context: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_unknown_explicit_token_never_selects_the_public_target() {
+        let mut routes = Routes::default();
+        routes.targets.insert(None, Arc::new(1));
+        routes.targets.insert(Some("private".into()), Arc::new(2));
+        assert!(routes.select(1, Some("wrong")).is_err());
+        assert!(!routes.connections.contains_key(&1));
+        assert_eq!(*routes.select(1, Some("private")).unwrap(), 2);
+        assert_eq!(*routes.select(2, None).unwrap(), 1);
+    }
+
     #[test]
     fn publications_route_by_token_and_connections_cannot_switch_or_rebind() {
         let mut routes = Routes::default();

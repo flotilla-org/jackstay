@@ -53,8 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Preserve the existing Windows compile gate. Native capture is unsupported.
+        with:
+          components: clippy
+      # Native capture is unsupported. Tests that need shared memory are
+      # ignored on Windows until its backing lands (flotilla-org/wheelhouse#53).
       - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
   abi:
     runs-on: ubuntu-latest
     steps:

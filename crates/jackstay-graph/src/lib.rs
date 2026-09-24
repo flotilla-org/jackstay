@@ -167,9 +167,8 @@ pub struct ExportRequest {
 /// A single-use capability handed to a bridge half by the coordinator that
 /// spawned it. 32 bytes from the OS random source, hex encoded.
 pub fn mint_token() -> std::io::Result<String> {
-    use std::io::Read;
     let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 

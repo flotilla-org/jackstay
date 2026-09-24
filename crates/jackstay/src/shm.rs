@@ -396,6 +396,7 @@ mod tests {
     use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn mapped_segment_roundtrips_bytes() {
         let mut segment = SharedMemorySegment::new(4).unwrap();
 
@@ -411,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn zero_length_read_only_mapping_is_rejected() {
         let segment = SharedMemorySegment::new(4).unwrap();
 
@@ -420,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn slice_at_returns_bounded_subrange() {
         let mut segment = SharedMemorySegment::new(8).unwrap();
         segment.as_mut_slice().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
@@ -428,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn write_at_updates_bounded_subrange() {
         let segment = SharedMemorySegment::new(8).unwrap();
 
@@ -437,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn with_slice_at_mut_updates_bounded_subrange() {
         let segment = SharedMemorySegment::new(8).unwrap();
 
@@ -446,6 +451,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_only_mapping_clones_contents_from_fd() {
         let mut segment = SharedMemorySegment::new(4).unwrap();
         segment.as_mut_slice().copy_from_slice(&[1, 2, 3, 4]);
@@ -455,6 +461,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_only_mapping_rejects_len_larger_than_backing_file() {
         let segment = SharedMemorySegment::new(4).unwrap();
 

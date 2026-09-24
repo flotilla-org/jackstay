@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Graph-manager vocabulary for Jackstay publications: export requests, chroma policy, codec decisions, tokens"
 
 [dependencies]
+getrandom = "0.4"
 serde = { workspace = true }
 thiserror = { workspace = true }
 

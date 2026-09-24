@@ -107,7 +107,7 @@ SDL_VIDEODRIVER=dummy scripts/smoke-viewer.sh
 ctest --test-dir build/viewer --output-on-failure
 ```
 
-`cargo test --locked --test acquisition_setup_ffi` checks blocked-attach
+`cargo test --locked --test acquisition_cpu_server_ffi` checks blocked-attach
 cancellation, partial-request server cancellation, FD-transfer errors, worker
 retention before admission, EOF/error status and held-frame lifetime after close.
 These are CPU transport checks. KS integration, input, audio, desktop permissions,

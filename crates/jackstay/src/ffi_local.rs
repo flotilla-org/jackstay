@@ -296,6 +296,108 @@ pub unsafe extern "C" fn ft_local_connection_alive(connection: *const FtLocalCon
     }
 }
 
+/// Run `exchange` with `timeout` (milliseconds, nonzero) applied to both
+/// directions, then restore the stream's blocking defaults for setup.
+fn with_timeout(stream: &mut Stream, timeout_ms: u32, exchange: impl FnOnce(&mut Stream) -> std::io::Result<FtStatus>) -> FtStatus {
+    let timeout = Some(std::time::Duration::from_millis(u64::from(timeout_ms)));
+    if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
+        return FT_STATUS_ERROR;
+    }
+    let result = exchange(stream);
+    let restored = stream.set_read_timeout(None).is_ok() && stream.set_write_timeout(None).is_ok();
+    match result {
+        Ok(_) if !restored => FT_STATUS_ERROR,
+        Ok(status) => status,
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => FT_STATUS_TIMEOUT,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => FT_STATUS_CLOSED,
+        Err(_) => FT_STATUS_ERROR,
+    }
+}
+
+/// Write all of `data` on an unconsumed connection: a host's own exchange
+/// before handing the connection to a setup call, such as presenting a
+/// host-issued attach token. Jackstay adds no framing. OK: every byte was
+/// written; CLOSED: the peer is gone; TIMEOUT: `timeout_ms` elapsed. After any
+/// failure the stream position is unknown: destroy the connection.
+///
+/// # Safety
+/// `connection` is live, exclusively owned and not concurrently used;
+/// `data` is readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_local_connection_write(
+    connection: *mut FtLocalConnection,
+    data: *const u8,
+    len: usize,
+    timeout_ms: u32,
+) -> FtStatus {
+    // SAFETY: caller supplies a live, exclusively owned handle.
+    let Some(connection) = (unsafe { connection.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if data.is_null() || len == 0 || timeout_ms == 0 {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: caller guarantees `len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    with_timeout(&mut connection.stream, timeout_ms, |stream| {
+        use std::io::Write;
+        stream.write_all(bytes)?;
+        stream.flush()?;
+        Ok(FT_STATUS_OK)
+    })
+}
+
+/// Read a host's reply up to and including the first `delimiter` byte, one
+/// byte at a time, so no byte after it (such as the start of setup) is
+/// consumed. `*out_len` counts the delimiter. CAPACITY: `capacity` bytes
+/// arrived without it; CLOSED: the peer closed first; TIMEOUT: `timeout_ms`
+/// elapsed. After any failure destroy the connection.
+///
+/// # Safety
+/// `connection` is live, exclusively owned and not concurrently used; `out` is
+/// writable for `capacity` bytes and `out_len` is writable; neither aliases.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_local_connection_read_until(
+    connection: *mut FtLocalConnection,
+    delimiter: u8,
+    out: *mut u8,
+    capacity: usize,
+    out_len: *mut usize,
+    timeout_ms: u32,
+) -> FtStatus {
+    // SAFETY: caller supplies live, disjoint pointers.
+    let (Some(connection), Some(out_len)) = (unsafe { connection.as_mut() }, unsafe { out_len.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if out.is_null() || capacity == 0 || timeout_ms == 0 {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    *out_len = 0;
+    // SAFETY: caller guarantees `capacity` writable bytes, disjoint from the rest.
+    let buffer = unsafe { std::slice::from_raw_parts_mut(out, capacity) };
+    let mut filled = 0;
+    let status = with_timeout(&mut connection.stream, timeout_ms, |stream| {
+        use std::io::Read;
+        while filled < capacity {
+            let mut byte = [0];
+            match stream.read(&mut byte) {
+                Ok(0) => return Ok(FT_STATUS_CLOSED),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+            buffer[filled] = byte[0];
+            filled += 1;
+            if byte[0] == delimiter {
+                return Ok(FT_STATUS_OK);
+            }
+        }
+        Ok(FT_STATUS_CAPACITY)
+    });
+    *out_len = filled;
+    status
+}
+
 /// Close an unconsumed connection. Null input/handle is harmless.
 ///
 /// # Safety

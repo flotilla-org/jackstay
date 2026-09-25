@@ -142,6 +142,24 @@ set to `FT_OS_OBJECT_NONE` once consumed.
 On Windows the build compiles `c_abi_header_smoke.c` with MSVC in C11 mode, and
 `acquisition_ffi` runs its C translation unit against a Rust producer.
 
+
+## C ABI 0.11: a host's own exchange
+
+A host may run its own exchange on a connection before the setup call that
+consumes it, for example to present a host-issued attach token and read which
+publication follows. Porthole's Windows native capture sessions work this way:
+the consumer sends one JSON line with the session's attach token, reads one
+reply line, and Jackstay's D3D11 or CPU setup then runs on the same stream.
+
+`ft_local_connection_write` sends bytes and `ft_local_connection_read_until`
+reads up to and including a delimiter byte, one byte at a time, so it never
+consumes the start of setup. Jackstay adds no framing and interprets nothing.
+Both take a nonzero timeout in milliseconds and restore the stream's blocking
+defaults before returning. After a failure (CLOSED, TIMEOUT, CAPACITY) the
+stream position is unknown and the caller destroys the connection. The calls
+are transport-neutral: the host protocol, not Jackstay, decides what the bytes
+mean, so no host's authority model enters the transport core.
+
 ## Evidence
 
 Windows unit tests cover rendering, identity reported both ways, a taken name

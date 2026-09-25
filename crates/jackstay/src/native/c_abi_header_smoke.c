@@ -47,6 +47,9 @@ int jackstay_c_local_endpoint_smoke(void) {
   ft_status (*connect_fn)(const ft_local_endpoint *, ft_local_connection **) = ft_local_connect;
   ft_status (*peer_fn)(const ft_local_connection *, ft_peer_identity *) = ft_local_connection_peer;
   ft_status (*alive_fn)(const ft_local_connection *) = ft_local_connection_alive;
+  ft_status (*write_fn)(ft_local_connection *, const uint8_t *, size_t, uint32_t) = ft_local_connection_write;
+  ft_status (*read_until_fn)(ft_local_connection *, uint8_t, uint8_t *, size_t, size_t *, uint32_t) =
+      ft_local_connection_read_until;
   ft_status (*serve_fn)(ft_cpu_producer *, ft_local_connection **, ft_cpu_setup_server **) =
       ft_cpu_producer_serve_local;
   ft_status (*create_fn)(ft_local_connection **, ft_cpu_acquisition_connection **) =
@@ -65,7 +68,8 @@ int jackstay_c_local_endpoint_smoke(void) {
   char rendered[512];
   if (ft_local_endpoint_render(&endpoint, rendered, sizeof rendered) != FT_STATUS_OK) return -1;
   return (int)(sizeof peer + (none == FT_OS_OBJECT_NONE) + (listen_fn != NULL) + (accept_fn != NULL) +
-               (connect_fn != NULL) + (peer_fn != NULL) + (alive_fn != NULL) + (serve_fn != NULL) +
+               (connect_fn != NULL) + (peer_fn != NULL) + (alive_fn != NULL) + (write_fn != NULL) +
+               (read_until_fn != NULL) + (serve_fn != NULL) +
                (create_fn != NULL) + (setup_alive_fn != NULL) + (bootstrap_accept_fn != NULL) +
                (bootstrap_connect_fn != NULL) + (input_serve_fn != NULL) + (input_connect_fn != NULL) +
                (import_fn != NULL) + FT_STATUS_ADDRESS_IN_USE + FT_STATUS_UNTRUSTED_PEER);

@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 10
+#define FT_ABI_VERSION_MINOR 11
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -156,6 +156,20 @@ ft_status ft_local_connect(const ft_local_endpoint *endpoint, ft_local_connectio
 ft_status ft_local_connection_peer(const ft_local_connection *connection, ft_peer_identity *out);
 /* OK while the peer holds its end, CLOSED after; never consumes bytes. */
 ft_status ft_local_connection_alive(const ft_local_connection *connection);
+/* ABI 0.11: a host's own exchange on an unconsumed connection before the setup
+ * call that consumes it, for example presenting a host-issued attach token
+ * and reading the host's reply. Jackstay adds no framing and interprets no
+ * bytes. Both block for at most timeout_ms (nonzero); run them off GUI/input
+ * threads. write sends all len bytes. read_until reads one byte at a time up
+ * to and including the first delimiter, so no later byte (such as the start
+ * of setup) is consumed; *out_len counts the bytes stored, delimiter included.
+ * CLOSED: the peer closed first. TIMEOUT: the time ran out. CAPACITY: no
+ * delimiter within capacity bytes. After any failure the stream position is
+ * unknown: destroy the connection. */
+ft_status ft_local_connection_write(ft_local_connection *connection, const uint8_t *data, size_t len,
+                                    uint32_t timeout_ms);
+ft_status ft_local_connection_read_until(ft_local_connection *connection, uint8_t delimiter, uint8_t *out,
+                                         size_t capacity, size_t *out_len, uint32_t timeout_ms);
 /* Closes an unconsumed connection; NULL and *connection=NULL are harmless. */
 void ft_local_connection_destroy(ft_local_connection **connection);
 

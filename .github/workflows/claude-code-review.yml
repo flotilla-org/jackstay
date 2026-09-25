@@ -2,8 +2,19 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
 jobs:
   claude-review:
+    # Optional: Filter by PR author
+    # if: |
+    #   github.event.pull_request.user.login == 'external-contributor' ||
+    #   github.event.pull_request.user.login == 'new-developer' ||
+    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,12 +47,115 @@ jobs:
 
             Use the repository's AGENTS.md for guidance on style and conventions. Be constructive and helpful in your feedback.
 
-            AFTER reviewing,
-              * CHECK your findings against the existing comments and replies on the PR. e.g if followup issues are filed or the implementor pushed back, make sure that is
+            Review the diff and relevant source directly in this session. Do not invoke
+            /code-review or another review skill. Complete the review and post its
+            comment before returning your final response; a promise to finish later
+            does not complete this CI job.
+
+            Review source only. Dedicated CI jobs run builds, tests, and linters;
+            do not run those commands as part of this review.
+
+            AFTER reviewing, 
+              * CHECK your findings against the existing comments and replies on the PR. e.g if followup issues are filed or the implementor pushed back, make sure that is 
               correct: drop issues that are already addressed, repeat issues that still need to be dealt with with an explanation.
               * ALWAYS Use `gh pr comment` with your Bash tool to leave your review as a SINGLE comment on the PR, properly formatted as markdown, even if just to say that you found no issues.
+              * Include this marker in that comment: <!-- jackstay-review:${{ github.event.pull_request.head.sha }} -->
+              * Use `gh pr comment` with a quoted heredoc on stdin (`--body-file -`); do not create a temporary file or wrap the command in another shell.
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://docs.claude.com/en/docs/claude-code/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+          claude_args: '--disallowed-tools Skill --allowed-tools "Read,Glob,Grep,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
 
+
+      - name: Summarize review permission denials
+        if: always() && steps.claude-review.outputs.execution_file != ''
+        uses: actions/github-script@v7
+        env:
+          REVIEW_EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        with:
+          script: |
+            const fs = require('fs');
+            const messages = JSON.parse(fs.readFileSync(process.env.REVIEW_EXECUTION_FILE, 'utf8'));
+            // Log fixed categories only, never tool arguments, results, or model prose.
+            const toolNames = new Set(['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Skill', 'Agent', 'Task', 'WebFetch', 'WebSearch']);
+            const prefixes = ['gh pr comment', 'gh pr diff', 'gh pr view', 'gh api', 'git diff', 'git show', 'git log', 'cat', 'sed', 'rg', 'grep', 'python3', 'python', 'node', 'ls'];
+            const counts = {};
+            let total = 0;
+            for (const message of messages) {
+              if (message.type !== 'result') continue;
+              for (const denial of message.permission_denials ?? []) {
+                let category = toolNames.has(denial.tool_name) ? denial.tool_name : 'other tool';
+                if (denial.tool_name === 'Bash') {
+                  const command = (denial.tool_input?.command ?? '').trimStart();
+                  const prefix = prefixes.find(value => command === value || command.startsWith(value + ' '));
+                  category = prefix ? `Bash: ${prefix}` : 'Bash: other command';
+                }
+                counts[category] = (counts[category] ?? 0) + 1;
+                total++;
+              }
+            }
+            core.info(JSON.stringify({permission_denials: total, categories: counts}, null, 2));
+
+      - name: Diagnose unpublished review on debug reruns
+        if: always() && runner.debug == '1' && steps.claude-review.outputs.execution_file != ''
+        env:
+          REVIEW_EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        shell: python
+        run: |
+          import json
+          import os
+          import shlex
+
+          with open(os.environ["REVIEW_EXECUTION_FILE"], encoding="utf-8") as source:
+              messages = json.load(source)
+
+          # Fixed shell vocabulary: preserve structure, omit paths and argument values.
+          vocabulary = set("gh pr diff view comment list issue api git show log status cat sed rg grep head tail wc python python3 node ls cd echo printf bash sh curl true false --repo --json --jq --body --body-file --stat --name-only --patch --raw -R -r -n -c -s -L -f | || && ; > >> < << ( )".split())
+          shapes = []
+          results = [message for message in messages if message.get("type") == "result"]
+          for result in results:
+              for denial in result.get("permission_denials", []):
+                  if denial.get("tool_name") != "Bash":
+                      continue
+                  command = denial.get("tool_input", {}).get("command", "")
+                  try:
+                      lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+                      lexer.whitespace_split = True
+                      shapes.append(" ".join(token if token in vocabulary else "<arg>" for token in lexer))
+                  except ValueError:
+                      shapes.append("<unparsed command>")
+
+          # Final response only: no intermediate messages or tool results.
+          # JSON escaping prevents embedded newlines becoming workflow commands.
+          print(json.dumps({"diagnostic": "review-publication",
+                            "denied_command_shapes": shapes,
+                            "final_responses": [result.get("result", "") for result in results]}))
+
+      - name: Require a posted review for this commit
+        uses: actions/github-script@v7
+        env:
+          REVIEW_EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        with:
+          script: |
+            // The review service deliberately skips changes to its own workflow.
+            // Those PRs need manual review before this configuration can run on main.
+            if (!process.env.REVIEW_EXECUTION_FILE) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                ...context.repo,
+                pull_number: context.issue.number,
+                per_page: 100,
+              });
+              if (files.some(file => file.filename === ".github/workflows/claude-code-review.yml")) {
+                core.notice("Automated review skipped for a workflow change; manual review is required.");
+                return;
+              }
+            }
+            const marker = `<!-- jackstay-review:${context.payload.pull_request.head.sha} -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            if (!comments.some(comment => comment.user?.type === "Bot" && comment.body?.includes(marker))) {
+              core.setFailed("The review action finished without posting a review for this commit. Check its tool-permission denials and output.");
+            }

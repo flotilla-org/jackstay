@@ -156,15 +156,29 @@ to publish the whole frame. `CapturePolicy` carries:
   keeping the aspect ratio) or `Fixed { width, height }` (fit the image with
   its aspect ratio, centred on black). Scaling is one draw with a runtime-compiled
   (`D3DCompile`) shader into a private texture, which is then copied into the
-  slot.
+  slot. The scaler updates one constant buffer in place and caches a shader
+  view for each source texture (WGC cycles two).
 - `adapter`, `publication` (`D3d11`, or `Cpu` on request), `arena` sizing, and
   an optional `DesktopMonitor`.
 
 Jackstay owns the D3D11 device, a free-threaded `Direct3D11CaptureFramePool` of
 two BGRA8 buffers, the session, the copy, fences and adapter identity.
-`FrameArrived` runs on a thread-pool thread. It drains the frame pool to the
-newest frame (older buffers go straight back), crops to the client area, and
-publishes.
+`FrameArrived` runs on a thread-pool thread. Under the capture lock it drains
+the frame pool to the newest frame (older buffers go straight back), so
+overlapping callbacks handle frames in arrival order. It then crops to the
+client area and publishes. A frame older than the newest one already published
+is dropped, so published timestamps only increase.
+
+A window can go static after publication dropped its newest frame: pool
+exhaustion, or a resize whose replacement pool is paused for capacity. WGC then
+sends nothing new. The capture therefore keeps a GPU copy of the newest dropped
+frame. At each interval the watch thread advances any paused replacement and
+publishes that copy once publication accepts it.
+
+A window minimized at start can report an empty size. The frame pool and arena
+then start at one pixel and follow the first real frame. A start that fails
+removes its `Closed` handler from the host's item and closes its session and
+frame pool, so the host can retry with the same item.
 
 To find the client area, the capture compares `DwmGetWindowAttribute`
 (`DWMWA_EXTENDED_FRAME_BOUNDS`) with `GetClientRect` and `ClientToScreen`, all
@@ -179,7 +193,7 @@ Lifecycle:
 | `Closed`, or window destroyed | publication stops. Terminal; nothing restarts it. | `Closed` |
 | session locked or disconnected | frames are dropped and counted; the capture resumes when the desktop returns | `Paused(Locked \| Disconnected)` |
 | device removed | once the desktop is available: a new device (default adapter, or the named LUID), frame pool, session and arena. The old publication is stopped. Retried at the watch interval for up to 300 attempts. | `Recovering`, then `Running` with `epoch + 1` and the new `mode`/LUID |
-| shared fences unavailable | CPU arena. Frames are copied to a staging texture, mapped and published with `CpuCopyComplete`. | `mode: Cpu { reason }` |
+| shared fences unavailable | CPU arena. Frames are copied into a staging texture. The mapping waits outside the capture lock, and the device context is held only for each poll. Rows go into a reused buffer and are published with `CpuCopyComplete`. | `mode: Cpu { reason }` |
 
 In #23, "resize → new arena incarnation" became a reconfiguration generation,
 because it keeps consumers attached, and a frame held across the resize stays
@@ -192,8 +206,10 @@ publication again when `epoch` advances.
 `SessionDesktop` reports the desktop as unavailable from
 `WTSQuerySessionInformation(WTSSessionInfoEx)`: a connect state other than active
 or connected, or the lock flag `WTS_SESSIONSTATE_LOCK`. A failed query counts as
-available. A watch thread polls it every `watch_interval` (default 100 ms). The
-same thread checks `GetDeviceRemovedReason` and the window's existence.
+available. A watch thread polls it once every `watch_interval` (default
+100 ms). The same thread checks `GetDeviceRemovedReason` and the window's
+existence. It wakes early only for a new event: a loss, closure or stop. A loss
+already known while the desktop is unavailable waits for the next interval.
 
 On Beaufort, WGC's `GraphicsCaptureItem.Closed` was not observed for a destroyed
 test window. `WgcCapture` therefore also treats `IsWindow == false` as closure.
@@ -254,6 +270,11 @@ By default, a capture's device goes on `9fe5`.
 | WGC window producer → consumer process: the same resize, hold and kill sequence | `native_arena_windows_process` (ignored by default) | pass |
 | WGC window producer process killed with a gated copy pending | `native_arena_windows_process` (ignored by default) | pass |
 | WGC in-process: client-area pixels, recolour, resize, injected lock pause and resume, simulated device loss (epoch 2, old publication closed), window close → `Closed` | `wgc_capture_windows` (ignored by default) | pass |
+| device loss injected while an injected disconnect lasts: 9 watch iterations in 1 s (no spin), recovery once the desktop returns | `wgc_capture_windows` | pass |
+| start while minimized (`Source`, and `Fit` with zero limits) at 1×1, then publish at the real size after restore | `wgc_capture_windows` | pass |
+| resize with the replacement paused for capacity; window static; freeing capacity publishes the kept frame at the new size | `wgc_capture_windows` | pass |
+| three failed starts on one item, then a working start on it | `wgc_capture_windows` | pass |
+| rapid repaints: published timestamps strictly increase (D3D11 and CPU) | `wgc_capture_windows` | pass |
 | output size `Fixed` (letterboxed) and `Fit` | `wgc_capture_windows` | pass |
 | CPU publication is reported and carries the client area | `wgc_capture_windows` | pass |
 

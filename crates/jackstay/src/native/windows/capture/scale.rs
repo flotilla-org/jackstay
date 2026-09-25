@@ -8,12 +8,12 @@ use ::windows::{
         Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, Fxc::D3DCompile, ID3DBlob},
         Direct3D11::{
             D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER,
-            D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC,
-            D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState,
-            ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+            D3D11_VIEWPORT, ID3D11Buffer, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
+            ID3D11Texture2D, ID3D11VertexShader,
         },
     },
-    core::{PCSTR, s},
+    core::{Interface, PCSTR, s},
 };
 
 use crate::{
@@ -80,10 +80,17 @@ pub(super) struct Placement {
     pub height: f32,
 }
 
+/// Cached shader views: two WGC buffers, their predecessors across one
+/// resize, and a private source copy.
+const VIEW_CACHE: usize = 5;
+
 pub(super) struct Scaler {
     vertex: ID3D11VertexShader,
     pixel: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
+    /// The source rectangle in UV space, updated in place per frame.
+    constants: ID3D11Buffer,
+    views: Vec<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
     target: Option<(u32, u32, ID3D11Texture2D, ID3D11RenderTargetView)>,
     /// A private copy of the source when the captured texture cannot be
     /// sampled directly.
@@ -98,6 +105,7 @@ impl Scaler {
         let mut vertex = None;
         let mut pixel = None;
         let mut sampler = None;
+        let mut constants = None;
         let sampler_desc = D3D11_SAMPLER_DESC {
             Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
             AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -105,6 +113,12 @@ impl Scaler {
             AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
             ComparisonFunc: D3D11_COMPARISON_NEVER,
             MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        let constants_desc = D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
             ..Default::default()
         };
         // SAFETY: bytecode and descriptions are live; out pointers are locals.
@@ -115,14 +129,36 @@ impl Scaler {
                 .map_err(|error| failure("scale-shader", error))?;
             raw.CreateSamplerState(&sampler_desc, Some(&mut sampler))
                 .map_err(|error| failure("scale-sampler", error))?;
+            raw.CreateBuffer(&constants_desc, None, Some(&mut constants))
+                .map_err(|error| failure("scale-constants", error))?;
         }
         Ok(Self {
             vertex: vertex.ok_or_else(|| failure("scale-shader", "no vertex shader"))?,
             pixel: pixel.ok_or_else(|| failure("scale-shader", "no pixel shader"))?,
             sampler: sampler.ok_or_else(|| failure("scale-sampler", "no sampler"))?,
+            constants: constants.ok_or_else(|| failure("scale-constants", "no buffer"))?,
+            views: Vec::new(),
             target: None,
             source: None,
         })
+    }
+
+    /// A shader view of `texture`, cached by texture identity. WGC cycles a
+    /// few buffers (two, recreated on resize); the cache holds each texture it
+    /// names, so an identity is never reused while cached.
+    fn view(&mut self, device: &D3d11Device, texture: &ID3D11Texture2D) -> Result<ID3D11ShaderResourceView> {
+        if let Some((_, view)) = self.views.iter().find(|(cached, _)| cached.as_raw() == texture.as_raw()) {
+            return Ok(view.clone());
+        }
+        let mut view = None;
+        // SAFETY: the texture belongs to this device; the out pointer is a local.
+        unsafe { device.raw().CreateShaderResourceView(texture, None, Some(&mut view)) }.map_err(|error| failure("scale-view", error))?;
+        let view = view.ok_or_else(|| failure("scale-view", "no view"))?;
+        if self.views.len() >= VIEW_CACHE {
+            self.views.remove(0);
+        }
+        self.views.push((texture.clone(), view.clone()));
+        Ok(view)
     }
 
     /// Draw `region` (left, top, width, height) of `texture` at `placement`
@@ -194,25 +230,12 @@ impl Scaler {
             region.2 as f32 / extent.0 as f32,
             region.3 as f32 / extent.1 as f32,
         ];
-        let constants = {
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: 16,
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-                ..Default::default()
-            };
-            let data = D3D11_SUBRESOURCE_DATA {
-                pSysMem: uv.as_ptr().cast(),
-                ..Default::default()
-            };
-            let mut buffer: Option<ID3D11Buffer> = None;
-            // SAFETY: 16 bytes of initial data for a 16-byte buffer.
-            unsafe { raw.CreateBuffer(&desc, Some(&data), Some(&mut buffer)) }.map_err(|error| failure("scale-constants", error))?;
-            buffer
-        };
-        let mut view: Option<ID3D11ShaderResourceView> = None;
-        // SAFETY: the sampled texture belongs to this device.
-        unsafe { raw.CreateShaderResourceView(&sampled, None, Some(&mut view)) }.map_err(|error| failure("scale-view", error))?;
+        drop(context);
+        let view = self.view(device, &sampled)?;
+        let context = device.context();
+        // SAFETY: 16 bytes of source for the 16-byte constant buffer; the
+        // context is locked.
+        unsafe { context.UpdateSubresource(&self.constants, 0, None, uv.as_ptr().cast(), 0, 0) };
         let (_, _, output, target) = self.target.as_ref().expect("created above");
         let viewport = D3D11_VIEWPORT {
             TopLeftX: placement.left,
@@ -232,9 +255,9 @@ impl Scaler {
             context.IASetInputLayout(None);
             context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.VSSetShader(&self.vertex, None);
-            context.VSSetConstantBuffers(0, Some(&[constants]));
+            context.VSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
             context.PSSetShader(&self.pixel, None);
-            context.PSSetShaderResources(0, Some(&[view]));
+            context.PSSetShaderResources(0, Some(&[Some(view)]));
             context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             context.Draw(3, 0);
             context.PSSetShaderResources(0, Some(&[None]));

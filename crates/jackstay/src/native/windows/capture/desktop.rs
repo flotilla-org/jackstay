@@ -6,8 +6,8 @@ use std::fmt;
 
 use ::windows::{
     Win32::System::RemoteDesktop::{
-        WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTSActive, WTSConnected, WTSDisconnected, WTSFreeMemory,
-        WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx,
+        WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTSActive, WTSConnected, WTSFreeMemory, WTSINFOEXW,
+        WTSQuerySessionInformationW, WTSSessionInfoEx,
     },
     core::PWSTR,
 };
@@ -89,7 +89,7 @@ impl SessionState {
     #[must_use]
     pub fn unavailable(&self) -> Option<DesktopUnavailable> {
         let connected = [WTSActive, WTSConnected].contains(&WTS_CONNECTSTATE_CLASS(self.connect_state));
-        if !connected || WTS_CONNECTSTATE_CLASS(self.connect_state) == WTSDisconnected {
+        if !connected {
             return Some(DesktopUnavailable::Disconnected);
         }
         (self.lock_flag == WTS_SESSIONSTATE_LOCK as i32).then_some(DesktopUnavailable::Locked)
@@ -99,5 +99,25 @@ impl SessionState {
 impl DesktopMonitor for SessionDesktop {
     fn unavailable(&self) -> Option<DesktopUnavailable> {
         Self::query().ok().and_then(|state| state.unavailable())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DesktopUnavailable, SessionState};
+
+    #[test]
+    fn session_states_map_to_desktop_availability() {
+        let state = |connect_state, lock_flag| SessionState {
+            session_id: 1,
+            connect_state,
+            lock_flag,
+        };
+        assert_eq!(state(0, 1).unavailable(), None);
+        assert_eq!(state(1, -1).unavailable(), None);
+        assert_eq!(state(0, 0).unavailable(), Some(DesktopUnavailable::Locked));
+        for disconnected in [2, 3, 4, 5, 9] {
+            assert_eq!(state(disconnected, 1).unavailable(), Some(DesktopUnavailable::Disconnected));
+        }
     }
 }

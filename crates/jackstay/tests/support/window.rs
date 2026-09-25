@@ -24,8 +24,8 @@ use windows::{
             WindowsAndMessaging::{
                 AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-                SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-                WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_PAINT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+                SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
+                ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_PAINT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
             },
         },
     },
@@ -177,6 +177,25 @@ impl TestWindow {
             SetThreadDpiAwarenessContext(previous);
             let _ = InvalidateRect(Some(self.hwnd()), None, true);
         }
+    }
+
+    /// Minimize without activating anything.
+    pub fn minimize(&self) {
+        // SAFETY: ShowWindow on a live window, from any thread.
+        let _ = unsafe { ShowWindow(self.hwnd(), SW_SHOWMINNOACTIVE) };
+    }
+
+    /// Restore from minimized, without activation.
+    pub fn restore(&self) {
+        // SAFETY: as minimize.
+        let _ = unsafe { ShowWindow(self.hwnd(), SW_SHOWNOACTIVATE) };
+        self.set_color(self.color());
+    }
+
+    fn color(&self) -> [u8; 3] {
+        // SAFETY: reading this window's own user data.
+        let value = unsafe { GetWindowLongPtrW(self.hwnd(), GWLP_USERDATA) } as u32;
+        [value as u8, (value >> 8) as u8, (value >> 16) as u8]
     }
 
     pub fn close(&mut self) {

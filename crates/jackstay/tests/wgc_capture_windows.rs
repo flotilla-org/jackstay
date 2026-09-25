@@ -315,3 +315,207 @@ fn capture_publishes_on_every_adapter_with_a_minimum_update_interval() {
         window.set_color(RED);
     }
 }
+
+#[test]
+#[ignore = "needs an interactive desktop; creates and captures its own window"]
+fn a_device_loss_known_while_the_desktop_is_unavailable_waits_without_spinning() {
+    let window = TestWindow::open(160, 120, RED);
+    let desktop = Arc::new(FakeDesktop::default());
+    let capture = start(
+        &window,
+        CapturePolicy {
+            cursor: false,
+            desktop: Some(desktop.clone()),
+            ..CapturePolicy::default()
+        },
+    );
+    wait(&capture, "first frame", |status| status.frames_published > 0);
+    *desktop.0.lock().unwrap() = Some(DesktopUnavailable::Disconnected);
+    capture.simulate_device_loss("injected while disconnected");
+    wait(&capture, "pause", |status| {
+        status.state == CaptureState::Paused(DesktopUnavailable::Disconnected)
+    });
+    // A pending loss the watcher already knows about must not wake it: at a
+    // 100 ms interval, one second is about ten iterations, not thousands.
+    let before = capture.watch_iterations();
+    std::thread::sleep(Duration::from_secs(1));
+    let iterations = capture.watch_iterations() - before;
+    assert!(iterations <= 20, "watcher spun {iterations} times in one second");
+    assert_eq!(capture.status().epoch, 1, "recovered while the desktop was unavailable");
+    *desktop.0.lock().unwrap() = None;
+    let recovered = wait(&capture, "recovery", |status| {
+        status.epoch == 2 && status.state == CaptureState::Running
+    });
+    eprintln!("{iterations} watch iterations in 1 s while paused with a pending loss; then {recovered:?}");
+}
+
+#[test]
+#[ignore = "needs an interactive desktop; creates and captures its own window"]
+fn a_minimized_window_starts_and_publishes_once_restored() {
+    let window = TestWindow::open(160, 120, BLUE);
+    window.minimize();
+    std::thread::sleep(Duration::from_millis(300));
+    for output_size in [
+        OutputSize::Source,
+        OutputSize::Fit {
+            max_width: 0,
+            max_height: 0,
+        },
+    ] {
+        let capture = start(
+            &window,
+            CapturePolicy {
+                cursor: false,
+                output_size,
+                ..CapturePolicy::default()
+            },
+        );
+        eprintln!("started minimized with {output_size:?}: {:?}", capture.status());
+    }
+    let capture = start(
+        &window,
+        CapturePolicy {
+            cursor: false,
+            ..CapturePolicy::default()
+        },
+    );
+    window.restore();
+    let (_, producer) = d3d11(&capture);
+    let status = wait(&capture, "restored frame", |status| {
+        status.size == (160, 120) && status.frames_published > 0
+    });
+    let PublicationMode::D3d11 { adapter } = status.mode else {
+        panic!()
+    };
+    let reader = Reader {
+        device: D3d11Device::new(AdapterSelection::Luid(adapter.luid)).unwrap(),
+    };
+    let mut consumer = producer.lock().unwrap().attach(1).unwrap().into_consumer().unwrap();
+    window.set_color(BLUE);
+    drop(reader.until_uniform(&producer, &mut consumer, BLUE, (160, 120)));
+}
+
+#[test]
+#[ignore = "needs an interactive desktop; creates and captures its own window"]
+fn a_replacement_paused_for_capacity_publishes_a_static_window_once_capacity_frees() {
+    use jackstay::{
+        model::{ClockDomain, ColorSpace, PixelFormat},
+        native::{NativeStreamParams, arena::ArenaNativeBackend, windows::D3d11FrameBackend},
+    };
+    let window = TestWindow::open(160, 120, RED);
+    // Room for one pool of either size plus arena metadata, never two.
+    let device = Arc::new(D3d11Device::new(AdapterSelection::Default).unwrap());
+    let bound = D3d11FrameBackend::new(device)
+        .pool_allocation_upper_bound(
+            &NativeStreamParams {
+                width: 200,
+                height: 120,
+                pixel_format: PixelFormat::Bgra8Unorm,
+                color_space: ColorSpace::Srgb,
+                clock_domain: ClockDomain::HostTime,
+                modifier: 0,
+            },
+            6,
+        )
+        .unwrap();
+    let capture = start(
+        &window,
+        CapturePolicy {
+            cursor: false,
+            arena: jackstay::native::windows::capture::CaptureArena {
+                memory_budget: bound + 16 * 4096,
+                ..Default::default()
+            },
+            ..CapturePolicy::default()
+        },
+    );
+    let status = wait(&capture, "first frame", |status| status.frames_published > 0);
+    let PublicationMode::D3d11 { adapter } = status.mode else {
+        panic!()
+    };
+    let (_, producer) = d3d11(&capture);
+    let reader = Reader {
+        device: D3d11Device::new(AdapterSelection::Luid(adapter.luid)).unwrap(),
+    };
+    let mut consumer = producer.lock().unwrap().attach(1).unwrap().into_consumer().unwrap();
+    let held = reader.until_uniform(&producer, &mut consumer, RED, (160, 120));
+    window.resize(200, 90);
+    let deadline = Instant::now() + TIMEOUT;
+    while !producer.lock().unwrap().reconfiguration_pending() {
+        assert!(Instant::now() < deadline, "the replacement never paused for capacity");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The window is now static: WGC sends no further frames.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = capture.status();
+    assert_eq!(before.size, (160, 120));
+    drop(held);
+    consumer.relinquish_configuration();
+    let after = wait(&capture, "deferred publication", |status| status.size == (200, 90));
+    assert!(after.frames_published > before.frames_published);
+    drop(reader.until_uniform(&producer, &mut consumer, RED, (200, 90)));
+}
+
+#[test]
+#[ignore = "needs an interactive desktop; creates and captures its own window"]
+fn a_failed_start_leaves_the_item_reusable() {
+    let window = TestWindow::open(160, 120, GREEN);
+    let item = capture_item_for_window(window.hwnd()).unwrap();
+    let starved = CapturePolicy {
+        arena: jackstay::native::windows::capture::CaptureArena {
+            memory_budget: 1,
+            ..Default::default()
+        },
+        ..CapturePolicy::default()
+    };
+    for _ in 0..3 {
+        assert!(WgcCapture::start(CaptureTarget::window_client_area(item.clone(), window.hwnd()), starved.clone()).is_err());
+    }
+    let capture = WgcCapture::start(
+        CaptureTarget::window_client_area(item, window.hwnd()),
+        CapturePolicy {
+            cursor: false,
+            ..CapturePolicy::default()
+        },
+    )
+    .unwrap();
+    wait(&capture, "first frame", |status| status.frames_published > 0);
+}
+
+#[test]
+#[ignore = "needs an interactive desktop; creates and captures its own window"]
+fn published_timestamps_never_go_backwards_under_rapid_repaints() {
+    let window = TestWindow::open(160, 120, RED);
+    for publication in [PublicationPreference::D3d11, PublicationPreference::Cpu] {
+        let capture = start(
+            &window,
+            CapturePolicy {
+                cursor: false,
+                publication,
+                ..CapturePolicy::default()
+            },
+        );
+        wait(&capture, "first frame", |status| status.frames_published > 0);
+        let consumer = match capture.publication().unwrap().1 {
+            Publication::D3d11(producer) => producer.lock().unwrap().attach(1).unwrap().into_consumer().unwrap(),
+            Publication::Cpu(producer) => ArenaConsumer::from_grant(producer.lock().unwrap().attach(1).unwrap()).unwrap(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (mut after, mut last, mut seen) = (0, 0, 0);
+        let mut color = 0;
+        while Instant::now() < deadline {
+            color += 1;
+            window.set_color([RED, GREEN, BLUE][color % 3]);
+            if let AcquireOutcome::Frame(frame) = consumer.acquire_latest(after).unwrap() {
+                after = frame.cursor();
+                let timestamp = frame.descriptor().timestamp_ns;
+                assert!(timestamp > last, "{publication:?}: timestamp went from {last} to {timestamp}");
+                last = timestamp;
+                seen += 1;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        eprintln!("{publication:?}: {seen} frames with increasing timestamps; {:?}", capture.status());
+        assert!(seen > 10);
+    }
+}

@@ -56,10 +56,10 @@ use ::windows::{
         Foundation::HWND,
         Graphics::{
             Direct3D11::{
-                D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-                ID3D11Texture2D,
+                D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+                D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Texture2D,
             },
-            Dxgi::IDXGIDevice,
+            Dxgi::{DXGI_ERROR_WAS_STILL_DRAWING, IDXGIDevice},
         },
         System::WinRT::{
             Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess},
@@ -306,17 +306,17 @@ struct Cpu {
     producer: Arc<Mutex<ArenaProducer>>,
     size: (u32, u32),
     pending: Option<(u32, u32)>,
-    staging: Option<(u32, u32, ID3D11Texture2D)>,
+    /// Free staging textures and row buffers. A readback in flight owns one
+    /// of each, so overlapping frames never share them.
+    staging: Vec<(u32, u32, ID3D11Texture2D)>,
+    buffers: Vec<Vec<u8>>,
     sequence: u64,
     dropped: u64,
     pending_drops: u32,
 }
 
 enum Publisher {
-    D3d11 {
-        producer: D3d11Producer,
-        pending: Option<(u32, u32)>,
-    },
+    D3d11(D3d11Producer),
     Cpu(Box<Cpu>),
 }
 
@@ -331,9 +331,55 @@ fn stream_params(size: (u32, u32)) -> NativeStreamParams {
     }
 }
 
+/// A CPU frame whose copy into a staging texture is queued. It is mapped
+/// without the capture lock, then published by [`Cpu::finish`].
+struct Readback {
+    staging: (u32, u32, ID3D11Texture2D),
+    buffer: Vec<u8>,
+    timestamp_ns: u64,
+}
+
+impl Readback {
+    /// Wait for the queued copy (holding the device context only per poll)
+    /// and copy its rows into the reused buffer.
+    fn map(&mut self, device: &D3d11Device, timeout: Duration) -> Result<()> {
+        let (width, height, staging) = &self.staging;
+        let row = *width as usize * 4;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let context = device.context();
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                // SAFETY: the staging texture belongs to this device; the
+                // context is locked; DO_NOT_WAIT never blocks on the GPU.
+                match unsafe { context.Map(staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32, Some(&mut mapped)) } {
+                    Ok(()) => {
+                        for (y, target) in self.buffer.chunks_exact_mut(row).take(*height as usize).enumerate() {
+                            // SAFETY: the mapping holds `height` rows of `RowPitch >= row` bytes.
+                            target.copy_from_slice(unsafe {
+                                std::slice::from_raw_parts(mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize), row)
+                            });
+                        }
+                        // SAFETY: mapped above on this locked context.
+                        unsafe { context.Unmap(staging, 0) };
+                        return Ok(());
+                    }
+                    Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => {}
+                    Err(error) => return Err(failure("cpu-map", error)),
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(failure("cpu-map", "the staging copy did not complete"));
+            }
+            std::thread::sleep(Duration::from_micros(250));
+        }
+    }
+}
+
 enum Staged {
     Published,
     Dropped,
+    Readback(Readback),
 }
 
 impl Publisher {
@@ -362,7 +408,8 @@ impl Publisher {
                     producer: Arc::new(Mutex::new(producer)),
                     size,
                     pending: None,
-                    staging: None,
+                    staging: Vec::new(),
+                    buffers: Vec::new(),
                     sequence: 0,
                     dropped: 0,
                     pending_drops: 0,
@@ -376,10 +423,7 @@ impl Publisher {
         let producer =
             NativeArenaProducer::new(D3d11FrameBackend::new(Arc::clone(device)), stream_params(size), config(0)).map_err(arena_failure)?;
         Ok((
-            Self::D3d11 {
-                producer: Arc::new(Mutex::new(producer)),
-                pending: None,
-            },
+            Self::D3d11(Arc::new(Mutex::new(producer))),
             PublicationMode::D3d11 {
                 adapter: device.adapter().clone(),
             },
@@ -388,14 +432,14 @@ impl Publisher {
 
     fn publication(&self) -> Publication {
         match self {
-            Self::D3d11 { producer, .. } => Publication::D3d11(Arc::clone(producer)),
+            Self::D3d11(producer) => Publication::D3d11(Arc::clone(producer)),
             Self::Cpu(cpu) => Publication::Cpu(Arc::clone(&cpu.producer)),
         }
     }
 
     fn size(&self) -> (u32, u32) {
         match self {
-            Self::D3d11 { producer, .. } => {
+            Self::D3d11(producer) => {
                 let producer = lock(producer);
                 (producer.params().width, producer.params().height)
             }
@@ -405,30 +449,28 @@ impl Publisher {
 
     fn stop(&self) {
         match self {
-            Self::D3d11 { producer, .. } => lock(producer).stop(),
+            Self::D3d11(producer) => lock(producer).stop(),
             Self::Cpu(cpu) => lock(&cpu.producer).stop(),
         }
     }
 
     /// Bring the arena to `size`; true once frames of that size can publish.
+    /// A replacement paused for capacity completes before a newer size is
+    /// proposed.
     fn ready_for(&mut self, size: (u32, u32)) -> std::result::Result<bool, ArenaError> {
         match self {
-            Self::D3d11 { producer, pending } => {
+            Self::D3d11(producer) => {
                 let mut producer = lock(producer);
                 loop {
-                    // A replacement paused for capacity completes before a
-                    // newer size can be proposed.
-                    if pending.is_some() {
-                        if !matches!(producer.advance_reconfiguration()?, ReconfigurationStatus::Ready { .. }) {
-                            return Ok(false);
-                        }
-                        *pending = None;
+                    if producer.reconfiguration_pending()
+                        && !matches!(producer.advance_reconfiguration()?, ReconfigurationStatus::Ready { .. })
+                    {
+                        return Ok(false);
                     }
                     if (producer.params().width, producer.params().height) == size {
                         return Ok(true);
                     }
                     if !matches!(producer.reconfigure(stream_params(size))?, ReconfigurationStatus::Ready { .. }) {
-                        *pending = Some(size);
                         return Ok(false);
                     }
                 }
@@ -458,8 +500,9 @@ impl Publisher {
         }
     }
 
-    fn publish(&mut self, device: &D3d11Device, frame: &D3d11CapturedFrame, timestamp_ns: u64) -> std::result::Result<Staged, ArenaError> {
-        if !self.ready_for(frame.size())? {
+    /// Publish a D3D11 frame, or queue a CPU frame's staging copy.
+    fn stage(&mut self, device: &D3d11Device, frame: &D3d11CapturedFrame, timestamp_ns: u64) -> Result<Staged> {
+        if !self.ready_for(frame.size()).map_err(arena_failure)? {
             if let Self::Cpu(cpu) = self {
                 cpu.dropped += 1;
                 cpu.pending_drops = cpu.pending_drops.saturating_add(1);
@@ -467,89 +510,107 @@ impl Publisher {
             return Ok(Staged::Dropped);
         }
         match self {
-            Self::D3d11 { producer, .. } => Ok(match lock(producer).publish(frame, timestamp_ns)? {
+            Self::D3d11(producer) => Ok(match lock(producer).publish(frame, timestamp_ns).map_err(arena_failure)? {
                 PublishOutcome::Published { .. } => Staged::Published,
                 PublishOutcome::Dropped => Staged::Dropped,
             }),
-            Self::Cpu(cpu) => cpu.publish(device, frame, timestamp_ns),
+            Self::Cpu(cpu) => cpu.queue(device, frame, timestamp_ns).map(Staged::Readback),
         }
     }
 }
 
 impl Cpu {
-    fn publish(&mut self, device: &D3d11Device, frame: &D3d11CapturedFrame, timestamp_ns: u64) -> std::result::Result<Staged, ArenaError> {
+    fn queue(&mut self, device: &D3d11Device, frame: &D3d11CapturedFrame, timestamp_ns: u64) -> Result<Readback> {
         let (width, height) = frame.size();
-        if self.staging.as_ref().is_none_or(|(w, h, _)| (*w, *h) != (width, height)) {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                ..super::texture_desc(width, height, super::dxgi_format(PixelFormat::Bgra8Unorm)?, false)
-            };
-            let mut staging = None;
-            // SAFETY: description and out pointer are live locals.
-            unsafe { device.raw().CreateTexture2D(&desc, None, Some(&mut staging)) }.map_err(|error| failure("cpu-staging", error))?;
-            self.staging = Some((width, height, staging.ok_or_else(|| failure("cpu-staging", "no texture"))?));
-        }
-        let staging = &self.staging.as_ref().expect("created above").2;
-        let row = width as usize * 4;
-        let mut pixels = vec![0; row * height as usize];
+        let staging = match self.staging.iter().position(|(w, h, _)| (*w, *h) == (width, height)) {
+            Some(index) => self.staging.swap_remove(index),
+            None => {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    ..super::texture_desc(width, height, super::dxgi_format(PixelFormat::Bgra8Unorm)?, false)
+                };
+                let mut staging = None;
+                // SAFETY: description and out pointer are live locals.
+                unsafe { device.raw().CreateTexture2D(&desc, None, Some(&mut staging)) }.map_err(|error| failure("cpu-staging", error))?;
+                (width, height, staging.ok_or_else(|| failure("cpu-staging", "no texture"))?)
+            }
+        };
+        let region = D3D11_BOX {
+            left: frame.left,
+            top: frame.top,
+            front: 0,
+            right: frame.left + width,
+            bottom: frame.top + height,
+            back: 1,
+        };
         {
             let context = device.context();
-            let region = D3D11_BOX {
-                left: frame.left,
-                top: frame.top,
-                front: 0,
-                right: frame.left + width,
-                bottom: frame.top + height,
-                back: 1,
-            };
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            // SAFETY: both textures belong to this device; the context is
-            // locked; the blocking map returns once the copy has executed.
+            // SAFETY: both textures belong to this device; the context is locked.
             unsafe {
-                context.CopySubresourceRegion(staging, 0, 0, 0, 0, &frame.texture, 0, Some(&region));
-                context
-                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                    .map_err(|error| failure("cpu-map", error))?;
-                for (y, target) in pixels.chunks_exact_mut(row).enumerate() {
-                    target.copy_from_slice(std::slice::from_raw_parts(
-                        mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize),
-                        row,
-                    ));
-                }
-                context.Unmap(staging, 0);
+                context.CopySubresourceRegion(&staging.2, 0, 0, 0, 0, &frame.texture, 0, Some(&region));
+                context.Flush();
             }
         }
-        self.sequence += 1;
-        let descriptor = FrameDescriptor {
-            sequence: self.sequence,
+        // Reused across frames: only growth is zero-filled.
+        let mut buffer = self.buffers.pop().unwrap_or_default();
+        buffer.resize(width as usize * height as usize * 4, 0);
+        Ok(Readback {
+            staging,
+            buffer,
             timestamp_ns,
-            width,
-            height,
-            stride: width * 4,
-            pixel_format: PixelFormat::Bgra8Unorm as u32,
-            color_space: ColorSpace::Srgb as u32,
-            clock_domain: ClockDomain::HostTime as u32,
-            payload_kind: PayloadKind::CpuShm as u32,
-            sync_kind: FrameSyncKind::CpuCopyComplete as u32,
-            damage_kind: DamageKind::FullFrame as u32,
-            damage_base_sequence: self.sequence,
-            dropped_before_publish: self.pending_drops,
-            producer_drop_count: self.dropped,
-            ..FrameDescriptor::default()
-        };
-        Ok(match lock(&self.producer).publish(descriptor, &pixels)? {
-            PublishOutcome::Published { .. } => {
-                self.pending_drops = 0;
-                Staged::Published
-            }
-            PublishOutcome::Dropped => {
-                self.dropped += 1;
-                self.pending_drops = self.pending_drops.saturating_add(1);
-                Staged::Dropped
-            }
         })
+    }
+
+    /// Publish a mapped readback and keep its staging texture and buffer.
+    fn finish(&mut self, readback: Readback) -> Result<Staged> {
+        let Readback {
+            staging,
+            buffer,
+            timestamp_ns,
+        } = readback;
+        let (width, height) = (staging.0, staging.1);
+        let result = if (width, height) != self.size || self.pending.is_some() {
+            // Reconfigured while this frame was being read.
+            self.dropped += 1;
+            self.pending_drops = self.pending_drops.saturating_add(1);
+            Ok(Staged::Dropped)
+        } else {
+            self.sequence += 1;
+            let descriptor = FrameDescriptor {
+                sequence: self.sequence,
+                timestamp_ns,
+                width,
+                height,
+                stride: width * 4,
+                pixel_format: PixelFormat::Bgra8Unorm as u32,
+                color_space: ColorSpace::Srgb as u32,
+                clock_domain: ClockDomain::HostTime as u32,
+                payload_kind: PayloadKind::CpuShm as u32,
+                sync_kind: FrameSyncKind::CpuCopyComplete as u32,
+                damage_kind: DamageKind::FullFrame as u32,
+                damage_base_sequence: self.sequence,
+                dropped_before_publish: self.pending_drops,
+                producer_drop_count: self.dropped,
+                ..FrameDescriptor::default()
+            };
+            match lock(&self.producer).publish(descriptor, &buffer).map_err(arena_failure) {
+                Ok(PublishOutcome::Published { .. }) => {
+                    self.pending_drops = 0;
+                    Ok(Staged::Published)
+                }
+                Ok(PublishOutcome::Dropped) => {
+                    self.dropped += 1;
+                    self.pending_drops = self.pending_drops.saturating_add(1);
+                    Ok(Staged::Dropped)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        self.staging.push(staging);
+        self.buffers.push(buffer);
+        result
     }
 }
 
@@ -564,6 +625,14 @@ fn arena_failure(error: ArenaError) -> crate::CaptureTransferError {
     }
 }
 
+/// The newest frame not yet published, kept when publication dropped it, so a
+/// static window still publishes once capacity or a paused replacement frees.
+struct Deferred {
+    texture: ID3D11Texture2D,
+    size: (u32, u32),
+    timestamp_ns: u64,
+}
+
 /// One device, frame pool, session and publication.
 struct Engine {
     id: u64,
@@ -575,6 +644,13 @@ struct Engine {
     content_size: SizeInt32,
     publisher: Publisher,
     scaler: Option<scale::Scaler>,
+    /// The newest published timestamp: an older frame is never published
+    /// after a newer one.
+    last_timestamp: u64,
+    /// A copy of the newest dropped frame, and whether it still awaits
+    /// publication.
+    deferred: Option<Deferred>,
+    deferred_pending: bool,
 }
 
 // SAFETY: WinRT capture objects are agile; D3D11 objects are free-threaded
@@ -588,6 +664,41 @@ impl Engine {
         let _ = self.pool.Close();
         self.publisher.stop();
     }
+
+    /// Keep a copy of a dropped frame for [`retry_deferred`].
+    fn defer(&mut self, frame: &D3d11CapturedFrame, timestamp_ns: u64) -> Result<()> {
+        let size = frame.size();
+        if self.deferred.as_ref().is_none_or(|deferred| deferred.size != size) {
+            let mut texture = None;
+            let desc = super::texture_desc(size.0, size.1, super::dxgi_format(PixelFormat::Bgra8Unorm)?, false);
+            // SAFETY: description and out pointer are live locals.
+            unsafe { self.device.raw().CreateTexture2D(&desc, None, Some(&mut texture)) }
+                .map_err(|error| failure("capture-defer", error))?;
+            self.deferred = Some(Deferred {
+                texture: texture.ok_or_else(|| failure("capture-defer", "no texture"))?,
+                size,
+                timestamp_ns,
+            });
+        }
+        let deferred = self.deferred.as_mut().expect("created above");
+        deferred.timestamp_ns = timestamp_ns;
+        let region = D3D11_BOX {
+            left: frame.left,
+            top: frame.top,
+            front: 0,
+            right: frame.left + size.0,
+            bottom: frame.top + size.1,
+            back: 1,
+        };
+        // SAFETY: both textures belong to this device; the context is locked.
+        unsafe {
+            self.device
+                .context()
+                .CopySubresourceRegion(&deferred.texture, 0, 0, 0, 0, &frame.texture, 0, Some(&region));
+        }
+        self.deferred_pending = true;
+        Ok(())
+    }
 }
 
 struct Inner {
@@ -599,6 +710,9 @@ struct Inner {
     closed_token: Option<i64>,
     lost: Option<String>,
     recovery_attempts: u32,
+    /// Something the watcher must handle before its next interval: a new
+    /// device loss, closure or a stop.
+    wake: bool,
 }
 
 // SAFETY: as Engine; the item is agile and the HWND is only passed to Win32.
@@ -610,12 +724,19 @@ struct Shared {
     stop: AtomicBool,
     closed: AtomicBool,
     next_engine: AtomicU64,
+    /// Watch-loop iterations, for tests of its pacing.
+    watch_iterations: AtomicU64,
 }
 
 impl Shared {
     fn update(&self, inner: &mut Inner, change: impl FnOnce(&mut CaptureStatus)) {
         change(&mut inner.status);
         inner.status.revision += 1;
+        self.changed.notify_all();
+    }
+
+    fn wake(&self, inner: &mut Inner) {
+        inner.wake = true;
         self.changed.notify_all();
     }
 }
@@ -645,9 +766,10 @@ fn frame_texture(frame: &Direct3D11CaptureFrame) -> ::windows::core::Result<ID3D
     unsafe { access.GetInterface() }
 }
 
-/// The region to publish and the output size and placement for it.
+/// The output size and placement for a region `(left, top, width, height)`.
+/// Empty regions and limits count as one pixel, so no plan is ever empty.
 fn plan(policy: OutputSize, region: (u32, u32, u32, u32)) -> ((u32, u32), Option<scale::Placement>) {
-    let (width, height) = (region.2, region.3);
+    let (width, height) = (region.2.max(1), region.3.max(1));
     let fit = |max_width: u32, max_height: u32| {
         let scale = (f64::from(max_width) / f64::from(width)).min(f64::from(max_height) / f64::from(height));
         (
@@ -658,10 +780,11 @@ fn plan(policy: OutputSize, region: (u32, u32, u32, u32)) -> ((u32, u32), Option
     match policy {
         OutputSize::Source => ((width, height), None),
         OutputSize::Fit { max_width, max_height } => {
+            let (max_width, max_height) = (max_width.max(1), max_height.max(1));
             if width <= max_width && height <= max_height {
                 ((width, height), None)
             } else {
-                let size = fit(max_width.max(1), max_height.max(1));
+                let size = fit(max_width, max_height);
                 (
                     size,
                     Some(scale::Placement {
@@ -697,7 +820,8 @@ fn plan(policy: OutputSize, region: (u32, u32, u32, u32)) -> ((u32, u32), Option
 
 impl WgcCapture {
     /// Start capturing. Fails if WGC is unsupported, the device cannot be
-    /// created, or [`BorderPolicy::RequireHidden`] cannot be met.
+    /// created, or [`BorderPolicy::RequireHidden`] cannot be met. A failed
+    /// start leaves no handler on the host's item.
     pub fn start(target: CaptureTarget, policy: CapturePolicy) -> Result<Self> {
         if !is_supported() {
             return Err(failure("capture-start", "Windows.Graphics.Capture is not supported"));
@@ -734,11 +858,13 @@ impl WgcCapture {
                 closed_token: None,
                 lost: None,
                 recovery_attempts: 0,
+                wake: false,
             }),
             changed: Condvar::new(),
             stop: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             next_engine: AtomicU64::new(1),
+            watch_iterations: AtomicU64::new(0),
         });
         {
             let mut inner = lock(&shared.inner);
@@ -749,26 +875,38 @@ impl WgcCapture {
                 .Closed(&TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
                     if let Some(shared) = weak.upgrade() {
                         shared.closed.store(true, Ordering::SeqCst);
-                        shared.changed.notify_all();
+                        shared.wake(&mut lock(&shared.inner));
                     }
                     Ok(())
                 }))
                 .map_err(|error| failure("capture-closed-event", error))?;
-            inner.closed_token = Some(token);
-            let engine = Self::create_engine(&shared, &mut inner)?;
-            Self::install(&shared, &mut inner, engine);
+            match Self::create_engine(&shared, &mut inner) {
+                Ok(engine) => {
+                    inner.closed_token = Some(token);
+                    Self::install(&shared, &mut inner, engine);
+                }
+                Err(error) => {
+                    let _ = inner.target.item.RemoveClosed(token);
+                    return Err(error);
+                }
+            }
         }
         let watcher = {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name("jackstay-wgc-watch".to_owned())
                 .spawn(move || watch(&shared))
-                .map_err(|error| failure("capture-watch", error))?
         };
-        Ok(Self {
-            shared,
-            watcher: Some(watcher),
-        })
+        match watcher {
+            Ok(watcher) => Ok(Self {
+                shared,
+                watcher: Some(watcher),
+            }),
+            Err(error) => {
+                drop(Self { shared, watcher: None });
+                Err(failure("capture-watch", error))
+            }
+        }
     }
 
     fn create_engine(shared: &Arc<Shared>, inner: &mut Inner) -> Result<Engine> {
@@ -780,70 +918,79 @@ impl WgcCapture {
             .and_then(|device| device.cast())
             .map_err(|error| failure("capture-device", error))?;
         let item = &inner.target.item;
-        let content_size = item.Size().map_err(|error| failure("capture-item-size", error))?;
+        // A minimized window can report an empty size: the pool and arena
+        // start at one pixel and follow the first real frame.
+        let mut content_size = item.Size().map_err(|error| failure("capture-item-size", error))?;
+        content_size.Width = content_size.Width.max(1);
+        content_size.Height = content_size.Height.max(1);
         let pool =
             Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt_device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, content_size)
                 .map_err(|error| failure("capture-frame-pool", error))?;
-        let session = pool.CreateCaptureSession(item).map_err(|error| failure("capture-session", error))?;
-        let mut notes = Vec::new();
-        if let Err(error) = session.SetIsCursorCaptureEnabled(policy.cursor) {
-            notes.push(format!("cursor capture setting unavailable: {error}"));
-        }
-        let border_shown = match policy.border {
-            BorderPolicy::Show => true,
-            BorderPolicy::PreferHidden | BorderPolicy::RequireHidden => {
-                let allowed = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
-                    .and_then(|operation| operation.join())
-                    .is_ok_and(|status| status == AppCapabilityAccessStatus::Allowed);
-                let hidden = allowed && session.SetIsBorderRequired(false).is_ok();
-                if !hidden {
-                    if policy.border == BorderPolicy::RequireHidden {
-                        let _ = session.Close();
-                        let _ = pool.Close();
-                        return Err(failure("capture-border", "borderless capture was refused"));
-                    }
-                    notes.push("borderless capture unavailable; the border is shown".to_owned());
-                }
-                !hidden
+        let session = match pool.CreateCaptureSession(item) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = pool.Close();
+                return Err(failure("capture-session", error));
             }
         };
-        if let Some(interval) = policy.min_update_interval {
-            let ticks = i64::try_from(interval.as_nanos() / 100).unwrap_or(i64::MAX);
-            if let Err(error) = session.SetMinUpdateInterval(TimeSpan { Duration: ticks }) {
-                notes.push(format!("minimum update interval unavailable: {error}"));
+        let mut frame_token = None;
+        let result = (|| {
+            let mut notes = Vec::new();
+            if let Err(error) = session.SetIsCursorCaptureEnabled(policy.cursor) {
+                notes.push(format!("cursor capture setting unavailable: {error}"));
             }
-        }
-        let region = window::client_region(
-            inner.target.window,
-            content_size.Width.max(1) as u32,
-            content_size.Height.max(1) as u32,
-        );
-        let (size, _) = plan(policy.output_size, region);
-        let (publisher, mode) = Publisher::new(&device, policy, size)?;
-        let id = shared.next_engine.fetch_add(1, Ordering::Relaxed);
-        let weak: Weak<Shared> = Arc::downgrade(shared);
-        let frame_token = pool
-            .FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
-                move |pool, _| {
-                    let Some(pool) = pool.as_ref() else {
-                        return Ok(());
-                    };
-                    // Drain to the newest frame; older buffers go straight back.
-                    let mut latest = None;
-                    while let Ok(frame) = pool.TryGetNextFrame() {
-                        if let Some(previous) = latest.replace(frame) {
-                            let _ = Direct3D11CaptureFrame::Close(&previous);
+            let border_shown = match policy.border {
+                BorderPolicy::Show => true,
+                BorderPolicy::PreferHidden | BorderPolicy::RequireHidden => {
+                    let allowed = GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
+                        .and_then(|operation| operation.join())
+                        .is_ok_and(|status| status == AppCapabilityAccessStatus::Allowed);
+                    let hidden = allowed && session.SetIsBorderRequired(false).is_ok();
+                    if !hidden {
+                        if policy.border == BorderPolicy::RequireHidden {
+                            return Err(failure("capture-border", "borderless capture was refused"));
                         }
+                        notes.push("borderless capture unavailable; the border is shown".to_owned());
                     }
-                    if let (Some(frame), Some(shared)) = (latest, weak.upgrade()) {
-                        on_frame(&shared, id, &frame);
-                        let _ = frame.Close();
-                    }
-                    Ok(())
-                },
-            ))
-            .map_err(|error| failure("capture-frame-event", error))?;
-        session.StartCapture().map_err(|error| failure("capture-start", error))?;
+                    !hidden
+                }
+            };
+            if let Some(interval) = policy.min_update_interval {
+                let ticks = i64::try_from(interval.as_nanos() / 100).unwrap_or(i64::MAX);
+                if let Err(error) = session.SetMinUpdateInterval(TimeSpan { Duration: ticks }) {
+                    notes.push(format!("minimum update interval unavailable: {error}"));
+                }
+            }
+            let region = window::client_region(inner.target.window, content_size.Width as u32, content_size.Height as u32);
+            let (size, _) = plan(policy.output_size, region);
+            let (publisher, mode) = Publisher::new(&device, policy, size)?;
+            let id = shared.next_engine.fetch_add(1, Ordering::Relaxed);
+            let weak: Weak<Shared> = Arc::downgrade(shared);
+            frame_token = Some(
+                pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
+                    move |pool, _| {
+                        if let (Some(pool), Some(shared)) = (pool.as_ref(), weak.upgrade()) {
+                            on_frame(&shared, id, pool);
+                        }
+                        Ok(())
+                    },
+                ))
+                .map_err(|error| failure("capture-frame-event", error))?,
+            );
+            session.StartCapture().map_err(|error| failure("capture-start", error))?;
+            Ok((notes, border_shown, size, publisher, mode, id))
+        })();
+        let (notes, border_shown, size, publisher, mode, id) = match result {
+            Ok(parts) => parts,
+            Err(error) => {
+                if let Some(token) = frame_token {
+                    let _ = pool.RemoveFrameArrived(token);
+                }
+                let _ = session.Close();
+                let _ = pool.Close();
+                return Err(error);
+            }
+        };
         inner.status.notes = notes;
         inner.status.border_shown = Some(border_shown);
         inner.status.mode = mode;
@@ -854,10 +1001,13 @@ impl WgcCapture {
             winrt_device,
             pool,
             session,
-            frame_token,
+            frame_token: frame_token.expect("registered above"),
             content_size,
             publisher,
             scaler: None,
+            last_timestamp: 0,
+            deferred: None,
+            deferred_pending: false,
         })
     }
 
@@ -899,15 +1049,24 @@ impl WgcCapture {
     /// after a real removal (for example an RDP reconnect), without removing
     /// the device.
     pub fn simulate_device_loss(&self, reason: &str) {
-        lock(&self.shared.inner).lost = Some(reason.to_owned());
-        self.shared.changed.notify_all();
+        let mut inner = lock(&self.shared.inner);
+        inner.lost = Some(reason.to_owned());
+        self.shared.wake(&mut inner);
+    }
+
+    /// How many times the lock/loss watcher has run, for checks that it
+    /// sleeps between intervals.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn watch_iterations(&self) -> u64 {
+        self.shared.watch_iterations.load(Ordering::SeqCst)
     }
 
     /// Stop capturing and publication. Consumers keep held frames; hosts
     /// drain each publication with its `poll_shutdown_ready`.
     pub fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        self.shared.changed.notify_all();
+        self.shared.wake(&mut lock(&self.shared.inner));
         if let Some(watcher) = self.watcher.take() {
             let _ = watcher.join();
         }
@@ -938,25 +1097,128 @@ impl Drop for WgcCapture {
     }
 }
 
-fn on_frame(shared: &Shared, engine_id: u64, frame: &Direct3D11CaptureFrame) {
-    let mut guard = lock(&shared.inner);
-    let inner = &mut *guard;
-    if inner.status.state != CaptureState::Running || inner.lost.is_some() {
-        if inner.engine.as_ref().is_some_and(|engine| engine.id == engine_id) {
-            shared.update(inner, |status| status.frames_dropped += 1);
-        }
-        return;
-    }
+/// Record a staging outcome for the engine it came from.
+fn record(shared: &Shared, inner: &mut Inner, engine_id: u64, result: Result<Staged>) {
     let Some(engine) = inner.engine.as_mut().filter(|engine| engine.id == engine_id) else {
         return;
     };
-    let result = (|| -> Result<Staged> {
+    match result {
+        Ok(Staged::Published) => {
+            engine.deferred_pending = false;
+            let size = engine.publisher.size();
+            shared.update(inner, |status| {
+                status.frames_published += 1;
+                status.size = size;
+            });
+        }
+        Ok(Staged::Dropped) => shared.update(inner, |status| status.frames_dropped += 1),
+        Ok(Staged::Readback(_)) => unreachable!("readbacks are finished before recording"),
+        Err(error) => {
+            if let Some(reason) = engine.device.removed_reason() {
+                inner.lost = Some(format!("device removed: {reason}"));
+                shared.wake(inner);
+            } else {
+                let message = error.to_string();
+                engine.publisher.stop();
+                shared.update(inner, |status| status.state = CaptureState::Failed(message));
+                shared.wake(inner);
+            }
+        }
+    }
+}
+
+/// Stage `frame` on the engine; keep a copy if publication drops it.
+fn stage(engine: &mut Engine, frame: &D3d11CapturedFrame, timestamp_ns: u64) -> Result<Staged> {
+    let staged = engine.publisher.stage(&engine.device, frame, timestamp_ns)?;
+    match staged {
+        Staged::Published => engine.last_timestamp = timestamp_ns,
+        Staged::Dropped => engine.defer(frame, timestamp_ns)?,
+        Staged::Readback(_) => {}
+    }
+    Ok(staged)
+}
+
+/// Map a CPU readback without the capture lock, then publish it unless a
+/// newer frame or another engine got there first.
+fn finish_readback(shared: &Shared, engine_id: u64, device: &D3d11Device, mut readback: Readback) {
+    let mapped = readback.map(device, Duration::from_secs(5));
+    let mut guard = lock(&shared.inner);
+    let inner = &mut *guard;
+    let Some(engine) = inner.engine.as_mut().filter(|engine| engine.id == engine_id) else {
+        return;
+    };
+    let Publisher::Cpu(cpu) = &mut engine.publisher else {
+        unreachable!("readbacks come from CPU publishers")
+    };
+    let timestamp_ns = readback.timestamp_ns;
+    let result = match mapped {
+        Err(error) => {
+            cpu.staging.push(readback.staging);
+            cpu.buffers.push(readback.buffer);
+            Err(error)
+        }
+        Ok(()) if timestamp_ns <= engine.last_timestamp => {
+            cpu.staging.push(readback.staging);
+            cpu.buffers.push(readback.buffer);
+            Ok(Staged::Dropped)
+        }
+        Ok(()) => cpu.finish(readback),
+    };
+    if matches!(result, Ok(Staged::Published)) {
+        engine.last_timestamp = timestamp_ns;
+    }
+    record(shared, inner, engine_id, result);
+}
+
+fn on_frame(shared: &Shared, engine_id: u64, pool: &Direct3D11CaptureFramePool) {
+    let mut guard = lock(&shared.inner);
+    // Drain under the lock, so overlapping callbacks handle frames in
+    // arrival order. Older buffers go straight back to WGC.
+    let mut latest = None;
+    while let Ok(frame) = pool.TryGetNextFrame() {
+        if let Some(previous) = latest.replace(frame) {
+            let _ = Direct3D11CaptureFrame::Close(&previous);
+        }
+    }
+    let Some(frame) = latest else {
+        return;
+    };
+    let inner = &mut *guard;
+    let result = stage_captured(inner, engine_id, &frame);
+    // The queued copy was the buffer's last use: return it to WGC now.
+    let _ = frame.Close();
+    match result {
+        None => {}
+        Some(Ok(Staged::Readback(readback))) => {
+            let device = Arc::clone(&inner.engine.as_ref().expect("staged engine").device);
+            drop(guard);
+            finish_readback(shared, engine_id, &device, readback);
+        }
+        Some(result) => record(shared, inner, engine_id, result),
+    }
+}
+
+/// `None` when the frame belongs to a retired engine.
+fn stage_captured(inner: &mut Inner, engine_id: u64, frame: &Direct3D11CaptureFrame) -> Option<Result<Staged>> {
+    let running = inner.status.state == CaptureState::Running && inner.lost.is_none();
+    let engine = inner.engine.as_mut().filter(|engine| engine.id == engine_id)?;
+    if !running {
+        return Some(Ok(Staged::Dropped));
+    }
+    let timestamp = timestamp_ns(frame);
+    if timestamp != 0 && timestamp <= engine.last_timestamp {
+        return Some(Ok(Staged::Dropped));
+    }
+    Some((|| -> Result<Staged> {
         let content = frame.ContentSize().map_err(|error| failure("capture-frame", error))?;
         let texture = frame_texture(frame).map_err(|error| failure("capture-frame", error))?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: GetDesc fills a local structure.
         unsafe { texture.GetDesc(&mut desc) };
-        if content.Width != engine.content_size.Width || content.Height != engine.content_size.Height {
+        if content.Width > 0
+            && content.Height > 0
+            && (content.Width != engine.content_size.Width || content.Height != engine.content_size.Height)
+        {
             // The next frames arrive at the new size; this one still fits
             // its old buffer.
             engine
@@ -987,35 +1249,50 @@ fn on_frame(shared: &Shared, engine_id: u64, frame: &Direct3D11CaptureFrame) {
                 D3d11CapturedFrame::new(scaler.render(&engine.device, &texture, region, size, placement)?)
             }
         };
-        engine
-            .publisher
-            .publish(&engine.device, &source, timestamp_ns(frame))
-            .map_err(arena_failure)
-    })();
-    match result {
-        Ok(Staged::Published) => {
-            let size = engine.publisher.size();
-            shared.update(inner, |status| {
-                status.frames_published += 1;
-                status.size = size;
-            });
-        }
-        Ok(Staged::Dropped) => shared.update(inner, |status| status.frames_dropped += 1),
-        Err(error) => {
-            if let Some(reason) = engine.device.removed_reason() {
-                inner.lost = Some(format!("device removed: {reason}"));
-                shared.changed.notify_all();
-            } else {
-                let message = error.to_string();
-                engine.publisher.stop();
-                shared.update(inner, |status| status.state = CaptureState::Failed(message));
-                shared.changed.notify_all();
-            }
-        }
-    }
+        stage(engine, &source, timestamp)
+    })())
 }
 
-/// Lock/disconnect, device removal, recovery and item closure.
+/// Publish the kept copy of a dropped frame once publication can take it:
+/// capacity freed, or a replacement paused for capacity completed. A static
+/// window sends no new frame to retry with.
+fn retry_deferred(shared: &Shared, inner: &mut Inner) {
+    if inner.status.state != CaptureState::Running || inner.lost.is_some() {
+        return;
+    }
+    let Some(engine) = inner.engine.as_mut().filter(|engine| engine.deferred_pending) else {
+        return;
+    };
+    let engine_id = engine.id;
+    let deferred = engine.deferred.as_ref().expect("pending deferred frame");
+    let (texture, timestamp) = (deferred.texture.clone(), deferred.timestamp_ns);
+    let frame = D3d11CapturedFrame::new(texture);
+    let result = match engine.publisher.stage(&engine.device, &frame, timestamp) {
+        Ok(Staged::Readback(mut readback)) => {
+            // Rare: the watcher maps under the capture lock.
+            let Publisher::Cpu(cpu) = &mut engine.publisher else {
+                unreachable!("readbacks come from CPU publishers")
+            };
+            match readback.map(&engine.device, Duration::from_secs(5)) {
+                Ok(()) => cpu.finish(readback),
+                Err(error) => {
+                    cpu.staging.push(readback.staging);
+                    cpu.buffers.push(readback.buffer);
+                    Err(error)
+                }
+            }
+        }
+        Ok(Staged::Dropped) => return,
+        other => other,
+    };
+    if matches!(result, Ok(Staged::Published)) {
+        engine.last_timestamp = engine.last_timestamp.max(timestamp);
+    }
+    record(shared, inner, engine_id, result);
+}
+
+/// Lock/disconnect, device removal, recovery, deferred publication and item
+/// closure, once per `watch_interval` unless woken for a new event.
 fn watch(shared: &Arc<Shared>) {
     let (desktop, interval) = {
         let inner = lock(&shared.inner);
@@ -1028,11 +1305,13 @@ fn watch(shared: &Arc<Shared>) {
         if shared.stop.load(Ordering::SeqCst) {
             return;
         }
+        shared.watch_iterations.fetch_add(1, Ordering::SeqCst);
         let unavailable = desktop.unavailable();
         let mut retired = None;
         {
             let mut guard = lock(&shared.inner);
             let inner = &mut *guard;
+            inner.wake = false;
             if inner.status.state.is_terminal() {
                 retired = inner.engine.take();
                 drop(guard);
@@ -1085,6 +1364,7 @@ fn watch(shared: &Arc<Shared>) {
                         if inner.status.state != CaptureState::Running {
                             shared.update(inner, |status| status.state = CaptureState::Running);
                         }
+                        retry_deferred(shared, inner);
                     }
                 }
             }
@@ -1097,7 +1377,7 @@ fn watch(shared: &Arc<Shared>) {
         {
             let mut guard = lock(&shared.inner);
             let inner = &mut *guard;
-            if matches!(inner.status.state, CaptureState::Recovering { .. }) && desktop.unavailable().is_none() {
+            if matches!(inner.status.state, CaptureState::Recovering { .. }) && unavailable.is_none() {
                 match WgcCapture::create_engine(shared, inner) {
                     Ok(engine) => {
                         inner.lost = None;
@@ -1120,15 +1400,53 @@ fn watch(shared: &Arc<Shared>) {
             if inner.status.state.is_terminal() {
                 continue;
             }
+            // Sleep for the interval unless something new needs handling. A
+            // loss that is already known (paused or recovering) waits too.
             let _ = shared
                 .changed
                 .wait_timeout_while(guard, interval, |inner| {
-                    // Wake early for a new loss; retry recovery at the interval.
-                    !shared.stop.load(Ordering::SeqCst)
-                        && !shared.closed.load(Ordering::SeqCst)
-                        && (inner.lost.is_none() || matches!(inner.status.state, CaptureState::Recovering { .. }))
+                    !shared.stop.load(Ordering::SeqCst) && !shared.closed.load(Ordering::SeqCst) && !inner.wake
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutputSize, plan};
+
+    #[test]
+    fn plans_are_never_empty() {
+        for policy in [
+            OutputSize::Source,
+            OutputSize::Fit {
+                max_width: 0,
+                max_height: 0,
+            },
+            OutputSize::Fit {
+                max_width: 80,
+                max_height: 0,
+            },
+            OutputSize::Fixed { width: 0, height: 0 },
+            OutputSize::Fixed { width: 64, height: 64 },
+        ] {
+            for region in [(0, 0, 0, 0), (3, 4, 0, 90), (0, 0, 160, 0), (0, 0, 160, 80)] {
+                let ((width, height), _) = plan(policy, region);
+                assert!(width >= 1 && height >= 1, "{policy:?} {region:?} -> {width}x{height}");
+            }
+        }
+        assert_eq!(
+            plan(
+                OutputSize::Fit {
+                    max_width: 80,
+                    max_height: 80
+                },
+                (0, 0, 160, 80)
+            )
+            .0,
+            (80, 40)
+        );
+        assert_eq!(plan(OutputSize::Fixed { width: 64, height: 64 }, (0, 0, 160, 80)).0, (64, 64));
     }
 }

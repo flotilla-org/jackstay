@@ -215,7 +215,7 @@ On Beaufort, WGC's `GraphicsCaptureItem.Closed` was not observed for a destroyed
 test window. `WgcCapture` therefore also treats `IsWindow == false` as closure.
 The note in the status records which signal ended the capture.
 
-## Consumer obligations (for the C accessors, #29, and Wheelhouse, #68)
+## Consumer obligations (Rust, the C ABI below, and Wheelhouse, #68)
 
 1. `describe()`, then create the device on that LUID, then `attach(holding, &device)`.
 2. On `AcquireOutcome::Reconfiguration`, call `install_configuration`.
@@ -227,6 +227,62 @@ The note in the status records which signal ended the capture.
 5. After the last GPU use of the frame, signal your registered release fence
    and call `defer_release(binding, value)`. If you have finished on the CPU,
    drop the frame instead (immediate release).
+
+## C ABI 0.10
+
+`capture_transfer.h` exposes the consumer side to C
+([#29](https://github.com/flotilla-org/jackstay/issues/29)) under `_WIN32`, in
+a library built with `backend-windows`. It mirrors the macOS accessors: setup
+calls on a connection handle, and one accessor that lends a frame's native
+handles. Everything per frame beyond the handles is already in the frame
+descriptor.
+
+| Call | Rust counterpart |
+| --- | --- |
+| `ft_acquisition_d3d11_connection_create_local` (consumes an `ft_local_connection`) | `D3d11SetupClient::from_stream` |
+| `ft_acquisition_d3d11_describe` → `ft_d3d11_adapter` (LUID, vendor and device IDs, software flag, UTF-8 description) | `describe` |
+| `ft_acquisition_d3d11_attach(connection, ID3D11Device*, holding, &consumer)` | `attach` |
+| `ft_acquisition_d3d11_install_configuration` | `install_configuration` |
+| `ft_acquisition_d3d11_register_release(connection, consumer, ID3D11Fence*, &timeline)` | `register_release_timeline` |
+| `ft_acquisition_d3d11_connection_alive` / `_cancel` / `_destroy` | `is_alive`, stream shutdown |
+| `ft_acquired_frame_d3d11_resources(frame, &texture, &readiness)` | `native_resources::<SharedTextureHandle, SharedFenceHandle>()` |
+| `ft_d3d11_fence_alive(ID3D11Fence*)` | `D3d11Fence::is_abandoned` (`ABANDONED_FENCE_VALUE`) |
+
+- **Handles are borrowed** NT handles, valid while the frame is held. The
+  consumer imports them itself (`OpenSharedResource1`, `OpenSharedFence`) and
+  caches by `pool_id`/`slot_id` and `fence_id` from the descriptor. The wait
+  value is the descriptor's `fence_value`.
+- **Adapter.** `describe` gives the LUID to create the device on. Attach
+  derives the device's LUID and a mismatch returns the new status
+  `FT_STATUS_ADAPTER_MISMATCH` (21) before any admission; the connection stays
+  usable. Every pool of a connection is checked against the attached adapter,
+  so frames carry no LUID of their own.
+- **Generations.** A replacement pool arrives through `RECONFIGURATION` and
+  `install_configuration`, and shows as a new `config_generation` and
+  `pool_id` in the descriptor. A device-loss epoch is a new publication:
+  setup liveness turns CLOSED and the consumer connects again.
+- **Abandonment.** `ft_d3d11_fence_alive` reports CLOSED for an abandoned
+  readiness fence; the consumer discards the frame and treats the producer as
+  lost, together with setup liveness.
+- The COM pointers passed in are borrowed for the call. The library keeps its
+  own reference to the release fence; it uses the attach device only to read
+  its adapter and never touches the caller's immediate context.
+
+`acquisition_d3d11_ffi` drives these calls against a producer served over a
+pipe: describe, refusal on another adapter, attach, import and read-back behind
+the GPU wait, an unshared release fence refused, deferred release, a held frame
+across reconfiguration, and cancellation. `acquisition_ffi` checks from the
+MSVC-compiled C smoke that a CPU frame has no D3D11 resources;
+`c_abi_header_smoke.c` references every D3D11 entry point when
+`JACKSTAY_BACKEND_WINDOWS` is defined (the build defines it with the feature).
+
+### Reference viewer
+
+[`tools/capture-viewer-d3d11`](../../tools/capture-viewer-d3d11/README.md) is a
+Win32 + D3D11 C viewer using only these calls; `scripts/smoke-viewer.ps1` runs it
+against the `d3d11_source` example (a synthetic pattern, or WGC of a window the
+example opens itself). SDL2's D3D11 renderer cannot choose the adapter by LUID
+or GPU-wait an external fence, so the viewer does not use SDL.
 
 ## Evidence (Beaufort, 2026-09-25)
 
@@ -291,6 +347,21 @@ cargo test -p jackstay --locked --features backend-windows --test wgc_capture_wi
 CI runs build, test and clippy with `backend-windows`. On CI the process and
 backend tests use whatever adapters the runner has. The window tests are
 ignored there.
+
+### Reference viewer (#29, observed)
+
+`scripts/smoke-viewer.ps1` on Beaufort, in the same RDP session, with the MSVC
+viewer and the `d3d11_source` example in separate processes:
+
+| Run | Result |
+| --- | --- |
+| synthetic, default adapter (`9fe5`), `-HoldMs 250 -Frames 12` | 12 frames presented; a `PrintWindow` of the viewer's own window shows the pattern (gradient, bar, frame bits) |
+| WGC of the source's own window, `-HoldMs 250 -ResizeEveryMs 1500 -Frames 16` | 16 frames across 7 pool generations (480x270, a transient 481x270 from WGC, 720x270); the screenshot shows the window's red at 720x270 |
+| synthetic on WARP (`ba31`), and on the Remote Display Adapter (`7d738999`), `-ResizeEveryMs 400 -Frames 90` | 90 frames each across 8 generations; the viewer created its device on the producer's LUID |
+| synthetic source killed while an unbounded viewer held frames for 250 ms | the viewer reported setup closure after 4 frames and exited cleanly |
+
+In that kill the setup connection's closure was seen first; the viewer's
+abandoned-fence branch was not reached in this run.
 
 ### Lock and RDP disconnect: not yet observed
 

@@ -57,10 +57,13 @@ the acquisition arena, the named-pipe setup channel and the acquisition,
 bootstrap and input C ABI ([Local Endpoints](docs/design/local-endpoints.md),
 ABI 0.9) build and are tested. `--features backend-windows` adds the D3D11 arena
 backend and Windows.Graphics.Capture sessions
-([D3D11 backend](docs/design/acquisition-d3d11.md)); its C accessors are not
-exposed yet. The SDL viewer supports macOS and
-Linux; its native presentation mode is Metal-only. Linux native reference checks
-use the Vulkan consumer in the library.
+([D3D11 backend](docs/design/acquisition-d3d11.md)), and ABI 0.10's D3D11
+consumer calls. The SDL viewer supports macOS and Linux; its native
+presentation mode is Metal-only. Linux native reference checks use the Vulkan
+consumer in the library. On Windows,
+[`tools/capture-viewer-d3d11`](tools/capture-viewer-d3d11/README.md) is the
+reference viewer and `scripts/smoke-viewer.ps1` its smoke (add `-HoldMs 250`
+for the delayed-consumer check).
 
 ## Library and host boundary
 

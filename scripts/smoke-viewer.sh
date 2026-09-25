@@ -5,7 +5,7 @@ cd "$jackstay_root"
 case "$(uname -s)" in
   Darwin) cargo build --workspace --locked --features backend-macos ;;
   Linux) cargo build --workspace --locked ;;
-  *) echo "SDL reference viewer supports macOS and Linux" >&2; exit 1 ;;
+  *) echo "SDL reference viewer supports macOS and Linux; on Windows run scripts/smoke-viewer.ps1" >&2; exit 1 ;;
 esac
 cmake -S tools/capture-viewer-sdl -B build/viewer
 cmake --build build/viewer

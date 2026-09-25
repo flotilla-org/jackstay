@@ -4,8 +4,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#if defined(__unix__) || defined(__APPLE__)
-/* Shared input, ABI 0.7. Host supplies authorized, connected Unix streams.
+#if defined(__unix__) || defined(__APPLE__) || defined(_WIN32)
+/* Shared input, ABI 0.7. Host supplies authorized, connected Unix streams, or
+ * (ABI 0.9, all platforms) Local Endpoint connections via the *_local calls.
  * Setup is blocking (bounded to five seconds on the client); run off GUI/input
  * threads. Established connections have independent network/heartbeat workers.
  * Handle destruction must not race calls. Other calls are thread safe except
@@ -104,7 +105,13 @@ ft_status ft_input_target_create(const ft_input_config *config, ft_input_target 
 /* After valid pointers/nonnegative fd/null output, consumes fd and sets -1 on
  * every outcome. Same ownership rule as CPU setup. No retained descriptor copies
  * or concurrent caller I/O. Library may retain private worker-owned copies. */
+#if defined(__unix__) || defined(__APPLE__)
 ft_status ft_input_target_serve(ft_input_target *target, int32_t *fd, ft_input_server **out);
+#endif
+/* Same as target_serve for a connection the host accepted and authorized;
+ * *connection is consumed and set to NULL on every outcome after basic checks. */
+ft_status ft_input_target_serve_local(ft_input_target *target, ft_local_connection **connection,
+                                      ft_input_server **out);
 /* Nonblocking: EMPTY or one owned work item. Only one item may be in flight.
  * describe borrows text from work until complete. Complete consumes work, even
  * when cleanup fails. Executor must settle dispatched work before completing.
@@ -129,7 +136,13 @@ _Static_assert(sizeof(ft_input_status) == 56, "input status ABI");
 /* OK means transport worker ended, not that executor cleanup succeeded. */
 ft_status ft_input_server_poll(const ft_input_server *server);
 void ft_input_server_destroy(ft_input_server **server);
+#if defined(__unix__) || defined(__APPLE__)
 ft_status ft_input_client_connect(int32_t *fd, uint32_t mode, ft_input_client **out);
+#endif
+/* Same as client_connect on a connection from ft_local_connect; *connection is
+ * consumed and set to NULL on every outcome after basic checks. */
+ft_status ft_input_client_connect_local(ft_local_connection **connection, uint32_t mode,
+                                        ft_input_client **out);
 ft_status ft_input_client_describe(const ft_input_client *client, ft_input_config *out, uint64_t *controller, uint64_t *epoch);
 /* OK means copied into a bounded send queue, not received/executed. Sequence
  * identifies a later completion or rejection; lost outcomes must not be replayed.

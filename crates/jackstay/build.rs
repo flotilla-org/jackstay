@@ -11,6 +11,32 @@ fn main() {
     if target_os == "linux" && backend_linux {
         build_linux_shim();
     }
+    if target_os == "windows" {
+        build_windows_smoke();
+    }
+}
+
+// Windows always compiles the public C header smoke with the platform C
+// compiler (MSVC), so the Windows C ABI is checked by real C, not only Rust.
+#[cfg(windows)]
+fn build_windows_smoke() {
+    println!("cargo:rerun-if-changed=include/capture_transfer.h");
+    println!("cargo:rerun-if-changed=include/jackstay_input.h");
+    println!("cargo:rerun-if-changed=include/jackstay_bootstrap.h");
+    println!("cargo:rerun-if-changed=src/native/c_abi_header_smoke.c");
+    let mut build = cc::Build::new();
+    build.include("include").file("src/native/c_abi_header_smoke.c");
+    if build.get_compiler().is_like_msvc() {
+        build.flag("/std:c11");
+    } else {
+        build.flag("-std=c11");
+    }
+    build.compile("jackstay_c_abi_header_smoke");
+}
+
+#[cfg(not(windows))]
+fn build_windows_smoke() {
+    println!("cargo:warning=skipping the Windows C header smoke when cross-compiling");
 }
 
 #[cfg(feature = "backend-macos")]

@@ -6,7 +6,9 @@ extern "C" {
 #endif
 
 /* ABI 0.8: one already connected, host-authorized source endpoint.
- * Unix-only, as for the current CPU setup and input transports.
+ * The fd forms are POSIX-only; ABI 0.9's *_local forms take a Local Endpoint
+ * connection on every platform (on Windows the input channel is a private pipe
+ * end duplicated into the verified peer, which acknowledges it).
  * Bootstrap runs BEFORE CPU setup. It retains the original connection for
  * media so CPU admission still sees the consumer's actual kernel PID. Input
  * uses a separate transferred connection; it does not share media backpressure.
@@ -36,8 +38,16 @@ extern "C" {
  * server, if any. A returned server is a worker owner, not proof of admission.
  * On failure/teardown continue pumping target cleanup, as for target_serve.
  */
+#if defined(__unix__) || defined(__APPLE__)
 ft_status ft_source_bootstrap_accept(int32_t *fd, ft_input_target *authorized_input,
                                     ft_input_server **out_input_server);
+#endif
+/* The same on a connection the host accepted: after basic checks *connection is
+ * NULL on failure (consumed) and the same connection on success, ready for
+ * ft_cpu_producer_serve_local. */
+ft_status ft_source_bootstrap_accept_local(ft_local_connection **connection,
+                                          ft_input_target *authorized_input,
+                                          ft_input_server **out_input_server);
 
 /* input_request is one of the constants above. input_mode is zero for NONE,
  * otherwise one FT_INPUT_MODE_* value. On success pass fd to
@@ -51,9 +61,18 @@ ft_status ft_source_bootstrap_accept(int32_t *fd, ft_input_target *authorized_in
  * explicitly close/poll/destroy input when abandoning the source association.
  * Input destroy alone does not confirm executor cleanup.
  */
+#if defined(__unix__) || defined(__APPLE__)
 ft_status ft_source_bootstrap_connect(int32_t *fd, uint32_t input_request,
                                      uint32_t input_mode, ft_input_client **out_input,
                                      ft_status *out_input_status);
+#endif
+/* The same on a connection from ft_local_connect: after basic checks
+ * *connection is NULL on failure (consumed) and the same connection on success,
+ * ready for ft_acquisition_cpu_connection_create_local. */
+ft_status ft_source_bootstrap_connect_local(ft_local_connection **connection,
+                                           uint32_t input_request, uint32_t input_mode,
+                                           ft_input_client **out_input,
+                                           ft_status *out_input_status);
 #ifdef __cplusplus
 }
 #endif

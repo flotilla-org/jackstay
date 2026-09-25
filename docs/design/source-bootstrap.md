@@ -36,7 +36,9 @@ available, and any clean optional-input rejection. Feed the media stream to
 then attach. Use the input client's welcome/configuration and event operations
 as before.
 
-The C equivalents are in `jackstay_bootstrap.h`:
+The C equivalents are in `jackstay_bootstrap.h` (ABI 0.9 adds
+`ft_source_bootstrap_accept_local`/`connect_local` for
+[Local Endpoint](local-endpoints.md) connections on every platform):
 
 - `ft_source_bootstrap_accept(&fd, authorized_input, &input_server)` precedes
   `ft_cpu_producer_serve(producer, &fd, &media_server)`.

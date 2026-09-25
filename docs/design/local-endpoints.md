@@ -105,6 +105,41 @@ the verified peer the same way, within the bootstrap's five-second deadline.
 The receiver checks it is a connected pipe. D3D11 slots will use the same
 transfer once per incarnation (#28).
 
+## C ABI 0.9
+
+`capture_transfer.h` adds `ft_local_endpoint` (scope, transport, name) and
+`ft_peer_identity` (PID, session, user string), with
+`ft_local_listener_create`/`accept`/`cancel`/`destroy`, `ft_local_connect`,
+`ft_local_connection_peer`, `ft_local_connection_alive` and
+`ft_local_endpoint_render`. New statuses: `FT_STATUS_ADDRESS_IN_USE` (19) for a
+taken endpoint and `FT_STATUS_UNTRUSTED_PEER` (20) for a failed owner or session
+check.
+
+A connection is consumed by exactly one `_local` setup call, which nulls the
+caller's handle after basic argument checks, as the FD calls set -1:
+
+| Host | Client |
+| --- | --- |
+| `ft_source_bootstrap_accept_local` (hands the connection back) | `ft_source_bootstrap_connect_local` (hands it back) |
+| `ft_cpu_producer_serve_local` | `ft_acquisition_cpu_connection_create_local`, then the existing attach, cancel and configuration calls |
+| `ft_input_target_serve_local` | `ft_input_client_connect_local` |
+
+`ft_acquisition_cpu_connection_alive` reports whether the producer still holds
+its end of setup (OK, CLOSED, or CANCELLED after cancellation) without consuming
+setup bytes, so a consumer no longer peeks at a borrowed descriptor to notice a
+vanished producer. It answers OK while another setup call owns the connection.
+
+The acquisition, producer, bootstrap and input APIs are now declared and built on
+Windows. The FD-taking setup calls (`ft_cpu_producer_serve`,
+`ft_acquisition_cpu_connection_create`, `ft_source_bootstrap_accept`/`connect`,
+`ft_input_target_serve`, `ft_input_client_connect`) and the Porthole daemon's
+`ft_acquisition_cpu_connect_session` remain POSIX-only. Raw grant import takes
+`ft_os_object`: an `int32_t` FD on POSIX (unchanged) or a `HANDLE` on Windows,
+set to `FT_OS_OBJECT_NONE` once consumed.
+
+On Windows the build compiles `c_abi_header_smoke.c` with MSVC in C11 mode, and
+`acquisition_ffi` runs its C translation unit against a Rust producer.
+
 ## Evidence
 
 Windows unit tests cover rendering, identity reported both ways, a taken name
@@ -123,6 +158,25 @@ accepting its own session is tested live.
 
 `acquisition_socket`, `bootstrap` and `input_transport` now run on Windows,
 including a child process admitted through a pipe listener and killed while it
-holds a claim. The arena suites' parent/child helper
+holds a claim. So do `acquisition_ffi`, `acquisition_producer_ffi`,
+`acquisition_cpu_server_ffi`, `bootstrap_ffi` and `input_ffi`, with `_local`
+counterparts of the FD tests (argument rejection versus consumption, blocked
+attach cancellation, partial-request server cancellation, EOF versus protocol
+failure, liveness). `acquisition_session` stays POSIX-only: it drives the Porthole
+daemon's Unix session protocol, which has no Windows implementation.
+
+`local_ffi_process` runs a producer and a consumer in separate processes using
+only the C entry points. The consumer child connects by endpoint, verifies the
+server's PID and user, bootstraps required input and attaches; the host checks
+the accepted peer is that child. They exchange a frame and text input; the host
+resizes the allocation and the consumer installs the replacement while holding
+the old frame; the host cancels setup and the consumer observes closure through
+liveness while its frames stay readable; the consumer presses a key and is
+killed. The host then sees the input target run the controller's disconnect
+cleanup and retire, and the producer, which refused destruction while the
+consumer lived, reclaims the dead process's claims and is destroyed. In the
+second test the producer child is killed while the consumer holds a frame: setup
+liveness turns CLOSED, the held bytes stay intact, and the input client closes
+without confirmed cleanup. The arena suites' parent/child helper
 (`tests/support/setup.rs`) now uses the pipe endpoint and handle transfer instead
 of loopback TCP and parent-side duplication.

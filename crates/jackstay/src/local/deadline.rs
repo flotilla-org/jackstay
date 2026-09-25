@@ -164,6 +164,10 @@ impl<S: BorrowMut<Stream>> Bounded<S> {
                 count => bytes = &bytes[count..],
             }
         }
+        // A Unix socket's flush is a no-op, so a write that placed every byte
+        // succeeds even if the deadline passes now. A pipe's flush can wait on
+        // a background write: bound it by the time left.
+        #[cfg(windows)]
         self.writable()?;
         self.stream_mut().flush()
     }

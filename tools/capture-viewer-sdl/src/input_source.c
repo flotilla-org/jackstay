@@ -101,6 +101,7 @@ int main(int argc, char **argv) {
   printf("ready\n"); fflush(stdout);
   uint8_t *pixels = malloc((size_t)LARGE_WIDTH * 4 * LARGE_HEIGHT); if (!pixels) return 1;
   uint32_t width = WIDTH, height = HEIGHT; uint64_t geometry_revision = config.geometry.revision, capacity = STRIDE * HEIGHT;
+  uint32_t next_width = WIDTH, next_height = HEIGHT; int growth_pending = 0;
   unsigned since_resize = 0, held_count = 0, buttons = 0, downs = 0, repeats = 0, releases = 0, cleanup = 0;
   size_t text_bytes = 0;
   uint64_t sequence = 1;
@@ -167,16 +168,29 @@ int main(int argc, char **argv) {
         }
       }
       if (!input_server && ft_cpu_setup_server_poll(media_server) != FT_STATUS_DRAINING) finished = 1;
-      if (resize_ms && (since_resize += 16) >= resize_ms) {
+      int apply_size = 0;
+      if (resize_ms && !growth_pending && (since_resize += 16) >= resize_ms) {
         /* Growing past the allocation replaces it while consumers may hold old
          * frames; shrinking reuses it. Pointer work from the old size is cancelled. */
         since_resize = 0;
-        width = width == WIDTH ? LARGE_WIDTH : WIDTH; height = height == HEIGHT ? LARGE_HEIGHT : HEIGHT;
-        if ((uint64_t)width * 4 * height > capacity) {
+        next_width = width == WIDTH ? LARGE_WIDTH : WIDTH; next_height = height == HEIGHT ? LARGE_HEIGHT : HEIGHT;
+        if ((uint64_t)next_width * 4 * next_height > capacity) {
           ft_cpu_reconfiguration replacement = {0};
-          capacity = (uint64_t)width * 4 * height;
-          checked(ft_cpu_producer_reconfigure(producer, capacity, &replacement));
-        }
+          ft_status grown = ft_cpu_producer_reconfigure(producer, (uint64_t)next_width * 4 * next_height, &replacement);
+          /* Until old frames retire, the transition pauses and publication is
+           * dropped; keep the old size and advance it below. */
+          if (grown == FT_STATUS_PAUSED_CAPACITY) growth_pending = 1; else { checked(grown); apply_size = 1; }
+        } else apply_size = 1;
+      }
+      if (growth_pending) {
+        ft_cpu_reconfiguration replacement = {0};
+        ft_status advanced = ft_cpu_producer_advance(producer, &replacement);
+        if (advanced == FT_STATUS_OK) { growth_pending = 0; apply_size = 1; }
+        else if (advanced != FT_STATUS_PAUSED_CAPACITY) checked(advanced);
+      }
+      if (apply_size) {
+        width = next_width; height = next_height;
+        if ((uint64_t)width * 4 * height > capacity) capacity = (uint64_t)width * 4 * height;
         ft_input_geometry geometry = {++geometry_revision, width, height};
         checked(ft_input_target_geometry(target, &geometry));
         pointer_x = pointer_x < width ? pointer_x : 0; pointer_y = pointer_y < height ? pointer_y : 0;

@@ -308,8 +308,15 @@ impl Deadline {
             .checked_duration_since(std::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
-        stream.set_read_timeout(Some(remaining))?;
-        stream.set_write_timeout(Some(remaining))
+        let set = stream
+            .set_read_timeout(Some(remaining))
+            .and_then(|()| stream.set_write_timeout(Some(remaining)));
+        match set {
+            // macOS refuses socket options once the peer has closed; the next
+            // read or write then reports that closure itself.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            other => other,
+        }
     }
 }
 
@@ -324,7 +331,8 @@ fn with_deadline(
     let result = exchange(stream, &deadline);
     let restored = stream.set_read_timeout(None).is_ok() && stream.set_write_timeout(None).is_ok();
     match result {
-        Ok(_) if !restored => FT_STATUS_ERROR,
+        // Setup needs the defaults back; a failed exchange is reported as is.
+        Ok(FT_STATUS_OK) if !restored => FT_STATUS_ERROR,
         Ok(status) => status,
         Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => FT_STATUS_TIMEOUT,
         Err(error)

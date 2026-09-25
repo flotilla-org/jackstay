@@ -160,12 +160,13 @@ ft_status ft_local_connection_alive(const ft_local_connection *connection);
  * call that consumes it, for example presenting a host-issued attach token
  * and reading the host's reply. Jackstay adds no framing and interprets no
  * bytes. Each call returns within timeout_ms (nonzero) in total, however the
- * peer paces its bytes; run them off GUI/input threads. write sends all len bytes. read_until reads one byte at a time up
- * to and including the first delimiter, so no later byte (such as the start
- * of setup) is consumed; *out_len counts the bytes stored, delimiter included.
- * CLOSED: the peer closed first. TIMEOUT: the time ran out. CAPACITY: no
- * delimiter within capacity bytes. After any failure the stream position is
- * unknown: destroy the connection. */
+ * peer paces its bytes; run them off GUI/input threads. write sends all len
+ * bytes. read_until reads one byte at a time up to and including the first
+ * delimiter, so no later byte (such as the start of setup) is consumed;
+ * *out_len counts the bytes stored, delimiter included. CLOSED: the peer
+ * closed first. TIMEOUT: the time ran out. CAPACITY: no delimiter within
+ * capacity bytes. After any failure the stream position is unknown: destroy
+ * the connection. */
 ft_status ft_local_connection_write(ft_local_connection *connection, const uint8_t *data, size_t len,
                                     uint32_t timeout_ms);
 ft_status ft_local_connection_read_until(ft_local_connection *connection, uint8_t delimiter, uint8_t *out,

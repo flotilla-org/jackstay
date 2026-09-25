@@ -15,6 +15,12 @@
 //!
 //! Operations never read more than asked, so a caller reading one byte at a
 //! time consumes nothing past what it needs.
+//!
+//! SIGPIPE: Local Endpoint connections are created with it suppressed
+//! (`local::unix` connect and accept), and bootstrap suppresses it on the
+//! host-supplied streams it takes, so writes here report `BrokenPipe` in a C
+//! host that keeps the default disposition. Setting the option here instead
+//! would fail on macOS once the peer has closed.
 
 use std::{
     borrow::BorrowMut,
@@ -252,6 +258,42 @@ mod tests {
         assert_eq!(exchange.read_some(&mut byte).unwrap(), 0);
         assert_eq!(exchange.read_exact(&mut byte).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
         let error = exchange.write_all(&[1; 4096]).unwrap_err();
+        assert!(
+            matches!(error.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset),
+            "{error:?}"
+        );
+    }
+
+    // Rust ignores SIGPIPE at startup; a C host need not. Write to a closed
+    // Local Endpoint peer with the default disposition in a child process.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_local_endpoint_peer_is_an_error_with_default_sigpipe() {
+        use crate::local::{Endpoint, Listener, Scope, Transport, connect};
+        const CHILD: &str = "JACKSTAY_TEST_DEADLINE_SIGPIPE";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local::deadline::tests::a_closed_local_endpoint_peer_is_an_error_with_default_sigpipe",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "C-host signal disposition killed the child: {status}");
+            return;
+        }
+        // SAFETY: process-wide state, changed only in this dedicated child.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let name = format!("deadline-sigpipe-{}", std::process::id());
+        let endpoint = Endpoint::new(Scope::User, &name, Transport::LocalStream).unwrap();
+        let listener = Listener::bind(&endpoint).unwrap();
+        let accepting = thread::spawn(move || listener.accept().unwrap().into_stream());
+        let client = connect(&endpoint).unwrap().into_stream();
+        let mut host = accepting.join().unwrap();
+        drop(client);
+        let mut exchange = Bounded::new(&mut host, Duration::from_secs(5)).unwrap();
+        let error = exchange.write_all(&[1; 1 << 16]).unwrap_err();
         assert!(
             matches!(error.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset),
             "{error:?}"

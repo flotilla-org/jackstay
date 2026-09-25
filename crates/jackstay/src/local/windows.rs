@@ -421,35 +421,43 @@ impl PipeListener {
     }
 
     pub(crate) fn accept(&self) -> Result<Connection, Error> {
-        let mut pending = self.pending.lock().map_err(|_| io::Error::other("listener mutex poisoned"))?;
-        if signaled(&self.cancel) {
-            return Err(Error::Cancelled);
-        }
-        let instance = match pending.take() {
-            Some(instance) => instance,
-            None => create_instance(&self.name, &self.descriptor, false, PIPE_UNLIMITED_INSTANCES)?,
-        };
-        match connect_instance(&instance, &self.connected, Some(&self.cancel)) {
-            Ok(true) => {}
-            Ok(false) => {
-                *pending = Some(instance);
-                return Err(Error::Cancelled);
-            }
-            // For example a client that connected and left before we noticed
-            // (ERROR_NO_DATA): this instance is spent. Keep the address served.
-            Err(error) => {
+        loop {
+            let instance = {
+                let mut pending = self.pending.lock().map_err(|_| io::Error::other("listener mutex poisoned"))?;
+                if signaled(&self.cancel) {
+                    return Err(Error::Cancelled);
+                }
+                let instance = match pending.take() {
+                    Some(instance) => instance,
+                    None => create_instance(&self.name, &self.descriptor, false, PIPE_UNLIMITED_INSTANCES)?,
+                };
+                let connected = connect_instance(&instance, &self.connected, Some(&self.cancel));
+                if matches!(connected, Ok(false)) {
+                    *pending = Some(instance);
+                    return Err(Error::Cancelled);
+                }
+                // Keep the address served before handing this instance out
+                // (or discarding it).
                 *pending = create_instance(&self.name, &self.descriptor, false, PIPE_UNLIMITED_INSTANCES).ok();
-                return Err(Error::Io(error));
-            }
+                match connected {
+                    Ok(_) => instance,
+                    // A client that connected and left before we noticed: this
+                    // instance is spent. Wait for the next client, as on Unix.
+                    Err(error) if is_error(&error, ERROR_NO_DATA) => continue,
+                    Err(error) => return Err(Error::Io(error)),
+                }
+            };
+            let mut stream = PipeStream::new(instance, true)?;
+            let (peer, process) = match identify_client(&stream) {
+                Ok(identified) => identified,
+                // It left during identification; nothing to hand the host.
+                Err(_) if !stream.is_alive() => continue,
+                Err(error) => return Err(Error::RefusedPeer(format!("cannot identify peer: {error}"))),
+            };
+            self.policy.check(&peer)?;
+            stream.peer_process = Some(Arc::new(process));
+            return Ok(Connection { stream, peer });
         }
-        // Keep the address served before handing this instance out.
-        *pending = create_instance(&self.name, &self.descriptor, false, PIPE_UNLIMITED_INSTANCES).ok();
-        drop(pending);
-        let mut stream = PipeStream::new(instance, true)?;
-        let (peer, process) = identify_client(&stream).map_err(|error| Error::RefusedPeer(format!("cannot identify peer: {error}")))?;
-        self.policy.check(&peer)?;
-        stream.peer_process = Some(Arc::new(process));
-        Ok(Connection { stream, peer })
     }
 
     pub(crate) fn cancel(&self) {
@@ -1196,17 +1204,21 @@ mod tests {
         // Real server, injected expectation: the check compares the server's
         // actual token owner against the policy, so SYSTEM must not match us.
         let endpoint = unique("owner");
-        let listener = Listener::bind(&endpoint).unwrap();
+        let listener = Arc::new(Listener::bind(&endpoint).unwrap());
         let name = render(&endpoint).unwrap();
-        let accepting = thread::spawn(move || {
-            let _ = listener.accept();
-        });
+        let accepting = {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || listener.accept().map(|_| ()))
+        };
         let policy = ServerPolicy {
             user: "S-1-5-18".into(),
             session: None,
         };
         assert!(matches!(connect_name(&name, &policy), Err(Error::UntrustedServer(_))));
-        accepting.join().unwrap();
+        // Accept either handed out the connection before the client left, or
+        // skipped it and waits for another client until cancelled.
+        listener.cancel();
+        assert!(matches!(accepting.join().unwrap(), Ok(()) | Err(Error::Cancelled)));
     }
 
     #[test]

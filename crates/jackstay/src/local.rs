@@ -201,9 +201,10 @@ impl Listener {
         })
     }
 
-    /// Wait for one client. [`Error::RefusedPeer`] reports a client that failed
-    /// the endpoint's policy (another Windows session on a session-bound
-    /// endpoint); the listener stays usable. [`Error::Cancelled`] follows
+    /// Wait for one client. Clients that leave before they can be identified
+    /// are skipped. [`Error::RefusedPeer`] reports a client that failed the
+    /// endpoint's policy (another Windows session on a session-bound
+    /// endpoint); the listener stays usable, as it does after other errors. [`Error::Cancelled`] follows
     /// [`Self::cancel`]. Accepts on one listener are serialized.
     pub fn accept(&self) -> Result<Connection, Error> {
         self.inner.accept()

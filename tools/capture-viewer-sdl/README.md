@@ -142,6 +142,23 @@ the top strip green; text fills a bottom bar; the pointer becomes red while a
 button is held. The source prints final input counts and held state on exit.
 This is a cooperative target, not native desktop injection.
 
+The source also listens on a [Local Endpoint](../../docs/design/local-endpoints.md)
+with `--endpoint NAME` (add `--session-scope` for a session endpoint), the only
+form on Windows. It needs no SDL, so build it there directly, for example from a
+Visual Studio developer prompt:
+
+```bat
+cl /std:c11 /I crates\jackstay\include tools\capture-viewer-sdl\src\input_source.c ^
+  /Fe:capture-input-source.exe /link target\debug\jackstay.dll.lib
+```
+
+Keep `jackstay.dll` beside the executable. `--log-input` prints one line per
+executed input operation. `--resize-every-ms MS` alternates the frame between
+320x180 and 480x360, replacing the allocation on the first growth and updating
+the input geometry, to exercise consumer reconfiguration. `--repeat` keeps the
+endpoint and serves viewers one after another until the source is killed, so a
+viewer can reconnect, for example to request input again.
+
 `--source-socket` requests optional cooperative input. Use `--observe` to request
 only media, or `--require-input` to fail if control is unavailable. Optional
 refusal is reported while observation continues. The source can withhold input

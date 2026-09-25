@@ -74,6 +74,8 @@ jobs:
           version: 0.15.2
       # The Windows declarations (HANDLE setup objects, Local Endpoint setup).
       - run: zig cc -target x86_64-windows-gnu -std=c11 -Wall -Werror -I crates/jackstay/include -c crates/jackstay/src/native/c_abi_header_smoke.c -o /dev/null
+      # The reference source's Local Endpoint mode builds for Windows too.
+      - run: zig cc -target x86_64-windows-gnu -std=c11 -Wall -Wextra -Werror -I crates/jackstay/include -c tools/capture-viewer-sdl/src/input_source.c -o /dev/null
       - run: zig translate-c -lc crates/jackstay/include/capture_transfer.h > /dev/null
       - run: zig translate-c -lc crates/jackstay/include/jackstay_ring.h > /dev/null
       - run: zig translate-c -lc crates/jackstay/include/jackstay_input.h > /dev/null

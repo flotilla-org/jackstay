@@ -83,6 +83,10 @@ build/viewer/capture-input-source /tmp/jackstay-source.sock
 build/viewer/capture-viewer-sdl --source-socket /tmp/jackstay-source.sock
 ```
 
+With `--endpoint NAME` the source listens on a [Local Endpoint](local-endpoints.md)
+instead, through the `_local` bootstrap and CPU setup calls. That is its only
+form on Windows, where Wheelhouse's session acceptance drives it.
+
 The viewer requests optional cooperative input by default. `--observe` never
 requests it; `--require-input` fails rather than attaching without it. The source's
 `--observe-only` option withholds input authority. The direct `--cpu-socket` and

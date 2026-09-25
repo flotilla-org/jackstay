@@ -26,6 +26,10 @@ fn build_windows_smoke() {
     println!("cargo:rerun-if-changed=src/native/c_abi_header_smoke.c");
     let mut build = cc::Build::new();
     build.include("include").file("src/native/c_abi_header_smoke.c");
+    // The D3D11 entry points exist only in a backend-windows library.
+    if std::env::var_os("CARGO_FEATURE_BACKEND_WINDOWS").is_some() {
+        build.define("JACKSTAY_BACKEND_WINDOWS", None);
+    }
     if build.get_compiler().is_like_msvc() {
         build.flag("/std:c11");
     } else {

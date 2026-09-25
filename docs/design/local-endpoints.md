@@ -124,6 +124,7 @@ caller's handle after basic argument checks, as the FD calls set -1:
 | `ft_source_bootstrap_accept_local` (hands the connection back) | `ft_source_bootstrap_connect_local` (hands it back) |
 | `ft_cpu_producer_serve_local` | `ft_acquisition_cpu_connection_create_local`, then the existing attach, cancel and configuration calls |
 | `ft_input_target_serve_local` | `ft_input_client_connect_local` |
+| a Rust `serve_d3d11` host | `ft_acquisition_d3d11_connection_create_local` (ABI 0.10, [D3D11](acquisition-d3d11.md#c-abi-010)) |
 
 `ft_acquisition_cpu_connection_alive` reports whether the producer still holds
 its end of setup (OK, CLOSED, or CANCELLED after cancellation) without consuming

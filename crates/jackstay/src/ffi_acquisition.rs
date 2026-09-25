@@ -540,3 +540,6 @@ destroy!(
 
 #[cfg(all(target_os = "macos", feature = "backend-macos"))]
 pub mod macos;
+
+#[cfg(all(windows, feature = "backend-windows"))]
+pub mod d3d11;

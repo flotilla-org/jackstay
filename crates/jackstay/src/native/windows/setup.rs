@@ -369,6 +369,11 @@ impl D3d11SetupClient {
         !self.failed && crate::local::is_alive(&self.stream)
     }
 
+    /// A handle that interrupts this client's setup I/O from another thread.
+    pub fn shutdown_handle(&self) -> std::io::Result<crate::local::ShutdownHandle> {
+        crate::local::shutdown_handle(&self.stream)
+    }
+
     fn fail(&mut self) {
         self.failed = true;
         self.stream.shutdown();

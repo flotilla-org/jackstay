@@ -3,11 +3,11 @@
 //! Hosts move an admitted Rust consumer into this API. Frames retain the same
 //! Rust lease; neither this boundary nor its callers maintain another lease book.
 
-use std::{
-    os::fd::{FromRawFd, OwnedFd},
-    ptr,
-    time::Duration,
-};
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd as OwnedObject};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, OwnedHandle as OwnedObject};
+use std::{ptr, time::Duration};
 
 use crate::{
     acquisition::arena::{
@@ -28,11 +28,49 @@ pub struct FtAcquisitionConsumer(ArenaConsumer);
 
 pub mod producer;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod session;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod setup_server;
+
+/// An owned setup object crossing the C boundary: a file descriptor on POSIX,
+/// a `HANDLE` on Windows (`ft_os_object` in the header).
+#[cfg(unix)]
+pub type FtOsObject = i32;
+/// An owned setup object crossing the C boundary: a file descriptor on POSIX,
+/// a `HANDLE` on Windows (`ft_os_object` in the header).
+#[cfg(windows)]
+pub type FtOsObject = *mut std::ffi::c_void;
+
+/// The value a consumed object slot is set to: -1, or a null `HANDLE`.
+#[cfg(unix)]
+pub const FT_OS_OBJECT_NONE: FtOsObject = -1;
+/// The value a consumed object slot is set to: -1, or a null `HANDLE`.
+#[cfg(windows)]
+pub const FT_OS_OBJECT_NONE: FtOsObject = ptr::null_mut();
+
+#[cfg(unix)]
+fn invalid_object(object: FtOsObject) -> bool {
+    object < 0
+}
+
+#[cfg(windows)]
+fn invalid_object(object: FtOsObject) -> bool {
+    // Null and INVALID_HANDLE_VALUE (also the current-process pseudo handle).
+    object.is_null() || object as isize == -1
+}
+
+/// # Safety
+/// `object` is a live object this process exclusively owns; ownership moves.
+unsafe fn own_object(object: FtOsObject) -> OwnedObject {
+    // SAFETY: the caller transfers sole ownership of this live object.
+    #[cfg(unix)]
+    return unsafe { OwnedObject::from_raw_fd(object) };
+    // SAFETY: as above, for a HANDLE.
+    #[cfg(windows)]
+    return unsafe { OwnedObject::from_raw_handle(object) };
+}
 
 impl FtAcquisitionConsumer {
     /// Transfer an admitted consumer to C. Destroy with
@@ -91,20 +129,22 @@ fn status(error: ArenaError) -> FtStatus {
 }
 
 /// Import a single-use CPU grant serialized as GrantDescriptor JSON, with its
-/// five owned setup FDs. After argument validation FDs are consumed on success
-/// OR failure, and their entries become -1. No extra transport copies may remain.
+/// five owned setup objects (FDs, or Windows handles with the access listed in
+/// docs/design/acquisition-process-cleanup.md). After argument validation they
+/// are consumed on success OR failure, and their entries become
+/// [`FT_OS_OBJECT_NONE`]. No extra transport copies may remain.
 ///
 /// # Safety
 /// The producer must obey ConsumerGrant::from_parts' shared-memory protocol.
 /// This process must be the sole intended recipient; never replay, forward or
 /// fork its grant/mappings. `json` must reference `len` readable bytes. `fds`
-/// must reference five distinct, exclusively owned live FDs; `out` must point
-/// to null. All arguments must be non-aliasing and valid throughout this call.
+/// must reference five distinct, exclusively owned live objects; `out` must
+/// point to null. All arguments must be non-aliasing and valid throughout.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_import_cpu(
     json: *const u8,
     len: usize,
-    fds: *mut i32,
+    fds: *mut FtOsObject,
     out: *mut *mut FtAcquisitionConsumer,
 ) -> FtStatus {
     if json.is_null() || fds.is_null() || len == 0 || len > 1024 * 1024 {
@@ -118,13 +158,17 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
         return FT_STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: checked non-null; array size/alignment/lifetime are caller obligations.
-    let fds = unsafe { &mut *fds.cast::<[i32; 5]>() };
-    if fds.iter().enumerate().any(|(index, fd)| *fd < 0 || fds[..index].contains(fd)) {
+    let fds = unsafe { &mut *fds.cast::<[FtOsObject; 5]>() };
+    if fds
+        .iter()
+        .enumerate()
+        .any(|(index, fd)| invalid_object(*fd) || fds[..index].contains(fd))
+    {
         return FT_STATUS_INVALID_ARGUMENT;
     }
-    let owned = std::mem::replace(fds, [-1; 5]).map(|fd| {
-        // SAFETY: each live FD is distinct and its sole ownership is transferred.
-        unsafe { OwnedFd::from_raw_fd(fd) }
+    let owned = std::mem::replace(fds, [FT_OS_OBJECT_NONE; 5]).map(|fd| {
+        // SAFETY: each live object is distinct and its sole ownership moves.
+        unsafe { own_object(fd) }
     });
     // SAFETY: readable range is guaranteed by the caller and length is bounded.
     let bytes = unsafe { std::slice::from_raw_parts(json, len) };
@@ -158,14 +202,14 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
 /// ConfigurationGrant::from_parts. No replay, forwarding, fork or other FD
 /// copies are allowed. `consumer` must be live and exclusively accessed; `json`
 /// must reference `len` readable bytes and `fd` must point to one exclusively
-/// owned live FD. All arguments must be non-aliasing. After basic validation the
-/// FD is consumed on every outcome and its caller-visible value becomes -1.
+/// owned live object. All arguments must be non-aliasing. After basic validation
+/// it is consumed on every outcome and its slot becomes [`FT_OS_OBJECT_NONE`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_install_cpu_configuration(
     consumer: *mut FtAcquisitionConsumer,
     json: *const u8,
     len: usize,
-    fd: *mut i32,
+    fd: *mut FtOsObject,
 ) -> FtStatus {
     if json.is_null() || len == 0 || len > 1024 * 1024 {
         return FT_STATUS_INVALID_ARGUMENT;
@@ -174,11 +218,11 @@ pub unsafe extern "C" fn ft_acquisition_install_cpu_configuration(
     let (Some(consumer), Some(fd)) = (unsafe { consumer.as_mut() }, unsafe { fd.as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    if *fd < 0 {
+    if invalid_object(*fd) {
         return FT_STATUS_INVALID_ARGUMENT;
     }
-    // SAFETY: sole ownership of this live FD is transferred exactly once.
-    let owned = unsafe { OwnedFd::from_raw_fd(std::mem::replace(fd, -1)) };
+    // SAFETY: sole ownership of this live object is transferred exactly once.
+    let owned = unsafe { own_object(std::mem::replace(fd, FT_OS_OBJECT_NONE)) };
     // SAFETY: caller guarantees the readable byte range; length is bounded above.
     let bytes = unsafe { std::slice::from_raw_parts(json, len) };
     let descriptor: ConfigurationDescriptor = match serde_json::from_slice(bytes) {

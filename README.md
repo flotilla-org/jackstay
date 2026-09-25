@@ -53,9 +53,9 @@ for capture acceptance; synthetic mode only checks the consumer machinery.
 Build just the Rust library with `cargo build --workspace --locked`. For macOS
 native capture consumers, add `--features backend-macos`; for Linux native
 transport add `--features backend-linux`. On Windows the library, shared memory,
-the acquisition arena and the named-pipe setup channel
-([Local Endpoints](docs/design/local-endpoints.md)) build and are tested; capture
-is not implemented yet. The SDL viewer supports macOS and
+the acquisition arena, the named-pipe setup channel and the acquisition,
+bootstrap and input C ABI ([Local Endpoints](docs/design/local-endpoints.md),
+ABI 0.9) build and are tested; capture is not implemented yet. The SDL viewer supports macOS and
 Linux; its native presentation mode is Metal-only. Linux native reference checks
 use the Vulkan consumer in the library.
 

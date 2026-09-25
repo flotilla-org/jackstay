@@ -1,7 +1,3 @@
-#![cfg(unix)]
-// Windows: the acquisition C ABI (`ffi_acquisition`) arrives with the named-pipe
-// setup channel, flotilla-org/jackstay#27.
-
 use std::{ptr, time::Duration};
 
 use jackstay::{
@@ -13,9 +9,21 @@ use jackstay::{
 #[path = "support/completion.rs"]
 mod completion;
 
+/// Give up an owned setup object as the C ABI's `ft_os_object`.
+#[cfg(unix)]
+fn into_raw<T: std::os::fd::IntoRawFd>(object: T) -> FtOsObject {
+    object.into_raw_fd()
+}
+
+#[cfg(windows)]
+fn into_raw<T: std::os::windows::io::IntoRawHandle>(object: T) -> FtOsObject {
+    object.into_raw_handle()
+}
+
 #[cfg(any(
     all(target_os = "macos", feature = "backend-macos"),
-    all(target_os = "linux", feature = "backend-linux")
+    all(target_os = "linux", feature = "backend-linux"),
+    windows
 ))]
 #[test]
 fn a_compiled_c_consumer_retains_and_reads_the_rust_producers_frame() {
@@ -55,15 +63,35 @@ fn a_compiled_c_consumer_retains_and_reads_the_rust_producers_frame() {
     }
 }
 
+#[cfg(any(
+    all(target_os = "macos", feature = "backend-macos"),
+    all(target_os = "linux", feature = "backend-linux"),
+    windows
+))]
+#[test]
+fn the_compiled_c_header_declares_and_renders_local_endpoints() {
+    unsafe extern "C" {
+        fn jackstay_c_local_endpoint_smoke() -> i32;
+    }
+    // SAFETY: the C function only takes addresses and renders a fixed endpoint.
+    assert!(unsafe { jackstay_c_local_endpoint_smoke() } > 0);
+}
+
 #[test]
 fn malformed_cpu_grant_consumes_all_transferred_fds_without_returning_a_consumer() {
-    use std::{
-        io::Read,
-        os::{fd::IntoRawFd, unix::net::UnixStream},
-    };
-    let (sender, mut peer) = UnixStream::pair().unwrap();
+    use std::io::Read;
+    // Five copies of one end of a connected pair: the peer sees EOF only once
+    // every copy has been closed.
+    #[cfg(unix)]
+    let (sender, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    #[cfg(unix)]
+    let sender = std::os::fd::OwnedFd::from(sender);
+    #[cfg(windows)]
+    let (mut peer, sender) = jackstay::local::pipe_pair().unwrap();
+    #[cfg(windows)]
+    let sender = sender.into_handle().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-    let mut fds: [i32; 5] = std::array::from_fn(|_| sender.try_clone().unwrap().into_raw_fd());
+    let mut fds: [FtOsObject; 5] = std::array::from_fn(|_| into_raw(sender.try_clone().unwrap()));
     drop(sender);
     let mut consumer = ptr::null_mut();
     // SAFETY: the malformed JSON is rejected before maps are accessed. All five
@@ -72,7 +100,7 @@ fn malformed_cpu_grant_consumes_all_transferred_fds_without_returning_a_consumer
         unsafe { ft_acquisition_import_cpu(b"!".as_ptr(), 1, fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_INVALID_ARGUMENT
     );
-    assert_eq!(fds, [-1; 5]);
+    assert_eq!(fds, [FT_OS_OBJECT_NONE; 5]);
     assert!(consumer.is_null());
     assert_eq!(peer.read(&mut [0]).unwrap(), 0, "one of the five transferred FDs leaked");
 }
@@ -91,12 +119,11 @@ fn producer() -> ArenaProducer {
 }
 
 fn imported_consumer(producer: &mut ArenaProducer, holding: u32) -> (jackstay::acquisition::IncarnationId, *mut FtAcquisitionConsumer) {
-    use std::os::fd::IntoRawFd;
     let grant = producer.attach_process(holding, std::process::id()).unwrap();
     let incarnation = grant.incarnation();
     let (descriptor, fds) = grant.into_parts().unwrap();
     let json = serde_json::to_vec(&descriptor).unwrap();
-    let mut fds = fds.map(IntoRawFd::into_raw_fd);
+    let mut fds = fds.map(into_raw);
     let mut consumer = ptr::null_mut();
     // SAFETY: conforming producer; sole intended recipient of this single-use
     // grant. No other FD copies remain and this test does not fork mappings.
@@ -104,13 +131,12 @@ fn imported_consumer(producer: &mut ArenaProducer, holding: u32) -> (jackstay::a
         unsafe { ft_acquisition_import_cpu(json.as_ptr(), json.len(), fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_OK
     );
-    assert_eq!(fds, [-1; 5]);
+    assert_eq!(fds, [FT_OS_OBJECT_NONE; 5]);
     (incarnation, consumer)
 }
 
 #[test]
 fn c_replacement_distinguishes_stale_offers_and_preserves_old_frames_and_credit() {
-    use std::os::fd::IntoRawFd;
     let mut producer = producer();
     let (incarnation, mut consumer) = imported_consumer(&mut producer, 2);
     producer
@@ -136,24 +162,24 @@ fn c_replacement_distinguishes_stale_offers_and_preserves_old_frames_and_credit(
         let (stale, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
         producer.reconfigure_cpu(12).unwrap();
         let json = serde_json::to_vec(&stale).unwrap();
-        let mut fd = fd.into_raw_fd();
+        let mut fd = into_raw(fd);
         assert_eq!(
             ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), &mut fd),
             FT_STATUS_STALE
         );
-        assert_eq!(fd, -1);
+        assert_eq!(fd, FT_OS_OBJECT_NONE);
         assert_eq!(
             ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut new, &mut range),
             FT_STATUS_RECONFIGURATION
         );
         let (current, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
         let json = serde_json::to_vec(&current).unwrap();
-        let mut fd = fd.into_raw_fd();
+        let mut fd = into_raw(fd);
         assert_eq!(
             ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), &mut fd),
             FT_STATUS_OK
         );
-        assert_eq!(fd, -1);
+        assert_eq!(fd, FT_OS_OBJECT_NONE);
         producer
             .publish(
                 FrameDescriptor {
@@ -292,10 +318,9 @@ fn c_frames_keep_independent_credit_and_survive_consumer_destruction() {
 #[test]
 fn c_selection_preserves_misses_gaps_and_empty_results() {
     let mut producer = producer();
-    use std::os::fd::IntoRawFd;
     let (grant, fds) = producer.attach_process(1, std::process::id()).unwrap().into_parts().unwrap();
     let json = serde_json::to_vec(&grant).unwrap();
-    let mut fds = fds.map(IntoRawFd::into_raw_fd);
+    let mut fds = fds.map(into_raw);
     let mut consumer = ptr::null_mut();
     // SAFETY: conforming producer, intended recipient, five uniquely owned FDs,
     // one import, and no fork or other copies of the transferred mappings.
@@ -303,7 +328,7 @@ fn c_selection_preserves_misses_gaps_and_empty_results() {
         unsafe { ft_acquisition_import_cpu(json.as_ptr(), json.len(), fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_OK
     );
-    assert_eq!(fds, [-1; 5]);
+    assert_eq!(fds, [FT_OS_OBJECT_NONE; 5]);
     for _ in 0..5 {
         producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     }

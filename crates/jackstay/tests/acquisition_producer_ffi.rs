@@ -1,7 +1,3 @@
-#![cfg(unix)]
-// Windows: the acquisition C ABI (`ffi_acquisition`) arrives with the named-pipe
-// setup channel, flotilla-org/jackstay#27.
-
 use std::ptr;
 
 use jackstay::{

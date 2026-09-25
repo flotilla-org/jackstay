@@ -145,17 +145,24 @@ impl Listener {
     }
 
     pub(super) fn accept(&self) -> Result<Connection, Error> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(Error::Cancelled);
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(Error::Cancelled);
+            }
+            let (stream, _) = self.listener.accept()?;
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(Error::Cancelled);
+            }
+            // Accepted sockets can inherit O_NONBLOCK on macOS; setup is blocking.
+            stream.set_nonblocking(false)?;
+            match identity(&stream) {
+                Ok(peer) => return Ok(Connection { stream, peer }),
+                // A client that left before identification, such as another
+                // bind's liveness probe: macOS then has no peer PID. Skip it.
+                Err(error) if !is_alive(&stream) => drop(error),
+                Err(error) => return Err(error.into()),
+            }
         }
-        let (stream, _) = self.listener.accept()?;
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(Error::Cancelled);
-        }
-        // Accepted sockets can inherit O_NONBLOCK on macOS; setup is blocking.
-        stream.set_nonblocking(false)?;
-        let peer = identity(&stream)?;
-        Ok(Connection { stream, peer })
     }
 
     pub(super) fn cancel(&self) {

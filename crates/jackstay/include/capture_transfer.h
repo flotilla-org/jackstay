@@ -159,8 +159,8 @@ ft_status ft_local_connection_alive(const ft_local_connection *connection);
 /* ABI 0.11: a host's own exchange on an unconsumed connection before the setup
  * call that consumes it, for example presenting a host-issued attach token
  * and reading the host's reply. Jackstay adds no framing and interprets no
- * bytes. Both block for at most timeout_ms (nonzero); run them off GUI/input
- * threads. write sends all len bytes. read_until reads one byte at a time up
+ * bytes. Each call returns within timeout_ms (nonzero) in total, however the
+ * peer paces its bytes; run them off GUI/input threads. write sends all len bytes. read_until reads one byte at a time up
  * to and including the first delimiter, so no later byte (such as the start
  * of setup) is consumed; *out_len counts the bytes stored, delimiter included.
  * CLOSED: the peer closed first. TIMEOUT: the time ran out. CAPACITY: no

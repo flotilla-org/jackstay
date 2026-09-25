@@ -579,6 +579,15 @@ fn a_host_exchange_runs_before_setup_on_the_same_connection() {
             let mut silent = accept();
             assert_eq!(read_line(silent, 8, 5000).0, FT_STATUS_CLOSED, "the client gave up and closed");
             ft_local_connection_destroy(&mut silent);
+            // A host that trickles one byte every 50 ms, never the delimiter.
+            let mut trickle = accept();
+            for _ in 0..40 {
+                if write(trickle, b"x") != FT_STATUS_OK {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            ft_local_connection_destroy(&mut trickle);
             ft_local_connection_destroy(&mut long);
             Raw(authorized as usize)
         });
@@ -602,6 +611,16 @@ fn a_host_exchange_runs_before_setup_on_the_same_connection() {
         assert_eq!(read_line(silent, 8, 100), (FT_STATUS_TIMEOUT, Vec::new()));
         assert!(started.elapsed() < DEADLINE);
         ft_local_connection_destroy(&mut silent);
+
+        // The deadline covers the whole call, not each byte.
+        let mut trickle = ptr::null_mut();
+        assert_eq!(ft_local_connect(&endpoint, &mut trickle), FT_STATUS_OK);
+        let started = Instant::now();
+        let (status, partial) = read_line(trickle, 64, 300);
+        assert_eq!(status, FT_STATUS_TIMEOUT);
+        assert!(!partial.is_empty(), "some bytes arrived before the deadline");
+        assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
+        ft_local_connection_destroy(&mut trickle);
 
         let mut served = host.join().unwrap().0 as *mut FtLocalConnection;
         ft_local_listener_destroy(&mut listener);

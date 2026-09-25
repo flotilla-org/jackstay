@@ -296,20 +296,45 @@ pub unsafe extern "C" fn ft_local_connection_alive(connection: *const FtLocalCon
     }
 }
 
-/// Run `exchange` with `timeout` (milliseconds, nonzero) applied to both
-/// directions, then restore the stream's blocking defaults for setup.
-fn with_timeout(stream: &mut Stream, timeout_ms: u32, exchange: impl FnOnce(&mut Stream) -> std::io::Result<FtStatus>) -> FtStatus {
-    let timeout = Some(std::time::Duration::from_millis(u64::from(timeout_ms)));
-    if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
-        return FT_STATUS_ERROR;
+/// An absolute deadline for one host exchange. Every read or write is bounded
+/// by the time left, so a peer that trickles bytes cannot stretch the call
+/// past `timeout_ms` (as in the bootstrap handshake).
+struct Deadline(std::time::Instant);
+
+impl Deadline {
+    fn bound(&self, stream: &Stream) -> std::io::Result<()> {
+        let remaining = self
+            .0
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+        stream.set_read_timeout(Some(remaining))?;
+        stream.set_write_timeout(Some(remaining))
     }
-    let result = exchange(stream);
+}
+
+/// Run `exchange` within `timeout_ms` (nonzero) from now, then restore the
+/// stream's blocking defaults for setup.
+fn with_deadline(
+    stream: &mut Stream,
+    timeout_ms: u32,
+    exchange: impl FnOnce(&mut Stream, &Deadline) -> std::io::Result<FtStatus>,
+) -> FtStatus {
+    let deadline = Deadline(std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms)));
+    let result = exchange(stream, &deadline);
     let restored = stream.set_read_timeout(None).is_ok() && stream.set_write_timeout(None).is_ok();
     match result {
         Ok(_) if !restored => FT_STATUS_ERROR,
         Ok(status) => status,
         Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => FT_STATUS_TIMEOUT,
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => FT_STATUS_CLOSED,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            FT_STATUS_CLOSED
+        }
         Err(_) => FT_STATUS_ERROR,
     }
 }
@@ -339,9 +364,19 @@ pub unsafe extern "C" fn ft_local_connection_write(
     }
     // SAFETY: caller guarantees `len` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-    with_timeout(&mut connection.stream, timeout_ms, |stream| {
+    with_deadline(&mut connection.stream, timeout_ms, |stream, deadline| {
         use std::io::Write;
-        stream.write_all(bytes)?;
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            deadline.bound(stream)?;
+            match stream.write(rest) {
+                Ok(0) => return Ok(FT_STATUS_CLOSED),
+                Ok(count) => rest = &rest[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        deadline.bound(stream)?;
         stream.flush()?;
         Ok(FT_STATUS_OK)
     })
@@ -376,10 +411,11 @@ pub unsafe extern "C" fn ft_local_connection_read_until(
     // SAFETY: caller guarantees `capacity` writable bytes, disjoint from the rest.
     let buffer = unsafe { std::slice::from_raw_parts_mut(out, capacity) };
     let mut filled = 0;
-    let status = with_timeout(&mut connection.stream, timeout_ms, |stream| {
+    let status = with_deadline(&mut connection.stream, timeout_ms, |stream, deadline| {
         use std::io::Read;
         while filled < capacity {
             let mut byte = [0];
+            deadline.bound(stream)?;
             match stream.read(&mut byte) {
                 Ok(0) => return Ok(FT_STATUS_CLOSED),
                 Ok(_) => {}

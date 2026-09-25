@@ -360,10 +360,15 @@ fn connect_instance(instance: &OwnedHandle, event: &OwnedHandle, cancel: Option<
     let mut transferred = 0;
     // SAFETY: waits for the (possibly cancelled) operation to settle.
     let settled = unsafe { GetOverlappedResult(instance.as_raw_handle(), &overlapped, &mut transferred, 1) };
+    if settled != 0 {
+        // Connected, even if cancellation woke us in the same instant: hand the
+        // client out rather than dropping a connection it already sees as open.
+        return Ok(true);
+    }
     if waited != WAIT_OBJECT_0 {
         return Ok(false);
     }
-    check(settled).map(|()| true)
+    Err(io::Error::last_os_error())
 }
 
 fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {

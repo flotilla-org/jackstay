@@ -155,11 +155,15 @@ impl Listener {
             }
             // Accepted sockets can inherit O_NONBLOCK on macOS; setup is blocking.
             stream.set_nonblocking(false)?;
+            // Skip a client that already left without sending anything, such
+            // as another bind's liveness probe (macOS cannot even report its
+            // PID). It never held a session worth handing to the host.
+            if !is_alive(&stream) {
+                continue;
+            }
             match identity(&stream) {
                 Ok(peer) => return Ok(Connection { stream, peer }),
-                // A client that left before identification, such as another
-                // bind's liveness probe: macOS then has no peer PID. Skip it.
-                Err(error) if !is_alive(&stream) => drop(error),
+                Err(_) if !is_alive(&stream) => continue,
                 Err(error) => return Err(error.into()),
             }
         }

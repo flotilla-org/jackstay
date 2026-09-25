@@ -411,7 +411,8 @@ impl RemoteConsumerGrant {
 
 /// Setup descriptor. Objects (FDs on Unix, handles on Windows): control,
 /// resources, claims, consumer notification endpoint, producer notification
-/// endpoint, in that order. Never resend a consumed grant.
+/// endpoint, in that order. Never resend a consumed grant. The Windows setup
+/// channel grants each position its own access (`acquisition::socket`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantDescriptor {
     pub version: u64,

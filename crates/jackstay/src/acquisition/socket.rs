@@ -259,8 +259,11 @@ fn send_objects(stream: &mut Stream, handles: Vec<OwnedFd>) -> Result<(), Socket
     };
 
     use crate::local::Access::Rights;
-    // Grant order: control, resources, claims, consumer event, producer event.
-    // A configuration offer carries one resource section.
+    // The order is fixed by ConsumerGrant::into_parts (see GrantDescriptor):
+    // control, resources, claims, consumer event, producer event. A
+    // configuration offer (ConfigurationGrant::into_parts) carries one resource
+    // section. Keep this list in step with those; import maps each object with
+    // exactly this access (docs/design/acquisition-process-cleanup.md).
     let access: &[u32] = match handles.len() {
         5 => &[
             FILE_MAP_READ,

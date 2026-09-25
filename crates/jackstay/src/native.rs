@@ -15,7 +15,6 @@
 //! in-use state; Linux answers with explicit lease/release state and native
 //! release synchronization.
 
-#[cfg(unix)]
 pub mod arena;
 pub mod attach;
 pub mod lease;

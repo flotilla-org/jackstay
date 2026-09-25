@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::sync::{Arc, Mutex, atomic::Ordering::SeqCst};
 
 use jackstay::{
@@ -40,6 +38,8 @@ impl ReleaseTimeline for ControlledTimeline {
     }
 }
 
+#[path = "support/setup.rs"]
+mod setup;
 #[path = "support/completion.rs"]
 mod shared_completion;
 use shared_completion::SharedCompletion;
@@ -252,21 +252,13 @@ fn deferred_completion_wakes_a_capacity_wait_without_more_producer_calls() {
 
 #[test]
 fn an_imported_grant_hands_off_release_and_wakes_without_a_frame_broker() {
-    use std::{
-        io::{Read, Write},
-        os::{fd::AsRawFd, unix::net::UnixListener},
-        process::Command,
-        time::Duration,
-    };
+    use std::process::Command;
 
-    use jackstay::fdpass;
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("release.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = setup::Listener::bind("release");
     let mut producer = producer(1);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "mapped_release_child", "--nocapture"])
-        .env("JACKSTAY_RELEASE_TEST_SOCKET", &socket)
+        .env("JACKSTAY_RELEASE_TEST_SOCKET", listener.address())
         .spawn()
         .unwrap();
     let grant = producer.attach_process(1, child.id()).unwrap();
@@ -278,15 +270,10 @@ fn an_imported_grant_hands_off_release_and_wakes_without_a_frame_broker() {
     let completion_fd = timeline.export_fd();
     let mut fds = Vec::from(fds);
     fds.push(completion_fd);
-    let (mut stream, _) = listener.accept().unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let json = serde_json::to_vec(&(descriptor, registration)).unwrap();
-    stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
-    stream.write_all(&json).unwrap();
-    fdpass::send_fds(&stream, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
-    let mut ready = [0];
-    stream.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [1]);
+    let mut stream = listener.accept();
+    stream.send(&(descriptor, registration));
+    stream.send_objects(&child, &fds);
+    assert_eq!(stream.read_byte(), 1);
     // Barrier only: no frame acquire/release or metadata messages after setup.
     // Completion alone must wake the child, without a producer call here.
     timeline.signal(5);
@@ -297,24 +284,14 @@ fn an_imported_grant_hands_off_release_and_wakes_without_a_frame_broker() {
 #[test]
 #[ignore = "subprocess helper invoked by an_imported_grant_hands_off_release_and_wakes_without_a_frame_broker"]
 fn mapped_release_child() {
-    use std::{
-        io::{Read, Write},
-        os::unix::net::UnixStream,
-        time::Duration,
-    };
+    use std::time::Duration;
 
-    use jackstay::{
-        acquisition::arena::{Cancellation, ConsumerGrant, GrantDescriptor, ReleaseTimelineRegistration, WaitInterest, WaitOutcome},
-        fdpass,
+    use jackstay::acquisition::arena::{
+        Cancellation, ConsumerGrant, GrantDescriptor, ReleaseTimelineRegistration, WaitInterest, WaitOutcome,
     };
-    let mut stream = UnixStream::connect(std::env::var("JACKSTAY_RELEASE_TEST_SOCKET").unwrap()).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut len = [0; 4];
-    stream.read_exact(&mut len).unwrap();
-    let mut json = vec![0; u32::from_le_bytes(len) as usize];
-    stream.read_exact(&mut json).unwrap();
-    let (descriptor, registration): (GrantDescriptor, ReleaseTimelineRegistration) = serde_json::from_slice(&json).unwrap();
-    let mut fds = fdpass::recv_fds(&stream, 6).unwrap();
+    let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_RELEASE_TEST_SOCKET").unwrap());
+    let (descriptor, registration): (GrantDescriptor, ReleaseTimelineRegistration) = stream.recv();
+    let mut fds = stream.recv_objects(6);
     let completion = Arc::new(SharedCompletion::from_fd(fds.pop().unwrap()));
     let fds = fds.try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer and this process is
@@ -328,7 +305,7 @@ fn mapped_release_child() {
     let observed = consumer.events();
     frame.defer_release(&registration, 5).unwrap();
     assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::HoldingLimit));
-    stream.write_all(&[1]).unwrap();
+    stream.write_byte(1);
     assert!(
         matches!(consumer.wait(observed, WaitInterest::CAPACITY, &Cancellation::new().unwrap(), Some(Duration::from_secs(5))).unwrap(), WaitOutcome::Changed(events) if events.capacity_epoch == observed.capacity_epoch + 1)
     );

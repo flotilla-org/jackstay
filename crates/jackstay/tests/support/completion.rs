@@ -1,8 +1,14 @@
 //! Controlled cross-process completion source for acquisition tests. Completion
 //! values travel over their own event channel, never the frame/setup broker.
+//!
+//! Unix uses a socket pair. Windows uses an anonymous pipe whose read end the
+//! parent duplicates into the child along with the grant.
+#[cfg(unix)]
+use std::os::{fd::OwnedFd as OwnedObject, unix::net::UnixStream as Channel};
+#[cfg(windows)]
+use std::{fs::File as Channel, os::windows::io::OwnedHandle as OwnedObject};
 use std::{
     io::{Read, Write},
-    os::{fd::OwnedFd, unix::net::UnixStream},
     sync::{Arc, Mutex},
     thread::JoinHandle,
 };
@@ -34,8 +40,8 @@ impl State {
 #[derive(Debug, Default)]
 pub struct SharedCompletion {
     state: Arc<State>,
-    writer: Mutex<Option<UnixStream>>,
-    receiver: Option<(UnixStream, JoinHandle<()>)>,
+    writer: Mutex<Option<Channel>>,
+    receiver: Option<(Channel, JoinHandle<()>)>,
 }
 
 impl SharedCompletion {
@@ -43,18 +49,18 @@ impl SharedCompletion {
         Self::default()
     }
 
-    pub fn export_fd(&self) -> OwnedFd {
+    pub fn export_fd(&self) -> OwnedObject {
         let mut writer = self.writer.lock().unwrap();
         assert!(writer.is_none(), "one remote observer in these tests");
-        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let (mut sender, receiver) = pair();
         sender.write_all(&self.state.0.lock().unwrap().0.to_le_bytes()).unwrap();
         *writer = Some(sender);
         receiver.into()
     }
 
-    pub fn from_fd(fd: OwnedFd) -> Self {
+    pub fn from_fd(fd: OwnedObject) -> Self {
         let state = Arc::new(State::default());
-        let mut receiver = UnixStream::from(fd);
+        let mut receiver = Channel::from(fd);
         let shutdown = receiver.try_clone().unwrap();
         let observed = Arc::clone(&state);
         let worker = std::thread::spawn(move || {
@@ -102,11 +108,42 @@ impl ReleaseTimeline for SharedCompletion {
     }
 }
 
+#[cfg(unix)]
+fn pair() -> (Channel, Channel) {
+    Channel::pair().unwrap()
+}
+
+#[cfg(windows)]
+fn pair() -> (Channel, Channel) {
+    use std::os::windows::io::FromRawHandle;
+
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    let (mut reader, mut writer) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: both out-pointers are valid; null attributes give
+    // non-inheritable handles, which the parent duplicates explicitly.
+    assert_ne!(unsafe { CreatePipe(&mut reader, &mut writer, std::ptr::null(), 0) }, 0);
+    // SAFETY: CreatePipe returned two fresh handles owned by nothing else.
+    unsafe {
+        (
+            Channel::from(OwnedObject::from_raw_handle(writer)),
+            Channel::from(OwnedObject::from_raw_handle(reader)),
+        )
+    }
+}
+
 impl Drop for SharedCompletion {
     fn drop(&mut self) {
-        if let Some((socket, worker)) = self.receiver.take() {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-            worker.join().unwrap();
+        if let Some((channel, worker)) = self.receiver.take() {
+            #[cfg(unix)]
+            {
+                let _ = channel.shutdown(std::net::Shutdown::Both);
+                worker.join().unwrap();
+            }
+            // An anonymous pipe read cannot be shut down from this side. The
+            // worker owns only its observed state and ends when the parent
+            // closes the write end (or with this process); leave it detached.
+            #[cfg(windows)]
+            drop((channel, worker));
         }
     }
 }

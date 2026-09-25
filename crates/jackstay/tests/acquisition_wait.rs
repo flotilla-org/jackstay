@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::{thread, time::Duration};
 
 use jackstay::acquisition::arena::{

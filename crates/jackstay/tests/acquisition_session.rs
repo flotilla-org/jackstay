@@ -1,4 +1,6 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
+// Windows: exercises the Unix socket setup channel; its named-pipe counterpart
+// is flotilla-org/jackstay#27.
 
 use std::{
     ffi::CString,

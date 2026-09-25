@@ -44,6 +44,41 @@ This follows the Linux [pidfd_open documentation](https://www.man7.org/linux/man
 Unsupported process observation is an admission error, never a fallback to PID
 polling or connection EOF.
 
+On Windows, the watch is a process handle with `SYNCHRONIZE`. A process object
+is signaled once its last thread has terminated and stays signaled, so the exit
+cannot be consumed or missed, and the handle keeps the process object (and its
+PID) from being reused while the watch lives. See
+[process termination](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process)
+and [`WaitForMultipleObjects`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects).
+There are two admission forms:
+
+- `attach_process(holding, pid)` opens the handle by PID at admission, just as
+  `pidfd_open` does. The caller must know that PID still names the admitted
+  process at that moment, as for Unix: for example an unwaited child (the
+  parent's own process handle keeps its PID from being reused), or the peer of
+  a setup connection that is still established.
+- `attach_process_handle(holding, handle)` watches a process handle the host
+  already holds (it needs `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`).
+  The watch keeps its own duplicate and takes the recipient PID from the handle,
+  so no PID is resolved at all. This is the shape the named-pipe setup channel
+  ([#27](https://github.com/flotilla-org/jackstay/issues/27)) is expected to use:
+  it opens the peer's process from the PID the pipe reports for a verified,
+  connected client (Wheelhouse
+  [ADR 0011](https://github.com/flotilla-org/wheelhouse/blob/84d3a46ee8419d38e8daefc8e5348eb973d5cd96/docs/adr/0011-windows-local-ipc-uses-named-pipes-with-logical-endpoints.md))
+  and then duplicates the grant's handles into that same process.
+
+The wake channel is a pair of unnamed manual-reset events rather than a socket
+pair, one per direction: the consumer event carries data, capacity,
+reconfiguration and closure wakes, the producer event carries release handoffs
+and completions to the cleanup owner. Each event has one reader, which resets it
+before rechecking shared state; signals coalesce exactly as a full nonblocking
+socket does. Events report no peer closure. Nothing depends on that: closure is
+in the shared claim page, and exit evidence only ever comes from the process
+watch. The grant's five setup objects are handles: the three section handles
+and the consumer and producer events. The consumer needs `SYNCHRONIZE |
+EVENT_MODIFY_STATE` on its event and `EVENT_MODIFY_STATE` on the producer's, and
+`FILE_MAP_READ` (plus `FILE_MAP_WRITE` for the claim page) on the sections.
+
 Each admitted incarnation has one cleanup owner, including local CPU consumers.
 This lets consumer-initiated closure report a stalled local lease while the host
 is idle. The sleeping worker polls the process descriptor alongside its existing
@@ -164,3 +199,17 @@ The mapped-process release/crash tests now transfer an independently observable
 controlled completion event at setup. These and three new retirement tests pass
 on macOS and Linux; they do not prove native GPU command retirement after process
 termination.
+
+Windows port ([#26](https://github.com/flotilla-org/jackstay/issues/26)): the
+arena unit tests and the `acquisition_arena`, `acquisition_cleanup`,
+`acquisition_reconfiguration`, `acquisition_release`, `acquisition_retirement`
+and `acquisition_wait` suites run on Windows, including their separate-process
+tests. Without a Windows setup channel yet, those tests move the grant's handles
+with a test-only transfer: the parent duplicates each handle straight into the
+child it spawned (or, when the child is the producer, out of it). Consumer kills
+use `TerminateProcess`, which runs no destructors. A new test kills a producer
+process while its consumer holds frames; the consumer's bytes, mappings and
+retained frame remain, and a wait simply times out, because producer exit is a
+setup-channel event, not an arena one. Another admits a child by process handle
+and reclaims its reservation only after the child is killed. The suites that
+need the Unix socket setup channel or the acquisition C ABI stay gated until #27.

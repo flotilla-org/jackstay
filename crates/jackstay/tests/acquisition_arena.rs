@@ -1,22 +1,14 @@
-#![cfg(unix)]
+use std::{process::Command, time::Duration};
 
-use std::{
-    io::{Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::net::{UnixListener, UnixStream},
-    },
-    process::Command,
-    time::Duration,
+use jackstay::acquisition::arena::{
+    AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, Cancellation, ConsumerGrant, FrameDescriptor, PublishOutcome, WaitInterest,
+    WaitOutcome,
 };
 
-use jackstay::{
-    acquisition::arena::{
-        AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, Cancellation, ConsumerGrant, FrameDescriptor, PublishOutcome,
-        WaitInterest, WaitOutcome,
-    },
-    fdpass,
-};
+#[path = "support/child.rs"]
+mod child;
+#[path = "support/setup.rs"]
+mod setup;
 
 fn config() -> ArenaConfig {
     ArenaConfig {
@@ -209,26 +201,19 @@ fn ordered_delivery_reports_a_published_gap_and_exact_selection_never_substitute
 
 #[test]
 fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange() {
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("arena.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = setup::Listener::bind("arena");
     let mut producer = ArenaProducer::new(config()).unwrap();
     producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "mapped_arena_child", "--nocapture"])
-        .env("JACKSTAY_ARENA_TEST_SOCKET", &socket)
+        .env("JACKSTAY_ARENA_TEST_SOCKET", listener.address())
         .spawn()
         .unwrap();
     let (descriptor, fds) = producer.attach_process(2, child.id()).unwrap().into_parts().unwrap();
-    let (mut stream, _) = listener.accept().unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let json = serde_json::to_vec(&descriptor).unwrap();
-    stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
-    stream.write_all(&json).unwrap();
-    fdpass::send_fds(&stream, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
-    let mut ready = [0];
-    stream.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [1]);
+    let mut stream = listener.accept();
+    stream.send(&descriptor);
+    stream.send_objects(&child, &fds);
+    assert_eq!(stream.read_byte(), 1);
     for sequence in 2..=100 {
         assert!(matches!(
             producer
@@ -245,9 +230,8 @@ fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange
     }
     // Test barrier only: no frame metadata, acquire, or release message crosses
     // this channel after setup. The child's next acquire is shared-memory only.
-    stream.write_all(&[2]).unwrap();
-    stream.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [3]);
+    stream.write_byte(2);
+    assert_eq!(stream.read_byte(), 3);
     producer
         .publish(
             FrameDescriptor {
@@ -263,14 +247,9 @@ fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange
 #[test]
 #[ignore = "subprocess helper invoked by a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange"]
 fn mapped_arena_child() {
-    let mut stream = UnixStream::connect(std::env::var("JACKSTAY_ARENA_TEST_SOCKET").unwrap()).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut len = [0; 4];
-    stream.read_exact(&mut len).unwrap();
-    let mut bytes = vec![0; u32::from_le_bytes(len) as usize];
-    stream.read_exact(&mut bytes).unwrap();
-    let descriptor = serde_json::from_slice(&bytes).unwrap();
-    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
+    let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_ARENA_TEST_SOCKET").unwrap());
+    let descriptor = stream.recv();
+    let fds = stream.recv_objects(5).try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer; this process is the
     // only recipient of the single-use grant and does not fork its mappings.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
@@ -278,10 +257,8 @@ fn mapped_arena_child() {
     let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
         panic!("child missing initial frame")
     };
-    stream.write_all(&[1]).unwrap();
-    let mut done = [0];
-    stream.read_exact(&mut done).unwrap();
-    assert_eq!(done, [2]);
+    stream.write_byte(1);
+    assert_eq!(stream.read_byte(), 2);
     assert_eq!(held.bytes(), b"abcd");
     let AcquireOutcome::Frame(latest) = consumer.acquire_latest(held.cursor()).unwrap() else {
         panic!("child missing latest frame")
@@ -290,7 +267,7 @@ fn mapped_arena_child() {
     assert_eq!(latest.descriptor().sequence, 100);
     drop(latest);
     let observed = consumer.events();
-    stream.write_all(&[3]).unwrap();
+    stream.write_byte(3);
     let cancel = Cancellation::new().unwrap();
     let WaitOutcome::Changed(events) = consumer
         .wait(observed, WaitInterest::DATA, &cancel, Some(Duration::from_secs(2)))
@@ -304,6 +281,66 @@ fn mapped_arena_child() {
         panic!("child missing frame after wait")
     };
     assert_eq!(next.bytes(), b"next");
+}
+
+#[test]
+fn a_killed_producer_process_leaves_the_consumers_frames_and_mappings_intact() {
+    let listener = setup::Listener::bind("producer");
+    let mut child = child::KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "producer_arena_child", "--nocapture"])
+            .env("JACKSTAY_ARENA_TEST_SOCKET", listener.address())
+            .env("JACKSTAY_ARENA_TEST_CONSUMER", std::process::id().to_string())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stream = listener.accept();
+    let descriptor = stream.recv();
+    let fds = stream.take_objects(&child, 5).try_into().unwrap();
+    // SAFETY: the child is the sole conforming producer and bound this grant
+    // to this process, which neither forks nor forwards it.
+    let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
+    let mut consumer = ArenaConsumer::from_grant(grant).unwrap();
+    let AcquireOutcome::Frame(held) = consumer.acquire_latest(0).unwrap() else {
+        panic!("missing producer frame")
+    };
+    // The producer dies without stopping its arena or running destructors.
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(held.bytes(), b"abcd");
+    // Producer exit is not an arena event: the setup channel reports it. The
+    // mappings stay valid and waiting neither fails nor reports a change.
+    let AcquireOutcome::Frame(again) = consumer.acquire_latest(0).unwrap() else {
+        panic!("retained frame lost with its producer")
+    };
+    assert_eq!(again.bytes(), b"abcd");
+    let observed = consumer.events();
+    let cancel = Cancellation::new().unwrap();
+    assert_eq!(
+        consumer
+            .wait(observed, WaitInterest::ALL, &cancel, Some(Duration::from_millis(50)))
+            .unwrap(),
+        WaitOutcome::TimedOut
+    );
+    drop((held, again));
+    drop(consumer);
+}
+
+#[test]
+#[ignore = "subprocess helper invoked by a_killed_producer_process_leaves_the_consumers_frames_and_mappings_intact"]
+fn producer_arena_child() {
+    let consumer = std::env::var("JACKSTAY_ARENA_TEST_CONSUMER").unwrap().parse().unwrap();
+    let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_ARENA_TEST_SOCKET").unwrap());
+    let mut producer = ArenaProducer::new(config()).unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let (descriptor, fds) = producer.attach_process(2, consumer).unwrap().into_parts().unwrap();
+    stream.send(&descriptor);
+    stream.offer_objects(&fds);
+    // Keep the producer, its objects and its cleanup owner alive until the
+    // parent kills this process.
+    loop {
+        std::thread::park();
+    }
 }
 
 #[test]

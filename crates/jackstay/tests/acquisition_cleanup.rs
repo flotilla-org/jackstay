@@ -1,11 +1,6 @@
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 
 use std::{
-    io::{Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::net::{UnixListener, UnixStream},
-    },
     process::Command,
     sync::{Arc, Mutex},
     time::Duration,
@@ -14,46 +9,60 @@ use std::{
 #[path = "support/child.rs"]
 mod child;
 use child::KillOnDrop;
+#[path = "support/setup.rs"]
+mod setup;
 #[path = "support/completion.rs"]
 mod shared_completion;
-use jackstay::{
-    acquisition::{
-        IncarnationId,
-        arena::{
-            AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, ConsumerGrant, FrameDescriptor, ReleaseNotification, ReleaseTimeline,
-        },
+use jackstay::acquisition::{
+    IncarnationId,
+    arena::{
+        AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, ConsumerGrant, FrameDescriptor, ReleaseNotification, ReleaseTimeline,
     },
-    fdpass,
 };
 use shared_completion::SharedCompletion;
 
 fn spawn_consumer(producer: &mut ArenaProducer, timeline: Option<Arc<SharedCompletion>>) -> (KillOnDrop, IncarnationId) {
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("crash.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    spawn_bound_consumer(producer, timeline, false)
+}
+
+/// `by_handle` admits the child through a process handle (Windows only)
+/// rather than resolving its PID at admission.
+fn spawn_bound_consumer(
+    producer: &mut ArenaProducer,
+    timeline: Option<Arc<SharedCompletion>>,
+    by_handle: bool,
+) -> (KillOnDrop, IncarnationId) {
+    let listener = setup::Listener::bind("crash");
     let child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "mapped_crash_child", "--nocapture"])
-        .env("JACKSTAY_CRASH_TEST_SOCKET", &socket)
+        .env("JACKSTAY_CRASH_TEST_SOCKET", listener.address())
         .spawn()
         .unwrap();
     let child = KillOnDrop(child);
-    let (mut stream, _) = listener.accept().unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let grant = producer.attach_process(1, child.id()).unwrap();
+    let mut stream = listener.accept();
+    #[cfg(windows)]
+    let grant = if by_handle {
+        use std::os::windows::io::AsHandle;
+        producer.attach_process_handle(1, child.as_handle())
+    } else {
+        producer.attach_process(1, child.id())
+    }
+    .unwrap();
+    #[cfg(unix)]
+    let grant = {
+        assert!(!by_handle, "process-handle admission is Windows-only");
+        producer.attach_process(1, child.id()).unwrap()
+    };
     let incarnation = grant.incarnation();
     let completion_fd = timeline.as_ref().map(|timeline| timeline.export_fd());
     let registration = timeline.map(|timeline| producer.register_release_timeline(incarnation, timeline).unwrap());
     let (descriptor, fds) = grant.into_parts().unwrap();
     let mut fds = Vec::from(fds);
     fds.extend(completion_fd);
-    let json = serde_json::to_vec(&(descriptor, registration)).unwrap();
-    stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
-    stream.write_all(&json).unwrap();
-    fdpass::send_fds(&stream, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
-    let mut ready = [0];
-    stream.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [1]);
-    assert_eq!(stream.read(&mut ready).unwrap(), 0, "child did not close its control connection");
+    stream.send(&(descriptor, registration));
+    stream.send_objects(&child, &fds);
+    assert_eq!(stream.read_byte(), 1);
+    assert!(stream.at_eof(), "child did not close its control connection");
     (child, incarnation)
 }
 
@@ -136,18 +145,37 @@ fn a_cpu_process_crash_retires_its_old_mapping_and_unblocks_a_capacity_paused_re
     assert_eq!(frame.bytes(), b"replacement");
 }
 
+#[cfg(windows)]
+#[test]
+fn a_consumer_admitted_by_process_handle_is_reclaimed_when_that_process_is_killed() {
+    let mut producer = ArenaProducer::new(ArenaConfig {
+        resource_capacity: 6,
+        retained_history: 2,
+        producer_reserve: 1,
+        payload_capacity: 4,
+        memory_budget: 1024 * 1024,
+        max_incarnations: 1,
+        drain_timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    // The child verifies that the grant names its own PID, read from the handle.
+    let (mut child, old) = spawn_bound_consumer(&mut producer, None, true);
+    producer.poll_cleanup().unwrap();
+    assert!(producer.attach(1).is_err(), "a live consumer's reservation was reclaimed");
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    producer.poll_cleanup().unwrap();
+    assert!(producer.cleanup_failures().is_empty());
+    assert_ne!(producer.attach(1).unwrap().incarnation(), old);
+}
+
 #[test]
 #[ignore = "subprocess helper invoked by cpu_process_crash_reclaims_only_that_incarnation_and_never_treats_connection_eof_as_exit"]
 fn mapped_crash_child() {
-    let mut stream = UnixStream::connect(std::env::var("JACKSTAY_CRASH_TEST_SOCKET").unwrap()).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut len = [0; 4];
-    stream.read_exact(&mut len).unwrap();
-    let mut json = vec![0; u32::from_le_bytes(len) as usize];
-    stream.read_exact(&mut json).unwrap();
-    let (descriptor, registration): (_, Option<jackstay::acquisition::arena::ReleaseTimelineRegistration>) =
-        serde_json::from_slice(&json).unwrap();
-    let mut fds = fdpass::recv_fds(&stream, 5 + usize::from(registration.is_some())).unwrap();
+    let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_CRASH_TEST_SOCKET").unwrap());
+    let (descriptor, registration): (_, Option<jackstay::acquisition::arena::ReleaseTimelineRegistration>) = stream.recv();
+    let mut fds = stream.recv_objects(5 + usize::from(registration.is_some()));
     let completion = registration
         .as_ref()
         .map(|_| Arc::new(SharedCompletion::from_fd(fds.pop().unwrap())));
@@ -167,9 +195,10 @@ fn mapped_crash_child() {
     } else {
         Some(held)
     };
-    stream.write_all(&[1]).unwrap();
+    stream.write_byte(1);
     drop(stream);
-    // SIGKILL must prevent all Rust destructors and shutdown acknowledgements.
+    // SIGKILL (TerminateProcess on Windows) must prevent all Rust destructors
+    // and shutdown acknowledgements.
     loop {
         std::thread::park();
     }

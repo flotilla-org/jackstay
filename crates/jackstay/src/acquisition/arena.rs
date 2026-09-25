@@ -6,12 +6,16 @@
 //! resources use the same descriptor/claim lifetime; their readiness and release
 //! completion must additionally be satisfied by the native backend.
 
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+// Setup objects are handles on Windows: the same five mapping/notification
+// objects, duplicated into a verified peer by the setup channel.
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
 use std::{
     cell::UnsafeCell,
     collections::BTreeMap,
-    io::Read,
     mem::{ManuallyDrop, align_of, size_of},
-    os::fd::OwnedFd,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering::SeqCst},
@@ -184,12 +188,29 @@ fn rounded(value: usize, alignment: usize) -> Result<usize, ArenaError> {
 }
 
 fn page_rounded(value: usize) -> Result<usize, ArenaError> {
-    // SAFETY: sysconf has no pointer arguments and does not mutate Rust memory.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page <= 0 {
+    let page = page_size();
+    if page == 0 {
         return Err(ArenaError::Configuration("cannot determine OS page size"));
     }
-    rounded(value, page as usize)
+    rounded(value, page)
+}
+
+#[cfg(unix)]
+fn page_size() -> usize {
+    // SAFETY: sysconf has no pointer arguments and does not mutate Rust memory.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page).unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn page_size() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    let mut info = std::mem::MaybeUninit::<SYSTEM_INFO>::zeroed();
+    // SAFETY: GetSystemInfo fills the provided, correctly sized structure and
+    // cannot fail.
+    unsafe { GetSystemInfo(info.as_mut_ptr()) };
+    // SAFETY: initialized above (zeroed, then filled).
+    unsafe { info.assume_init() }.dwPageSize as usize
 }
 
 #[derive(Debug)]
@@ -205,13 +226,30 @@ struct ClaimMap {
 
 fn random_scope() -> Result<[u8; 16], ArenaError> {
     let mut scope = [0; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut random| random.read_exact(&mut scope))
-        .map_err(|error| CaptureTransferError::SharedMemory {
-            operation: "acquisition-scope",
-            message: error.to_string(),
-        })?;
+    fill_random(&mut scope).map_err(|error| CaptureTransferError::SharedMemory {
+        operation: "acquisition-scope",
+        message: error.to_string(),
+    })?;
     Ok(scope)
+}
+
+#[cfg(unix)]
+fn fill_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom").and_then(|mut random| random.read_exact(bytes))
+}
+
+#[cfg(windows)]
+fn fill_random(bytes: &mut [u8]) -> std::io::Result<()> {
+    use windows_sys::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+    let len = u32::try_from(bytes.len()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: the buffer is writable for len bytes; the system-preferred RNG
+    // needs no algorithm handle.
+    let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status < 0 {
+        return Err(std::io::Error::other(format!("BCryptGenRandom failed with NTSTATUS {status:#x}")));
+    }
+    Ok(())
 }
 
 impl ClaimMap {
@@ -371,8 +409,9 @@ impl RemoteConsumerGrant {
     }
 }
 
-/// Setup descriptor. FDs: control, resources, claims, notification reader,
-/// notification writer, in that order. Never resend a consumed grant.
+/// Setup descriptor. Objects (FDs on Unix, handles on Windows): control,
+/// resources, claims, consumer notification endpoint, producer notification
+/// endpoint, in that order. Never resend a consumed grant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantDescriptor {
     pub version: u64,
@@ -400,7 +439,7 @@ impl ConsumerGrant {
     }
 
     fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 5]), ArenaError> {
-        let writer_fd = self.claims.wake.fd()?;
+        let writer_fd = wait::producer_endpoint(&self.claims.wake, &self.claims.release_wake)?;
         self.consumed = true;
         let descriptor = GrantDescriptor {
             version: VERSION,
@@ -464,6 +503,7 @@ impl ConsumerGrant {
         }
         // Keep the mapped owner solely for abandonment acknowledgement until
         // from_grant transfers the lifetime to a ConsumerLifetime.
+        let (wake, release_wake) = wait::import(&reader_fd, writer_fd)?;
         let claims = Arc::new(ClaimMap::map(
             claim_fd.try_clone().map_err(|error| CaptureTransferError::SharedMemory {
                 operation: "clone-claim-fd",
@@ -472,8 +512,8 @@ impl ConsumerGrant {
             IncarnationId(descriptor.incarnation),
             descriptor.holding as usize,
             claim_len,
-            Arc::new(wait::Wake::from_fd(writer_fd)?),
-            Arc::new(wait::Wake::from_fd(reader_fd.try_clone()?)?),
+            wake,
+            release_wake,
             descriptor.recipient_pid,
         )?);
         if descriptor.mapping_slot as usize >= claims.frames + 2
@@ -610,9 +650,29 @@ impl ArenaProducer {
     /// mapping escapes. The host selects/authorizes the recipient and must send
     /// this grant only to that process. A remote grant cannot be mapped locally
     /// through the safe in-process consumer constructor.
+    ///
+    /// The PID is resolved to a process object (kqueue, pidfd, or a Windows
+    /// process handle) here, once: it must still name the admitted process now,
+    /// for example a connected setup peer or an unwaited child.
     pub fn attach_process(&mut self, holding: u32, pid: u32) -> Result<RemoteConsumerGrant, ArenaError> {
         let process = Arc::new(process::ProcessWatch::new(pid)?);
         self.attach_with_recipient(holding, pid, Some(process)).map(RemoteConsumerGrant)
+    }
+
+    /// Like [`Self::attach_process`], but bound to a process handle the host
+    /// already holds (with `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`),
+    /// such as the one it opened for its verified setup-channel peer. The watch
+    /// keeps its own duplicate; the handle names the process object itself, so
+    /// no PID is resolved. The recipient PID is taken from that handle.
+    #[cfg(windows)]
+    pub fn attach_process_handle(
+        &mut self,
+        holding: u32,
+        process: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> Result<RemoteConsumerGrant, ArenaError> {
+        let (process, pid) = process::ProcessWatch::from_handle(process)?;
+        self.attach_with_recipient(holding, pid, Some(Arc::new(process)))
+            .map(RemoteConsumerGrant)
     }
 
     fn attach_with_recipient(
@@ -632,8 +692,7 @@ impl ArenaProducer {
         })?;
         let incarnation = reservation.incarnation();
         let result = (|| {
-            let (wake, receiver) = wait::channel()?;
-            let release_wake = Arc::new(wait::Wake::from_fd(receiver.fd()?)?);
+            let (wake, release_wake, receiver) = wait::incarnation()?;
             let claims = Arc::new(ClaimMap::new(incarnation, holding, len, wake, release_wake, recipient_pid)?);
             let control_fd = self.control.storage.try_clone_fd()?;
             let resources = self.resources.as_ref().expect("admission requires installed allocation");

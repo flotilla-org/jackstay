@@ -17,6 +17,9 @@ backend-macos = ["dep:cc"]
 # Linux native transport/backend work (dmabuf + drm_syncobj). The first
 # slices add the UDS + SCM_RIGHTS attach transport before the real backend.
 backend-linux = ["dep:cc", "dep:pkg-config"]
+# Windows native backend: D3D11 shared textures, ID3D11Fence timelines and
+# Windows.Graphics.Capture sessions. A no-op on other targets.
+backend-windows = ["dep:windows"]
 
 [build-dependencies]
 cc = { version = "1", optional = true }
@@ -49,6 +52,33 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
+# The D3D11 backend and Windows.Graphics.Capture. windows-sys has no COM or
+# WinRT projections; `windows` comes from the same windows-rs release and
+# shares windows-link with the windows-sys above.
+windows = { version = "0.62.2", optional = true, features = [
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Security_Authorization_AppCapabilityAccess",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -59,3 +89,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [lints]
 workspace = true
+
+[[example]]
+name = "wgc_session_watch"
+required-features = ["backend-windows"]

@@ -55,11 +55,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Native capture is unsupported so far. Setup runs over named pipes, and
-      # the build compiles the public C header smoke with MSVC.
+      # Without backend-windows: setup runs over named pipes, and the build
+      # compiles the public C header smoke with MSVC. The D3D11 backend has
+      # its own job below.
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+  windows-backend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The D3D11 backend on the runner's adapters (typically only the Basic
+      # Render Driver), including the cross-process scenarios. Window capture
+      # tests need an interactive desktop and stay ignored here.
+      - run: cargo build --workspace --locked --features backend-windows
+      - run: cargo test --workspace --locked --features backend-windows
+      - run: cargo clippy --workspace --all-targets --locked --features backend-windows -- -D warnings
   abi:
     runs-on: ubuntu-latest
     steps:

@@ -102,8 +102,9 @@ one read-only section. The consumer adopts handles only from a server that
 
 Bootstrap's optional input channel is one end of a `pipe_pair`, duplicated into
 the verified peer the same way, within the bootstrap's five-second deadline.
-The receiver checks it is a connected pipe. D3D11 slots will use the same
-transfer once per incarnation (#28).
+The receiver checks it is a connected pipe. D3D11 pool textures and fences use
+the same transfer once per consumer incarnation and pool generation
+([D3D11 backend](acquisition-d3d11.md)).
 
 ## C ABI 0.9
 

@@ -22,6 +22,8 @@ pub mod lease;
 pub mod linux;
 #[cfg(all(target_os = "macos", feature = "backend-macos"))]
 pub mod macos;
+#[cfg(all(windows, feature = "backend-windows"))]
+pub mod windows;
 
 use std::collections::VecDeque;
 #[cfg(unix)]

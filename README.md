@@ -55,7 +55,10 @@ native capture consumers, add `--features backend-macos`; for Linux native
 transport add `--features backend-linux`. On Windows the library, shared memory,
 the acquisition arena, the named-pipe setup channel and the acquisition,
 bootstrap and input C ABI ([Local Endpoints](docs/design/local-endpoints.md),
-ABI 0.9) build and are tested; capture is not implemented yet. The SDL viewer supports macOS and
+ABI 0.9) build and are tested. `--features backend-windows` adds the D3D11 arena
+backend and Windows.Graphics.Capture sessions
+([D3D11 backend](docs/design/acquisition-d3d11.md)); its C accessors are not
+exposed yet. The SDL viewer supports macOS and
 Linux; its native presentation mode is Metal-only. Linux native reference checks
 use the Vulkan consumer in the library.
 

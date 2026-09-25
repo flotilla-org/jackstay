@@ -231,6 +231,25 @@ where
         })
     }
 
+    /// The backend, for its device and adapter identity. Staging stays with
+    /// [`Self::publish`].
+    #[must_use]
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Current stream parameters (the last installed configuration).
+    #[must_use]
+    pub fn params(&self) -> &NativeStreamParams {
+        &self.params
+    }
+
+    /// Whether a reconfiguration is waiting for capacity.
+    #[must_use]
+    pub fn reconfiguration_pending(&self) -> bool {
+        self.pending_params.is_some()
+    }
+
     pub fn attach(&mut self, holding: u32) -> Result<NativeArenaGrant<B::SurfaceHandle, B::SyncHandle>, ArenaError> {
         let consumer = self.arena.attach(holding)?;
         self.grant(consumer)
@@ -242,6 +261,18 @@ where
         pid: u32,
     ) -> Result<NativeArenaGrant<B::SurfaceHandle, B::SyncHandle, RemoteConsumerGrant>, ArenaError> {
         let consumer = self.arena.attach_process(holding, pid)?;
+        self.grant(consumer)
+    }
+
+    /// [`ArenaProducer::attach_process_handle`] for native resources: bound to
+    /// a process handle the host holds for its verified setup peer.
+    #[cfg(windows)]
+    pub fn attach_process_handle(
+        &mut self,
+        holding: u32,
+        process: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> Result<NativeArenaGrant<B::SurfaceHandle, B::SyncHandle, RemoteConsumerGrant>, ArenaError> {
+        let consumer = self.arena.attach_process_handle(holding, process)?;
         self.grant(consumer)
     }
 

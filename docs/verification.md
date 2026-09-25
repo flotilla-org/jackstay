@@ -1,7 +1,10 @@
 # Verification
 
 The repository gates are listed in AGENTS.md. CI runs them on macOS and Linux,
-then builds/tests the matching native feature. It compiles the library on Windows.
+then builds/tests the matching native feature. On Windows it builds, tests and
+lints without features and, in a separate job, with `backend-windows`. Window
+capture tests need an interactive desktop, so they run only by hand
+([D3D11 backend](design/acquisition-d3d11.md)).
 C11 and Zig checks compile the public headers independently. The SDL dummy-video
 smoke checks generated payloads through the real C ABI and software renderer.
 

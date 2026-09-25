@@ -62,6 +62,12 @@ enum Response {
 }
 
 fn read_message<T: DeserializeOwned>(stream: &mut Stream) -> Result<Option<T>, SocketError> {
+    read_framed(stream, MAGIC)
+}
+
+/// One length-prefixed JSON message behind an 8-byte protocol magic. Shared
+/// with the native setup channels, which differ only in magic and messages.
+pub(crate) fn read_framed<T: DeserializeOwned>(stream: &mut Stream, magic: &[u8; 8]) -> Result<Option<T>, SocketError> {
     let mut header = [0; 12];
     loop {
         match stream.read(&mut header[..1]) {
@@ -72,7 +78,7 @@ fn read_message<T: DeserializeOwned>(stream: &mut Stream) -> Result<Option<T>, S
         }
     }
     stream.read_exact(&mut header[1..])?;
-    if &header[..8] != MAGIC {
+    if &header[..8] != magic {
         return Err(SocketError::Protocol("unsupported version"));
     }
     let len = u32::from_le_bytes(header[8..].try_into().expect("four bytes")) as usize;
@@ -86,6 +92,10 @@ fn read_message<T: DeserializeOwned>(stream: &mut Stream) -> Result<Option<T>, S
 }
 
 fn write_message<T: Serialize>(stream: &mut Stream, value: &T) -> Result<(), SocketError> {
+    write_framed(stream, MAGIC, value)
+}
+
+pub(crate) fn write_framed<T: Serialize>(stream: &mut Stream, magic: &[u8; 8], value: &T) -> Result<(), SocketError> {
     // Setup accepts host-owned streams; apply this at the fallible write boundary
     // rather than making the infallible CpuSetupClient constructor fallible.
     #[cfg(unix)]
@@ -94,7 +104,7 @@ fn write_message<T: Serialize>(stream: &mut Stream, value: &T) -> Result<(), Soc
     if bytes.is_empty() || bytes.len() > MAX_MESSAGE {
         return Err(SocketError::Protocol("message size exceeds limit"));
     }
-    stream.write_all(MAGIC)?;
+    stream.write_all(magic)?;
     stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
     stream.write_all(&bytes)?;
     Ok(())
@@ -249,7 +259,7 @@ fn send_objects(stream: &mut Stream, fds: Vec<OwnedFd>) -> Result<(), SocketErro
 /// needs (docs/design/acquisition-process-cleanup.md). Duplication closes these
 /// copies before the peer learns any value, and the peer acknowledges receipt.
 #[cfg(windows)]
-fn send_objects(stream: &mut Stream, handles: Vec<OwnedFd>) -> Result<(), SocketError> {
+pub(crate) fn send_objects(stream: &mut Stream, handles: Vec<OwnedFd>) -> Result<(), SocketError> {
     use windows_sys::Win32::{
         Storage::FileSystem::SYNCHRONIZE,
         System::{
@@ -285,7 +295,7 @@ fn send_objects(stream: &mut Stream, handles: Vec<OwnedFd>) -> Result<(), Socket
 }
 
 #[cfg(unix)]
-fn receive_objects(stream: &mut Stream, count: usize) -> Result<Vec<OwnedFd>, SocketError> {
+pub(crate) fn receive_objects(stream: &mut Stream, count: usize) -> Result<Vec<OwnedFd>, SocketError> {
     let fds = crate::fdpass::recv_fds(stream, count)?;
     if fds.len() != count {
         return Err(SocketError::Protocol("incorrect setup FD count"));
@@ -308,7 +318,7 @@ fn receive_objects(stream: &mut Stream, count: usize) -> Result<Vec<OwnedFd>, So
 /// Windows: the server duplicated these non-inheritable handles into this
 /// process and closed its own copies before sending their values.
 #[cfg(windows)]
-fn receive_objects(stream: &mut Stream, count: usize) -> Result<Vec<OwnedFd>, SocketError> {
+pub(crate) fn receive_objects(stream: &mut Stream, count: usize) -> Result<Vec<OwnedFd>, SocketError> {
     Ok(crate::local::receive_handles(stream, count)?)
 }
 

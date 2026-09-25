@@ -38,13 +38,15 @@ pub const FT_NATIVE_ATTACH_TRANSPORT_UNIX_SOCKET: u32 = 2;
 
 pub const FT_NATIVE_HANDLE_IOSURFACE: u32 = 1;
 pub const FT_NATIVE_HANDLE_DMABUF: u32 = 2;
-pub const FT_NATIVE_HANDLE_D3D12_RESOURCE: u32 = 3;
+/// NT handle of a shared (`SHARED_NTHANDLE`) BGRA8 `ID3D11Texture2D`.
+pub const FT_NATIVE_HANDLE_D3D11_TEXTURE: u32 = 3;
 pub const FT_NATIVE_MAX_PLANES: usize = 4;
 
 pub const FT_NATIVE_SYNC_NONE: u32 = 0;
 pub const FT_NATIVE_SYNC_MTL_SHARED_EVENT: u32 = 1;
 pub const FT_NATIVE_SYNC_DRM_SYNCOBJ_TIMELINE: u32 = 2;
-pub const FT_NATIVE_SYNC_D3D12_FENCE: u32 = 3;
+/// NT handle of a shared `ID3D11Fence` timeline.
+pub const FT_NATIVE_SYNC_D3D11_FENCE: u32 = 3;
 
 pub const FT_NATIVE_RELEASE_NOW: u32 = 1;
 pub const FT_NATIVE_RELEASE_TIMELINE_VALUE: u32 = 2;
@@ -1618,7 +1620,7 @@ mod linux_tests {
                     pools: vec![LinuxPoolDescriptor {
                         pool_id: 77,
                         surfaces: vec![LinuxSurfaceDescriptor {
-                            handle_kind: super::FT_NATIVE_HANDLE_D3D12_RESOURCE,
+                            handle_kind: super::FT_NATIVE_HANDLE_D3D11_TEXTURE,
                             width: 64,
                             height: 32,
                             pixel_format: 875_713_112,

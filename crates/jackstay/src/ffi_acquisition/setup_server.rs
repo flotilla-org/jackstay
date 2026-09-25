@@ -1,12 +1,12 @@
 //! C host setup: one worker per explicitly authorized connection. No listener,
 //! routing, token policy, or frame copies belong to this setup owner.
 
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::net::UnixStream,
+};
 use std::{
-    net::Shutdown,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::net::UnixStream,
-    },
     ptr,
     sync::{
         Mutex,
@@ -16,13 +16,17 @@ use std::{
 };
 
 use super::producer::FtCpuProducer;
+#[cfg(unix)]
+use crate::acquisition::socket::peer_pid;
 use crate::{
-    acquisition::socket::{peer_pid, serve_cpu},
+    acquisition::socket::serve_cpu,
     ffi::*,
+    ffi_local::{FtLocalConnection, take_connection},
+    local::{ShutdownHandle, Stream},
 };
 
 pub struct FtCpuSetupServer {
-    shutdown: UnixStream,
+    shutdown: ShutdownHandle,
     cancelled: AtomicBool,
     state: Mutex<ServerWorker>,
 }
@@ -35,6 +39,7 @@ struct ServerWorker {
 /// Consume a descriptor after basic pointer/value checks performed by the caller.
 /// A wrong socket or setup error still consumes it. The duplicate retained by a
 /// connection owner is private and used only to interrupt synchronous I/O.
+#[cfg(unix)]
 pub(crate) unsafe fn take_stream(fd: &mut i32) -> std::io::Result<UnixStream> {
     // SAFETY: caller transfers sole ownership of this live descriptor.
     let stream = unsafe { UnixStream::from_raw_fd(std::mem::replace(fd, -1)) };
@@ -96,6 +101,7 @@ pub(crate) unsafe fn take_stream(fd: &mut i32) -> std::io::Result<UnixStream> {
 /// Arguments are disjoint. Host producer calls are serialized. After basic
 /// validation fd is consumed/set to -1 on every outcome. No retained caller
 /// descriptor copies, concurrent stream I/O, or forwarded grants are allowed.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_cpu_producer_serve(producer: *mut FtCpuProducer, fd: *mut i32, out: *mut *mut FtCpuSetupServer) -> FtStatus {
     // SAFETY: caller supplies live disjoint arguments.
@@ -109,7 +115,40 @@ pub unsafe extern "C" fn ft_cpu_producer_serve(producer: *mut FtCpuProducer, fd:
     let Ok(stream) = (unsafe { take_stream(fd) }) else {
         return FT_STATUS_ERROR;
     };
-    let Ok(shutdown) = stream.try_clone() else {
+    start(producer, stream, out)
+}
+
+/// Serve CPU setup on a Local Endpoint connection the host accepted and
+/// authorized. Admission binds to that connection's verified peer process.
+/// OK means the worker started, not that its peer has completed admission.
+///
+/// # Safety
+/// Producer is live; `*connection` is a live, exclusively owned handle; out is
+/// writable and null. Arguments are disjoint. Host producer calls are
+/// serialized. After basic validation the connection is consumed and nulled on
+/// every outcome.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_producer_serve_local(
+    producer: *mut FtCpuProducer,
+    connection: *mut *mut FtLocalConnection,
+    out: *mut *mut FtCpuSetupServer,
+) -> FtStatus {
+    // SAFETY: caller supplies live disjoint arguments.
+    let (Some(producer), Some(out)) = (unsafe { producer.as_ref() }, unsafe { out.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: caller transfers the exclusively owned connection handle.
+    let Some(connection) = (unsafe { take_connection(connection) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    start(producer, connection.stream, out)
+}
+
+fn start(producer: &FtCpuProducer, stream: Stream, out: &mut *mut FtCpuSetupServer) -> FtStatus {
+    let Ok(shutdown) = crate::local::shutdown_handle(&stream) else {
         return FT_STATUS_ERROR;
     };
     let arena = producer.0.clone();
@@ -142,7 +181,7 @@ pub unsafe extern "C" fn ft_cpu_setup_server_cancel(server: *const FtCpuSetupSer
     // SAFETY: caller keeps the handle alive until this call returns.
     if let Some(server) = unsafe { server.as_ref() } {
         server.cancelled.store(true, Ordering::Release);
-        let _ = server.shutdown.shutdown(Shutdown::Both);
+        server.shutdown.shutdown();
     }
 }
 
@@ -202,7 +241,7 @@ pub unsafe extern "C" fn ft_cpu_setup_server_destroy(server: *mut *mut FtCpuSetu
     let server = unsafe { Box::from_raw(std::mem::replace(out, ptr::null_mut())) };
     if server.finish(false) == FT_STATUS_DRAINING {
         server.cancelled.store(true, Ordering::Release);
-        let _ = server.shutdown.shutdown(Shutdown::Both);
+        server.shutdown.shutdown();
     }
     server.finish(true)
 }

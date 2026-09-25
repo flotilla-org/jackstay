@@ -342,7 +342,6 @@ impl CpuSetupClient {
 
     // The C connection keeps this private handle solely to interrupt I/O.
     // It never reads, writes, exports, or receives grants.
-    #[cfg(unix)]
     pub(crate) fn shutdown_handle(&self) -> std::io::Result<crate::local::ShutdownHandle> {
         crate::local::shutdown_handle(&self.stream)
     }

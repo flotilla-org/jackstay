@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 8
+#define FT_ABI_VERSION_MINOR 9
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -45,6 +45,8 @@ uint32_t ft_abi_version(void);
 #define FT_STATUS_PAUSED_CAPACITY 16
 #define FT_STATUS_CAPACITY 17
 #define FT_STATUS_RECOVERY_REQUIRED 18
+#define FT_STATUS_ADDRESS_IN_USE 19
+#define FT_STATUS_UNTRUSTED_PEER 20
 
 #define FT_SOURCE_KIND_WINDOW 1
 #define FT_SOURCE_KIND_DISPLAY 2
@@ -87,9 +89,77 @@ typedef int32_t ft_status;
 typedef uint64_t ft_source_id;
 typedef uint64_t ft_track_id;
 
+/* An owned OS setup object: a file descriptor on POSIX, a HANDLE on Windows.
+ * Consumed slots are set to FT_OS_OBJECT_NONE. */
+#if defined(_WIN32)
+typedef void *ft_os_object;
+#define FT_OS_OBJECT_NONE ((ft_os_object)0)
+#else
+typedef int32_t ft_os_object;
+#define FT_OS_OBJECT_NONE ((ft_os_object)-1)
+#endif
 
-#if defined(__unix__) || defined(__APPLE__)
-/* Common acquisition ownership (Unix shared arena). Import a host's CPU grant,
+/* ABI 0.9 Local Endpoints (Wheelhouse ADR 0011): a logical address (scope,
+ * name, transport kind) rendered per platform, never a caller-supplied path:
+ * <runtime>/jackstay-<uid>/<name>.sock on POSIX, or
+ * \\.\pipe\jackstay.<user SID>[.s<session>].<name> on Windows (named pipes with a
+ * protected SYSTEM+user DACL, or the logon SID for SESSION scope; remote
+ * clients rejected; first-instance creation). Names are 1..64 of [A-Za-z0-9._-]
+ * and do not start with '.'. SESSION equals USER where there is no session.
+ *
+ * A host creates a listener and accepts connections carrying the kernel's view
+ * of the peer (PID, user, Windows session); it still authorizes each peer and
+ * selects the source. A client connects and the library verifies the server
+ * runs as the current user (and session, for SESSION scope) before returning.
+ * A connection is then consumed by exactly one *_local setup call: CPU setup,
+ * source bootstrap (which hands it back for CPU setup) or input. These are the
+ * Windows setup entry points; the fd-taking calls remain for POSIX callers.
+ * Setup is blocking: run it off GUI/input threads. */
+#define FT_ENDPOINT_SCOPE_USER 1u
+#define FT_ENDPOINT_SCOPE_SESSION 2u
+#define FT_ENDPOINT_TRANSPORT_LOCAL_STREAM 1u
+
+typedef struct ft_local_endpoint {
+  uint32_t scope;     /* FT_ENDPOINT_SCOPE_* */
+  uint32_t transport; /* FT_ENDPOINT_TRANSPORT_LOCAL_STREAM; others UNSUPPORTED */
+  const char *name;   /* UTF-8, copied during the call */
+} ft_local_endpoint;
+
+typedef struct ft_peer_identity {
+  uint32_t pid;
+  uint32_t session;     /* Windows session ID when has_session */
+  uint32_t has_session;
+  uint32_t reserved;
+  char user[192];       /* NUL-terminated: user SID string, or decimal UID */
+} ft_peer_identity;
+
+typedef struct ft_local_listener ft_local_listener;
+typedef struct ft_local_connection ft_local_connection;
+
+/* The platform address, NUL-terminated, for diagnostics. CAPACITY: too short. */
+ft_status ft_local_endpoint_render(const ft_local_endpoint *endpoint, char *out, size_t len);
+/* ADDRESS_IN_USE: the endpoint (on Windows, any pipe of that name) exists; it
+ * is never shared or taken over. *out starts NULL. */
+ft_status ft_local_listener_create(const ft_local_endpoint *endpoint, ft_local_listener **out);
+/* Blocks for one client. UNTRUSTED_PEER: the client could not be identified or
+ * is in another Windows session on a SESSION endpoint; it was disconnected and
+ * the listener stays usable. CANCELLED after cancel. Accept and cancel may
+ * overlap; destroy only after both return. *out starts NULL. */
+ft_status ft_local_listener_accept(const ft_local_listener *listener, ft_local_connection **out);
+void ft_local_listener_cancel(const ft_local_listener *listener);
+void ft_local_listener_destroy(ft_local_listener **listener);
+/* Connects and verifies the server (UNTRUSTED_PEER otherwise). Waits up to five
+ * seconds for a busy endpoint (TIMEOUT). *out starts NULL. */
+ft_status ft_local_connect(const ft_local_endpoint *endpoint, ft_local_connection **out);
+ft_status ft_local_connection_peer(const ft_local_connection *connection, ft_peer_identity *out);
+/* OK while the peer holds its end, CLOSED after; never consumes bytes. */
+ft_status ft_local_connection_alive(const ft_local_connection *connection);
+/* Closes an unconsumed connection; NULL and *connection=NULL are harmless. */
+void ft_local_connection_destroy(ft_local_connection **connection);
+
+
+#if defined(__unix__) || defined(__APPLE__) || defined(_WIN32)
+/* Common acquisition ownership (shared arena). Import a host's CPU grant,
  * or transfer an admitted Rust ArenaConsumer via FtAcquisitionConsumer::into_raw.
  * Serialize calls on a consumer. Frame handles are independent owners and may
  * outlive it. Never copy ownership, fork mappings, or call through stale handles.
@@ -149,25 +219,27 @@ typedef struct ft_acquisition_events {
   uint32_t reserved;
 } ft_acquisition_events;
 
-/* Import GrantDescriptor JSON and its five owned setup FDs. The trusted producer
- * must follow Jackstay's shared-memory protocol and bind the grant to this PID.
- * Grants are single-use: no replay, forwarding, fork or retained transport FD
- * copies. JSON length must be 1..1048576; *out must start NULL. Invalid pointers,
- * lengths, occupied outputs or negative/duplicate FDs reject without transfer.
- * Once these argument checks pass, all five FDs are consumed and set to -1,
- * including on malformed JSON or failed mapping. Import CPU grants only; native
- * resources require the backend setup that retains their handles with leases. */
-ft_status ft_acquisition_import_cpu(const uint8_t *json, size_t len, int32_t fds[5],
+/* Import GrantDescriptor JSON and its five owned setup objects (FDs; on Windows
+ * HANDLEs owned by this process). The trusted producer must follow Jackstay's
+ * shared-memory protocol and bind the grant to this PID. Grants are single-use:
+ * no replay, forwarding, fork or retained transport copies. JSON length must be
+ * 1..1048576; *out must start NULL. Invalid pointers, lengths, occupied outputs
+ * or invalid/duplicate objects reject without transfer. Once these argument
+ * checks pass, all five are consumed and set to FT_OS_OBJECT_NONE, including on
+ * malformed JSON or failed mapping. Import CPU grants only; native resources
+ * require the backend setup that retains their handles with leases. */
+ft_status ft_acquisition_import_cpu(const uint8_t *json, size_t len, ft_os_object fds[5],
                                    ft_acquisition_consumer **out);
-/* Install ConfigurationDescriptor JSON plus its single owned resource FD on
- * this already admitted consumer. The same single-use, no-fork and no-extra-FD
- * rules apply. Invalid pointers, lengths or a negative FD reject without
- * transfer. After basic validation the FD is consumed and set to -1 on every
- * outcome. OK installs it; STALE disposes a valid superseded offer so the host
- * can offer the current generation. Contradictory mappings remain ERROR.
- * Existing frame handles keep their original storage and holding credit. */
+/* Install ConfigurationDescriptor JSON plus its single owned resource object on
+ * this already admitted consumer. The same single-use, no-fork and no-extra-copy
+ * rules apply. Invalid pointers, lengths or an invalid object reject without
+ * transfer. After basic validation the object is consumed and set to
+ * FT_OS_OBJECT_NONE on every outcome. OK installs it; STALE disposes a valid
+ * superseded offer so the host can offer the current generation. Contradictory
+ * mappings remain ERROR. Existing frame handles keep their original storage and
+ * holding credit. */
 ft_status ft_acquisition_install_cpu_configuration(ft_acquisition_consumer *,
-                                                  const uint8_t *json, size_t len, int32_t *fd);
+                                                  const uint8_t *json, size_t len, ft_os_object *fd);
 /* Drop the consumer's unleased current mapping, e.g. during a capacity pause.
  * Frame handles and deferred uses retain their own mappings; admission and
  * notification state survive. The host retries allocation once budget permits. */
@@ -210,12 +282,34 @@ void ft_acquisition_cancellation_destroy(ft_acquisition_cancellation **);
  * All destroy functions accept NULL or *handle=NULL and clear live handles. */
 void ft_acquisition_consumer_destroy(ft_acquisition_consumer **);
 
+#if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
+typedef struct ft_cpu_acquisition_connection ft_cpu_acquisition_connection;
+/* Generic setup on a connection from ft_local_connect (after an optional
+ * ft_source_bootstrap_connect_local), whose server was verified. Same rules as
+ * ft_acquisition_cpu_connection_create below: the peer must be the conforming
+ * sole producer, no forwarding/replay of grants/maps, and no admission I/O until
+ * attach. After basic checks *connection is consumed and set to NULL on every
+ * outcome. On Windows the producer duplicates the grant's handles into this
+ * verified process and this process acknowledges them. */
+ft_status ft_acquisition_cpu_connection_create_local(ft_local_connection **connection,
+                                                    ft_cpu_acquisition_connection **out);
+/* Liveness of the producer's end of setup, never consuming setup bytes: OK while
+ * it holds the connection (also while a setup call is in progress), CLOSED once
+ * it closed, exited or setup failed, CANCELLED after cancel. Poll it between
+ * frames; held frames stay valid. May overlap other calls except destroy. */
+ft_status ft_acquisition_cpu_connection_alive(const ft_cpu_acquisition_connection *);
+ft_status ft_acquisition_cpu_attach(ft_cpu_acquisition_connection *, uint32_t holding,
+                                   ft_acquisition_consumer **out);
+void ft_acquisition_cpu_connection_cancel(const ft_cpu_acquisition_connection *);
+ft_status ft_acquisition_cpu_install_configuration(ft_cpu_acquisition_connection *, ft_acquisition_consumer *);
+void ft_acquisition_cpu_connection_destroy(ft_cpu_acquisition_connection **);
+#endif
+
 #if defined(__APPLE__) || defined(__linux__)
 /* Select a trusted host session, authorize it with an optional token and admit
  * the requested holding capacity. Strings are UTF-8 and copied during setup.
  * Both output handles start NULL; track is set on success. Never fork, forward
  * or replay these mappings. Connection, consumer and frames are separate owners. */
-typedef struct ft_cpu_acquisition_connection ft_cpu_acquisition_connection;
 /* Generic setup on a connected, host-authorized Unix SOCK_STREAM. No daemon is
  * required. The peer must be the conforming sole producer; this process must be
  * the original peer and sole recipient of grants. No caller descriptor copies,
@@ -232,15 +326,10 @@ typedef struct ft_cpu_acquisition_connection ft_cpu_acquisition_connection;
  * A private descriptor duplicate is used only for shutdown, never grant I/O.
  * All calls must return before connection destruction. */
 ft_status ft_acquisition_cpu_connection_create(int32_t *fd, ft_cpu_acquisition_connection **out);
-ft_status ft_acquisition_cpu_attach(ft_cpu_acquisition_connection *, uint32_t holding,
-                                   ft_acquisition_consumer **out);
-void ft_acquisition_cpu_connection_cancel(const ft_cpu_acquisition_connection *);
 ft_status ft_acquisition_cpu_connect_session(const char *control_path, const char *session_id,
                                              const char *token, uint32_t holding,
                                              ft_cpu_acquisition_connection **out_connection,
                                              ft_acquisition_consumer **out_consumer, uint64_t *out_track);
-ft_status ft_acquisition_cpu_install_configuration(ft_cpu_acquisition_connection *, ft_acquisition_consumer *);
-void ft_acquisition_cpu_connection_destroy(ft_cpu_acquisition_connection **);
 #endif
 
 #if defined(__APPLE__)
@@ -310,6 +399,20 @@ ft_status ft_cpu_producer_poll_cleanup(ft_cpu_producer *);
  * Only OK destroys/clears it; timeout never permits forced reclamation. */
 ft_status ft_cpu_producer_destroy(ft_cpu_producer **);
 
+#if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
+typedef struct ft_cpu_setup_server ft_cpu_setup_server;
+/* One setup worker for one connection the host accepted from a Local Endpoint
+ * listener and authorized. Admission binds to that connection's verified peer
+ * process; on Windows grants are duplicated into it and acknowledged. After
+ * basic checks *connection is consumed and set to NULL on every outcome. Same
+ * worker, poll, cancel and destroy semantics as ft_cpu_producer_serve below. */
+ft_status ft_cpu_producer_serve_local(ft_cpu_producer *, ft_local_connection **connection,
+                                      ft_cpu_setup_server **out);
+void ft_cpu_setup_server_cancel(const ft_cpu_setup_server *);
+ft_status ft_cpu_setup_server_poll(ft_cpu_setup_server *);
+ft_status ft_cpu_setup_server_destroy(ft_cpu_setup_server **);
+#endif
+
 #if defined(__APPLE__) || defined(__linux__)
 /* One setup worker for one connected, host-authorized Unix SOCK_STREAM. Host
  * owns listening, authorization and source selection. Same FD-transfer rules as
@@ -322,11 +425,7 @@ ft_status ft_cpu_producer_destroy(ft_cpu_producer **);
  * final status. No other call may overlap destruction. It can wait for a finite
  * arena operation; shutdown interrupts socket I/O. Close stops new acquisitions;
  * existing frame ownership survives. EOF is not proof of peer process death. */
-typedef struct ft_cpu_setup_server ft_cpu_setup_server;
 ft_status ft_cpu_producer_serve(ft_cpu_producer *, int32_t *fd, ft_cpu_setup_server **out);
-void ft_cpu_setup_server_cancel(const ft_cpu_setup_server *);
-ft_status ft_cpu_setup_server_poll(ft_cpu_setup_server *);
-ft_status ft_cpu_setup_server_destroy(ft_cpu_setup_server **);
 #endif
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -339,6 +438,12 @@ _Static_assert(sizeof(ft_acquisition_events) == 32, "acquisition events size");
 _Static_assert(sizeof(ft_cpu_producer_config) == 40, "CPU producer config size");
 _Static_assert(sizeof(ft_cpu_reconfiguration) == 24, "CPU reconfiguration size");
 #endif
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(ft_local_endpoint) == 16, "local endpoint size");
+_Static_assert(offsetof(ft_local_endpoint, name) == 8, "local endpoint packing");
+_Static_assert(sizeof(ft_peer_identity) == 208, "peer identity size");
 #endif
 
 typedef struct ft_synthetic_session {

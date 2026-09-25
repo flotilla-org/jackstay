@@ -1,7 +1,8 @@
 //! Owned CPU setup connections, with optional host session selection.
 
+#[cfg(unix)]
+use std::ffi::{CStr, c_char};
 use std::{
-    ffi::{CStr, c_char},
     ptr,
     sync::{
         Mutex,
@@ -12,8 +13,8 @@ use std::{
 use super::{FtAcquisitionConsumer, status};
 use crate::{
     acquisition::{arena::ConfigurationInstall, socket::CpuSetupClient},
-    daemon,
     ffi::*,
+    ffi_local::{FtLocalConnection, take_connection},
 };
 
 pub struct FtCpuAcquisitionConnection {
@@ -58,6 +59,7 @@ impl FtCpuAcquisitionConnection {
 /// The peer is the conforming sole producer. This process must be the original
 /// peer and sole recipient of grants; no caller FD copies, fork, forwarding or
 /// replay is allowed. After basic checks fd is consumed/set to -1 on all outcomes.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_cpu_connection_create(fd: *mut i32, out: *mut *mut FtCpuAcquisitionConnection) -> FtStatus {
     // SAFETY: caller supplies valid disjoint writable storage.
@@ -79,6 +81,69 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connection_create(fd: *mut i32, out:
             FT_STATUS_OK
         }
         Err(_) => FT_STATUS_ERROR,
+    }
+}
+
+/// Own a connection from `ft_local_connect` (optionally after source bootstrap)
+/// for CPU setup. Its server was verified when connecting. No admission I/O
+/// happens until attach, so cancellation can be installed first.
+///
+/// # Safety
+/// `connection` and `out` are writable/disjoint; `*connection` is a live,
+/// exclusively owned handle; `*out` is null. The server is the conforming sole
+/// producer; this process is the sole recipient of its grants (no forwarding or
+/// replay). After basic checks the connection is consumed/nulled on all outcomes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_acquisition_cpu_connection_create_local(
+    connection: *mut *mut FtLocalConnection,
+    out: *mut *mut FtCpuAcquisitionConnection,
+) -> FtStatus {
+    // SAFETY: caller supplies valid disjoint writable storage.
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: caller transfers the exclusively owned connection handle.
+    let Some(connection) = (unsafe { take_connection(connection) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    // SAFETY: local::connect verified the server; the caller guarantees the
+    // trusted producer and sole-recipient contract.
+    let client = unsafe { CpuSetupClient::from_stream(connection.stream) };
+    match FtCpuAcquisitionConnection::new(client) {
+        Ok(connection) => {
+            *out = Box::into_raw(Box::new(connection));
+            FT_STATUS_OK
+        }
+        Err(_) => FT_STATUS_ERROR,
+    }
+}
+
+/// Liveness of the producer's end of setup, without consuming setup bytes: OK
+/// while it holds the connection (including while a setup call is in progress),
+/// CLOSED once it closed, exited or setup failed, CANCELLED after cancellation.
+/// Poll it between frames to notice a vanished producer; held frames stay valid.
+///
+/// # Safety
+/// Connection is live until this call returns. May run concurrently with other
+/// calls on the connection except destruction.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_acquisition_cpu_connection_alive(connection: *const FtCpuAcquisitionConnection) -> FtStatus {
+    // SAFETY: caller keeps the handle alive for this call.
+    let Some(connection) = (unsafe { connection.as_ref() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if connection.cancelled.load(Ordering::Acquire) {
+        return FT_STATUS_CANCELLED;
+    }
+    match connection.client.try_lock() {
+        Ok(client) if client.is_alive() => FT_STATUS_OK,
+        Ok(_) => FT_STATUS_CLOSED,
+        // A setup call owns the stream now; it reports failure itself.
+        Err(std::sync::TryLockError::WouldBlock) => FT_STATUS_OK,
+        Err(std::sync::TryLockError::Poisoned(_)) => FT_STATUS_ERROR,
     }
 }
 
@@ -130,6 +195,7 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connection_cancel(connection: *const
 /// Strings are live NUL-terminated UTF-8 (token may be null). Outputs are writable,
 /// exclusive and do not alias; both handle outputs start null. The daemon must
 /// obey the common sole-producer contract. Never fork/forward/replay mappings.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_cpu_connect_session(
     control_path: *const c_char,
@@ -169,12 +235,12 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connect_session(
         };
         Some(token.to_owned())
     };
-    let Ok(mut info) = daemon::get_session(control_path, session_id) else {
+    let Ok(mut info) = crate::daemon::get_session(control_path, session_id) else {
         return FT_STATUS_ERROR;
     };
     info.bearer_token = token;
     // SAFETY: delegated to the caller's trusted daemon / sole-recipient contract.
-    let Ok(client) = (unsafe { daemon::open_cpu_setup(&info) }) else {
+    let Ok(client) = (unsafe { crate::daemon::open_cpu_setup(&info) }) else {
         return FT_STATUS_ERROR;
     };
     // Allocate the shutdown descriptor before admission can create map owners.
@@ -234,7 +300,7 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connection_destroy(connection: *mut 
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::net::UnixStream, sync::Arc, thread, time::Duration};
+    use std::{sync::Arc, thread, time::Duration};
 
     use super::*;
     use crate::acquisition::{
@@ -255,7 +321,10 @@ mod tests {
             })
             .unwrap(),
         ));
-        let (server, client) = UnixStream::pair().unwrap();
+        #[cfg(unix)]
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        #[cfg(windows)]
+        let (server, client) = crate::local::pipe_pair().unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let served = producer.clone();
         let worker = thread::spawn(move || serve_cpu(server, served));

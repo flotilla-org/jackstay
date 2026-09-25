@@ -22,6 +22,10 @@ backend-linux = ["dep:cc", "dep:pkg-config"]
 cc = { version = "1", optional = true }
 pkg-config = { version = "0.3", optional = true }
 
+# Windows builds compile the public C header smoke with MSVC (see build.rs).
+[target.'cfg(windows)'.build-dependencies]
+cc = "1"
+
 [dependencies]
 libc = "0.2"
 serde = { workspace = true }

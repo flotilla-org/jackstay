@@ -9,25 +9,11 @@ use jackstay::{
     acquisition::arena::FrameDescriptor,
     ffi::*,
     ffi_acquisition::{producer::*, session::*, setup_server::*, *},
-    ffi_local::FtLocalConnection,
-    local::{self, Endpoint, Scope, Transport},
 };
 
-/// A connected Local Endpoint pair: (accepted by the listener, connected client).
-fn local_pair() -> (local::Connection, local::Connection) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = format!("cpu-ffi-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
-    let endpoint = Endpoint::new(Scope::User, &name, Transport::LocalStream).unwrap();
-    let listener = local::Listener::bind(&endpoint).unwrap();
-    let client = thread::spawn(move || local::connect(&endpoint).unwrap());
-    let accepted = listener.accept().unwrap();
-    (accepted, client.join().unwrap())
-}
-
-fn to_c(connection: local::Connection) -> *mut FtLocalConnection {
-    Box::into_raw(Box::new(connection.into()))
-}
+#[path = "support/local.rs"]
+mod local;
+use local::{pair as local_pair, to_c};
 
 fn config() -> FtCpuProducerConfig {
     FtCpuProducerConfig {
@@ -403,6 +389,12 @@ fn local_server_reports_orderly_eof_separately_from_protocol_failure() {
             if malformed {
                 client.write_all(&[0]).unwrap();
             }
+            // Unix: half-close, so the worker can still read the peer's PID
+            // (macOS reports none once the peer has gone). Windows identified
+            // the peer at accept, and pipes have no half-close.
+            #[cfg(unix)]
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            #[cfg(windows)]
             drop(client);
             let deadline = Instant::now() + Duration::from_secs(5);
             let status = loop {

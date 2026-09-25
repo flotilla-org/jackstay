@@ -271,13 +271,20 @@ fn a_killed_consumer_process_is_cleaned_up_after_resize_input_and_cancellation()
                 .unwrap(),
         );
         // Accept on a worker so a lost child cancels instead of hanging.
+        // The watchdog is stopped and joined as soon as accept returns, so it
+        // can never touch the listener after destruction.
         let address = Raw(listener as usize);
+        let (accepted, stopped) = std::sync::mpsc::channel::<()>();
         let watchdog = thread::spawn(move || {
-            thread::sleep(DEADLINE);
-            ft_local_listener_cancel(address.0 as *const FtLocalListener);
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(DEADLINE) {
+                ft_local_listener_cancel(address.0 as *const FtLocalListener);
+            }
         });
         let mut connection = ptr::null_mut();
-        assert_eq!(ft_local_listener_accept(listener, &mut connection), FT_STATUS_OK);
+        let status = ft_local_listener_accept(listener, &mut connection);
+        drop(accepted);
+        watchdog.join().unwrap();
+        assert_eq!(status, FT_STATUS_OK);
         let mut peer = FtPeerIdentity::default();
         assert_eq!(ft_local_connection_peer(connection, &mut peer), FT_STATUS_OK);
         assert_eq!(peer.pid, child.id(), "accept must report the kernel's peer");
@@ -358,9 +365,7 @@ fn a_killed_consumer_process_is_cleaned_up_after_resize_input_and_cancellation()
         });
         assert!(producer.is_null());
 
-        ft_local_listener_cancel(listener);
         ft_local_listener_destroy(&mut listener);
-        drop(watchdog);
     }
 }
 

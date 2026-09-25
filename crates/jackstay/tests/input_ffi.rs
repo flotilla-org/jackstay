@@ -1,6 +1,9 @@
 use std::ptr;
 
 use jackstay::{ffi::*, ffi_input::*};
+
+#[path = "support/local.rs"]
+mod local;
 #[test]
 fn c_input_layouts_and_recoverable_handle_destruction_match_header() {
     if usize::BITS == 64 {
@@ -28,22 +31,10 @@ fn c_input_layouts_and_recoverable_handle_destruction_match_header() {
 #[test]
 fn c_input_serves_and_connects_over_local_endpoint_connections() {
     use std::{
-        sync::atomic::{AtomicU64, Ordering},
         thread,
         time::{Duration, Instant},
     };
-
-    use jackstay::{
-        ffi_local::FtLocalConnection,
-        local::{self, Endpoint, Scope, Transport},
-    };
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = format!("input-ffi-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
-    let endpoint = Endpoint::new(Scope::User, &name, Transport::LocalStream).unwrap();
-    let listener = local::Listener::bind(&endpoint).unwrap();
-    let connecting = thread::spawn(move || local::connect(&endpoint).unwrap());
-    let accepted: *mut FtLocalConnection = Box::into_raw(Box::new(listener.accept().unwrap().into()));
-    let connected: *mut FtLocalConnection = Box::into_raw(Box::new(connecting.join().unwrap().into()));
+    let (accepted, connected) = local::c_pair();
     // SAFETY: exclusively owned handles, each consumed or destroyed once.
     unsafe {
         let mut config = FtInputConfig::default();

@@ -7,25 +7,11 @@ use std::os::{
 };
 use std::{ptr, thread};
 
-use jackstay::{
-    ffi::*,
-    ffi_bootstrap::*,
-    ffi_input::*,
-    ffi_local::FtLocalConnection,
-    local::{self, Endpoint, Scope, Transport},
-};
+use jackstay::{ffi::*, ffi_bootstrap::*, ffi_input::*};
 
-fn local_pair() -> (*mut FtLocalConnection, *mut FtLocalConnection) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = format!("bootstrap-ffi-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
-    let endpoint = Endpoint::new(Scope::User, &name, Transport::LocalStream).unwrap();
-    let listener = local::Listener::bind(&endpoint).unwrap();
-    let client = thread::spawn(move || local::connect(&endpoint).unwrap());
-    let accepted = listener.accept().unwrap();
-    let connected = client.join().unwrap();
-    (Box::into_raw(Box::new(accepted.into())), Box::into_raw(Box::new(connected.into())))
-}
+#[path = "support/local.rs"]
+mod local;
+use local::c_pair as local_pair;
 
 /// Moves a C handle across threads in a test.
 struct Owned<T>(T);

@@ -186,13 +186,13 @@ pub unsafe extern "C" fn ft_source_bootstrap_connect_local(
     if !out.is_null() {
         return FT_STATUS_INVALID_ARGUMENT;
     }
-    let Some(request) = parse_request(input_request, input_mode) else {
-        return FT_STATUS_INVALID_ARGUMENT;
-    };
-    // Validate before taking ownership, as for the FD form.
+    // Validate everything before taking ownership, in the FD form's order.
     if unsafe { connection.as_ref() }.is_none_or(|slot| slot.is_null()) {
         return FT_STATUS_INVALID_ARGUMENT;
     }
+    let Some(request) = parse_request(input_request, input_mode) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
     *input_status = FT_STATUS_EMPTY;
     let Some(taken) = (unsafe { take_connection(connection) }) else {
         return FT_STATUS_INVALID_ARGUMENT;

@@ -197,6 +197,10 @@ cleanup and retire, and the producer, which refused destruction while the
 consumer lived, reclaims the dead process's claims and is destroyed. In the
 second test the producer child is killed while the consumer holds a frame: setup
 liveness turns CLOSED, the held bytes stay intact, and the input client closes
-without confirmed cleanup. The arena suites' parent/child helper
+without confirmed cleanup. A third test runs a host exchange (ABI 0.11) in
+one process: a token line and reply, then CPU setup and a frame on the same
+connection; a reply without the delimiter (CAPACITY); a silent host (TIMEOUT,
+after which the host sees CLOSED); and a host trickling bytes, which cannot
+stretch a 300 ms call. The arena suites' parent/child helper
 (`tests/support/setup.rs`) now uses the pipe endpoint and handle transfer instead
 of loopback TCP and parent-side duplication.

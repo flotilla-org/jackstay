@@ -329,7 +329,8 @@ fn with_deadline(
 ) -> FtStatus {
     let deadline = Deadline(std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms)));
     let result = exchange(stream, &deadline);
-    let restored = stream.set_read_timeout(None).is_ok() && stream.set_write_timeout(None).is_ok();
+    let read_restored = stream.set_read_timeout(None).is_ok();
+    let restored = stream.set_write_timeout(None).is_ok() && read_restored;
     match result {
         // Setup needs the defaults back; a failed exchange is reported as is.
         Ok(FT_STATUS_OK) if !restored => FT_STATUS_ERROR,

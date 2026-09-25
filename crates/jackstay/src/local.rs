@@ -16,11 +16,13 @@
 
 use std::{fmt, io, time::Duration};
 
+mod deadline;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
 
+pub(crate) use deadline::Bounded;
 #[cfg(unix)]
 pub use unix::ShutdownHandle;
 #[cfg(windows)]

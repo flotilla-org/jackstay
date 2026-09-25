@@ -6,19 +6,16 @@
 //! Unix, or a private pipe-pair end duplicated into the verified peer process
 //! on Windows. The host selects and authorizes both resources; this module
 //! creates no listener, discovers no source and grants no authority.
-use std::{
-    io::{self, Read, Write},
-    time::{Duration, Instant},
-};
 #[cfg(unix)]
-use std::{os::fd::AsRawFd, thread};
+use std::os::fd::AsRawFd;
+use std::{io, time::Duration};
 
 use crate::{
     input::{
         self, Mode, Target,
         transport::{Client, ConnectError, Server},
     },
-    local::Stream,
+    local::{Bounded, Stream},
 };
 
 const MAGIC: &[u8; 8] = b"JSBOOT01";
@@ -161,77 +158,38 @@ fn channel_pair() -> io::Result<(Stream, Stream)> {
 }
 
 // A fixed-size preface with an absolute deadline, not a per-byte timeout that a
-// stalled or trickling peer can extend. No buffered reader may eat media bytes
-// or the ancillary-data byte belonging to the input channel.
+// stalled or trickling peer can extend (crate::local::Bounded). No buffered
+// reader may eat media bytes or the ancillary-data byte belonging to the input
+// channel.
 struct Handshake {
-    stream: Stream,
-    deadline: Instant,
-    #[cfg(windows)]
-    timeouts: (Option<Duration>, Option<Duration>),
+    exchange: Bounded<Stream>,
+}
+
+impl Handshake {
+    fn new(stream: Stream) -> io::Result<Self> {
+        #[cfg(unix)]
+        crate::socket_options::suppress_sigpipe(&stream)?;
+        Ok(Self {
+            exchange: Bounded::new(stream, TIMEOUT)?,
+        })
+    }
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        self.exchange.read_exact(bytes)
+    }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.exchange.write_all(bytes)
+    }
+    /// The media stream, blocking again with its previous timeouts.
+    fn finish(self) -> io::Result<Stream> {
+        self.exchange.finish()
+    }
 }
 
 #[cfg(unix)]
 impl Handshake {
-    fn new(stream: Stream) -> io::Result<Self> {
-        crate::socket_options::suppress_sigpipe(&stream)?;
-        stream.set_nonblocking(true)?;
-        Ok(Self {
-            stream,
-            deadline: Instant::now() + TIMEOUT,
-        })
-    }
-    fn ready(&self, events: i16) -> io::Result<()> {
-        loop {
-            let remaining = self
-                .deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-            let mut fd = libc::pollfd {
-                fd: self.stream.as_raw_fd(),
-                events,
-                revents: 0,
-            };
-            // SAFETY: one initialized pollfd; the stream owns its live descriptor.
-            let result = unsafe { libc::poll(&mut fd, 1, remaining.as_millis().max(1) as i32) };
-            if result > 0 {
-                return Ok(());
-            }
-            if result == 0 {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-    }
-    fn read(&mut self, mut bytes: &mut [u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            self.ready(libc::POLLIN)?;
-            match self.stream.read(bytes) {
-                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(count) => bytes = &mut bytes[count..],
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => thread::yield_now(),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-    fn write(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            self.ready(libc::POLLOUT)?;
-            match self.stream.write(bytes) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(count) => bytes = &bytes[count..],
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => thread::yield_now(),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
     fn send_input(&mut self, peer: Stream) -> Result<(), Error> {
-        self.ready(libc::POLLOUT)?;
-        crate::fdpass::send_fd(&self.stream, peer.as_raw_fd())?;
+        self.exchange.writable()?;
+        crate::fdpass::send_fd(self.exchange.stream(), peer.as_raw_fd())?;
         // Retain the sending copy until the peer has installed the descriptor.
         // Parallel macOS bootstrap tests otherwise intermittently see input EOF.
         let mut receipt = [0];
@@ -244,8 +202,8 @@ impl Handshake {
         Ok(())
     }
     fn receive_input(&mut self) -> Result<Stream, Error> {
-        self.ready(libc::POLLIN)?;
-        let fd = crate::fdpass::recv_fd(&self.stream)?;
+        self.exchange.readable()?;
+        let fd = crate::fdpass::recv_fd(self.exchange.stream())?;
         // SAFETY: this live received FD must not leak through exec.
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error().into());
@@ -257,62 +215,23 @@ impl Handshake {
         self.write(&[1])?;
         Ok(stream)
     }
-    fn finish(self) -> io::Result<Stream> {
-        self.stream.set_nonblocking(false)?;
-        Ok(self.stream)
-    }
 }
 
-// Windows pipes are overlapped: each blocking operation is bounded by the time
-// left until the absolute deadline, then the host's own timeouts are restored.
+// Handle transfer is one write and one acknowledgement, both bounded by the
+// time left: ready() sets the pipe's timeouts to it.
 #[cfg(windows)]
 impl Handshake {
-    fn new(stream: Stream) -> io::Result<Self> {
-        stream.set_nonblocking(false)?;
-        let timeouts = (stream.read_timeout()?, stream.write_timeout()?);
-        Ok(Self {
-            stream,
-            deadline: Instant::now() + TIMEOUT,
-            timeouts,
-        })
-    }
-    fn bound(&self) -> io::Result<()> {
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.set_write_timeout(Some(remaining))
-    }
-    fn read(&mut self, mut bytes: &mut [u8]) -> io::Result<()> {
-        while !bytes.is_empty() {
-            self.bound()?;
-            match self.stream.read(bytes) {
-                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(count) => bytes = &mut bytes[count..],
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.bound()?;
-        self.stream.write_all(bytes)?;
-        self.stream.flush()
-    }
     fn send_input(&mut self, peer: Stream) -> Result<(), Error> {
-        self.bound()?;
+        self.exchange.writable()?;
         // Duplication closes this copy before the peer learns the value, so it
         // cannot keep the controller channel alive after peer loss; the peer
         // acknowledges adopting it within the same deadline.
-        crate::local::send_handles(&mut self.stream, vec![(peer.into_handle()?, crate::local::Access::Same)])?;
+        crate::local::send_handles(self.exchange.stream_mut(), vec![(peer.into_handle()?, crate::local::Access::Same)])?;
         Ok(())
     }
     fn receive_input(&mut self) -> Result<Stream, Error> {
-        self.bound()?;
-        let handle = crate::local::receive_handles(&mut self.stream, 1)?.remove(0);
+        self.exchange.readable()?;
+        let handle = crate::local::receive_handles(self.exchange.stream_mut(), 1)?.remove(0);
         // SAFETY: the host this stream connected to duplicated its private pipe
         // end into this process for this receiver alone.
         let stream = unsafe { crate::local::PipeStream::from_owned_handle(handle, false) }
@@ -321,10 +240,5 @@ impl Handshake {
             return Err(Error::Protocol("input handle is not a connected pipe"));
         }
         Ok(stream)
-    }
-    fn finish(self) -> io::Result<Stream> {
-        self.stream.set_read_timeout(self.timeouts.0)?;
-        self.stream.set_write_timeout(self.timeouts.1)?;
-        Ok(self.stream)
     }
 }

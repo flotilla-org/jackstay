@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     ffi::*,
-    local::{self, Connection, Endpoint, Error, Listener, PeerIdentity, Scope, Stream, Transport},
+    local::{self, Bounded, Connection, Endpoint, Error, Listener, PeerIdentity, Scope, Stream, Transport},
 };
 
 pub const FT_ENDPOINT_SCOPE_USER: u32 = 1;
@@ -296,50 +296,30 @@ pub unsafe extern "C" fn ft_local_connection_alive(connection: *const FtLocalCon
     }
 }
 
-/// An absolute deadline for one host exchange. Every read or write is bounded
-/// by the time left, so a peer that trickles bytes cannot stretch the call
-/// past `timeout_ms` (as in the bootstrap handshake).
-struct Deadline(std::time::Instant);
-
-impl Deadline {
-    fn bound(&self, stream: &Stream) -> std::io::Result<()> {
-        let remaining = self
-            .0
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
-        let set = stream
-            .set_read_timeout(Some(remaining))
-            .and_then(|()| stream.set_write_timeout(Some(remaining)));
-        match set {
-            // macOS refuses socket options once the peer has closed; the next
-            // read or write then reports that closure itself.
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-            other => other,
-        }
-    }
-}
-
-/// Run `exchange` within `timeout_ms` (nonzero) from now, then restore the
-/// stream's blocking defaults for setup.
+/// Run a host exchange on `stream` within `timeout_ms` (nonzero) of now,
+/// through the same deadline-bounded stream as the bootstrap preface, then
+/// hand the stream back in its setup mode.
 fn with_deadline(
     stream: &mut Stream,
     timeout_ms: u32,
-    exchange: impl FnOnce(&mut Stream, &Deadline) -> std::io::Result<FtStatus>,
+    exchange: impl FnOnce(&mut Bounded<&mut Stream>) -> std::io::Result<FtStatus>,
 ) -> FtStatus {
-    let deadline = Deadline(std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms)));
-    let result = exchange(stream, &deadline);
-    let read_restored = stream.set_read_timeout(None).is_ok();
-    let restored = stream.set_write_timeout(None).is_ok() && read_restored;
+    use std::io::ErrorKind;
+    let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+    let result = Bounded::new(stream, timeout).and_then(|mut bounded| {
+        let status = exchange(&mut bounded)?;
+        // Setup needs the stream back as it was; a failed exchange reports
+        // its own status and the connection is destroyed anyway.
+        bounded.finish()?;
+        Ok(status)
+    });
     match result {
-        // Setup needs the defaults back; a failed exchange is reported as is.
-        Ok(FT_STATUS_OK) if !restored => FT_STATUS_ERROR,
         Ok(status) => status,
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => FT_STATUS_TIMEOUT,
+        Err(error) if error.kind() == ErrorKind::TimedOut => FT_STATUS_TIMEOUT,
         Err(error)
             if matches!(
                 error.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::WriteZero
             ) =>
         {
             FT_STATUS_CLOSED
@@ -373,20 +353,8 @@ pub unsafe extern "C" fn ft_local_connection_write(
     }
     // SAFETY: caller guarantees `len` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-    with_deadline(&mut connection.stream, timeout_ms, |stream, deadline| {
-        use std::io::Write;
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            deadline.bound(stream)?;
-            match stream.write(rest) {
-                Ok(0) => return Ok(FT_STATUS_CLOSED),
-                Ok(count) => rest = &rest[count..],
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        deadline.bound(stream)?;
-        stream.flush()?;
+    with_deadline(&mut connection.stream, timeout_ms, |stream| {
+        stream.write_all(bytes)?;
         Ok(FT_STATUS_OK)
     })
 }
@@ -420,16 +388,11 @@ pub unsafe extern "C" fn ft_local_connection_read_until(
     // SAFETY: caller guarantees `capacity` writable bytes, disjoint from the rest.
     let buffer = unsafe { std::slice::from_raw_parts_mut(out, capacity) };
     let mut filled = 0;
-    let status = with_deadline(&mut connection.stream, timeout_ms, |stream, deadline| {
-        use std::io::Read;
+    let status = with_deadline(&mut connection.stream, timeout_ms, |stream| {
         while filled < capacity {
             let mut byte = [0];
-            deadline.bound(stream)?;
-            match stream.read(&mut byte) {
-                Ok(0) => return Ok(FT_STATUS_CLOSED),
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
+            if stream.read_some(&mut byte)? == 0 {
+                return Ok(FT_STATUS_CLOSED);
             }
             buffer[filled] = byte[0];
             filled += 1;

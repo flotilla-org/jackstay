@@ -154,11 +154,21 @@ reply line, and Jackstay's D3D11 or CPU setup then runs on the same stream.
 `ft_local_connection_write` sends bytes and `ft_local_connection_read_until`
 reads up to and including a delimiter byte, one byte at a time, so it never
 consumes the start of setup. Jackstay adds no framing and interprets nothing.
-Both take a nonzero timeout in milliseconds and restore the stream's blocking
-defaults before returning. After a failure (CLOSED, TIMEOUT, CAPACITY) the
+Both take a nonzero timeout in milliseconds that bounds the whole call,
+however the peer paces its bytes, and hand the stream back as it was.
+After a failure (CLOSED, TIMEOUT, CAPACITY) the
 stream position is unknown and the caller destroys the connection. The calls
 are transport-neutral: the host protocol, not Jackstay, decides what the bytes
 mean, so no host's authority model enters the transport core.
+
+They share one helper with the bootstrap preface, `local::Bounded`: a stream
+whose operations are all bounded by one absolute deadline. On Unix it makes
+the socket non-blocking and `poll`s for the time left before each operation,
+touching no socket option, and puts the socket back to blocking at the end.
+On Windows each pipe operation runs with the pipe's timeouts set to the time
+left, and the previous timeouts are restored at the end. Its unit tests cover
+a deadline across many partial reads, a closed peer, and the stream's mode
+being handed back.
 
 ## Evidence
 

@@ -3,6 +3,7 @@ use std::{ffi::c_char, ptr, slice, str, time::Duration};
 
 use crate::{
     ffi::*,
+    ffi_local::{FtLocalConnection, take_connection},
     input::{
         transport::{Client, ConnectError, Server},
         *,
@@ -362,6 +363,7 @@ pub unsafe extern "C" fn ft_input_target_create(config: *const FtInputConfig, ou
 /// # Safety
 /// Target is live; fd owns a connected Unix stream. Out is writable and null.
 /// After basic checks, fd is consumed on every outcome. Arguments are disjoint.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_input_target_serve(target: *mut FtInputTarget, fd: *mut i32, out: *mut *mut FtInputServer) -> FtStatus {
     let (Some(t), Some(fd), Some(out)) = (unsafe { target.as_ref() }, unsafe { fd.as_mut() }, unsafe { out.as_mut() }) else {
@@ -374,6 +376,34 @@ pub unsafe extern "C" fn ft_input_target_serve(target: *mut FtInputTarget, fd: *
         return FT_STATUS_ERROR;
     };
     match Server::start(t.0.clone(), stream) {
+        Ok(s) => {
+            *out = Box::into_raw(Box::new(FtInputServer { _server: s }));
+            FT_STATUS_OK
+        }
+        Err(_) => FT_STATUS_ERROR,
+    }
+}
+/// Serve input on a Local Endpoint connection the host accepted and authorized.
+/// # Safety
+/// Target is live; connection points to a live, exclusively owned connection
+/// handle; out is writable and null. After basic checks the connection is
+/// consumed and nulled on every outcome. Arguments are disjoint.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_input_target_serve_local(
+    target: *mut FtInputTarget,
+    connection: *mut *mut FtLocalConnection,
+    out: *mut *mut FtInputServer,
+) -> FtStatus {
+    let (Some(t), Some(out)) = (unsafe { target.as_ref() }, unsafe { out.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    let Some(connection) = (unsafe { take_connection(connection) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    match Server::start(t.0.clone(), connection.stream) {
         Ok(s) => {
             *out = Box::into_raw(Box::new(FtInputServer { _server: s }));
             FT_STATUS_OK
@@ -489,6 +519,7 @@ pub unsafe extern "C" fn ft_input_server_destroy(server: *mut *mut FtInputServer
 /// # Safety
 /// Fd exclusively owns a connected Unix stream; out writable and null. Consumes
 /// fd after basic checks on every outcome. Blocks for bounded admission.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_input_client_connect(fd: *mut i32, value: u32, out: *mut *mut FtInputClient) -> FtStatus {
     let (Some(fd), Some(mode), Some(out)) = (unsafe { fd.as_mut() }, mode(value), unsafe { out.as_mut() }) else {
@@ -500,6 +531,9 @@ pub unsafe extern "C" fn ft_input_client_connect(fd: *mut i32, value: u32, out: 
     let Ok(stream) = (unsafe { crate::ffi_acquisition::setup_server::take_stream(fd) }) else {
         return FT_STATUS_ERROR;
     };
+    connect_client(stream, mode, out)
+}
+fn connect_client(stream: crate::local::Stream, mode: Mode, out: &mut *mut FtInputClient) -> FtStatus {
     match Client::connect(stream, mode) {
         Ok(c) => {
             *out = Box::into_raw(Box::new(FtInputClient(c)));
@@ -508,6 +542,28 @@ pub unsafe extern "C" fn ft_input_client_connect(fd: *mut i32, value: u32, out: 
         Err(ConnectError::Admission(e)) => status(e),
         Err(_) => FT_STATUS_ERROR,
     }
+}
+/// Request input control on a verified Local Endpoint connection.
+/// # Safety
+/// Connection points to a live, exclusively owned connection handle; out is
+/// writable and null. After basic checks the connection is consumed and nulled
+/// on every outcome. Blocks for bounded admission.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_input_client_connect_local(
+    connection: *mut *mut FtLocalConnection,
+    value: u32,
+    out: *mut *mut FtInputClient,
+) -> FtStatus {
+    let (Some(mode), Some(out)) = (mode(value), unsafe { out.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    let Some(connection) = (unsafe { take_connection(connection) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    connect_client(connection.stream, mode, out)
 }
 /// # Safety
 /// Client is live; all output pointers are writable and disjoint.

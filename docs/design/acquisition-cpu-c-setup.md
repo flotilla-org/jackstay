@@ -110,5 +110,7 @@ ctest --test-dir build/viewer --output-on-failure
 `cargo test --locked --test acquisition_cpu_server_ffi` checks blocked-attach
 cancellation, partial-request server cancellation, FD-transfer errors, worker
 retention before admission, EOF/error status and held-frame lifetime after close.
-These are CPU transport checks. KS integration, input, audio, desktop permissions,
-GPU imports and Windows setup need their own implementation and evidence.
+These are CPU transport checks. KS integration, input, audio, desktop permissions
+and GPU imports need their own implementation and evidence. Windows hosts and
+clients use the same setup through [Local Endpoint](local-endpoints.md)
+connections (ABI 0.9) instead of FDs.

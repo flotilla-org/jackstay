@@ -1,4 +1,5 @@
 #include "capture_transfer.h"
+#include "jackstay_bootstrap.h"
 #include <string.h>
 
 /* Run by acquisition_ffi.rs through this actual C translation unit. The test
@@ -30,6 +31,42 @@ int jackstay_c_acquisition_finish(ft_acquired_frame **frame) {
   return failed;
 }
 
+/* ABI 0.9 Local Endpoint setup, declared on every platform. */
+int jackstay_c_local_endpoint_smoke(void) {
+  ft_local_endpoint endpoint = {FT_ENDPOINT_SCOPE_SESSION, FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, "smoke"};
+  ft_peer_identity peer = {0};
+  ft_os_object none = FT_OS_OBJECT_NONE;
+  ft_status (*listen_fn)(const ft_local_endpoint *, ft_local_listener **) = ft_local_listener_create;
+  ft_status (*accept_fn)(const ft_local_listener *, ft_local_connection **) = ft_local_listener_accept;
+  ft_status (*connect_fn)(const ft_local_endpoint *, ft_local_connection **) = ft_local_connect;
+  ft_status (*peer_fn)(const ft_local_connection *, ft_peer_identity *) = ft_local_connection_peer;
+  ft_status (*alive_fn)(const ft_local_connection *) = ft_local_connection_alive;
+  ft_status (*serve_fn)(ft_cpu_producer *, ft_local_connection **, ft_cpu_setup_server **) =
+      ft_cpu_producer_serve_local;
+  ft_status (*create_fn)(ft_local_connection **, ft_cpu_acquisition_connection **) =
+      ft_acquisition_cpu_connection_create_local;
+  ft_status (*setup_alive_fn)(const ft_cpu_acquisition_connection *) = ft_acquisition_cpu_connection_alive;
+  ft_status (*bootstrap_accept_fn)(ft_local_connection **, ft_input_target *, ft_input_server **) =
+      ft_source_bootstrap_accept_local;
+  ft_status (*bootstrap_connect_fn)(ft_local_connection **, uint32_t, uint32_t, ft_input_client **,
+                                    ft_status *) = ft_source_bootstrap_connect_local;
+  ft_status (*input_serve_fn)(ft_input_target *, ft_local_connection **, ft_input_server **) =
+      ft_input_target_serve_local;
+  ft_status (*input_connect_fn)(ft_local_connection **, uint32_t, ft_input_client **) =
+      ft_input_client_connect_local;
+  ft_status (*import_fn)(const uint8_t *, size_t, ft_os_object[5], ft_acquisition_consumer **) =
+      ft_acquisition_import_cpu;
+  char rendered[512];
+  if (ft_local_endpoint_render(&endpoint, rendered, sizeof rendered) != FT_STATUS_OK) return -1;
+  return (int)(sizeof peer + (none == FT_OS_OBJECT_NONE) + (listen_fn != NULL) + (accept_fn != NULL) +
+               (connect_fn != NULL) + (peer_fn != NULL) + (alive_fn != NULL) + (serve_fn != NULL) +
+               (create_fn != NULL) + (setup_alive_fn != NULL) + (bootstrap_accept_fn != NULL) +
+               (bootstrap_connect_fn != NULL) + (input_serve_fn != NULL) + (input_connect_fn != NULL) +
+               (import_fn != NULL) + FT_STATUS_ADDRESS_IN_USE + FT_STATUS_UNTRUSTED_PEER);
+}
+
+#if !defined(_WIN32)
+/* The native attach ABI has no Windows implementation yet (#28). */
 int porthole_capture_transfer_c_abi_header_smoke(void) {
   ft_native_attach_descriptor descriptor = {
       .struct_size = sizeof(ft_native_attach_descriptor),
@@ -87,3 +124,4 @@ int porthole_capture_transfer_c_abi_header_smoke(void) {
                (poll_fn != NULL) + (get_pool_fn != NULL) +
                (destroy_fn != NULL));
 }
+#endif

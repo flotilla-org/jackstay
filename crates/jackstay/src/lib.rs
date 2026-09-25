@@ -85,12 +85,10 @@ pub mod error;
 #[cfg(unix)]
 pub mod fdpass;
 pub mod ffi;
-#[cfg(unix)]
 pub mod ffi_acquisition;
-#[cfg(unix)]
 pub mod ffi_bootstrap;
-#[cfg(unix)]
 pub mod ffi_input;
+pub mod ffi_local;
 #[cfg(any(
     all(target_os = "macos", feature = "backend-macos"),
     all(target_os = "linux", feature = "backend-linux")

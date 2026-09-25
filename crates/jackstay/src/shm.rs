@@ -280,6 +280,10 @@ impl SharedMemorySegment {
         Self::map_view(mapping, len, true, "map-view")
     }
 
+    /// Maps `len` bytes of the section read-only. Like the macOS guard (whose
+    /// shm objects are page-rounded), the length check is page-granular: `len`
+    /// may exceed the created size up to the next page boundary, where the
+    /// kernel-zeroed tail of the last page is visible.
     pub fn map_read_only(handle: OwnedFd, len: usize) -> Result<Self> {
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
@@ -287,6 +291,8 @@ impl SharedMemorySegment {
         Self::map_view(handle, len, false, "mmap-read-only")
     }
 
+    /// Maps `len` bytes of the section read/write, with the same page-granular
+    /// length check as [`Self::map_read_only`].
     pub fn map_read_write(handle: OwnedFd, len: usize) -> Result<Self> {
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
@@ -350,7 +356,7 @@ impl SharedMemorySegment {
             unmap_view(ptr);
             return Err(CaptureTransferError::SharedMemory {
                 operation,
-                message: format!("requested map length {len} exceeds backing section length {region_len}"),
+                message: format!("requested map length {len} exceeds page-rounded section view length {region_len}"),
             });
         }
         Ok(Self {

@@ -319,13 +319,16 @@ impl SharedMemorySegment {
         })
     }
 
-    /// Maps the whole section, checks `len` against the view's page-rounded
-    /// size (a section handle has no documented size query), and exposes the
-    /// first `len` bytes.
+    /// Maps the whole section, checks that the first `len` bytes are committed
+    /// with the requested access, and exposes them. The size check is
+    /// page-granular because a section handle has no documented size query.
     fn map_view(mapping: OwnedFd, len: usize, writable: bool, operation: &'static str) -> Result<Self> {
         use std::os::windows::io::AsRawHandle;
 
-        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION, MapViewOfFile, VirtualQuery};
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEMORY_BASIC_INFORMATION, MapViewOfFile, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        };
 
         let access = if writable { FILE_MAP_READ | FILE_MAP_WRITE } else { FILE_MAP_READ };
         // SAFETY: mapping is a valid section handle; a zero length maps the
@@ -351,7 +354,27 @@ impl SharedMemorySegment {
             });
         }
         // SAFETY: VirtualQuery returned non-zero, so it filled info.
-        let region_len = unsafe { info.assume_init() }.RegionSize;
+        let info = unsafe { info.assume_init() };
+        // MapViewOfFile can succeed for SEC_RESERVE sections without committing
+        // any pages. VirtualQuery groups pages with the same state/protection,
+        // so these access checks and the length check cover the entire range.
+        let allowed_protection = if writable {
+            // Writes must reach shared storage, not a private copy-on-write page.
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        };
+        if info.State != MEM_COMMIT || info.Protect & PAGE_GUARD != 0 || info.Protect & allowed_protection == 0 {
+            unmap_view(ptr);
+            return Err(CaptureTransferError::SharedMemory {
+                operation,
+                message: format!(
+                    "section view is not committed with the requested access (writable={writable}, state={:#x}, protection={:#x})",
+                    info.State, info.Protect
+                ),
+            });
+        }
+        let region_len = info.RegionSize;
         if len > region_len {
             unmap_view(ptr);
             return Err(CaptureTransferError::SharedMemory {
@@ -591,6 +614,49 @@ mod tests {
         drop(segment);
 
         assert_eq!(peer.slice_at(0, 8), &[0, 4, 5, 0, 0, 0, 9, 0]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mappings_reject_uncommitted_sections() {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::Memory::{CreateFileMappingW, PAGE_READWRITE, SEC_RESERVE},
+        };
+
+        // SAFETY: this creates an unnamed section with reserved, uncommitted
+        // pages. Neither mapping attempt below dereferences those pages.
+        let raw = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                4096,
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null(), "{}", std::io::Error::last_os_error());
+        // SAFETY: raw is a fresh valid section handle owned by nothing else.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+
+        for (result, expected_operation) in [
+            (
+                SharedMemorySegment::map_read_only(handle.try_clone().unwrap(), 4096),
+                "mmap-read-only",
+            ),
+            (SharedMemorySegment::map_read_write(handle, 4096), "mmap-read-write"),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(CaptureTransferError::SharedMemory { operation, .. }) if operation == expected_operation
+                ),
+                "{expected_operation} accepted an uncommitted section: {result:?}"
+            );
+        }
     }
 
     #[cfg(windows)]

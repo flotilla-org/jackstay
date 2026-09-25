@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 9
+#define FT_ABI_VERSION_MINOR 10
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -47,6 +47,8 @@ uint32_t ft_abi_version(void);
 #define FT_STATUS_RECOVERY_REQUIRED 18
 #define FT_STATUS_ADDRESS_IN_USE 19
 #define FT_STATUS_UNTRUSTED_PEER 20
+/* ABI 0.10: a D3D11 producer refused a consumer device on another adapter. */
+#define FT_STATUS_ADAPTER_MISMATCH 21
 
 #define FT_SOURCE_KIND_WINDOW 1
 #define FT_SOURCE_KIND_DISPLAY 2
@@ -362,6 +364,84 @@ ft_status ft_acquired_frame_macos_resources(const ft_acquired_frame *, void **ou
 /* Close setup without declaring outstanding work complete; clears the handle.
  * Consumer/frame handles have their own lifetimes. NULL is harmless. */
 void ft_acquisition_macos_connection_destroy(ft_macos_acquisition_connection **);
+#endif
+
+#if defined(_WIN32)
+/* ABI 0.10 D3D11 frames. Requires a library built with backend-windows. Setup
+ * runs on a connection from ft_local_connect (after an optional
+ * ft_source_bootstrap_connect_local) whose server was verified; the peer must
+ * be the conforming sole producer, and grants and handles are never forwarded
+ * or replayed. Handles move once per consumer incarnation and pool generation;
+ * per-frame data is the descriptor (slot, pool, fence id and value). Serialize
+ * setup calls; cancel and alive may overlap them. See
+ * docs/design/acquisition-d3d11.md.
+ *
+ * A consumer: describe; create its device on the reported LUID; attach with it;
+ * create a shared ID3D11Fence (D3D11_FENCE_FLAG_SHARED) and register it. For
+ * each frame: describe it, borrow its handles, import the texture with
+ * ID3D11Device1::OpenSharedResource1 (cache by pool_id and slot_id) and the
+ * readiness fence with ID3D11Device5::OpenSharedFence (cache by fence_id), check
+ * ft_d3d11_fence_alive, queue ID3D11DeviceContext4::Wait(fence, fence_value),
+ * sample, then Signal the release fence on the same context and defer the
+ * frame's release to that value. On RECONFIGURATION, relinquish and install
+ * the replacement; drop cached imports of pools no held frame uses. */
+typedef struct ft_d3d11_acquisition_connection ft_d3d11_acquisition_connection;
+
+#define FT_D3D11_ADAPTER_DESCRIPTION_LEN 128
+typedef struct ft_d3d11_adapter {
+  uint64_t luid;      /* (HighPart << 32) | LowPart of the DXGI adapter LUID */
+  uint32_t vendor_id;
+  uint32_t device_id;
+  uint32_t software;  /* nonzero for WARP / the Basic Render Driver */
+  uint32_t reserved;
+  char description[FT_D3D11_ADAPTER_DESCRIPTION_LEN]; /* UTF-8, NUL-terminated */
+} ft_d3d11_adapter;
+
+/* Consumes *connection and sets it to NULL on every outcome after basic checks.
+ * No setup I/O happens until describe or attach. *out starts NULL. */
+ft_status ft_acquisition_d3d11_connection_create_local(ft_local_connection **connection,
+                                                      ft_d3d11_acquisition_connection **out);
+/* OK while the producer holds its end of setup (also during another setup
+ * call), CLOSED once it closed, exited or setup failed, CANCELLED after cancel. */
+ft_status ft_acquisition_d3d11_connection_alive(const ft_d3d11_acquisition_connection *);
+void ft_acquisition_d3d11_connection_cancel(const ft_d3d11_acquisition_connection *);
+/* The producer's adapter; create the importing device on its LUID. */
+ft_status ft_acquisition_d3d11_describe(const ft_d3d11_acquisition_connection *, ft_d3d11_adapter *out);
+/* device: a borrowed ID3D11Device* (ID3D11Device5 capable) on the producer's
+ * adapter. ADAPTER_MISMATCH admits nothing and leaves the connection usable.
+ * *out starts NULL. */
+ft_status ft_acquisition_d3d11_attach(const ft_d3d11_acquisition_connection *, void *device,
+                                      uint32_t holding, ft_acquisition_consumer **out);
+/* OK installed, EMPTY no offer, STALE disposed a valid superseded offer. Held
+ * frames keep their own pool's handles. */
+ft_status ft_acquisition_d3d11_install_configuration(const ft_d3d11_acquisition_connection *,
+                                                    ft_acquisition_consumer *);
+/* fence: a borrowed shared ID3D11Fence* on the attached adapter; the library
+ * keeps its own reference. Register once, before deferring releases to it.
+ * *out starts NULL. */
+ft_status ft_acquisition_d3d11_register_release(const ft_d3d11_acquisition_connection *,
+                                               const ft_acquisition_consumer *, void *fence,
+                                               ft_acquisition_release_timeline **out);
+/* Close setup without declaring outstanding work complete; clears the handle.
+ * Consumer and frame handles have their own lifetimes. NULL is harmless. */
+void ft_acquisition_d3d11_connection_destroy(ft_d3d11_acquisition_connection **);
+/* Borrow the NT HANDLEs of this frame's pool texture (DXGI_SHARED_RESOURCE_READ)
+ * and producer readiness fence. Valid only while the frame is held: import
+ * before releasing it. Outputs must not alias and are cleared on non-success.
+ * UNSUPPORTED means the frame has no D3D11 resources. The descriptor supplies
+ * size, format, pool_id, slot_id, fence_id and the fence_value to GPU-wait;
+ * every frame of a connection lives on the adapter attach verified. */
+ft_status ft_acquired_frame_d3d11_resources(const ft_acquired_frame *, void **out_texture,
+                                            void **out_readiness);
+/* fence: a borrowed ID3D11Fence* (an imported readiness fence). OK while its
+ * producer device exists; CLOSED once abandoned (removed, or the producer
+ * exited): it then reads UINT64_MAX and satisfies every wait although the copy
+ * never ran, so discard its frames and treat the producer as lost. */
+ft_status ft_d3d11_fence_alive(void *fence);
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(ft_d3d11_adapter) == 152, "D3D11 adapter size");
+_Static_assert(offsetof(ft_d3d11_adapter, description) == 24, "D3D11 adapter packing");
+#endif
 #endif
 
 /* Single-stream CPU producer. Source/track selection belongs to

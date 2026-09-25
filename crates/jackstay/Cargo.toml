@@ -93,3 +93,7 @@ workspace = true
 [[example]]
 name = "wgc_session_watch"
 required-features = ["backend-windows"]
+
+[[example]]
+name = "d3d11_source"
+required-features = ["backend-windows"]

@@ -12,7 +12,7 @@ pub type FtStatus = i32;
 /// pre-stabilization: layouts may still change freely, with a minor bump as
 /// the only signal; 1.0 waits until an external consumer needs the promise.
 pub const FT_ABI_VERSION_MAJOR: u32 = 0;
-pub const FT_ABI_VERSION_MINOR: u32 = 9;
+pub const FT_ABI_VERSION_MINOR: u32 = 10;
 pub const FT_ABI_VERSION: u32 = (FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR;
 
 /// Report the linked library's ABI version.
@@ -44,6 +44,10 @@ pub const FT_STATUS_RECOVERY_REQUIRED: FtStatus = 18;
 pub const FT_STATUS_ADDRESS_IN_USE: FtStatus = 19;
 /// A server or peer failed identity verification (owner or session).
 pub const FT_STATUS_UNTRUSTED_PEER: FtStatus = 20;
+/// A D3D11 producer refused a consumer whose device is on another adapter.
+/// Nothing was admitted; attach again on the producer's adapter, or use a CPU
+/// publication.
+pub const FT_STATUS_ADAPTER_MISMATCH: FtStatus = 21;
 
 pub const FT_SOURCE_KIND_WINDOW: u32 = 1;
 pub const FT_SOURCE_KIND_DISPLAY: u32 = 2;
@@ -156,6 +160,6 @@ mod tests {
         assert_eq!(define("FT_ABI_VERSION_MAJOR"), super::FT_ABI_VERSION_MAJOR);
         assert_eq!(define("FT_ABI_VERSION_MINOR"), super::FT_ABI_VERSION_MINOR);
         assert_eq!(super::ft_abi_version(), super::FT_ABI_VERSION);
-        assert_eq!(super::FT_ABI_VERSION, 0x0000_0009);
+        assert_eq!(super::FT_ABI_VERSION, 0x0000_000A);
     }
 }

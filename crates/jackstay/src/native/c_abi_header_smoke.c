@@ -27,6 +27,12 @@ int jackstay_c_acquisition_finish(ft_acquired_frame **frame) {
   if (ft_acquired_frame_macos_resources(*frame, &surface, &readiness) != FT_STATUS_UNSUPPORTED ||
       surface != NULL || readiness != NULL) failed = 1;
 #endif
+#if defined(_WIN32) && defined(JACKSTAY_BACKEND_WINDOWS)
+  void *texture = &descriptor;
+  void *ready = &descriptor;
+  if (ft_acquired_frame_d3d11_resources(*frame, &texture, &ready) != FT_STATUS_UNSUPPORTED ||
+      texture != NULL || ready != NULL) failed = 1;
+#endif
   if (ft_acquired_frame_release(frame) != FT_STATUS_OK || *frame != NULL) return 1;
   return failed;
 }
@@ -64,6 +70,38 @@ int jackstay_c_local_endpoint_smoke(void) {
                (bootstrap_connect_fn != NULL) + (input_serve_fn != NULL) + (input_connect_fn != NULL) +
                (import_fn != NULL) + FT_STATUS_ADDRESS_IN_USE + FT_STATUS_UNTRUSTED_PEER);
 }
+
+#if defined(_WIN32)
+/* ABI 0.10 D3D11 consumer declarations. The build defines
+ * JACKSTAY_BACKEND_WINDOWS when the library has backend-windows, so the entry
+ * points are referenced only where they link. */
+int jackstay_c_d3d11_smoke(void) {
+  ft_d3d11_adapter adapter = {0};
+  int total = (int)(sizeof adapter + FT_D3D11_ADAPTER_DESCRIPTION_LEN + FT_STATUS_ADAPTER_MISMATCH +
+                    FT_NATIVE_HANDLE_D3D11_TEXTURE + FT_NATIVE_SYNC_D3D11_FENCE);
+#if defined(JACKSTAY_BACKEND_WINDOWS)
+  ft_status (*create_fn)(ft_local_connection **, ft_d3d11_acquisition_connection **) =
+      ft_acquisition_d3d11_connection_create_local;
+  ft_status (*alive_fn)(const ft_d3d11_acquisition_connection *) = ft_acquisition_d3d11_connection_alive;
+  void (*cancel_fn)(const ft_d3d11_acquisition_connection *) = ft_acquisition_d3d11_connection_cancel;
+  ft_status (*describe_fn)(const ft_d3d11_acquisition_connection *, ft_d3d11_adapter *) =
+      ft_acquisition_d3d11_describe;
+  ft_status (*attach_fn)(const ft_d3d11_acquisition_connection *, void *, uint32_t, ft_acquisition_consumer **) =
+      ft_acquisition_d3d11_attach;
+  ft_status (*install_fn)(const ft_d3d11_acquisition_connection *, ft_acquisition_consumer *) =
+      ft_acquisition_d3d11_install_configuration;
+  ft_status (*register_fn)(const ft_d3d11_acquisition_connection *, const ft_acquisition_consumer *, void *,
+                           ft_acquisition_release_timeline **) = ft_acquisition_d3d11_register_release;
+  void (*destroy_fn)(ft_d3d11_acquisition_connection **) = ft_acquisition_d3d11_connection_destroy;
+  ft_status (*resources_fn)(const ft_acquired_frame *, void **, void **) = ft_acquired_frame_d3d11_resources;
+  ft_status (*fence_fn)(void *) = ft_d3d11_fence_alive;
+  total += (create_fn != NULL) + (alive_fn != NULL) + (cancel_fn != NULL) + (describe_fn != NULL) +
+           (attach_fn != NULL) + (install_fn != NULL) + (register_fn != NULL) + (destroy_fn != NULL) +
+           (resources_fn != NULL) + (fence_fn != NULL);
+#endif
+  return total;
+}
+#endif
 
 #if !defined(_WIN32)
 /* The native attach ABI has no Windows implementation yet (#28). */

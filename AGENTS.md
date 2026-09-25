@@ -15,7 +15,8 @@ cargo +nightly-2026-03-12 fmt --check
 ```
 
 Also check the relevant native feature (`backend-macos`, `backend-linux` or
-`backend-windows`) and run `scripts/smoke-viewer.sh` for viewer/ABI changes.
+`backend-windows`) and run `scripts/smoke-viewer.sh` for viewer/ABI changes
+(`scripts/smoke-viewer.ps1` on Windows).
 Offline SDL uses `SDL_VIDEODRIVER=dummy`; this exercises synthetic content and
 cannot prove desktop capture. Hardware checks and porthole integration need
 separate live evidence. Windows capture tests create and capture only their own

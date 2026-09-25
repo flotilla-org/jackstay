@@ -74,6 +74,9 @@ jobs:
       - run: cargo build --workspace --locked --features backend-windows
       - run: cargo test --workspace --locked --features backend-windows
       - run: cargo clippy --workspace --all-targets --locked --features backend-windows -- -D warnings
+      # The D3D11 reference viewer (MSVC) against the synthetic d3d11_source,
+      # through the ABI 0.10 C calls, on the runner's default adapter.
+      - run: powershell -ExecutionPolicy Bypass -File scripts/smoke-viewer.ps1 -Frames 30
   abi:
     runs-on: ubuntu-latest
     steps:
@@ -88,6 +91,9 @@ jobs:
           version: 0.15.2
       # The Windows declarations (HANDLE setup objects, Local Endpoint setup).
       - run: zig cc -target x86_64-windows-gnu -std=c11 -Wall -Werror -I crates/jackstay/include -c crates/jackstay/src/native/c_abi_header_smoke.c -o /dev/null
+      # ...including the ABI 0.10 D3D11 entry points of a backend-windows build.
+      - run: zig cc -target x86_64-windows-gnu -std=c11 -Wall -Werror -DJACKSTAY_BACKEND_WINDOWS -I crates/jackstay/include -c crates/jackstay/src/native/c_abi_header_smoke.c -o /dev/null
+      - run: zig cc -target x86_64-windows-gnu -std=c11 -Wall -Wextra -Werror -I crates/jackstay/include -c tools/capture-viewer-d3d11/src/main.c -o /dev/null
       # The reference source's Local Endpoint mode builds for Windows too.
       - run: zig cc -target x86_64-windows-gnu -std=c11 -Wall -Wextra -Werror -I crates/jackstay/include -c tools/capture-viewer-sdl/src/input_source.c -o /dev/null
       - run: zig translate-c -lc crates/jackstay/include/capture_transfer.h > /dev/null

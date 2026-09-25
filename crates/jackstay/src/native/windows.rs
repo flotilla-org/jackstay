@@ -529,6 +529,10 @@ macro_rules! shared_handle {
 shared_handle!(SharedTextureHandle);
 shared_handle!(SharedFenceHandle);
 
+/// The completed value a fence reports once its device is gone: removed, or
+/// its process exited. See [`D3d11Fence::is_abandoned`].
+pub const ABANDONED_FENCE_VALUE: u64 = u64::MAX;
+
 /// An `ID3D11Fence` timeline: the producer's readiness fence, a consumer's
 /// release fence, or either one opened from its shared handle.
 ///
@@ -561,6 +565,14 @@ impl D3d11Fence {
         }
     }
 
+    /// Adopt a fence the caller created on its own device, for example a
+    /// renderer's shared release fence. Registration as a release timeline
+    /// needs one created with `D3D11_FENCE_FLAG_SHARED`.
+    #[must_use]
+    pub fn from_raw(fence: ID3D11Fence) -> Self {
+        Self::new(fence)
+    }
+
     #[must_use]
     pub fn raw(&self) -> &ID3D11Fence {
         &self.fence
@@ -581,7 +593,7 @@ impl D3d11Fence {
     /// lost.
     #[must_use]
     pub fn is_abandoned(&self) -> bool {
-        self.completed_value() == u64::MAX
+        self.completed_value() == ABANDONED_FENCE_VALUE
     }
 
     /// Block until `value` completes; false on timeout. For tests and

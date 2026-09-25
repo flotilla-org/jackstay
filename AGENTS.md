@@ -14,10 +14,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo +nightly-2026-03-12 fmt --check
 ```
 
-Also check the relevant native feature (`backend-macos` or `backend-linux`) and
-run `scripts/smoke-viewer.sh` for viewer/ABI changes. Offline SDL uses
-`SDL_VIDEODRIVER=dummy`; this exercises synthetic content and cannot prove desktop
-capture. Hardware checks and porthole integration need separate live evidence.
+Also check the relevant native feature (`backend-macos`, `backend-linux` or
+`backend-windows`) and run `scripts/smoke-viewer.sh` for viewer/ABI changes.
+Offline SDL uses `SDL_VIDEODRIVER=dummy`; this exercises synthetic content and
+cannot prove desktop capture. Hardware checks and porthole integration need
+separate live evidence. Windows capture tests create and capture only their own
+windows and are ignored without `--ignored` (see
+docs/design/acquisition-d3d11.md); never capture other windows or the screen.
 
 If a live macOS capture operation lacks Accessibility or Screen Recording
 permission, report BLOCKED and wait for the user to grant it. Do not bypass the

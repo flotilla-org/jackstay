@@ -1168,7 +1168,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn control_page_layout_packs_cacheline_records() {
         let page = VideoTrackControlPage::new(3);
 
@@ -1199,7 +1198,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn hot_words_never_share_a_cacheline_between_records() {
         let page = VideoTrackControlPage::new(2);
 
@@ -1213,7 +1211,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn push_returns_monotonic_cursors() {
         let mut page = VideoTrackControlPage::new(2);
 
@@ -1223,7 +1220,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn control_page_mapped_slots_start_zeroed() {
         let page = VideoTrackControlPage::new(2);
 
@@ -1232,7 +1228,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn latest_cursor_returns_none_on_empty_page() {
         let page = VideoTrackControlPage::new(2);
 
@@ -1241,7 +1236,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn empty_track_control_page_writes_geometry_header() {
         let page = VideoTrackControlPage::new(0);
 
@@ -1258,7 +1252,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn track_control_page_rounds_capacity_to_power_of_two() {
         let page = VideoTrackControlPage::new(3);
 
@@ -1266,7 +1259,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn track_control_page_wraps_entries_in_oldest_to_newest_order() {
         let mut page = VideoTrackControlPage::new(2);
 
@@ -1290,7 +1282,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn track_control_page_reports_latest_lossy_lap_state() {
         let mut page = VideoTrackControlPage::new(3);
 
@@ -1318,7 +1309,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_entry_for_cursor_reports_empty_and_future_cursors() {
         let mut page = VideoTrackControlPage::new(2);
 
@@ -1344,7 +1334,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_entry_for_cursor_returns_requested_entry() {
         let mut page = VideoTrackControlPage::new(4);
 
@@ -1362,7 +1351,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_entry_for_cursor_merges_full_descriptor_and_config() {
         let mut page = VideoTrackControlPage::new(2);
         let pending = full_pending(10);
@@ -1396,7 +1384,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_entry_for_cursor_reports_lapped_cursors_after_wraparound() {
         let mut page = VideoTrackControlPage::new(2);
 
@@ -1415,7 +1402,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_entry_for_cursor_reports_slot_sequence_mismatch() {
         let mut page = VideoTrackControlPage::new(2);
 
@@ -1433,7 +1419,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_latest_lossy_entry_returns_newest_entry_after_wraparound() {
         let mut page = VideoTrackControlPage::new(2);
 
@@ -1449,7 +1434,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn unchanged_stream_values_reuse_one_config_generation() {
         let mut page = VideoTrackControlPage::new(4);
 
@@ -1466,7 +1450,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn changed_stream_values_publish_new_config_generation() {
         let mut page = VideoTrackControlPage::new(4);
 
@@ -1486,7 +1469,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn frames_older_than_the_config_ring_report_config_overwritten() {
         // Capacity 8 ring keeps old frames live while more than
         // CONFIG_RING_CAPACITY reconfigures overwrite generation 1.
@@ -1515,7 +1497,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn consumer_cursor_slot_registers_and_roundtrips_release_cursor() {
         let page = VideoTrackControlPage::new(2);
 
@@ -1529,7 +1510,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn consumer_cursor_slot_reuses_existing_consumer_slot() {
         let page = VideoTrackControlPage::new(2);
 
@@ -1541,7 +1521,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn consumer_cursor_slot_unregisters_and_zeroes_consumer() {
         let page = VideoTrackControlPage::new(2);
         let slot = page.register_consumer_cursor(7).unwrap();
@@ -1559,7 +1538,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn consumer_release_update_rejects_slot_consumer_mismatch() {
         let page = VideoTrackControlPage::new(2);
         let slot = page.register_consumer_cursor(7).unwrap();
@@ -1570,7 +1548,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn consumer_acquire_update_rejects_slot_consumer_mismatch() {
         let page = VideoTrackControlPage::new(2);
         let slot = page.register_consumer_cursor(7).unwrap();
@@ -1581,7 +1558,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn consumer_acquire_update_preserves_release_cursor() {
         let page = VideoTrackControlPage::new(2);
         let slot = page.register_consumer_cursor(7).unwrap();
@@ -1598,7 +1574,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_only_control_page_mapping_validates_header_from_fd() {
         let page = VideoTrackControlPage::new(3);
 
@@ -1612,7 +1587,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_only_control_page_shadow_reads_published_entry_from_fd() {
         let mut page = VideoTrackControlPage::new(2);
         page.push(pending(10));
@@ -1629,7 +1603,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_only_control_page_shadow_reads_full_descriptor_from_fd() {
         let mut page = VideoTrackControlPage::new(2);
         let pending = full_pending(10);

@@ -266,7 +266,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn attach_transfers_handles_once_and_steady_state_is_shared_memory_only() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);
@@ -325,7 +324,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn session_reports_attached_only_after_a_grant() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);
@@ -347,7 +345,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn attach_before_authorize_is_rejected_when_token_required() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);
@@ -360,7 +357,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn wrong_bearer_token_is_rejected_and_does_not_authorize() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);
@@ -384,7 +380,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn second_attach_on_the_same_session_is_rejected() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);
@@ -398,7 +393,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn unauthenticated_endpoint_attaches_without_authorize() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);
@@ -409,7 +403,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn zero_consumer_id_requests_assigned_consumer_id() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);
@@ -424,7 +417,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn reattach_on_a_new_session_reuses_the_consumer_slot() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry);

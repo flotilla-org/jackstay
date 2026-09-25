@@ -2,27 +2,33 @@
 use std::os::fd::OwnedFd;
 #[cfg(windows)]
 use std::os::windows::io::OwnedHandle as OwnedFd;
+use std::ptr::NonNull;
 #[cfg(unix)]
-use std::{fs::File, os::fd::AsRawFd, ptr::NonNull};
+use std::{fs::File, os::fd::AsRawFd};
 
 use crate::{
     error::{CaptureTransferError, Result},
     model::PayloadKind,
 };
 
+/// A shared-memory mapping and the OS object that backs it.
+///
+/// On Unix the backing is an anonymous memfd/shm object identified by its fd.
+/// On Windows it is an unnamed pagefile-backed section identified only by its
+/// handle, so later setup-channel work can duplicate the handle into a
+/// verified peer process (Wheelhouse ADR 0011).
 #[derive(Debug)]
 pub struct SharedMemorySegment {
-    #[cfg(unix)]
     ptr: NonNull<u8>,
-    #[cfg(unix)]
     len: usize,
-    #[cfg(unix)]
     writable: bool,
     #[cfg(unix)]
     _file: File,
+    #[cfg(windows)]
+    mapping: OwnedFd,
 }
 
-// SAFETY: SharedMemorySegment owns a file-backed mmap. Shared reads are safe;
+// SAFETY: SharedMemorySegment owns a shared mapping. Shared reads are safe;
 // producer writes use explicit offset/length APIs and are guarded by the slot
 // manager so pinned ranges are not overwritten. Drop unmaps only when the final
 // owner goes away.
@@ -33,14 +39,74 @@ unsafe impl Send for SharedMemorySegment {}
 // pinned by consumers.
 unsafe impl Sync for SharedMemorySegment {}
 
-#[cfg(unix)]
 impl SharedMemorySegment {
     /// Raw access for internal typed shared-memory layouts. Unlike `as_slice`,
     /// this does not construct a plain reference spanning mutable atomic words.
+    #[cfg_attr(windows, allow(dead_code, reason = "only the Unix-only acquisition arena uses raw access so far"))]
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }
 
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub const fn payload_kind(&self) -> PayloadKind {
+        PayloadKind::CpuShm
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr points to a live mapping of len bytes owned by self.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        assert!(self.writable);
+        // SAFETY: ptr points to a live mutable mapping of len bytes owned by self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[must_use]
+    pub fn slice_at(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(offset <= self.len);
+        assert!(len <= self.len - offset);
+        // SAFETY: offset and len were bounds-checked against the live mapping.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
+    }
+
+    pub fn with_slice_at_mut<R>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        assert!(self.writable);
+        assert!(offset <= self.len);
+        assert!(len <= self.len - offset);
+        // SAFETY: offset and len were bounds-checked. The slot manager only
+        // hands this out for producer-owned slots that are not pinned.
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) };
+        f(slice)
+    }
+
+    pub fn write_at(&self, offset: usize, bytes: &[u8]) {
+        assert!(self.writable);
+        assert!(offset <= self.len);
+        assert!(bytes.len() <= self.len - offset);
+        // SAFETY: offset and len were bounds-checked. Callers only write into a
+        // producer-owned slot that is not pinned by acquired frames.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(offset), bytes.len());
+        }
+    }
+}
+
+#[cfg(unix)]
+impl SharedMemorySegment {
     pub fn new(len: usize) -> Result<Self> {
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
@@ -149,63 +215,6 @@ impl SharedMemorySegment {
         })
     }
 
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[must_use]
-    pub const fn payload_kind(&self) -> PayloadKind {
-        PayloadKind::CpuShm
-    }
-
-    #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: ptr points to a live mapping of len bytes owned by self.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-
-    #[must_use]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        assert!(self.writable);
-        // SAFETY: ptr points to a live mutable mapping of len bytes owned by self.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    #[must_use]
-    pub fn slice_at(&self, offset: usize, len: usize) -> &[u8] {
-        assert!(offset <= self.len);
-        assert!(len <= self.len - offset);
-        // SAFETY: offset and len were bounds-checked against the live mapping.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
-    }
-
-    pub fn with_slice_at_mut<R>(&self, offset: usize, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        assert!(self.writable);
-        assert!(offset <= self.len);
-        assert!(len <= self.len - offset);
-        // SAFETY: offset and len were bounds-checked. The slot manager only
-        // hands this out for producer-owned slots that are not pinned.
-        let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) };
-        f(slice)
-    }
-
-    pub fn write_at(&self, offset: usize, bytes: &[u8]) {
-        assert!(self.writable);
-        assert!(offset <= self.len);
-        assert!(bytes.len() <= self.len - offset);
-        // SAFETY: offset and len were bounds-checked. Callers only write into a
-        // producer-owned slot that is not pinned by acquired frames.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(offset), bytes.len());
-        }
-    }
-
     pub fn try_clone_fd(&self) -> Result<OwnedFd> {
         self._file
             .try_clone()
@@ -231,77 +240,177 @@ impl Drop for SharedMemorySegment {
 
 #[cfg(windows)]
 impl SharedMemorySegment {
+    /// Creates an unnamed, pagefile-backed section of `len` bytes and maps it
+    /// read/write. The kernel zero-fills the section, and it lives until every
+    /// handle and view of it (in any process) is gone.
     pub fn new(len: usize) -> Result<Self> {
+        use std::os::windows::io::FromRawHandle;
+
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::Memory::{CreateFileMappingW, PAGE_READWRITE},
+        };
+
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
         }
-        Err(unimplemented_windows_shm("create"))
+        let size = len as u64;
+        // SAFETY: INVALID_HANDLE_VALUE requests a pagefile-backed section. Null
+        // security attributes give a non-inheritable handle, and a null name
+        // keeps the section out of every object namespace: the handle is the
+        // only way to reach it.
+        let raw = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                (size >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if raw.is_null() {
+            return Err(CaptureTransferError::SharedMemory {
+                operation: "create-file-mapping",
+                message: std::io::Error::last_os_error().to_string(),
+            });
+        }
+        // SAFETY: raw is a fresh section handle owned by nothing else.
+        let mapping = unsafe { OwnedFd::from_raw_handle(raw) };
+        Self::map_view(mapping, len, true, "map-view")
     }
 
-    pub fn map_read_only(_fd: OwnedFd, len: usize) -> Result<Self> {
+    /// Maps `len` bytes of the section read-only. Like the macOS guard (whose
+    /// shm objects are page-rounded), the length check is page-granular: `len`
+    /// may exceed the created size up to the next page boundary, where the
+    /// kernel-zeroed tail of the last page is visible.
+    pub fn map_read_only(handle: OwnedFd, len: usize) -> Result<Self> {
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
         }
-        Err(unimplemented_windows_shm("mmap-read-only"))
+        Self::map_view(handle, len, false, "mmap-read-only")
     }
 
-    pub fn map_read_write(_fd: OwnedFd, len: usize) -> Result<Self> {
+    /// Maps `len` bytes of the section read/write, with the same page-granular
+    /// length check as [`Self::map_read_only`].
+    pub fn map_read_write(handle: OwnedFd, len: usize) -> Result<Self> {
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
         }
-        Err(unimplemented_windows_shm("mmap-read-write"))
+        Self::map_view(handle, len, true, "mmap-read-write")
     }
 
+    /// Borrows the section handle that identifies this mapping, for example to
+    /// `DuplicateHandle` it (possibly with reduced `FILE_MAP_*` access) into a
+    /// verified peer process. The segment keeps ownership of the handle.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        0
+    pub fn mapping_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        use std::os::windows::io::AsHandle;
+
+        self.mapping.as_handle()
     }
 
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        true
-    }
-
-    #[must_use]
-    pub const fn payload_kind(&self) -> PayloadKind {
-        PayloadKind::CpuShm
-    }
-
-    #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
-        &[]
-    }
-
-    #[must_use]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        panic!("shm backing unimplemented on Windows")
-    }
-
-    #[must_use]
-    pub fn slice_at(&self, offset: usize, len: usize) -> &[u8] {
-        assert_eq!(offset, 0);
-        assert_eq!(len, 0);
-        &[]
-    }
-
-    pub fn with_slice_at_mut<R>(&self, _offset: usize, _len: usize, _f: impl FnOnce(&mut [u8]) -> R) -> R {
-        panic!("shm backing unimplemented on Windows")
-    }
-
-    pub fn write_at(&self, _offset: usize, _bytes: &[u8]) {
-        panic!("shm backing unimplemented on Windows")
-    }
-
+    /// Duplicates the section handle within this process with the same access:
+    /// the Windows counterpart of cloning the backing fd on Unix.
     pub fn try_clone_fd(&self) -> Result<OwnedFd> {
-        Err(unimplemented_windows_shm("clone-fd"))
+        self.mapping.try_clone().map_err(|error| CaptureTransferError::SharedMemory {
+            operation: "clone-fd",
+            message: error.to_string(),
+        })
+    }
+
+    /// Maps the whole section, checks that the first `len` bytes are committed
+    /// with the requested access, and exposes them. The size check is
+    /// page-granular because a section handle has no documented size query.
+    fn map_view(mapping: OwnedFd, len: usize, writable: bool, operation: &'static str) -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEMORY_BASIC_INFORMATION, MapViewOfFile, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        };
+
+        let access = if writable { FILE_MAP_READ | FILE_MAP_WRITE } else { FILE_MAP_READ };
+        // SAFETY: mapping is a valid section handle; a zero length maps the
+        // whole section. The view is released in Drop, or below on error.
+        let view = unsafe { MapViewOfFile(mapping.as_raw_handle(), access, 0, 0, 0) };
+        let Some(ptr) = NonNull::new(view.Value.cast::<u8>()) else {
+            return Err(CaptureTransferError::SharedMemory {
+                operation,
+                message: std::io::Error::last_os_error().to_string(),
+            });
+        };
+
+        let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+        // SAFETY: info is a writable buffer of the size passed; ptr is the base
+        // of the view mapped above.
+        let written = unsafe { VirtualQuery(ptr.as_ptr().cast(), info.as_mut_ptr(), size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if written == 0 {
+            let message = std::io::Error::last_os_error().to_string();
+            unmap_view(ptr);
+            return Err(CaptureTransferError::SharedMemory {
+                operation: "query-view",
+                message,
+            });
+        }
+        // SAFETY: VirtualQuery returned non-zero, so it filled info.
+        let info = unsafe { info.assume_init() };
+        // MapViewOfFile can succeed for SEC_RESERVE sections without committing
+        // any pages. VirtualQuery groups pages with the same state/protection,
+        // so these access checks and the length check cover the entire range.
+        let allowed_protection = if writable {
+            // Writes must reach shared storage, not a private copy-on-write page.
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        };
+        if info.State != MEM_COMMIT || info.Protect & PAGE_GUARD != 0 || info.Protect & allowed_protection == 0 {
+            unmap_view(ptr);
+            return Err(CaptureTransferError::SharedMemory {
+                operation,
+                message: format!(
+                    "section view is not committed with the requested access (writable={writable}, state={:#x}, protection={:#x})",
+                    info.State, info.Protect
+                ),
+            });
+        }
+        let region_len = info.RegionSize;
+        if len > region_len {
+            unmap_view(ptr);
+            return Err(CaptureTransferError::SharedMemory {
+                operation,
+                message: format!("requested map length {len} exceeds page-rounded section view length {region_len}"),
+            });
+        }
+        Ok(Self {
+            ptr,
+            len,
+            writable,
+            mapping,
+        })
     }
 }
 
 #[cfg(windows)]
-fn unimplemented_windows_shm(operation: &'static str) -> CaptureTransferError {
-    CaptureTransferError::SharedMemory {
-        operation,
-        message: "shm backing unimplemented on Windows".to_string(),
+fn unmap_view(base: NonNull<u8>) {
+    use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+    // SAFETY: base is the address MapViewOfFile returned for a view that has
+    // not been unmapped yet; callers unmap each view exactly once.
+    unsafe {
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+            Value: base.as_ptr().cast(),
+        });
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SharedMemorySegment {
+    fn drop(&mut self) {
+        // The section outlives this view while any other handle or view
+        // (including in other processes) references it; `mapping` closes this
+        // segment's handle after the view is gone.
+        unmap_view(self.ptr);
     }
 }
 
@@ -396,7 +505,6 @@ mod tests {
     use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn mapped_segment_roundtrips_bytes() {
         let mut segment = SharedMemorySegment::new(4).unwrap();
 
@@ -412,7 +520,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn zero_length_read_only_mapping_is_rejected() {
         let segment = SharedMemorySegment::new(4).unwrap();
 
@@ -422,7 +529,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn slice_at_returns_bounded_subrange() {
         let mut segment = SharedMemorySegment::new(8).unwrap();
         segment.as_mut_slice().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
@@ -431,7 +537,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn write_at_updates_bounded_subrange() {
         let segment = SharedMemorySegment::new(8).unwrap();
 
@@ -441,7 +546,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn with_slice_at_mut_updates_bounded_subrange() {
         let segment = SharedMemorySegment::new(8).unwrap();
 
@@ -451,7 +555,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_only_mapping_clones_contents_from_fd() {
         let mut segment = SharedMemorySegment::new(4).unwrap();
         segment.as_mut_slice().copy_from_slice(&[1, 2, 3, 4]);
@@ -461,7 +564,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn read_only_mapping_rejects_len_larger_than_backing_file() {
         let segment = SharedMemorySegment::new(4).unwrap();
 
@@ -476,5 +578,96 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn read_write_mapping_rejects_len_larger_than_backing_file() {
+        let segment = SharedMemorySegment::new(4).unwrap();
+
+        let error = SharedMemorySegment::map_read_write(segment.try_clone_fd().unwrap(), 1 << 21).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CaptureTransferError::SharedMemory {
+                operation: "mmap-read-write",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn new_segment_is_zero_filled() {
+        let segment = SharedMemorySegment::new(4096 + 17).unwrap();
+
+        assert!(segment.as_slice().iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn mappings_share_storage_and_outlive_the_creating_segment() {
+        let segment = SharedMemorySegment::new(8).unwrap();
+        let peer = SharedMemorySegment::map_read_write(segment.try_clone_fd().unwrap(), 8).unwrap();
+
+        peer.write_at(1, &[4, 5]);
+        assert_eq!(segment.slice_at(0, 4), &[0, 4, 5, 0]);
+
+        segment.write_at(6, &[9]);
+        drop(segment);
+
+        assert_eq!(peer.slice_at(0, 8), &[0, 4, 5, 0, 0, 0, 9, 0]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mappings_reject_uncommitted_sections() {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::Memory::{CreateFileMappingW, PAGE_READWRITE, SEC_RESERVE},
+        };
+
+        // SAFETY: this creates an unnamed section with reserved, uncommitted
+        // pages. Neither mapping attempt below dereferences those pages.
+        let raw = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                4096,
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null(), "{}", std::io::Error::last_os_error());
+        // SAFETY: raw is a fresh valid section handle owned by nothing else.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+
+        for (result, expected_operation) in [
+            (
+                SharedMemorySegment::map_read_only(handle.try_clone().unwrap(), 4096),
+                "mmap-read-only",
+            ),
+            (SharedMemorySegment::map_read_write(handle, 4096), "mmap-read-write"),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(CaptureTransferError::SharedMemory { operation, .. }) if operation == expected_operation
+                ),
+                "{expected_operation} accepted an uncommitted section: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn borrowed_mapping_handle_identifies_the_section() {
+        let segment = SharedMemorySegment::new(4).unwrap();
+        segment.write_at(0, &[1, 2, 3, 4]);
+
+        let handle = segment.mapping_handle().try_clone_to_owned().unwrap();
+        let mapped = SharedMemorySegment::map_read_only(handle, 4).unwrap();
+
+        assert_eq!(mapped.as_slice(), &[1, 2, 3, 4]);
     }
 }

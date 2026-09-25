@@ -297,9 +297,9 @@ impl IncarnationObserver {
         process: Option<Arc<ProcessWatch>>,
         drain_timeout: Duration,
     ) -> Result<Self, ArenaError> {
-        // Socket directions are independent: consumers read data/capacity wakes
-        // on one end and write handoff wakes back to this sole reverse reader.
-        let mut receiver = wait::Receiver::from_fd(claims.wake.fd()?)?;
+        // Wake directions are independent: consumers read data/capacity wakes
+        // and write handoff wakes back to this sole reverse reader.
+        let mut receiver = wait::producer_receiver(&claims.wake, &claims.release_wake)?;
         let wake = Arc::clone(&claims.release_wake);
         let state = Arc::new(Mutex::new(ObservationState {
             armed: vec![None; claims.frames],
@@ -333,7 +333,7 @@ impl IncarnationObserver {
                 if worker_stop.load(SeqCst) {
                     break;
                 }
-                // Retain the watch FD while sleeping: a concurrent host refresh
+                // Retain the process watch while sleeping: a concurrent host refresh
                 // can consume its exit event and remove it from shared state.
                 let (process, deadline) = {
                     let state = worker_state.lock().expect("incarnation cleanup state");
@@ -342,7 +342,7 @@ impl IncarnationObserver {
                     }
                     (state.process.clone(), state.wake_deadline())
                 };
-                if let Err(error) = receiver.sleep(process.as_ref().map(|process| process.fd()), deadline) {
+                if let Err(error) = receiver.sleep(process.as_deref(), deadline) {
                     worker_state
                         .lock()
                         .expect("incarnation cleanup state")

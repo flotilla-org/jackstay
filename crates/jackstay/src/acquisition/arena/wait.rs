@@ -1,9 +1,5 @@
 use std::{
-    io::{self, Read, Write},
-    os::{
-        fd::{AsRawFd, OwnedFd},
-        unix::net::UnixStream,
-    },
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering::SeqCst},
@@ -13,127 +9,22 @@ use std::{
 
 use super::{ACTIVE, ArenaConsumer, ArenaError, CAPACITY_EPOCH, LATEST, RECONFIGURATION_EPOCH, WAIT_INTEREST};
 
+// Each OS supplies the coalescing wake primitive and its sleep. Everything
+// else here (arming, epochs, cancellation precedence) is platform-neutral.
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as sys;
+#[cfg(windows)]
+mod windows;
+pub(super) use sys::{Receiver, Wake, import, incarnation, producer_endpoint, producer_receiver};
+#[cfg(windows)]
+use windows as sys;
+
 pub(super) const DATA: u64 = 1;
 pub(super) const CAPACITY: u64 = 2;
 pub(super) const RECONFIGURATION: u64 = 4;
 pub(super) const CLOSED: u64 = 8;
-
-#[derive(Debug)]
-pub(super) struct Wake(UnixStream);
-
-#[derive(Debug)]
-pub(super) struct Receiver(UnixStream);
-
-pub(super) fn channel() -> io::Result<(Arc<Wake>, Receiver)> {
-    let (writer, reader) = UnixStream::pair()?;
-    crate::socket_options::suppress_sigpipe(&writer)?;
-    writer.set_nonblocking(true)?;
-    reader.set_nonblocking(true)?;
-    Ok((Arc::new(Wake(writer)), Receiver(reader)))
-}
-
-impl Wake {
-    pub(super) fn from_fd(fd: OwnedFd) -> io::Result<Self> {
-        let stream = UnixStream::from(fd);
-        crate::socket_options::suppress_sigpipe(&stream)?;
-        stream.set_nonblocking(true)?;
-        Ok(Self(stream))
-    }
-
-    pub(super) fn fd(&self) -> io::Result<OwnedFd> {
-        self.0.try_clone().map(OwnedFd::from)
-    }
-
-    pub(super) fn signal(&self) -> io::Result<()> {
-        // The writer is configured at creation/import so a closed receiver is
-        // an I/O error even when the embedding host has default SIGPIPE handling.
-        loop {
-            match (&self.0).write(&[1]) {
-                Ok(1) => return Ok(()),
-                Ok(_) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                // A pending byte is sufficient: the waiter rechecks shared
-                // state, rather than counting notifications as frame events.
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-impl Receiver {
-    pub(super) fn fd(&self) -> io::Result<OwnedFd> {
-        self.0.try_clone().map(OwnedFd::from)
-    }
-
-    pub(super) fn sleep(&self, process_fd: Option<std::os::fd::RawFd>, deadline: Option<Instant>) -> io::Result<()> {
-        let mut descriptors = [
-            libc::pollfd {
-                fd: self.0.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: process_fd.unwrap_or(-1),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        loop {
-            // SAFETY: initialized descriptors and their owned FDs live through poll.
-            let milliseconds = deadline.map_or(-1, |deadline| {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                remaining
-                    .as_millis()
-                    .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
-                    .min(i32::MAX as u128) as i32
-            });
-            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, milliseconds) };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if descriptors[0].revents & libc::POLLHUP != 0
-                || descriptors
-                    .iter()
-                    .any(|descriptor| descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
-            {
-                return Err(io::Error::other("cleanup observation channel failed"));
-            }
-            // A process descriptor's HUP is a wake, not a socket failure. The
-            // lifetime observer validates its backend-specific terminal event.
-            return Ok(());
-        }
-    }
-
-    pub(super) fn from_fd(fd: OwnedFd) -> io::Result<Self> {
-        let stream = UnixStream::from(fd);
-        stream.set_nonblocking(true)?;
-        Ok(Self(stream))
-    }
-
-    pub(super) fn into_fd(self) -> OwnedFd {
-        self.0.into()
-    }
-
-    pub(super) fn drain(&mut self) -> io::Result<()> {
-        // Bounded drain: a notification flood must not starve cancellation or
-        // the predicate recheck. Residual bytes keep the next poll readable.
-        let mut bytes = [0; 4096];
-        loop {
-            match self.0.read(&mut bytes) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-                Ok(_) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
 
 /// Snapshot BEFORE checking the acquisition predicate, then pass it to wait if
 /// acquisition reports no usable result. Epochs are notifications, not leases.
@@ -184,7 +75,7 @@ pub struct Cancellation(Arc<CancellationInner>);
 
 impl Cancellation {
     pub fn new() -> io::Result<Self> {
-        let (wake, reader) = channel()?;
+        let (wake, reader) = sys::channel()?;
         Ok(Self(Arc::new(CancellationInner {
             cancelled: AtomicBool::new(false),
             wake,
@@ -258,44 +149,12 @@ impl ArenaConsumer {
             if interest.changed(observed, current) {
                 return Ok(WaitOutcome::Changed(current));
             }
-            let milliseconds = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Ok(WaitOutcome::TimedOut);
-                    }
-                    remaining
-                        .as_millis()
-                        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
-                        .min(i32::MAX as u128) as i32
-                }
-                None => -1,
-            };
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(WaitOutcome::TimedOut);
+            }
             #[cfg(test)]
             super::concurrency_tests::run_hook(super::concurrency_tests::Phase::BeforeSleep);
-            let mut descriptors = [
-                libc::pollfd {
-                    fd: self.receiver.0.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: cancel.0.reader.0.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            // SAFETY: both FDs and the initialized two-entry pollfd array live
-            // through the call. No application locks are held while sleeping.
-            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as libc::nfds_t, milliseconds) };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error.into());
-                }
-            } else if descriptors.iter().any(|fd| fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0) {
-                return Err(io::Error::other("acquisition wait channel failed").into());
-            }
+            self.receiver.sleep_or_cancel(&cancel.0.reader, deadline)?;
             // Cancellation is deliberately never drained: every current and
             // future waiter must see it. Data bytes are coalesced above.
         }
@@ -310,6 +169,7 @@ impl super::ClaimMap {
         match self.wake.signal() {
             // The consumer has destroyed its wait reader. Outstanding frame
             // claims still drain normally; this is not a reclamation signal.
+            // Windows events never report this; closure uses the claim page.
             Err(error) if matches!(error.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset) => {
                 self.word(ACTIVE).store(0, SeqCst);
                 Ok(())

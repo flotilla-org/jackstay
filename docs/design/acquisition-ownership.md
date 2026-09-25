@@ -239,7 +239,9 @@ completion before reusing a staging target. Actual IOSurface allocation sizes
 count against the arena byte budget. The old host/native and C paths have not
 yet been replaced. The new setup descriptor (version 7)
 carries five FDs: control, resources, claim page, notification reader,
-notification writer. Control and resource headers carry an arena scope; the
+notification writer. (On Windows these are handles, and the two notification
+objects are the consumer's and the producer's wake events; see
+acquisition-process-cleanup.md.) Control and resource headers carry an arena scope; the
 claim header has an independent incarnation scope. Import rejects mappings
 mixed between otherwise identical arenas.
 Both the producer and the consumer's release path can notify that consumer.

@@ -4,13 +4,12 @@
 use std::{
     cell::UnsafeCell,
     mem::{align_of, size_of},
-    os::fd::OwnedFd,
     sync::atomic::AtomicU64,
 };
 
 use super::{
-    ArenaError, CONFIGURATION, FIRST_CURSOR, FrameDescriptor, HEADER_LEN, LATEST, RECONFIGURATION_EPOCH, ResourceRecord, TERMINAL, VERSION,
-    checked_add, checked_mul, page_rounded,
+    ArenaError, CONFIGURATION, FIRST_CURSOR, FrameDescriptor, HEADER_LEN, LATEST, OwnedFd, RECONFIGURATION_EPOCH, ResourceRecord, TERMINAL,
+    VERSION, checked_add, checked_mul, page_rounded,
 };
 use crate::shm::SharedMemorySegment;
 const RESOURCE_MAGIC: u64 = u64::from_le_bytes(*b"JSRES001");

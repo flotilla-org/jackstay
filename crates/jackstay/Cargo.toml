@@ -29,11 +29,23 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# Already in the lockfile via tempfile; pagefile-backed shared memory.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory"] }
+# Already in the lockfile via tempfile. Pagefile-backed shared memory, and the
+# acquisition arena's wake events, process watches, page size and random scope.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dev-dependencies]
+# Test-only handle transfer into spawned children and a pipe completion source.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

@@ -1,6 +1,5 @@
 use std::{
     mem::ManuallyDrop,
-    os::fd::OwnedFd,
     sync::{Arc, atomic::Ordering::SeqCst},
 };
 
@@ -8,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ACTIVE, AdmissionError, AllocationId, ArenaConsumer, ArenaError, ArenaProducer, CLAIM_SLOT_LEN, CONFIGURATION, ClaimMap,
-    ConsumerResources, FIRST_CURSOR, HEADER_LEN, IncarnationId, OFFERED_GENERATION, RECONFIGURATION_EPOCH, ResourceAttachment,
+    ConsumerResources, FIRST_CURSOR, HEADER_LEN, IncarnationId, OFFERED_GENERATION, OwnedFd, RECONFIGURATION_EPOCH, ResourceAttachment,
     ResourceLayout, ResourceMap, TERMINAL, VERSION, wait,
 };
 

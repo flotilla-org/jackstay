@@ -1,11 +1,11 @@
-#![cfg(unix)]
-
 use jackstay::acquisition::arena::{
     AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, ConfigurationInstall, FrameDescriptor, PublishOutcome, ReconfigurationStatus,
 };
 
 #[path = "support/child.rs"]
 mod child;
+#[path = "support/setup.rs"]
+mod setup;
 
 #[test]
 fn a_stale_offer_with_a_contradictory_resource_header_is_an_error() {
@@ -46,17 +46,9 @@ fn a_stale_offer_with_a_contradictory_resource_header_is_an_error() {
 
 #[test]
 fn a_separate_process_installs_replacement_storage_while_retaining_its_old_frame() {
-    use std::{
-        io::{Read, Write},
-        os::{fd::AsRawFd, unix::net::UnixListener},
-        process::Command,
-        time::Duration,
-    };
+    use std::{process::Command, time::Duration};
 
-    use jackstay::fdpass;
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("configuration.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = setup::Listener::bind("configuration");
     let mut producer = ArenaProducer::new(ArenaConfig {
         resource_capacity: 6,
         retained_history: 2,
@@ -79,23 +71,18 @@ fn a_separate_process_installs_replacement_storage_while_retaining_its_old_frame
     let mut child = child::KillOnDrop(
         Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "mapped_configuration_child", "--nocapture"])
-            .env("JACKSTAY_CONFIGURATION_TEST_SOCKET", &socket)
+            .env("JACKSTAY_CONFIGURATION_TEST_SOCKET", listener.address())
             .spawn()
             .unwrap(),
     );
     let grant = producer.attach_process(2, child.id()).unwrap();
     let incarnation = grant.incarnation();
     let (descriptor, fds) = grant.into_parts().unwrap();
-    let (mut stream, _) = listener.accept().unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let json = serde_json::to_vec(&descriptor).unwrap();
-    stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
-    stream.write_all(&json).unwrap();
-    fdpass::send_fds(&stream, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
+    let mut stream = listener.accept();
+    stream.send(&descriptor);
+    stream.send_objects(&child, &fds);
     drop(fds);
-    let mut ready = [0];
-    stream.read_exact(&mut ready).unwrap();
-    assert_eq!(ready, [1]);
+    assert_eq!(stream.read_byte(), 1);
     producer.reconfigure_cpu(8).unwrap();
     let (replacement, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
     for _ in 0..100 {
@@ -109,10 +96,8 @@ fn a_separate_process_installs_replacement_storage_while_retaining_its_old_frame
             )
             .unwrap();
     }
-    let json = serde_json::to_vec(&replacement).unwrap();
-    stream.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
-    stream.write_all(&json).unwrap();
-    fdpass::send_fds(&stream, &[fd.as_raw_fd()]).unwrap();
+    stream.send(&replacement);
+    stream.send_objects(&child, std::slice::from_ref(&fd));
     drop(fd);
     assert!(child.wait().unwrap().success());
     assert_ne!(producer.attach(1).unwrap().incarnation(), incarnation);
@@ -121,24 +106,10 @@ fn a_separate_process_installs_replacement_storage_while_retaining_its_old_frame
 #[test]
 #[ignore = "subprocess helper invoked by a_separate_process_installs_replacement_storage_while_retaining_its_old_frame"]
 fn mapped_configuration_child() {
-    use std::{
-        io::{Read, Write},
-        os::unix::net::UnixStream,
-        time::Duration,
-    };
-
-    use jackstay::{
-        acquisition::arena::{ConfigurationGrant, ConsumerGrant},
-        fdpass,
-    };
-    let mut stream = UnixStream::connect(std::env::var("JACKSTAY_CONFIGURATION_TEST_SOCKET").unwrap()).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut len = [0; 4];
-    stream.read_exact(&mut len).unwrap();
-    let mut json = vec![0; u32::from_le_bytes(len) as usize];
-    stream.read_exact(&mut json).unwrap();
-    let descriptor = serde_json::from_slice(&json).unwrap();
-    let fds = fdpass::recv_fds(&stream, 5).unwrap().try_into().unwrap();
+    use jackstay::acquisition::arena::{ConfigurationGrant, ConsumerGrant};
+    let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_CONFIGURATION_TEST_SOCKET").unwrap());
+    let descriptor = stream.recv();
+    let fds = stream.recv_objects(5).try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer. This process is the
     // admitted sole recipient and does not fork or forward any setup grant.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
@@ -146,12 +117,9 @@ fn mapped_configuration_child() {
     let AcquireOutcome::Frame(old) = consumer.acquire_latest(0).unwrap() else {
         panic!("missing old frame")
     };
-    stream.write_all(&[1]).unwrap();
-    stream.read_exact(&mut len).unwrap();
-    let mut json = vec![0; u32::from_le_bytes(len) as usize];
-    stream.read_exact(&mut json).unwrap();
-    let descriptor = serde_json::from_slice(&json).unwrap();
-    let fd = fdpass::recv_fds(&stream, 1).unwrap().pop().unwrap();
+    stream.write_byte(1);
+    let descriptor = stream.recv();
+    let fd = stream.recv_objects(1).pop().unwrap();
     // SAFETY: this is the parent's single-use replacement offer for the same
     // admitted process. It retains its allocation until this recipient retires it.
     let offer = unsafe { ConfigurationGrant::from_parts(&consumer, descriptor, fd) }.unwrap();

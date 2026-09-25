@@ -42,7 +42,6 @@ unsafe impl Sync for SharedMemorySegment {}
 impl SharedMemorySegment {
     /// Raw access for internal typed shared-memory layouts. Unlike `as_slice`,
     /// this does not construct a plain reference spanning mutable atomic words.
-    #[cfg_attr(windows, allow(dead_code, reason = "only the Unix-only acquisition arena uses raw access so far"))]
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }

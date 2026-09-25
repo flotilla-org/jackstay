@@ -2,18 +2,23 @@
 //!
 //! The original stream remains the media setup stream: moving CPU setup to a
 //! socketpair would lose the original peer's kernel identity. Only the optional
-//! input channel is transferred. The host selects and authorizes both resources;
-//! this module creates no listener, discovers no source and grants no authority.
+//! input channel is transferred: a socketpair end passed with SCM_RIGHTS on
+//! Unix, or a private pipe-pair end duplicated into the verified peer process
+//! on Windows. The host selects and authorizes both resources; this module
+//! creates no listener, discovers no source and grants no authority.
 use std::{
     io::{self, Read, Write},
-    os::{fd::AsRawFd, unix::net::UnixStream},
-    thread,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::{os::fd::AsRawFd, thread};
 
-use crate::input::{
-    self, Mode, Target,
-    transport::{Client, ConnectError, Server},
+use crate::{
+    input::{
+        self, Mode, Target,
+        transport::{Client, ConnectError, Server},
+    },
+    local::Stream,
 };
 
 const MAGIC: &[u8; 8] = b"JSBOOT01";
@@ -28,14 +33,14 @@ pub enum InputRequest {
 
 pub struct Accepted {
     /// Continue with serve_cpu on this original, blocking connection.
-    pub media: UnixStream,
+    pub media: Stream,
     /// Retain this independently of media; dropping schedules target cleanup.
     pub input: Option<Server>,
 }
 
 pub struct Connected {
     /// Continue with CpuSetupClient on this original, blocking connection.
-    pub media: UnixStream,
+    pub media: Stream,
     pub input: Option<Client>,
     /// Clean admission rejection for Optional input; None for an observer.
     pub input_error: Option<input::Error>,
@@ -59,7 +64,7 @@ pub enum Error {
 /// On any failure all owned channels close; keep pumping target cleanup.
 /// The fixed-size bootstrap is bounded to five seconds. The returned media
 /// stream is blocking; existing read/write timeouts are left unchanged.
-pub fn accept(stream: UnixStream, target: Option<Target>) -> Result<Accepted, Error> {
+pub fn accept(stream: Stream, target: Option<Target>) -> Result<Accepted, Error> {
     let mut handshake = Handshake::new(stream)?;
     let mut request = [0; 12];
     handshake.read(&mut request)?;
@@ -73,7 +78,7 @@ pub fn accept(stream: UnixStream, target: Option<Target>) -> Result<Accepted, Er
     let input = if mode != 0 {
         target
             .map(|target| {
-                let (host, peer) = UnixStream::pair()?;
+                let (host, peer) = channel_pair()?;
                 Ok::<_, io::Error>((Server::start(target, host)?, peer))
             })
             .transpose()?
@@ -85,17 +90,7 @@ pub fn accept(stream: UnixStream, target: Option<Target>) -> Result<Accepted, Er
     reply[8..].copy_from_slice(&u32::from(input.is_some()).to_be_bytes());
     handshake.write(&reply)?;
     let server = if let Some((server, peer)) = input {
-        handshake.ready(libc::POLLOUT)?;
-        crate::fdpass::send_fd(&handshake.stream, peer.as_raw_fd())?;
-        // Retain the sending copy until the peer has installed the descriptor.
-        // Parallel macOS bootstrap tests otherwise intermittently see input EOF.
-        let mut receipt = [0];
-        handshake.read(&mut receipt)?;
-        if receipt != [1] {
-            return Err(Error::Protocol("input descriptor not received"));
-        }
-        // This copy must not keep the controller channel alive after peer loss.
-        drop(peer);
+        handshake.send_input(peer)?;
         Some(server)
     } else {
         None
@@ -113,7 +108,7 @@ pub fn accept(stream: UnixStream, target: Option<Target>) -> Result<Accepted, Er
 /// reason. Protocol/transport errors and Required rejection fail the whole setup.
 /// The caller separately attaches media. A later media failure does not close
 /// input automatically; close/poll it if the host abandons the association.
-pub fn connect(stream: UnixStream, request: InputRequest) -> Result<Connected, Error> {
+pub fn connect(stream: Stream, request: InputRequest) -> Result<Connected, Error> {
     let mut handshake = Handshake::new(stream)?;
     let mode = match request {
         InputRequest::None => None,
@@ -134,17 +129,7 @@ pub fn connect(stream: UnixStream, request: InputRequest) -> Result<Connected, E
         (None, 0) => {}
         (Some(_), 0) => input_error = Some(input::Error::Unsupported),
         (Some(mode), 1) => {
-            handshake.ready(libc::POLLIN)?;
-            let fd = crate::fdpass::recv_fd(&handshake.stream)?;
-            // SAFETY: this live received FD must not leak through exec.
-            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            let stream = UnixStream::from(fd);
-            if stream.peer_addr().is_err() {
-                return Err(Error::Protocol("input descriptor is not a connected Unix socket"));
-            }
-            handshake.write(&[1])?;
+            let stream = handshake.receive_input()?;
             match Client::connect(stream, mode) {
                 Ok(client) => input = Some(client),
                 Err(ConnectError::Admission(error)) => input_error = Some(error),
@@ -165,15 +150,29 @@ pub fn connect(stream: UnixStream, request: InputRequest) -> Result<Connected, E
     })
 }
 
+#[cfg(unix)]
+fn channel_pair() -> io::Result<(Stream, Stream)> {
+    Stream::pair()
+}
+
+#[cfg(windows)]
+fn channel_pair() -> io::Result<(Stream, Stream)> {
+    crate::local::pipe_pair()
+}
+
 // A fixed-size preface with an absolute deadline, not a per-byte timeout that a
 // stalled or trickling peer can extend. No buffered reader may eat media bytes
 // or the ancillary-data byte belonging to the input channel.
 struct Handshake {
-    stream: UnixStream,
+    stream: Stream,
     deadline: Instant,
+    #[cfg(windows)]
+    timeouts: (Option<Duration>, Option<Duration>),
 }
+
+#[cfg(unix)]
 impl Handshake {
-    fn new(stream: UnixStream) -> io::Result<Self> {
+    fn new(stream: Stream) -> io::Result<Self> {
         crate::socket_options::suppress_sigpipe(&stream)?;
         stream.set_nonblocking(true)?;
         Ok(Self {
@@ -230,8 +229,102 @@ impl Handshake {
         }
         Ok(())
     }
-    fn finish(self) -> io::Result<UnixStream> {
+    fn send_input(&mut self, peer: Stream) -> Result<(), Error> {
+        self.ready(libc::POLLOUT)?;
+        crate::fdpass::send_fd(&self.stream, peer.as_raw_fd())?;
+        // Retain the sending copy until the peer has installed the descriptor.
+        // Parallel macOS bootstrap tests otherwise intermittently see input EOF.
+        let mut receipt = [0];
+        self.read(&mut receipt)?;
+        if receipt != [1] {
+            return Err(Error::Protocol("input descriptor not received"));
+        }
+        // This copy must not keep the controller channel alive after peer loss.
+        drop(peer);
+        Ok(())
+    }
+    fn receive_input(&mut self) -> Result<Stream, Error> {
+        self.ready(libc::POLLIN)?;
+        let fd = crate::fdpass::recv_fd(&self.stream)?;
+        // SAFETY: this live received FD must not leak through exec.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let stream = Stream::from(fd);
+        if stream.peer_addr().is_err() {
+            return Err(Error::Protocol("input descriptor is not a connected Unix socket"));
+        }
+        self.write(&[1])?;
+        Ok(stream)
+    }
+    fn finish(self) -> io::Result<Stream> {
         self.stream.set_nonblocking(false)?;
+        Ok(self.stream)
+    }
+}
+
+// Windows pipes are overlapped: each blocking operation is bounded by the time
+// left until the absolute deadline, then the host's own timeouts are restored.
+#[cfg(windows)]
+impl Handshake {
+    fn new(stream: Stream) -> io::Result<Self> {
+        stream.set_nonblocking(false)?;
+        let timeouts = (stream.read_timeout()?, stream.write_timeout()?);
+        Ok(Self {
+            stream,
+            deadline: Instant::now() + TIMEOUT,
+            timeouts,
+        })
+    }
+    fn bound(&self) -> io::Result<()> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.set_write_timeout(Some(remaining))
+    }
+    fn read(&mut self, mut bytes: &mut [u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            self.bound()?;
+            match self.stream.read(bytes) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => bytes = &mut bytes[count..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.bound()?;
+        self.stream.write_all(bytes)?;
+        self.stream.flush()
+    }
+    fn send_input(&mut self, peer: Stream) -> Result<(), Error> {
+        self.bound()?;
+        // Duplication closes this copy before the peer learns the value, so it
+        // cannot keep the controller channel alive after peer loss; the peer
+        // acknowledges adopting it within the same deadline.
+        crate::local::send_handles(&mut self.stream, vec![(peer.into_handle()?, crate::local::Access::Same)])?;
+        Ok(())
+    }
+    fn receive_input(&mut self) -> Result<Stream, Error> {
+        self.bound()?;
+        let handle = crate::local::receive_handles(&mut self.stream, 1)?.remove(0);
+        // SAFETY: the host this stream connected to duplicated its private pipe
+        // end into this process for this receiver alone.
+        let stream = unsafe { crate::local::PipeStream::from_owned_handle(handle, false) }
+            .map_err(|_| Error::Protocol("input handle is not a connected pipe"))?;
+        if !stream.is_alive() {
+            return Err(Error::Protocol("input handle is not a connected pipe"));
+        }
+        Ok(stream)
+    }
+    fn finish(self) -> io::Result<Stream> {
+        self.stream.set_read_timeout(self.timeouts.0)?;
+        self.stream.set_write_timeout(self.timeouts.1)?;
         Ok(self.stream)
     }
 }

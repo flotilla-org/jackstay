@@ -85,8 +85,9 @@ The viewer requests optional cooperative input by default. `--observe` never
 requests it; `--require-input` fails rather than attaching without it. The source's
 `--observe-only` option withholds input authority. The direct `--cpu-socket` and
 `--input-socket` options remain low-level adapter test paths, not the combined
-source interface. This bootstrap does not yet extend native GPU setup, Windows
-transport or the cross-host bridge.
+source interface. On Windows the input channel is a private pipe-pair end
+duplicated into the verified peer ([Local Endpoints](local-endpoints.md)). This
+bootstrap does not yet extend native GPU setup or the cross-host bridge.
 
 Public Rust/C tests cover independent channel lifetimes, observer admission,
 optional/required refusal, busy targets, malformed offers, stalled negotiation

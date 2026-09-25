@@ -411,7 +411,8 @@ impl RemoteConsumerGrant {
 
 /// Setup descriptor. Objects (FDs on Unix, handles on Windows): control,
 /// resources, claims, consumer notification endpoint, producer notification
-/// endpoint, in that order. Never resend a consumed grant.
+/// endpoint, in that order. Never resend a consumed grant. The Windows setup
+/// channel grants each position its own access (`acquisition::socket`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantDescriptor {
     pub version: u64,
@@ -954,7 +955,6 @@ impl ArenaConsumer {
         self.lifetime.claims.incarnation
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn claim_scope(&self) -> [u8; 16] {
         self.lifetime.claims.scope
     }

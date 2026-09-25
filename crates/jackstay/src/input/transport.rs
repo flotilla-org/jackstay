@@ -1,9 +1,9 @@
-//! Versioned, bounded input over a host-authorized connected Unix stream.
+//! Versioned, bounded input over a host-authorized local connection: a
+//! connected Unix stream, or a named pipe on Windows ([`crate::local`]).
 //! Listener selection and authorization are deliberately outside this module.
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
-    os::unix::net::UnixStream,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -15,6 +15,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::*;
+use crate::local::Stream;
 const MAX_FRAME: usize = 128 * 1024;
 const MAX_BUFFER: usize = 512 * 1024;
 const STEP: Duration = Duration::from_millis(5);
@@ -38,14 +39,15 @@ enum Wire {
     Close,
 }
 struct Framed {
-    stream: UnixStream,
+    stream: Stream,
     input: Vec<u8>,
     output: VecDeque<Vec<u8>>,
     offset: usize,
     queued: usize,
 }
 impl Framed {
-    fn new(stream: UnixStream) -> io::Result<Self> {
+    fn new(stream: Stream) -> io::Result<Self> {
+        #[cfg(unix)]
         crate::socket_options::suppress_sigpipe(&stream)?;
         stream.set_nonblocking(true)?;
         Ok(Self {
@@ -87,6 +89,18 @@ impl Framed {
         }
         Ok(())
     }
+    /// Everything queued has been handed to the transport. A Windows pipe can
+    /// still be completing an accepted write in the background.
+    fn idle(&mut self) -> io::Result<bool> {
+        if !self.output.is_empty() {
+            return Ok(false);
+        }
+        match self.stream.flush() {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
     fn receive(&mut self) -> io::Result<Option<Wire>> {
         loop {
             if self.input.len() >= 4 {
@@ -121,7 +135,7 @@ impl Server {
     pub fn finished(&self) -> bool {
         self.worker.as_ref().is_none_or(|w| w.is_finished())
     }
-    pub fn start(target: Target, stream: UnixStream) -> io::Result<Self> {
+    pub fn start(target: Target, stream: Stream) -> io::Result<Self> {
         let wire = Framed::new(stream)?;
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
@@ -207,7 +221,7 @@ fn serve(target: Target, mut wire: Framed, stop: Arc<AtomicBool>) -> io::Result<
             heartbeat = Instant::now();
         }
         wire.flush()?;
-        if closing && wire.output.is_empty() {
+        if closing && wire.idle()? {
             return Ok(());
         }
         thread::sleep(STEP);
@@ -247,7 +261,7 @@ pub struct Client {
 }
 impl Client {
     /// Performs bounded startup (five seconds). Call off an input/render thread.
-    pub fn connect(stream: UnixStream, mode: Mode) -> Result<Self, ConnectError> {
+    pub fn connect(stream: Stream, mode: Mode) -> Result<Self, ConnectError> {
         let mut wire = Framed::new(stream)?;
         wire.send(Wire::Hello { version: 1, mode })?;
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -422,6 +436,17 @@ fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<Atom
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn pair() -> (Stream, Stream) {
+        Stream::pair().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn pair() -> (Stream, Stream) {
+        crate::local::pipe_pair().unwrap()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn closed_peer_is_an_error_with_default_sigpipe() {
         const CHILD: &str = "JACKSTAY_TEST_DEFAULT_SIGPIPE";
@@ -437,7 +462,7 @@ mod tests {
         // Change process-wide state only in this dedicated test subprocess.
         // Rust normally ignores SIGPIPE at startup; C hosts need not do so.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
-        let (stream, peer) = UnixStream::pair().unwrap();
+        let (stream, peer) = pair();
         let mut wire = Framed::new(stream).unwrap();
         drop(peer);
         wire.send(Wire::Reset).unwrap();
@@ -446,7 +471,7 @@ mod tests {
 
     #[test]
     fn close_ack_is_read_when_heartbeat_is_due_and_peer_has_closed() {
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair();
         let mut peer = Framed::new(a).unwrap();
         let wire = Framed::new(b).unwrap();
         let closed = Status::Closed {

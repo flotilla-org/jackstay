@@ -6,5 +6,4 @@ mod model;
 mod session;
 pub use model::*;
 pub use session::{Controller, Target};
-#[cfg(unix)]
 pub mod transport;

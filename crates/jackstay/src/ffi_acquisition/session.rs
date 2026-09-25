@@ -2,8 +2,6 @@
 
 use std::{
     ffi::{CStr, c_char},
-    net::Shutdown,
-    os::unix::net::UnixStream,
     ptr,
     sync::{
         Mutex,
@@ -20,7 +18,7 @@ use crate::{
 
 pub struct FtCpuAcquisitionConnection {
     client: Mutex<CpuSetupClient>,
-    shutdown: UnixStream,
+    shutdown: crate::local::ShutdownHandle,
     cancelled: AtomicBool,
 }
 
@@ -122,7 +120,7 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connection_cancel(connection: *const
     // SAFETY: caller keeps the handle alive until this operation returns.
     if let Some(connection) = unsafe { connection.as_ref() } {
         connection.cancelled.store(true, Ordering::Release);
-        let _ = connection.shutdown.shutdown(Shutdown::Both);
+        connection.shutdown.shutdown();
     }
 }
 
@@ -236,7 +234,7 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connection_destroy(connection: *mut 
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{os::unix::net::UnixStream, sync::Arc, thread, time::Duration};
 
     use super::*;
     use crate::acquisition::{

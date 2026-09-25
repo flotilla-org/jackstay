@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub mod arena;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod socket;
 
 mod allocation;

@@ -121,7 +121,8 @@ The initial implementation polls at 5 ms; readiness/wakeup optimization can foll
 without changing execution semantics. Missing peer traffic expires the controller
 independently of video progress. Application execution may still stall; expiry
 cannot complete its in-flight work or claim cleanup on the executor's behalf.
-The transport is currently Unix-only; the Rust state model builds on Windows.
+The transport runs over Unix sockets and, on Windows, over named pipes
+([Local Endpoints](local-endpoints.md)); the protocol is unchanged.
 
 ## Reference acceptance
 

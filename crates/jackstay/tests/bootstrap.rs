@@ -1,8 +1,7 @@
-#![cfg(unix)]
+//! Source bootstrap over a local connection: a Unix socket, or a Windows pipe.
 
 use std::{
     io::{Read, Write},
-    os::unix::net::UnixStream,
     thread,
     time::{Duration, Instant},
 };
@@ -10,7 +9,18 @@ use std::{
 use jackstay::{
     bootstrap::{self, InputRequest},
     input::{Config, Event, Mode, Operation, Outcome, Status, Target},
+    local::Stream,
 };
+
+#[cfg(unix)]
+fn pair() -> (Stream, Stream) {
+    Stream::pair().unwrap()
+}
+
+#[cfg(windows)]
+fn pair() -> (Stream, Stream) {
+    jackstay::local::pipe_pair().unwrap()
+}
 
 #[test]
 fn one_connection_bootstraps_input_without_consuming_media_bytes() {
@@ -32,7 +42,7 @@ fn concurrent_descriptor_handoffs_keep_input_connected() {
 
 fn exercise_input_roundtrip() {
     let target = Target::new(Config::default()).unwrap();
-    let (host, peer) = UnixStream::pair().unwrap();
+    let (host, peer) = pair();
     let host_target = target.clone();
     let worker = thread::spawn(move || bootstrap::accept(host, Some(host_target)).unwrap());
     let mut connection = bootstrap::connect(peer, InputRequest::Required(Mode::Cooperative)).unwrap();
@@ -73,7 +83,7 @@ fn exercise_input_roundtrip() {
 #[test]
 fn observer_does_not_claim_input_and_optional_denial_preserves_media() {
     for request in [InputRequest::None, InputRequest::Optional(Mode::Cooperative)] {
-        let (host, peer) = UnixStream::pair().unwrap();
+        let (host, peer) = pair();
         let target = Target::new(Config::default()).unwrap();
         let offered = if matches!(request, InputRequest::None) {
             Some(target.clone())
@@ -100,7 +110,7 @@ fn observer_does_not_claim_input_and_optional_denial_preserves_media() {
 
 #[test]
 fn required_input_denial_closes_media_and_optional_busy_is_explicit() {
-    let (host, peer) = UnixStream::pair().unwrap();
+    let (host, peer) = pair();
     let worker = thread::spawn(move || bootstrap::accept(host, None).unwrap());
     assert!(matches!(
         bootstrap::connect(peer, InputRequest::Required(Mode::Cooperative)),
@@ -111,7 +121,7 @@ fn required_input_denial_closes_media_and_optional_busy_is_explicit() {
 
     let target = Target::new(Config::default()).unwrap();
     let _existing = target.admit(Mode::Cooperative).unwrap();
-    let (host, peer) = UnixStream::pair().unwrap();
+    let (host, peer) = pair();
     let worker = thread::spawn(move || bootstrap::accept(host, Some(target)).unwrap());
     let connected = bootstrap::connect(peer, InputRequest::Optional(Mode::Cooperative)).unwrap();
     assert_eq!(connected.input_error, Some(jackstay::input::Error::Busy));
@@ -121,10 +131,10 @@ fn required_input_denial_closes_media_and_optional_busy_is_explicit() {
 
 #[test]
 fn malformed_preface_and_truncated_input_offer_fail_instead_of_downgrading() {
-    let (host, mut peer) = UnixStream::pair().unwrap();
+    let (host, mut peer) = pair();
     peer.write_all(b"BADBOOT1\0\0\0\0").unwrap();
     assert!(matches!(bootstrap::accept(host, None), Err(bootstrap::Error::Protocol(_))));
-    let (mut host, peer) = UnixStream::pair().unwrap();
+    let (mut host, peer) = pair();
     let worker = thread::spawn(move || {
         let mut hello = [0; 12];
         host.read_exact(&mut hello).unwrap();
@@ -137,7 +147,7 @@ fn malformed_preface_and_truncated_input_offer_fail_instead_of_downgrading() {
 
 #[test]
 fn silent_peer_cannot_hold_bootstrap_indefinitely() {
-    let (host, _peer) = UnixStream::pair().unwrap();
+    let (host, _peer) = pair();
     let started = Instant::now();
     assert!(matches!(bootstrap::accept(host, None), Err(bootstrap::Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
     assert!(started.elapsed() < Duration::from_secs(8));

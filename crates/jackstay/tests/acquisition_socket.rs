@@ -1,20 +1,60 @@
-#![cfg(any(target_os = "macos", target_os = "linux"))]
-// Windows: exercises the Unix socket setup channel; its named-pipe counterpart
-// is flotilla-org/jackstay#27.
+//! CPU setup over a local connection: a Unix socket, or a Windows named pipe.
 
 use std::{
-    os::unix::net::UnixStream,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use jackstay::acquisition::{
-    arena::{AcquireOutcome, ArenaConfig, ArenaProducer, FrameDescriptor},
-    socket::{CpuSetupClient, serve_cpu},
+use jackstay::{
+    acquisition::{
+        arena::{AcquireOutcome, ArenaConfig, ArenaProducer, FrameDescriptor},
+        socket::{CpuSetupClient, serve_cpu},
+    },
+    local::{self, Endpoint, Scope, Stream, Transport},
 };
 
 #[path = "support/child.rs"]
 mod child;
+
+#[cfg(unix)]
+fn pair() -> (Stream, Stream) {
+    Stream::pair().unwrap()
+}
+
+#[cfg(windows)]
+fn pair() -> (Stream, Stream) {
+    local::pipe_pair().unwrap()
+}
+
+fn endpoint(name: &str) -> Endpoint {
+    Endpoint::new(Scope::User, name, Transport::LocalStream).unwrap()
+}
+
+fn unique(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Tests in one binary bind concurrently; the clock alone can collide.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!("{prefix}-{}-{nonce}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Accept one connection, or fail the test instead of hanging on a lost child.
+fn accept(listener: &local::Listener) -> local::Connection {
+    std::thread::scope(|scope| {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        scope.spawn(move || {
+            if wait.recv_timeout(Duration::from_secs(10)).is_err() {
+                listener.cancel();
+            }
+        });
+        let connection = listener.accept().expect("child did not connect");
+        let _ = done.send(());
+        connection
+    })
+}
 
 fn new_producer() -> Arc<Mutex<ArenaProducer>> {
     Arc::new(Mutex::new(
@@ -34,7 +74,7 @@ fn new_producer() -> Arc<Mutex<ArenaProducer>> {
 #[test]
 fn socket_setup_admits_once_and_frames_outlive_connection_and_history() {
     let producer = new_producer();
-    let (server, stream) = UnixStream::pair().unwrap();
+    let (server, stream) = pair();
     let served = producer.clone();
     let task = std::thread::spawn(move || serve_cpu(server, served));
     // SAFETY: this stream's sole producer is the conforming arena above. The
@@ -69,7 +109,7 @@ fn connect(
     CpuSetupClient,
     std::thread::JoinHandle<Result<(), jackstay::acquisition::socket::SocketError>>,
 ) {
-    let (server, stream) = UnixStream::pair().unwrap();
+    let (server, stream) = pair();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     let producer = producer.clone();
@@ -203,49 +243,31 @@ fn socket_setup_can_resume_a_capacity_pause_after_the_old_frame_retires() {
 fn socket_eof_keeps_a_live_peers_claim_but_verified_process_exit_returns_admission() {
     use std::{
         io::{Read, Write},
-        os::unix::net::UnixListener,
         process::Command,
         time::Instant,
     };
 
-    use jackstay::acquisition::socket::peer_pid;
     let producer = new_producer();
     producer.lock().unwrap().publish(FrameDescriptor::default(), b"held").unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let setup_path = directory.path().join("setup.sock");
-    let control_path = directory.path().join("control.sock");
-    let setup = UnixListener::bind(&setup_path).unwrap();
-    let control = UnixListener::bind(&control_path).unwrap();
-    setup.set_nonblocking(true).unwrap();
-    control.set_nonblocking(true).unwrap();
+    let (setup_name, control_name) = (unique("setup"), unique("control"));
+    let setup = local::Listener::bind(&endpoint(&setup_name)).unwrap();
+    let control = local::Listener::bind(&endpoint(&control_name)).unwrap();
     let mut child = child::KillOnDrop(
         Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "socket_claim_child", "--nocapture"])
-            .env("JACKSTAY_SOCKET_SETUP_TEST", &setup_path)
-            .env("JACKSTAY_SOCKET_CONTROL_TEST", &control_path)
+            .env("JACKSTAY_SOCKET_SETUP_TEST", &setup_name)
+            .env("JACKSTAY_SOCKET_CONTROL_TEST", &control_name)
             .spawn()
             .unwrap(),
     );
-    let accept = |listener: &UnixListener| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "child did not connect");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("accept: {error}"),
-            }
-        }
-    };
-    let stream = accept(&setup);
-    assert_eq!(peer_pid(&stream).unwrap(), child.id());
-    assert_ne!(peer_pid(&stream).unwrap(), std::process::id());
+    let connection = accept(&setup);
+    // Admission uses the kernel-reported peer, never a claimed identity.
+    assert_eq!(connection.peer().pid, child.id());
+    assert_ne!(connection.peer().pid, std::process::id());
+    let stream = connection.into_stream();
     let served = producer.clone();
     let task = std::thread::spawn(move || serve_cpu(stream, served));
-    let mut control = accept(&control);
-    control.set_nonblocking(false).unwrap();
+    let mut control = accept(&control).into_stream();
     control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     control.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut response = [0; 4];
@@ -289,7 +311,9 @@ fn socket_eof_keeps_a_live_peers_claim_but_verified_process_exit_returns_admissi
 #[ignore = "subprocess helper invoked by socket_eof_keeps_a_live_peers_claim_but_verified_process_exit_returns_admission"]
 fn socket_claim_child() {
     use std::io::{Read, Write};
-    let stream = UnixStream::connect(std::env::var("JACKSTAY_SOCKET_SETUP_TEST").unwrap()).unwrap();
+    let stream = local::connect(&endpoint(&std::env::var("JACKSTAY_SOCKET_SETUP_TEST").unwrap()))
+        .unwrap()
+        .into_stream();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     // SAFETY: the parent binds this single-use grant to the child's real socket
     // peer identity. The child never forks or forwards its mappings.
@@ -299,7 +323,9 @@ fn socket_claim_child() {
         AcquireOutcome::Frame(frame) => frame,
         other => panic!("no child frame: {other:?}"),
     };
-    let mut control = UnixStream::connect(std::env::var("JACKSTAY_SOCKET_CONTROL_TEST").unwrap()).unwrap();
+    let mut control = local::connect(&endpoint(&std::env::var("JACKSTAY_SOCKET_CONTROL_TEST").unwrap()))
+        .unwrap()
+        .into_stream();
     control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     control.write_all(frame.bytes()).unwrap();
     let mut command = [0; 5];

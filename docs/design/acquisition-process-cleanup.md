@@ -204,12 +204,13 @@ Windows port ([#26](https://github.com/flotilla-org/jackstay/issues/26)): the
 arena unit tests and the `acquisition_arena`, `acquisition_cleanup`,
 `acquisition_reconfiguration`, `acquisition_release`, `acquisition_retirement`
 and `acquisition_wait` suites run on Windows, including their separate-process
-tests. Without a Windows setup channel yet, those tests move the grant's handles
-with a test-only transfer: the parent duplicates each handle straight into the
-child it spawned (or, when the child is the producer, out of it). Consumer kills
+tests. Their parent/child helper now moves the grant's handles over a
+[Local Endpoint](local-endpoints.md) pipe: whichever end holds the objects
+duplicates them into its verified peer, which acknowledges them. Consumer kills
 use `TerminateProcess`, which runs no destructors. A new test kills a producer
 process while its consumer holds frames; the consumer's bytes, mappings and
 retained frame remain, and a wait simply times out, because producer exit is a
 setup-channel event, not an arena one. Another admits a child by process handle
-and reclaims its reservation only after the child is killed. The suites that
-need the Unix socket setup channel or the acquisition C ABI stay gated until #27.
+and reclaims its reservation only after the child is killed. The named-pipe setup
+channel ([#27](https://github.com/flotilla-org/jackstay/issues/27)) admits its
+accepted peer this way with `attach_process_handle`.

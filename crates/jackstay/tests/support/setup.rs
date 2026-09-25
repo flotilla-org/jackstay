@@ -1,11 +1,11 @@
 //! Test-only stand-in for a setup channel between a parent test and the child
 //! process it spawned: length-prefixed JSON, barrier bytes, and OS objects.
 //!
-//! Unix passes FDs with SCM_RIGHTS over a Unix socket. Windows has no handle
-//! passing on a byte stream, so the parent duplicates each handle straight into
-//! the child it spawned and sends the resulting values over loopback TCP. The
-//! real Windows setup channel (named pipes per Wheelhouse ADR 0011) is separate
-//! work; this only moves already-created objects, as that channel will.
+//! Unix passes FDs with SCM_RIGHTS over a Unix socket. Windows uses Jackstay's
+//! named-pipe Local Endpoint (Wheelhouse ADR 0011): the listener identifies the
+//! connecting child, and handles are duplicated into whichever end is the peer,
+//! which acknowledges them. This only moves already-created objects, as the
+//! CPU setup channel does.
 #![allow(dead_code, reason = "each test crate uses a different subset")]
 
 #[cfg(unix)]
@@ -23,7 +23,7 @@ use serde::{Serialize, de::DeserializeOwned};
 #[cfg(unix)]
 type Stream = std::os::unix::net::UnixStream;
 #[cfg(windows)]
-type Stream = std::net::TcpStream;
+type Stream = jackstay::local::Stream;
 
 /// The parent's listening end. `address` goes to the child in an environment
 /// variable.
@@ -33,7 +33,7 @@ pub struct Listener {
     #[cfg(unix)]
     _directory: tempfile::TempDir,
     #[cfg(windows)]
-    listener: std::net::TcpListener,
+    listener: jackstay::local::Listener,
     address: String,
 }
 
@@ -51,9 +51,20 @@ impl Listener {
     }
 
     #[cfg(windows)]
-    pub fn bind(_name: &str) -> Self {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap().to_string();
+    pub fn bind(name: &str) -> Self {
+        use std::{
+            sync::atomic::{AtomicU64, Ordering},
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        // Tests in one binary bind concurrently; the clock alone can collide.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        let address = format!(
+            "test-{name}-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let listener = jackstay::local::Listener::bind(&endpoint(&address)).unwrap();
         Self { listener, address }
     }
 
@@ -61,10 +72,22 @@ impl Listener {
         &self.address
     }
 
+    #[cfg(unix)]
     pub fn accept(&self) -> Link {
         let (stream, _) = self.listener.accept().unwrap();
         Link::new(stream)
     }
+
+    #[cfg(windows)]
+    pub fn accept(&self) -> Link {
+        Link::new(self.listener.accept().unwrap().into_stream())
+    }
+}
+
+#[cfg(windows)]
+fn endpoint(address: &str) -> jackstay::local::Endpoint {
+    use jackstay::local::{Endpoint, Scope, Transport};
+    Endpoint::new(Scope::User, address, Transport::LocalStream).unwrap()
 }
 
 pub struct Link(Stream);
@@ -75,8 +98,14 @@ impl Link {
         Self(stream)
     }
 
+    #[cfg(unix)]
     pub fn connect(address: &str) -> Self {
         Self::new(Stream::connect(address).unwrap())
+    }
+
+    #[cfg(windows)]
+    pub fn connect(address: &str) -> Self {
+        Self::new(jackstay::local::connect(&endpoint(address)).unwrap().into_stream())
     }
 
     pub fn send<T: Serialize>(&mut self, value: &T) {
@@ -121,41 +150,16 @@ impl Link {
         jackstay::fdpass::recv_fds(&self.0, count).unwrap()
     }
 
-    /// Duplicate each handle into `peer` (same access, not inheritable) and
-    /// send the values the child can adopt. The sender keeps its own handles.
+    /// Duplicate each handle into the pipe's peer (same access, not
+    /// inheritable); it acknowledges adopting them. The sender keeps its own.
     #[cfg(windows)]
-    pub fn send_objects(&mut self, peer: &Child, objects: &[OwnedObject]) {
-        use std::os::windows::io::AsRawHandle;
-
-        use windows_sys::Win32::{
-            Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
-            System::Threading::GetCurrentProcess,
-        };
-        let mut values = Vec::with_capacity(objects.len());
-        for object in objects {
-            let mut duplicate = std::ptr::null_mut();
-            // SAFETY: both process handles and the source handle are live;
-            // the duplicate is owned by the child from here on.
-            let duplicated = unsafe {
-                DuplicateHandle(
-                    GetCurrentProcess(),
-                    object.as_raw_handle(),
-                    peer.as_raw_handle(),
-                    &mut duplicate,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            };
-            assert_ne!(duplicated, 0, "{}", std::io::Error::last_os_error());
-            values.push(duplicate as usize as u64);
-        }
-        self.send(&values);
+    pub fn send_objects(&mut self, _peer: &Child, objects: &[OwnedObject]) {
+        self.offer_objects(objects);
     }
 
     /// Offer OS objects to the parent process that spawned this one. The
-    /// parent collects them with [`Self::take_objects`]; on Windows this
-    /// process keeps its own handles open until it exits.
+    /// parent collects them with [`Self::take_objects`]. On Windows the child
+    /// duplicates copies straight into the parent, the pipe's server.
     #[cfg(unix)]
     pub fn offer_objects(&mut self, objects: &[OwnedObject]) {
         use std::os::fd::AsRawFd;
@@ -169,56 +173,18 @@ impl Link {
 
     #[cfg(windows)]
     pub fn offer_objects(&mut self, objects: &[OwnedObject]) {
-        use std::os::windows::io::AsRawHandle;
-        let values: Vec<u64> = objects.iter().map(|object| object.as_raw_handle() as usize as u64).collect();
-        self.send(&values);
+        use jackstay::local::{Access, send_handles};
+        let copies = objects.iter().map(|object| (object.try_clone().unwrap(), Access::Same)).collect();
+        send_handles(&mut self.0, copies).unwrap();
     }
 
-    /// Duplicate the handles a child offered into this process.
     #[cfg(windows)]
-    pub fn take_objects(&mut self, peer: &Child, count: usize) -> Vec<OwnedObject> {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-
-        use windows_sys::Win32::{
-            Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
-            System::Threading::GetCurrentProcess,
-        };
-        let values: Vec<u64> = self.recv();
-        assert_eq!(values.len(), count);
-        values
-            .into_iter()
-            .map(|value| {
-                let mut duplicate = std::ptr::null_mut();
-                // SAFETY: the child keeps each offered handle open while parked;
-                // the duplicate is a fresh handle owned by this process.
-                let duplicated = unsafe {
-                    DuplicateHandle(
-                        peer.as_raw_handle(),
-                        value as usize as _,
-                        GetCurrentProcess(),
-                        &mut duplicate,
-                        0,
-                        0,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                };
-                assert_ne!(duplicated, 0, "{}", std::io::Error::last_os_error());
-                // SAFETY: DuplicateHandle succeeded; nothing else owns it.
-                unsafe { OwnedObject::from_raw_handle(duplicate) }
-            })
-            .collect()
+    pub fn take_objects(&mut self, _peer: &Child, count: usize) -> Vec<OwnedObject> {
+        self.recv_objects(count)
     }
 
     #[cfg(windows)]
     pub fn recv_objects(&mut self, count: usize) -> Vec<OwnedObject> {
-        use std::os::windows::io::FromRawHandle;
-        let values: Vec<u64> = self.recv();
-        assert_eq!(values.len(), count);
-        values
-            .into_iter()
-            // SAFETY: the parent duplicated each handle into this process for
-            // this receiver alone; nothing else owns or closes these values.
-            .map(|value| unsafe { OwnedObject::from_raw_handle(value as usize as _) })
-            .collect()
+        jackstay::local::receive_handles(&mut self.0, count).unwrap()
     }
 }

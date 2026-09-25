@@ -1,5 +1,4 @@
 pub mod acquisition;
-#[cfg(unix)]
 pub mod bootstrap;
 pub mod control_page;
 #[cfg(unix)]
@@ -98,6 +97,7 @@ pub mod ffi_input;
 ))]
 pub mod ffi_native;
 pub mod input;
+pub mod local;
 pub mod model;
 pub mod native;
 pub mod shm;

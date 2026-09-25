@@ -746,7 +746,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn pool_must_exceed_rounded_ring_capacity() {
         let registry = FakeSurfaceRegistry::default();
         // Ring capacity 3 rounds to 4; a 4-slot pool could be fully pinned by
@@ -764,7 +763,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn producer_can_start_from_preallocated_native_parts() {
         let registry = FakeSurfaceRegistry::default();
         let mut backend = FakeNativeBackend::new(registry.clone());
@@ -785,7 +783,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn fake_backend_native_frame_round_trips_producer_ring_consumer() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 4, 5, PoolExhaustionPolicy::default());
@@ -821,7 +818,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn producer_reconfigure_switches_pool_and_config_without_resetting_stream_counters() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::default());
@@ -856,7 +852,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn producer_reconfigure_rejects_pool_that_cannot_escape_the_live_ring() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 3, 5, PoolExhaustionPolicy::default());
@@ -868,7 +863,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn native_frames_rotate_pool_slots_with_monotonic_fence_values() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::default());
@@ -893,7 +887,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn held_surface_is_never_restaged_until_released() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 2, 4, PoolExhaustionPolicy::default());
@@ -927,7 +920,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn exhausted_pool_drops_frames_and_accounts_the_gap() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::DropFrame);
@@ -964,7 +956,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn exhausted_pool_fails_without_consuming_the_frame_under_fail_policy() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::Fail);
@@ -991,7 +982,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn lapped_native_consumer_detects_lap_and_resyncs_to_latest() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::default());
@@ -1018,7 +1008,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows shared memory unimplemented; see flotilla-org/wheelhouse#53")]
     fn native_consumer_double_read_rejects_torn_slot() {
         let registry = FakeSurfaceRegistry::default();
         let mut producer = producer(&registry, 2, 3, PoolExhaustionPolicy::default());

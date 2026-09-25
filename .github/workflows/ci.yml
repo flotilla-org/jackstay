@@ -55,8 +55,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # Native capture and the setup channel are unsupported so far; suites
-      # that need the setup channel are gated off (flotilla-org/jackstay#27).
+      # Native capture is unsupported so far. The setup channel runs over named
+      # pipes; the acquisition C ABI suites are still gated (flotilla-org/jackstay#27).
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings

@@ -1,11 +1,23 @@
-#![cfg(unix)]
+//! Input over a local connection: a Unix socket, or a Windows named pipe.
 use std::{
-    os::unix::net::UnixStream,
     thread,
     time::{Duration, Instant},
 };
 
-use jackstay::input::{transport::*, *};
+use jackstay::{
+    input::{transport::*, *},
+    local::Stream,
+};
+
+#[cfg(unix)]
+fn pair() -> (Stream, Stream) {
+    Stream::pair().unwrap()
+}
+
+#[cfg(windows)]
+fn pair() -> (Stream, Stream) {
+    jackstay::local::pipe_pair().unwrap()
+}
 fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
     let start = Instant::now();
     loop {
@@ -19,7 +31,7 @@ fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
 #[test]
 fn socket_text_completion_and_disconnect_cleanup_are_executor_acknowledged() {
     let target = Target::new(Config::default()).unwrap();
-    let (a, b) = UnixStream::pair().unwrap();
+    let (a, b) = pair();
     let _server = Server::start(target.clone(), a).unwrap();
     let client = Client::connect(b, Mode::Cooperative).unwrap();
     let text = "é🙂".repeat(100);
@@ -56,7 +68,7 @@ fn worker_heartbeats_keep_idle_controller_alive_without_frame_or_application_pol
         ..Config::default()
     })
     .unwrap();
-    let (a, b) = UnixStream::pair().unwrap();
+    let (a, b) = pair();
     let _server = Server::start(target.clone(), a).unwrap();
     let client = Client::connect(b, Mode::Cooperative).unwrap();
     thread::sleep(Duration::from_millis(400));
@@ -72,7 +84,7 @@ fn worker_heartbeats_keep_idle_controller_alive_without_frame_or_application_pol
 #[test]
 fn maximum_text_survives_json_escaping_and_invalid_input_does_not_close_session() {
     let t = Target::new(Config::default()).unwrap();
-    let (a, b) = UnixStream::pair().unwrap();
+    let (a, b) = pair();
     let _server = Server::start(t.clone(), a).unwrap();
     let c = Client::connect(b, Mode::Cooperative).unwrap();
     assert_eq!(c.send(Event::Text("x".repeat(16385))), Err(Error::Invalid));

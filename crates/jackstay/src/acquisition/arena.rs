@@ -954,7 +954,6 @@ impl ArenaConsumer {
         self.lifetime.claims.incarnation
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn claim_scope(&self) -> [u8; 16] {
         self.lifetime.claims.scope
     }

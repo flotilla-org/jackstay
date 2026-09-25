@@ -1,7 +1,9 @@
 # CPU acquisition setup over Unix sockets
 
 `acquisition::socket` supplies the setup boundary for the common CPU arena on
-macOS and Linux. Porthole's CPU host, recorder and SDL reference viewer now
+macOS and Linux. The same protocol runs over named pipes on Windows, where
+grants move by duplication into the verified peer instead of SCM_RIGHTS; see
+[Local Endpoints](local-endpoints.md). Porthole's CPU host, recorder and SDL reference viewer now
 use it in the coordinated worktree. The old daemon acquire/release protocol and
 its Rust/C frame wrappers have been removed. Successful frames no longer depend
 on the diagnostic ring entry remaining readable.

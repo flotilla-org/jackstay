@@ -126,7 +126,7 @@ ft_status ft_input_target_resolve(ft_input_target *target);
 /* DRAINING keeps the handle live until controller cleanup finishes; failed
  * cleanup gives RECOVERY_REQUIRED. Destroy server/client first, then pump work. */
 ft_status ft_input_target_destroy(ft_input_target **target);
-#if !defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
+#if !defined(__cplusplus) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(ft_input_config) == 56, "input config ABI");
 _Static_assert(sizeof(ft_input_event) == 152, "input event ABI");
 _Static_assert(offsetof(ft_input_event, text) == 136, "input text pointer ABI");

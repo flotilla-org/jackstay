@@ -1561,9 +1561,13 @@ mod linux_tests {
         assert_eq!(release_sync_id, 42);
 
         server.join().unwrap();
+        // The server's socket is closed, but a process that another test
+        // thread is spawning at that moment can still hold the descriptor
+        // until it execs (CLOEXEC), so EOF may not be visible yet. Wait for
+        // the closure rather than checking once; TIMEOUT still fails.
         let mut ready_cursor = 0;
         assert_eq!(
-            unsafe { ft_native_wait_frame(attach, frame.cursor, 0, &mut ready_cursor) },
+            unsafe { ft_native_wait_frame(attach, frame.cursor, 5_000_000_000, &mut ready_cursor) },
             FT_STATUS_CLOSED
         );
         assert_eq!(ready_cursor, frame.cursor);

@@ -531,3 +531,114 @@ fn local_ffi_producer_child() {
         }
     }
 }
+
+/// # Safety
+/// A live connection handle, used only by the caller.
+unsafe fn read_line(connection: *mut FtLocalConnection, capacity: usize, timeout_ms: u32) -> (FtStatus, Vec<u8>) {
+    let mut line = vec![0; capacity];
+    let mut len = usize::MAX;
+    // SAFETY: live connection; the buffer and length are disjoint locals.
+    let status = unsafe { ft_local_connection_read_until(connection, b'\n', line.as_mut_ptr(), capacity, &mut len, timeout_ms) };
+    line.truncate(len);
+    (status, line)
+}
+
+/// # Safety
+/// A live connection handle, used only by the caller.
+unsafe fn write(connection: *mut FtLocalConnection, bytes: &[u8]) -> FtStatus {
+    // SAFETY: live connection; bytes are live for the call.
+    unsafe { ft_local_connection_write(connection, bytes.as_ptr(), bytes.len(), 5000) }
+}
+
+#[test]
+fn a_host_exchange_runs_before_setup_on_the_same_connection() {
+    let name = CString::new(unique("local-ffi-exchange")).unwrap();
+    let endpoint = endpoint(&name);
+    // SAFETY: this test owns every handle; each crosses threads with one owner.
+    unsafe {
+        let mut listener = ptr::null_mut();
+        assert_eq!(ft_local_listener_create(&endpoint, &mut listener), FT_STATUS_OK);
+        let address = Raw(listener as usize);
+        let host = thread::spawn(move || {
+            let accept = || {
+                let mut connection = ptr::null_mut();
+                assert_eq!(
+                    ft_local_listener_accept(address.0 as *const FtLocalListener, &mut connection),
+                    FT_STATUS_OK
+                );
+                connection
+            };
+            // A host authorizes with its own line protocol, then hands over.
+            let authorized = accept();
+            assert_eq!(read_line(authorized, 64, 5000), (FT_STATUS_OK, b"token=abc\n".to_vec()));
+            assert_eq!(write(authorized, b"{\"op\":\"opened\"}\n"), FT_STATUS_OK);
+            // A reply without a delimiter within the capacity.
+            let mut long = accept();
+            assert_eq!(write(long, b"abcdef"), FT_STATUS_OK);
+            // A host that never answers.
+            let mut silent = accept();
+            assert_eq!(read_line(silent, 8, 5000).0, FT_STATUS_CLOSED, "the client gave up and closed");
+            ft_local_connection_destroy(&mut silent);
+            // A host that trickles one byte every 50 ms, never the delimiter.
+            let mut trickle = accept();
+            for _ in 0..40 {
+                if write(trickle, b"x") != FT_STATUS_OK {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            ft_local_connection_destroy(&mut trickle);
+            ft_local_connection_destroy(&mut long);
+            Raw(authorized as usize)
+        });
+
+        let mut client = ptr::null_mut();
+        assert_eq!(ft_local_connect(&endpoint, &mut client), FT_STATUS_OK);
+        assert_eq!(ft_local_connection_write(client, ptr::null(), 1, 5000), FT_STATUS_INVALID_ARGUMENT);
+        assert_eq!(ft_local_connection_write(client, b"x".as_ptr(), 1, 0), FT_STATUS_INVALID_ARGUMENT);
+        assert_eq!(write(client, b"token=abc\n"), FT_STATUS_OK);
+        // Setup bytes follow the reply on the same stream; none are consumed.
+        assert_eq!(read_line(client, 64, 5000), (FT_STATUS_OK, b"{\"op\":\"opened\"}\n".to_vec()));
+
+        let mut long = ptr::null_mut();
+        assert_eq!(ft_local_connect(&endpoint, &mut long), FT_STATUS_OK);
+        assert_eq!(read_line(long, 4, 5000), (FT_STATUS_CAPACITY, b"abcd".to_vec()));
+        ft_local_connection_destroy(&mut long);
+
+        let mut silent = ptr::null_mut();
+        assert_eq!(ft_local_connect(&endpoint, &mut silent), FT_STATUS_OK);
+        let started = Instant::now();
+        assert_eq!(read_line(silent, 8, 100), (FT_STATUS_TIMEOUT, Vec::new()));
+        assert!(started.elapsed() < DEADLINE);
+        ft_local_connection_destroy(&mut silent);
+
+        // The deadline covers the whole call, not each byte.
+        let mut trickle = ptr::null_mut();
+        assert_eq!(ft_local_connect(&endpoint, &mut trickle), FT_STATUS_OK);
+        let started = Instant::now();
+        let (status, partial) = read_line(trickle, 64, 300);
+        assert_eq!(status, FT_STATUS_TIMEOUT);
+        assert!(!partial.is_empty(), "some bytes arrived before the deadline");
+        assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
+        ft_local_connection_destroy(&mut trickle);
+
+        let mut served = host.join().unwrap().0 as *mut FtLocalConnection;
+        ft_local_listener_destroy(&mut listener);
+        let mut producer = ptr::null_mut();
+        assert_eq!(ft_cpu_producer_create(&producer_config(), &mut producer), FT_STATUS_OK);
+        let mut server = ptr::null_mut();
+        assert_eq!(ft_cpu_producer_serve_local(producer, &mut served, &mut server), FT_STATUS_OK);
+        let mut setup = ptr::null_mut();
+        assert_eq!(ft_acquisition_cpu_connection_create_local(&mut client, &mut setup), FT_STATUS_OK);
+        let mut consumer = ptr::null_mut();
+        assert_eq!(ft_acquisition_cpu_attach(setup, 1, &mut consumer), FT_STATUS_OK);
+        publish(producer, b"exchange");
+        let mut frame = acquire_after(consumer, setup, 0);
+        assert_eq!(bytes(frame).1, b"exchange");
+        assert_eq!(ft_acquired_frame_release(&mut frame), FT_STATUS_OK);
+        ft_acquisition_consumer_destroy(&mut consumer);
+        ft_acquisition_cpu_connection_destroy(&mut setup);
+        ft_cpu_setup_server_destroy(&mut server);
+        until("producer shutdown", || ft_cpu_producer_destroy(&mut producer) == FT_STATUS_OK);
+    }
+}

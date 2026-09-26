@@ -142,6 +142,34 @@ set to `FT_OS_OBJECT_NONE` once consumed.
 On Windows the build compiles `c_abi_header_smoke.c` with MSVC in C11 mode, and
 `acquisition_ffi` runs its C translation unit against a Rust producer.
 
+
+## C ABI 0.11: a host's own exchange
+
+A host may run its own exchange on a connection before the setup call that
+consumes it, for example to present a host-issued attach token and read which
+publication follows. Porthole's Windows native capture sessions work this way:
+the consumer sends one JSON line with the session's attach token, reads one
+reply line, and Jackstay's D3D11 or CPU setup then runs on the same stream.
+
+`ft_local_connection_write` sends bytes and `ft_local_connection_read_until`
+reads up to and including a delimiter byte, one byte at a time, so it never
+consumes the start of setup. Jackstay adds no framing and interprets nothing.
+Both take a nonzero timeout in milliseconds that bounds the whole call,
+however the peer paces its bytes, and hand the stream back as it was.
+After a failure (CLOSED, TIMEOUT, CAPACITY) the
+stream position is unknown and the caller destroys the connection. The calls
+are transport-neutral: the host protocol, not Jackstay, decides what the bytes
+mean, so no host's authority model enters the transport core.
+
+They share one helper with the bootstrap preface, `local::Bounded`: a stream
+whose operations are all bounded by one absolute deadline. On Unix it makes
+the socket non-blocking and `poll`s for the time left before each operation,
+touching no socket option, and puts the socket back to blocking at the end.
+On Windows each pipe operation runs with the pipe's timeouts set to the time
+left, and the previous timeouts are restored at the end. Its unit tests cover
+a deadline across many partial reads, a closed peer, and the stream's mode
+being handed back.
+
 ## Evidence
 
 Windows unit tests cover rendering, identity reported both ways, a taken name
@@ -179,6 +207,10 @@ cleanup and retire, and the producer, which refused destruction while the
 consumer lived, reclaims the dead process's claims and is destroyed. In the
 second test the producer child is killed while the consumer holds a frame: setup
 liveness turns CLOSED, the held bytes stay intact, and the input client closes
-without confirmed cleanup. The arena suites' parent/child helper
+without confirmed cleanup. A third test runs a host exchange (ABI 0.11) in
+one process: a token line and reply, then CPU setup and a frame on the same
+connection; a reply without the delimiter (CAPACITY); a silent host (TIMEOUT,
+after which the host sees CLOSED); and a host trickling bytes, which cannot
+stretch a 300 ms call. The arena suites' parent/child helper
 (`tests/support/setup.rs`) now uses the pipe endpoint and handle transfer instead
 of loopback TCP and parent-side duplication.

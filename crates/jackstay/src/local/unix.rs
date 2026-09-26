@@ -155,6 +155,17 @@ impl Listener {
             }
             // Accepted sockets can inherit O_NONBLOCK on macOS; setup is blocking.
             stream.set_nonblocking(false)?;
+            // Every Local Endpoint connection is born with SIGPIPE suppressed
+            // (SO_NOSIGPIPE on Darwin), before its peer can close, so any later
+            // write, including a host's own exchange, fails with EPIPE in a C
+            // host with the default disposition. A client already gone is
+            // skipped like any other.
+            if let Err(error) = crate::socket_options::suppress_sigpipe(&stream) {
+                if !is_alive(&stream) {
+                    continue;
+                }
+                return Err(error.into());
+            }
             // Skip a client that already left without sending anything, such
             // as another bind's liveness probe (macOS cannot even report its
             // PID). It never held a session worth handing to the host.
@@ -185,6 +196,7 @@ impl Drop for Listener {
 pub(super) fn connect(endpoint: &Endpoint) -> Result<Connection, Error> {
     let directory = private_directory(false)?;
     let stream = UnixStream::connect(directory.join(format!("{}.sock", endpoint.name)))?;
+    crate::socket_options::suppress_sigpipe(&stream)?;
     let server = identity(&stream)?;
     if server.user != euid().to_string() {
         return Err(Error::UntrustedServer(format!(

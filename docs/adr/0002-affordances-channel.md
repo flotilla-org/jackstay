@@ -26,7 +26,7 @@ turning this one into a generic widget protocol.
 - **Producer-drawn chrome:** duplicates host themes, scaling, accessibility and
   control layout. Producers describe application meaning; hosts choose controls
   and appearance. Content frames remain on media.
-- **Porthole control-API vocabulary:** couples app-to-app state to one desktop
+- **[Porthole control-API vocabulary (#32, ruling 1)](https://github.com/flotilla-org/jackstay/issues/32):** couples app-to-app state to one desktop
   coordinator. These domains require no desktop authority; Porthole is one host
   and authorization remains host supplied.
 - **Generic widgets:** transfers layout and toolkit semantics, growing a remote
@@ -54,4 +54,4 @@ checked and children with activate/about-to-show; lazy population deserves its
 own contract. Dialogs and pickers are deferred because they require request/reply,
 deferral and cancellation semantics. Pixel buffers for assets are deferred
 because they require ownership, bounds and lifetime rules beyond references.
-The toolkit slice implements Rust and C parity; this decision implements no code.
+The [toolkit slice (#39)](https://github.com/flotilla-org/jackstay/issues/39) implements Rust and C parity; this decision implements no code.

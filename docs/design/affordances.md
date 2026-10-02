@@ -1,6 +1,6 @@
 # Affordances channel, JSON version 1
 
-Status: accepted design for the toolkit slice; not an implemented ABI.
+Status: accepted design for the [toolkit slice (#39)](https://github.com/flotilla-org/jackstay/issues/39); not an implemented ABI.
 [ADR-0002](../adr/0002-affordances-channel.md) records the decision and
 [prior art](../affordance-prior-art-2026-09-25.md) records its evidence.
 The producer owns application state. The host owns chrome and publishes
@@ -49,7 +49,12 @@ that many UTF-8 bytes. Length must be 1 through 131072 bytes; queued wire bytes
 are bounded to 524288 including prefixes. These are separate from media and
 input queue bounds. Invalid framing/JSON or invalid required field types closes
 only the established affordances channel. Overflow closes it visibly rather
-than silently dropping verbs. Callers do not replay verbs after uncertainty.
+than silently dropping verbs. Callers do not replay verbs after uncertainty. Mid-session closure, including
+overflow, never fails media or input merely because affordances was optional.
+V1 has no heartbeat or idle expiry: an idle source may have unchanged state
+indefinitely. EOF/I/O failure detects disconnect; bounded output detects a
+stalled reader only when traffic accumulates. Silent stalls have no guaranteed
+detection deadline; hosts may close an unresponsive channel by their own policy.
 
 Every JSON object has `version: 1`, `domain` (string), `domain_version: 1`,
 `kind` (`snapshot` or `verb`) and `body` (object). A verb additionally has `verb`
@@ -64,7 +69,9 @@ Snapshots replace the complete state of one domain, including its `capabilities`
 object where applicable. Send an initial snapshot for every supported domain on
 each fresh connection, then on change. No old state survives reconnect; verbs
 are never replayed. Absent domains are unavailable until their first snapshot.
-A snapshot with `body: null` withdraws a domain and its controls (the sole
+A snapshot with `body: null` withdraws a domain and its controls. The receiver
+clears all cached state and capabilities for it; the producer ignores verbs for
+a withdrawn domain until it publishes that domain again (the sole
 exception to the object body rule). Nullable fields explicitly clear values;
 missing required fields are malformed, not a partial update. Delivery order is
 stream order in each direction; there is no total order across directions or
@@ -76,7 +83,14 @@ verbs, in `media`, `navigation` or `scroll`. A known message in the wrong
 direction is malformed and closes the channel.
 
 All field names below are exact and required unless explicitly called optional.
-Numbers are finite JSON numbers; strings are UTF-8. Capabilities are booleans in
+Numbers are finite JSON numbers representable as f64; strings are UTF-8.
+Out-of-range/nonfinite numbers, negative media position/duration, nonpositive
+scale or size dimensions, negative scroll lengths and out-of-range snapshot
+scroll positions are malformed and close the channel. Negative zero counts as
+zero (valid for nonnegative fields, invalid for strictly positive fields). Media
+rate is signed: negative means reverse playback; zero means no advancement.
+Verb seek/set-position clamping is explicitly described in their domains; no
+snapshot field is silently clamped. Capabilities are booleans in
 the snapshot's `body.capabilities`, named exactly like their verbs. Missing
 capability flags mean false. State availability and executable capability differ:
 `can_go_back`, for example, describes history, while `capabilities.back` describes
@@ -137,6 +151,10 @@ and icon resolution policy. Artwork is content metadata, not control appearance.
 | `reload` | `{}` |
 | `stop` | `{}` |
 | `load` | `{"url": string}` |
+
+Verb names and capability flags are domain-scoped: `media.stop` and
+`navigation.stop` are distinct operations. C discriminators must preserve the
+domain/verb pair, even if verb tags share numeric values.
 
 The producer owns URL interpretation and policy. A load is a semantic navigation
 verb, not injected typing into an address field. No completion reply is implied;
@@ -233,7 +251,7 @@ of the toolkit slice.
 | `ft_affordances_producer_publish` | Producer handle + borrowed typed snapshot; copies data before return |
 | `ft_affordances_producer_poll` | Producer handle; receives host snapshot or typed verb |
 | `ft_affordances_host_publish` | Host handle + borrowed presentation snapshot; copies before return |
-| `ft_affordances_host_send` | Host handle + typed domain/verb body; enqueue success only |
+| `ft_affordances_host_send` | Host handle + typed domain/verb body; enqueue success only, even if the channel later closes before delivery |
 | `ft_affordances_host_poll` | Host handle; receives producer snapshot or closure |
 | `ft_affordances_event_destroy` | Owned `ft_affordances_event`; releases borrowed payload views |
 | `ft_affordances_producer_close`, `ft_affordances_host_close` | Begin channel close; do not confirm input cleanup |

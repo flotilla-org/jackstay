@@ -103,6 +103,13 @@ application commands. Physical identifiers use DOM code names. Unknown physical
 positions must remain logical/text input rather than guessed codes. The SDL
 reference currently maps common keyboard positions and logs unmapped keys.
 
+Every executor receives DOM `KeyboardEvent.code` names on the wire for
+physical-mode key events and owns their translation to its platform's key identity
+(SDL scancode, `NSEvent.keyCode`, Windows virtual key or scan code, or `xkb`
+keycode). An executor that cannot translate a code rejects the operation cleanly
+and never guesses. Translation tables belong to the executor, not the library or
+the C ABI.
+
 The transport uses version-1 length-prefixed JSON messages internal to the Rust
 implementation; C/Zig callers do not implement that encoding. It bounds a frame
 to 128 KiB and queued wire bytes to 512 KiB, independently of configured event

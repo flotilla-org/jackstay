@@ -72,6 +72,9 @@ typedef struct {
   ft_input_geometry geometry;
 } ft_input_config;
 /* key is a NUL-terminated UTF-8 DOM code (physical) or key meaning (logical).
+ * Every executor receives DOM KeyboardEvent.code names for physical-mode keys
+ * on the wire and owns platform translation outside the library/C ABI, cleanly
+ * rejecting codes it cannot translate without guessing.
  * press is opaque and nonzero; repeat/up use the binding recorded by down.
  * Text is length-delimited UTF-8, copied by send; no SDL-sized text restriction.
  * x/y are target-local logical positions for motion/button and fractional deltas

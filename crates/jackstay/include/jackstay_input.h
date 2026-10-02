@@ -75,7 +75,8 @@ typedef struct {
  * Every executor receives DOM KeyboardEvent.code names for physical-mode keys
  * on the wire, owns platform translation and its tables (not the library/C ABI),
  * and completes unmappable codes as FT_INPUT_UNSUPPORTED without guessing
- * (client poll reports FT_INPUT_REFUSED; see docs/design/input.md).
+ * (client poll reports FT_INPUT_COMPLETED with result FT_INPUT_UNSUPPORTED;
+ * see docs/design/input.md).
  * press is opaque and nonzero; repeat/up use the binding recorded by down.
  * Text is length-delimited UTF-8, copied by send; no SDL-sized text restriction.
  * x/y are target-local logical positions for motion/button and fractional deltas

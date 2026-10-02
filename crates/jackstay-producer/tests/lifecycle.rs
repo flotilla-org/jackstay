@@ -366,3 +366,96 @@ fn malformed_ignored_verbs_never_reach_callbacks() {
     assert!(local::is_alive(&media));
     source.stop().unwrap();
 }
+
+// Review #57: all four user callback seams may panic. Complete in-flight input
+// as uncertain, close the owners, execute the cleanup barrier and report failure.
+#[test]
+fn callback_panics_still_run_ordered_shutdown() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use jackstay::affordances::Event as AffEvent;
+    struct Panics {
+        stage: u32,
+        trigger: Arc<AtomicBool>,
+        cleanups: Arc<AtomicU32>,
+    }
+    use std::sync::atomic::AtomicU32;
+    impl Panics {
+        fn fire(&self, stage: u32) {
+            if self.stage == stage && self.trigger.swap(false, Ordering::AcqRel) {
+                panic!("callback stage {stage}")
+            }
+        }
+    }
+    impl Producer for Panics {
+        fn frame(&mut self) -> Option<Frame> {
+            self.fire(1);
+            None
+        }
+        fn snapshots(&mut self) -> Vec<jackstay::affordances::Snapshot> {
+            self.fire(2);
+            Vec::new()
+        }
+        fn affordance(&mut self, _: AffEvent) {
+            self.fire(3)
+        }
+        fn execute(&mut self, w: Work) -> Outcome {
+            if matches!(w.operation, Operation::Event(_)) {
+                self.fire(0)
+            } else {
+                self.cleanups.fetch_add(1, Ordering::AcqRel);
+            }
+            Outcome::Executed
+        }
+    }
+    for stage in 0..4 {
+        let ep = endpoint(&format!("panic-{stage}"));
+        let trigger = Arc::new(AtomicBool::new(false));
+        let cleanups = Arc::new(AtomicU32::new(0));
+        let source = Builder::new(
+            ep.clone(),
+            config(),
+            Config::default(),
+            Panics {
+                stage,
+                trigger: trigger.clone(),
+                cleanups: cleanups.clone(),
+            },
+        )
+        .start()
+        .unwrap();
+        let c = bootstrap::connect_v2(
+            local::connect(&ep).unwrap().into_stream(),
+            InputRequest::Required(Mode::Cooperative),
+            ChannelRequest::Required,
+        )
+        .unwrap();
+        trigger.store(true, Ordering::Release);
+        if stage == 0 {
+            c.input.as_ref().unwrap().send(Event::Text("panic".into())).unwrap();
+        } else if stage == 3 {
+            c.affordances.as_ref().unwrap().publish(Default::default()).unwrap();
+        }
+        wait(|| !trigger.load(Ordering::Acquire));
+        let error = source.stop().unwrap_err();
+        assert!(error.to_string().contains("producer callback panicked"));
+        assert!(cleanups.load(Ordering::Acquire) > 0);
+        assert!(local::connect(&ep).is_err());
+        drop(c);
+    }
+}
+// Review #57: a silent peer occupies the one worker slot. Additional peers are
+// visibly disconnected and stop interrupts the admitted peer's stalled read.
+#[test]
+fn connection_limit_rejects_peers_while_bootstrap_stalls() {
+    let ep = endpoint("limit");
+    let source = Builder::new(ep.clone(), config(), Config::default(), TestProducer(Arc::default()))
+        .max_connections(1)
+        .start()
+        .unwrap();
+    let first = local::connect(&ep).unwrap();
+    let second = local::connect(&ep).unwrap();
+    wait(|| !second.is_alive());
+    assert!(first.is_alive());
+    source.stop().unwrap();
+}

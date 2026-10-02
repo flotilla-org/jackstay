@@ -31,6 +31,7 @@ pub struct Frame {
 pub trait Producer: Send + 'static {
     fn frame(&mut self) -> Option<Frame>;
     fn execute(&mut self, work: Work) -> Outcome;
+    /// Return only changed domains; an empty Vec requires no allocation.
     fn snapshots(&mut self) -> Vec<Snapshot> {
         Vec::new()
     }
@@ -81,28 +82,13 @@ impl<P: Producer> Builder<P> {
                 let c = match accept_listener.accept() {
                     Ok(c) => c,
                     Err(jackstay::local::Error::Cancelled) => break,
-                    Err(_) => continue,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
                 };
                 let mut peers = peers.lock().unwrap();
-                peers.retain_mut(|p| {
-                    if p.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-                        let _ = p.worker.take().unwrap().join();
-                        p.worker = None;
-                        let c = p.channels.lock().unwrap();
-                        c.as_ref().is_some_and(|c| {
-                            c.input.as_ref().is_some_and(|i| !i.finished()) || c.affordances.as_ref().is_some_and(|a| !a.finished())
-                        })
-                    } else {
-                        if p.worker.is_none() {
-                            let c = p.channels.lock().unwrap();
-                            c.as_ref().is_some_and(|c| {
-                                c.input.as_ref().is_some_and(|i| !i.finished()) || c.affordances.as_ref().is_some_and(|a| !a.finished())
-                            })
-                        } else {
-                            true
-                        }
-                    }
-                });
+                peers.retain_mut(Peer::alive);
                 if flag.load(Ordering::Acquire) {
                     break;
                 }
@@ -169,6 +155,24 @@ struct Peer {
     worker: Option<JoinHandle<()>>,
     channels: Arc<Mutex<Option<Channels>>>,
 }
+impl Peer {
+    fn alive(&mut self) -> bool {
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            let _ = self.worker.take().unwrap().join();
+        }
+        if self.worker.is_some() {
+            return true;
+        }
+        self.channels
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|c| c.input.as_ref().is_some_and(|i| !i.finished()) || c.affordances.as_ref().is_some_and(|a| !a.finished()))
+    }
+}
+fn callback<T>(f: impl FnOnce() -> T) -> io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| io::Error::other("producer callback panicked"))
+}
 /// Running source. Drop performs the same ordered shutdown as stop.
 pub struct Source {
     listener: Arc<Listener>,
@@ -214,7 +218,10 @@ fn pump<P: Producer>(
         target.tick();
         while let Some(work) = target.next() {
             let id = work.id;
-            let outcome = p.execute(work);
+            let outcome = callback(|| p.execute(work)).unwrap_or_else(|e| {
+                error = Some(e);
+                Outcome::Uncertain
+            });
             if let Err(e) = target.complete(id, outcome) {
                 error = Some(io::Error::other(format!("input completion: {e:?}")));
                 break;
@@ -223,9 +230,17 @@ fn pump<P: Producer>(
         if error.is_some() {
             break;
         }
-        for snapshot in p.snapshots() {
+        let changed = match callback(|| p.snapshots()) {
+            Ok(v) => v,
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        };
+        for snapshot in changed {
             snapshots.insert(snapshot.domain(), snapshot);
         }
+        let mut events = Vec::new();
         {
             let peers = peers.lock().unwrap();
             for peer in peers.iter() {
@@ -238,13 +253,29 @@ fn pump<P: Producer>(
                             }
                         }
                         while let Some(e) = a.poll() {
-                            p.affordance(e)
+                            events.push(e)
                         }
                     }
                 }
             }
         }
-        if let Some(frame) = p.frame() {
+        for event in events {
+            if let Err(e) = callback(|| p.affordance(event)) {
+                error = Some(e);
+                break;
+            }
+        }
+        if error.is_some() {
+            break;
+        }
+        let frame = match callback(|| p.frame()) {
+            Ok(v) => v,
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        };
+        if let Some(frame) = frame {
             let dims = (frame.descriptor.width, frame.descriptor.height, frame.descriptor.stride);
             let mut a = arena.lock().unwrap();
             // Avoid replacing the caller's correctly sized initial arena: a
@@ -320,7 +351,10 @@ fn pump<P: Producer>(
     drop(peers);
     while let Some(work) = target.next() {
         let id = work.id;
-        let outcome = p.execute(work);
+        let outcome = callback(|| p.execute(work)).unwrap_or_else(|e| {
+            error = Some(e);
+            Outcome::Uncertain
+        });
         let _ = target.complete(id, outcome);
     }
     if target.failed() {
@@ -328,7 +362,8 @@ fn pump<P: Producer>(
     }
     arena.lock().unwrap().stop();
     loop {
-        match arena.lock().unwrap().poll_shutdown_ready() {
+        let ready = arena.lock().unwrap().poll_shutdown_ready();
+        match ready {
             Ok(true) => break,
             Ok(false) => thread::sleep(Duration::from_millis(5)),
             Err(e) => {

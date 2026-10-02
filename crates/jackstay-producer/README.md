@@ -11,27 +11,38 @@ stops input servers, completes the input cleanup barrier, and drains media
 before freeing the owners. Dropping the source follows the same sequence.
 Errors in input cleanup or media draining are returned from `stop`.
 
+Fatal pump errors stop the source internally; `stop()` retrieves their error.
+There is no asynchronous failure accessor; `Drop` completes shutdown but
+discards its result. Call `stop()` to observe completion or failure.
+
 The endpoint uses an owner-only Unix runtime directory/socket or a Windows
 private named pipe. Endpoint access is scoped to the current user/session;
 the host still selects and authorizes the source. The builder input config
 specifies supported typing modes and capabilities; semantic callbacks confer
 no input authority. Connections are bounded to eight by default; use
 `max_connections` to change the limit. A silent bootstrap cannot hold shutdown.
+At the limit, newly accepted connections are closed without negotiation. A peer
+continues to count after media EOF while input or affordances remains alive.
 Each accepted connection runs the explicit v2 bootstrap on a worker bounded
 by the existing five-second handshake deadline. Successful media streams keep
 their original peer identity and go to the CPU setup server.
 
 Callbacks run serially on the source pump, roughly every five milliseconds.
-They must return promptly and must not panic. `frame` returns owned bytes and a
-complete descriptor, or `None` for unchanged content. Size/stride changes
+Each channel worker also polls at five milliseconds, so callback delivery can take about ten milliseconds or longer
+with scheduling/callback delays; this is polling rather than event driven.
+They must return promptly. Callback panics are caught, input execution is
+completed as uncertain where needed, and ordered shutdown still runs. Cleanup
+callbacks are attempted even after a panic; a failed cleanup is reported.
+`frame` returns owned bytes and a complete descriptor, or `None` for unchanged content. Size/stride changes
 reconfigure CPU storage; capacity pauses skip that publication and retry on
 later frames. Subsequent size changes advance the input geometry revision.
 `execute` receives `Work`, including cleanup: return `Executed` only after
 actual execution/release. Return `Uncertain` for execution uncertainty. Failed
 cleanup is reported, never silently treated as successful release.
 
-`snapshots` supplies complete changed domain state. The toolkit retains the
-latest state, publishes every supported domain on a new connection, and sends
+`snapshots` supplies complete changed domain state. Return an empty `Vec` on
+unchanged ticks (it allocates no heap storage); snapshots need only allocate
+when application state changes. The toolkit retains the latest state, publishes every supported domain on a new connection, and sends
 changes thereafter. Return `Snapshot::Withdraw(domain)` to remove a domain;
 omitting it from a later callback leaves its last snapshot intact. Snapshot
 publication is validated by Jackstay. Invalid snapshots are rejected

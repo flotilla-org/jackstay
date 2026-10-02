@@ -203,7 +203,7 @@ fn c_bootstrap_snapshot_verb_and_destroy() {
 #[test]
 fn compiled_c_publishes_to_rust_host() {
     unsafe extern "C" {
-        fn jackstay_c_affordances_publish(producer: *mut FtAffordancesProducer) -> FtStatus;
+        fn jackstay_c_affordances_publish(producer: *mut std::ffi::c_void) -> FtStatus;
     }
     #[cfg(unix)]
     let (a, b) = jackstay::local::Stream::pair().unwrap();
@@ -211,7 +211,10 @@ fn compiled_c_publishes_to_rust_host() {
     let (a, b) = jackstay::local::pipe_pair().unwrap();
     let mut producer = FtAffordancesProducer(jackstay::affordances::Producer::start(a).unwrap());
     let host = jackstay::affordances::Host::start(b).unwrap();
-    assert_eq!(unsafe { jackstay_c_affordances_publish(&mut producer) }, FT_STATUS_OK);
+    assert_eq!(
+        unsafe { jackstay_c_affordances_publish((&mut producer as *mut FtAffordancesProducer).cast()) },
+        FT_STATUS_OK
+    );
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(event) = host.poll() {

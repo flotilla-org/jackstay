@@ -1,3 +1,4 @@
+#include "jackstay_affordances.h"
 #include "capture_transfer.h"
 #include "jackstay_bootstrap.h"
 #include <string.h>
@@ -167,3 +168,105 @@ int porthole_capture_transfer_c_abi_header_smoke(void) {
                (destroy_fn != NULL));
 }
 #endif
+
+/* C/Rust layout parity: sizes, alignments and every field offset. */
+size_t jackstay_c_affordances_layout(uint32_t index) {
+  switch (index) {
+    case 0: return sizeof(ft_aff_string);
+    case 1: return _Alignof(ft_aff_string);
+    case 2: return offsetof(ft_aff_string, data);
+    case 3: return offsetof(ft_aff_string, len);
+    case 4: return sizeof(ft_aff_optional_string);
+    case 5: return _Alignof(ft_aff_optional_string);
+    case 6: return offsetof(ft_aff_optional_string, present);
+    case 7: return offsetof(ft_aff_optional_string, value);
+    case 8: return sizeof(ft_aff_optional_number);
+    case 9: return _Alignof(ft_aff_optional_number);
+    case 10: return offsetof(ft_aff_optional_number, present);
+    case 11: return offsetof(ft_aff_optional_number, value);
+    case 12: return sizeof(ft_aff_size);
+    case 13: return _Alignof(ft_aff_size);
+    case 14: return offsetof(ft_aff_size, present);
+    case 15: return offsetof(ft_aff_size, width);
+    case 16: return offsetof(ft_aff_size, height);
+    case 17: return sizeof(ft_aff_artwork);
+    case 18: return _Alignof(ft_aff_artwork);
+    case 19: return offsetof(ft_aff_artwork, kind);
+    case 20: return offsetof(ft_aff_artwork, value);
+    case 21: return sizeof(ft_aff_media);
+    case 22: return _Alignof(ft_aff_media);
+    case 23: return offsetof(ft_aff_media, status);
+    case 24: return offsetof(ft_aff_media, position);
+    case 25: return offsetof(ft_aff_media, rate);
+    case 26: return offsetof(ft_aff_media, duration);
+    case 27: return offsetof(ft_aff_media, title);
+    case 28: return offsetof(ft_aff_media, artwork);
+    case 29: return offsetof(ft_aff_media, capabilities);
+    case 30: return sizeof(ft_aff_navigation);
+    case 31: return _Alignof(ft_aff_navigation);
+    case 32: return offsetof(ft_aff_navigation, url);
+    case 33: return offsetof(ft_aff_navigation, title);
+    case 34: return offsetof(ft_aff_navigation, can_go_back);
+    case 35: return offsetof(ft_aff_navigation, can_go_forward);
+    case 36: return offsetof(ft_aff_navigation, loading);
+    case 37: return offsetof(ft_aff_navigation, capabilities);
+    case 38: return sizeof(ft_aff_axis);
+    case 39: return _Alignof(ft_aff_axis);
+    case 40: return offsetof(ft_aff_axis, scrollable);
+    case 41: return offsetof(ft_aff_axis, content_length);
+    case 42: return offsetof(ft_aff_axis, viewport_length);
+    case 43: return offsetof(ft_aff_axis, position);
+    case 44: return sizeof(ft_aff_scroll);
+    case 45: return _Alignof(ft_aff_scroll);
+    case 46: return offsetof(ft_aff_scroll, x);
+    case 47: return offsetof(ft_aff_scroll, y);
+    case 48: return offsetof(ft_aff_scroll, capabilities);
+    case 49: return sizeof(ft_aff_window);
+    case 50: return _Alignof(ft_aff_window);
+    case 51: return offsetof(ft_aff_window, title);
+    case 52: return offsetof(ft_aff_window, requested_size);
+    case 53: return offsetof(ft_aff_window, ready);
+    case 54: return sizeof(ft_aff_presentation);
+    case 55: return _Alignof(ft_aff_presentation);
+    case 56: return offsetof(ft_aff_presentation, visible);
+    case 57: return offsetof(ft_aff_presentation, preferred_size);
+    case 58: return offsetof(ft_aff_presentation, scale);
+    case 59: return offsetof(ft_aff_presentation, focused);
+    case 60: return sizeof(ft_aff_snapshot);
+    case 61: return _Alignof(ft_aff_snapshot);
+    case 62: return offsetof(ft_aff_snapshot, domain);
+    case 63: return offsetof(ft_aff_snapshot, withdrawn);
+    case 64: return offsetof(ft_aff_snapshot, media);
+    case 65: return offsetof(ft_aff_snapshot, navigation);
+    case 66: return offsetof(ft_aff_snapshot, cursor);
+    case 67: return offsetof(ft_aff_snapshot, scroll);
+    case 68: return offsetof(ft_aff_snapshot, window);
+    case 69: return offsetof(ft_aff_snapshot, presentation);
+    case 70: return sizeof(ft_aff_verb);
+    case 71: return _Alignof(ft_aff_verb);
+    case 72: return offsetof(ft_aff_verb, domain);
+    case 73: return offsetof(ft_aff_verb, verb);
+    case 74: return offsetof(ft_aff_verb, number);
+    case 75: return offsetof(ft_aff_verb, url);
+    case 76: return offsetof(ft_aff_verb, axis);
+    case 77: return offsetof(ft_aff_verb, step);
+    case 78: return offsetof(ft_aff_verb, direction);
+    case 79: return sizeof(ft_aff_event_view);
+    case 80: return _Alignof(ft_aff_event_view);
+    case 81: return offsetof(ft_aff_event_view, kind);
+    case 82: return offsetof(ft_aff_event_view, snapshot);
+    case 83: return offsetof(ft_aff_event_view, verb);
+    default: return (size_t)-1;
+  }
+}
+
+/* Real C constructs typed input and calls the Rust-backed implementation. */
+ft_status jackstay_c_affordances_publish(ft_affordances_producer *producer) {
+  ft_aff_snapshot snapshot = {0};
+  snapshot.domain = FT_AFF_DOMAIN_WINDOW;
+  snapshot.window.ready = 1;
+  snapshot.window.title.present = 1;
+  snapshot.window.title.value.data = (const uint8_t *)"C producer";
+  snapshot.window.title.value.len = 10;
+  return ft_affordances_producer_publish(producer, &snapshot);
+}

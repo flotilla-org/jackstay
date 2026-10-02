@@ -152,3 +152,71 @@ fn silent_peer_cannot_hold_bootstrap_indefinitely() {
     assert!(matches!(bootstrap::accept(host, None), Err(bootstrap::Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
     assert!(started.elapsed() < Duration::from_secs(8));
 }
+
+// V2 preserves media identity and independent channel lifetimes; every request
+// combination negotiates clean optional refusals without consuming media bytes.
+#[test]
+fn v2_independent_offers_and_refusals() {
+    use bootstrap::ChannelRequest;
+    for enabled in [false, true] {
+        for request in [ChannelRequest::None, ChannelRequest::Optional, ChannelRequest::Required] {
+            let (a, b) = pair();
+            let w = thread::spawn(move || bootstrap::accept_v2(a, None, enabled).unwrap());
+            let c = bootstrap::connect_v2(b, InputRequest::Optional(Mode::Cooperative), request);
+            let mut a = w.join().unwrap();
+            if !enabled && request == ChannelRequest::Required {
+                assert!(c.is_err());
+                continue;
+            }
+            let mut c = c.unwrap();
+            assert_eq!(c.input_error, Some(jackstay::input::Error::Unsupported));
+            assert_eq!(c.affordances.is_some(), enabled && request != ChannelRequest::None);
+            assert_eq!(c.affordances_refused, !enabled && request != ChannelRequest::None);
+            c.media.write_all(b"v2").unwrap();
+            let mut bytes = [0; 2];
+            a.media.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, *b"v2");
+        }
+    }
+}
+
+// Channel names and versions are explicit offers; malformed offers fail even
+// when both requests are optional. No downgrade on a partially read stream.
+#[test]
+fn v2_malformed_offers_do_not_downgrade() {
+    for field in [8, 12, 16, 20, 24, 36] {
+        let (mut a, b) = pair();
+        let w = thread::spawn(move || {
+            let mut request = [0; 24];
+            a.read_exact(&mut request).unwrap();
+            let mut reply = [0; 48];
+            reply[..8].copy_from_slice(b"JSBOOT02");
+            reply[24..36].copy_from_slice(b"input\0\0\0\0\0\0\0");
+            reply[36..48].copy_from_slice(b"affordances\0");
+            reply[field] = 255;
+            a.write_all(&reply).unwrap();
+        });
+        assert!(bootstrap::connect_v2(b, InputRequest::Optional(Mode::Cooperative), bootstrap::ChannelRequest::Optional).is_err());
+        w.join().unwrap();
+    }
+}
+// No common affordances version is a clean refusal, with original media usable.
+#[test]
+fn v2_unknown_affordances_version_is_optional_refusal() {
+    let (a, mut b) = pair();
+    let w = thread::spawn(move || bootstrap::accept_v2(a, None, true).unwrap());
+    let mut request = [0; 24];
+    request[..8].copy_from_slice(b"JSBOOT02");
+    request[15] = 1;
+    request[19] = 2;
+    b.write_all(&request).unwrap();
+    let mut reply = [0; 48];
+    b.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply[8..24], &[0; 16]);
+    let mut a = w.join().unwrap();
+    assert!(a.affordances.is_none());
+    b.write_all(b"media").unwrap();
+    let mut bytes = [0; 5];
+    a.media.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, *b"media");
+}

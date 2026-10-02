@@ -1,0 +1,11 @@
+[package]
+name = "jackstay-producer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+[dependencies]
+jackstay = { path = "../jackstay" }
+[lints]
+workspace = true

@@ -1,6 +1,7 @@
 # Affordances channel, JSON version 1
 
-Status: accepted design for the [toolkit slice (#39)](https://github.com/flotilla-org/jackstay/issues/39); not an implemented ABI.
+Status: implemented by `jackstay::affordances`, explicit bootstrap v2 and the
+ABI 0.12 typed `jackstay_affordances.h` surface in the toolkit slice (#39).
 [ADR-0002](../adr/0002-affordances-channel.md) records the decision and
 [prior art](../affordance-prior-art-2026-09-25.md) records its evidence.
 The producer owns application state. The host owns chrome and publishes
@@ -165,7 +166,8 @@ Verb names and capability flags are domain-scoped: `media.stop` and
 `navigation.stop` are distinct operations. C discriminators must preserve the
 domain/verb pair, even if verb tags share numeric values.
 
-The producer owns URL interpretation and policy. A load is a semantic navigation
+`navigation.load` URLs are untrusted host input. The producer owns URL
+interpretation and policy, including schemes and file/network access. A load is a semantic navigation
 verb, not injected typing into an address field. No completion reply is implied;
 subsequent snapshots describe actual state.
 
@@ -248,9 +250,9 @@ admission, or while cleanup blocks replacement, it cannot execute that input.
 The channel cannot open a second route around those constraints. No connection,
 capability flag, presentation hint or enqueue success grants desktop authority.
 
-## C ABI parity (planned naming and handle shape)
+## C ABI parity
 
-The toolkit slice adds `jackstay_affordances.h`, backed by the same Rust channel
+ABI 0.12 adds `jackstay_affordances.h`, backed by the same Rust channel
 implementation, with opaque owned `ft_affordances_producer` and
 `ft_affordances_host` handles. Producer and host are application roles, not a
 requirement that transport remain one-way. Bootstrap's extended accept result
@@ -260,7 +262,7 @@ optional channels return null plus an explicit refusal status. Existing bootstra
 functions are not silently extended; new entry points and ABI version are part
 of the toolkit slice.
 
-| Planned operation names | Handle and ownership shape |
+| Operation names | Handle and ownership shape |
 |---|---|
 | `ft_affordances_producer_publish` | Producer handle + borrowed typed snapshot; copies data before return |
 | `ft_affordances_producer_poll` | Producer handle; receives host snapshot or typed verb |
@@ -289,3 +291,23 @@ and bounds; v1 carries only URL/named-icon references. Further media controls,
 window management, cross-host translation and synchronized position clocks are
 not implied by the initial vocabulary. Extension remains per domain and version,
 with vendor prefixes for private additions.
+
+## Implemented bootstrap v2 layout
+
+`JSBOOT02` uses a 24-byte request and a 48-byte reply, with unsigned big-endian u32
+fields after the eight-byte magic. Request fields are input typing mode
+(0, 1, 2 or 4), affordances request (none=0, optional=1, required=2),
+affordances version (v1=1), and reserved zero. Reply fields are channel mask
+(INPUT=1, AFFORDANCES=2), input version (0 or 1), affordances version (0 or 1),
+and reserved zero, followed by two 12-byte NUL-padded UTF-8 channel names
+(`input`, `affordances`). Zero versions mean unavailable. No common affordances version
+is a clean refusal. Receipts and transfers follow in input, affordances order
+within one five-second bootstrap deadline; input admission follows separately.
+Legacy entry points explicitly select `JSBOOT01`; v2 never retries v1.
+
+The C v2 Local Endpoint entry points return independently owned input and
+affordances handles and preserve media in the original connection. Optional
+refusal returns a null handle and explicit `UNSUPPORTED` status; unrequested
+channels return null and `EMPTY`. The C header documents all domain and verb
+tags, capability bits, cursor tags and payload layouts. Event payload views
+last until event destruction. C callers supply typed data, never JSON.

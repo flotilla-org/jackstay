@@ -2,6 +2,7 @@ fn main() {
     // The macOS native backend shim: compiled only when the feature is on
     // AND the target is macOS (the feature may be enabled by a dependent on
     // any platform; it must be a no-op elsewhere).
+    println!("cargo:rerun-if-changed=include/jackstay_affordances.h");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let backend_macos = std::env::var_os("CARGO_FEATURE_BACKEND_MACOS").is_some();
     let backend_linux = std::env::var_os("CARGO_FEATURE_BACKEND_LINUX").is_some();

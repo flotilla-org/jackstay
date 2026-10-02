@@ -216,3 +216,102 @@ pub unsafe extern "C" fn ft_source_bootstrap_connect_local(
         Err(error) => status(error),
     }
 }
+
+/// V2 bootstrap with independent affordances ownership.
+/// # Safety
+/// Same exclusive/disjoint connection and output ownership as v1 local accept.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_source_bootstrap_accept_v2_local(
+    connection: *mut *mut FtLocalConnection,
+    target: *mut FtInputTarget,
+    enable: u32,
+    input: *mut *mut FtInputServer,
+    aff: *mut *mut crate::ffi_affordances::FtAffordancesProducer,
+) -> FtStatus {
+    let (Some(input), Some(aff)) = (unsafe { input.as_mut() }, unsafe { aff.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !input.is_null() || !aff.is_null() || enable > 1 {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    let target = unsafe { target.as_ref() }.map(|t| t.0.clone());
+    let Some(taken) = (unsafe { take_connection(connection) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    let FtLocalConnection { stream, peer } = *taken;
+    match bootstrap::accept_v2(stream, target, enable == 1) {
+        Ok(a) => {
+            *input = a
+                .input
+                .map_or(ptr::null_mut(), |s| Box::into_raw(Box::new(FtInputServer { _server: s })));
+            *aff = a.affordances.map_or(ptr::null_mut(), |a| {
+                Box::into_raw(Box::new(crate::ffi_affordances::FtAffordancesProducer(a)))
+            });
+            unsafe { restore_connection(connection, FtLocalConnection { stream: a.media, peer }) };
+            FT_STATUS_OK
+        }
+        Err(e) => status(e),
+    }
+}
+/// V2 bootstrap; outputs start null and become independently owned on success.
+/// # Safety
+/// Same exclusive/disjoint connection and output ownership as v1 local connect.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_source_bootstrap_connect_v2_local(
+    connection: *mut *mut FtLocalConnection,
+    input_request: u32,
+    mode: u32,
+    aff_request: u32,
+    input: *mut *mut FtInputClient,
+    input_status: *mut FtStatus,
+    aff: *mut *mut crate::ffi_affordances::FtAffordancesHost,
+    aff_status: *mut FtStatus,
+) -> FtStatus {
+    let (Some(input), Some(input_status), Some(aff), Some(aff_status)) = (
+        unsafe { input.as_mut() },
+        unsafe { input_status.as_mut() },
+        unsafe { aff.as_mut() },
+        unsafe { aff_status.as_mut() },
+    ) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !input.is_null() || !aff.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    let Some(request) = parse_request(input_request, mode) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    let request_aff = match aff_request {
+        0 => bootstrap::ChannelRequest::None,
+        1 => bootstrap::ChannelRequest::Optional,
+        2 => bootstrap::ChannelRequest::Required,
+        _ => return FT_STATUS_INVALID_ARGUMENT,
+    };
+    let Some(taken) = (unsafe { take_connection(connection) }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    *input_status = FT_STATUS_EMPTY;
+    *aff_status = FT_STATUS_EMPTY;
+    let FtLocalConnection { stream, peer } = *taken;
+    match bootstrap::connect_v2(stream, request, request_aff) {
+        Ok(c) => {
+            *input_status = c
+                .input_error
+                .map_or(if c.input.is_some() { FT_STATUS_OK } else { FT_STATUS_EMPTY }, ffi_input::status);
+            *aff_status = if c.affordances_refused {
+                FT_STATUS_UNSUPPORTED
+            } else if c.affordances.is_some() {
+                FT_STATUS_OK
+            } else {
+                FT_STATUS_EMPTY
+            };
+            *input = c.input.map_or(ptr::null_mut(), |c| Box::into_raw(Box::new(FtInputClient(c))));
+            *aff = c.affordances.map_or(ptr::null_mut(), |a| {
+                Box::into_raw(Box::new(crate::ffi_affordances::FtAffordancesHost(a)))
+            });
+            unsafe { restore_connection(connection, FtLocalConnection { stream: c.media, peer }) };
+            FT_STATUS_OK
+        }
+        Err(e) => status(e),
+    }
+}

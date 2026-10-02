@@ -437,6 +437,7 @@ fn callback_panics_still_run_ordered_shutdown() {
             c.affordances.as_ref().unwrap().publish(Default::default()).unwrap();
         }
         wait(|| !trigger.load(Ordering::Acquire));
+        wait(|| source.is_finished());
         let error = source.stop().unwrap_err();
         assert!(error.to_string().contains("producer callback panicked"));
         assert!(cleanups.load(Ordering::Acquire) > 0);

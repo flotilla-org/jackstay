@@ -12,8 +12,10 @@ before freeing the owners. Dropping the source follows the same sequence.
 Errors in input cleanup or media draining are returned from `stop`.
 
 Fatal pump errors stop the source internally; `stop()` retrieves their error.
-There is no asynchronous failure accessor; `Drop` completes shutdown but
-discards its result. Call `stop()` to observe completion or failure.
+`is_finished()` reports when the pump has ended after teardown; poll it to
+detect a source that ended on its own, then call `stop()` to retrieve the result.
+`Drop` completes shutdown but discards its result. Both worker joins are
+completed before any error is returned, including after an accept-thread panic.
 
 The endpoint uses an owner-only Unix runtime directory/socket or a Windows
 private named pipe. Endpoint access is scoped to the current user/session;

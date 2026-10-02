@@ -83,6 +83,7 @@ impl<P: Producer> Builder<P> {
                     Ok(c) => c,
                     Err(jackstay::local::Error::Cancelled) => break,
                     Err(_) => {
+                        // Retry persistent accept errors at a fixed, bounded pace.
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     }
@@ -93,6 +94,7 @@ impl<P: Producer> Builder<P> {
                     break;
                 }
                 if peers.len() >= limit {
+                    // Silently disconnect rather than admit another worker.
                     continue;
                 }
                 let stream = c.into_stream();
@@ -181,19 +183,29 @@ pub struct Source {
     worker: Option<JoinHandle<io::Result<()>>>,
 }
 impl Source {
+    /// Whether the pump has ended, after its ordered teardown. Call stop to
+    /// retrieve completion/failure; this accessor grants no cleanup authority.
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
     pub fn stop(mut self) -> io::Result<()> {
         self.shutdown()
     }
     fn shutdown(&mut self) -> io::Result<()> {
         self.stop.store(true, Ordering::Release);
         self.listener.cancel();
-        if let Some(w) = self.accept.take() {
-            w.join().map_err(|_| io::Error::other("accept worker panicked"))?
-        }
-        if let Some(w) = self.worker.take() {
-            return w.join().map_err(|_| io::Error::other("producer callback panicked"))?;
-        }
-        Ok(())
+        // Evaluate both joins before reporting either error, including in Drop.
+        let accept = if let Some(w) = self.accept.take() {
+            w.join().map_err(|_| io::Error::other("accept worker panicked"))
+        } else {
+            Ok(())
+        };
+        let pump = if let Some(w) = self.worker.take() {
+            w.join().unwrap_or_else(|_| Err(io::Error::other("producer callback panicked")))
+        } else {
+            Ok(())
+        };
+        accept.and(pump)
     }
 }
 impl Drop for Source {
@@ -373,4 +385,44 @@ fn pump<P: Producer>(
         }
     }
     error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Review #57: an accept-thread panic cannot bypass joining the pump,
+    // including the private shutdown path used by Drop. Use real thread owners.
+    #[test]
+    fn shutdown_joins_the_pump_after_accept_panics() {
+        let endpoint = Endpoint::new(
+            jackstay::local::Scope::User,
+            &format!("toolkit-join-{}", std::process::id()),
+            jackstay::local::Transport::LocalStream,
+        )
+        .unwrap();
+        let listener = Arc::new(Listener::bind(&endpoint).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = finished.clone();
+        let accept = thread::spawn(|| panic!("accept failure"));
+        let worker = thread::spawn(move || {
+            while !flag.load(Ordering::Acquire) {
+                thread::yield_now()
+            }
+            thread::sleep(Duration::from_millis(50));
+            done.store(true, Ordering::Release);
+            Ok(())
+        });
+        let mut source = Source {
+            listener,
+            stop,
+            accept: Some(accept),
+            worker: Some(worker),
+        };
+        let error = source.shutdown().unwrap_err();
+        assert!(error.to_string().contains("accept worker panicked"));
+        assert!(finished.load(Ordering::Acquire), "shutdown returned before the pump joined");
+        assert!(source.is_finished());
+    }
 }

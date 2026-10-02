@@ -107,10 +107,10 @@ verb support. Hosts enable back only when both are true.
 A receiver ignores unknown domains, domain versions, kinds, verbs and optional
 fields. Unsupported verbs, including ones disabled since the last snapshot, are
 ignored without error or reply. Validate known supported bodies before execution;
-malformed known messages close the channel. Unknown enum values are ignored at
-the affected field, preserving its prior known value (or its domain fallback
-below on first publication or after withdrawal clears the cached value); never
-interpret them as another executable value.
+malformed known messages close the channel. Unknown enum values in a snapshot map to that field's documented fallback:
+media status becomes `unknown`, artwork becomes null and cursor shape becomes
+`default`. No value is retained from the previous snapshot. Unknown enum values
+in a verb cause the whole verb to be ignored, as specified for scroll below.
 Future standard enum additions require a newer `domain_version`; vendors use
 `x-<vendor>-<name>` for domains, verbs, fields and enum values. An unrecognized
 extension cannot enable a standard capability. No generic widget escape hatch.

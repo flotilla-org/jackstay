@@ -75,7 +75,8 @@ A snapshot with `body: null` withdraws a domain and its controls. The receiver
 clears all cached state and capabilities for it; the producer ignores verbs for
 a withdrawn domain until it publishes that domain again. A null snapshot body
 is the sole exception to the object body rule. Nullable fields explicitly clear values;
-missing required fields are malformed, not a partial update. Delivery order is
+missing required fields are malformed, not a partial update. Known optional
+fields with incorrect types are malformed too; only unknown fields are ignored. Delivery order is
 stream order in each direction; there is no total order across directions or
 across channels. Hosts may display the latest snapshot without retaining history.
 
@@ -92,7 +93,10 @@ scroll positions are malformed and close the channel. Negative zero counts as
 zero (valid for nonnegative fields, invalid for strictly positive fields). Media
 rate is signed: negative means reverse playback; zero means no advancement.
 Verb seek/set-position clamping is explicitly described in their domains; no
-snapshot field is silently clamped. These validation and closure rules apply
+snapshot field is silently clamped. A media position greater than a known
+duration is malformed. A non-scrollable axis with nonzero position is malformed;
+viewport length greater than content length is valid and collapses the allowed
+position range to `[0,0]`, even when `scrollable` is true. These validation and closure rules apply
 symmetrically: producers validate host presentation snapshots and verbs, and
 hosts validate producer snapshots. Capabilities are booleans in
 the snapshot's `body.capabilities`, named exactly like their verbs. Missing
@@ -226,6 +230,9 @@ preference, not a host resize command. Ready does not acknowledge a frame lease.
 | `scale` | Positive device pixels per logical unit |
 | `focused` | Boolean; snapshots carry both focus-in and focus-out |
 
+The host may withdraw presentation with `body: null`. Before its first snapshot
+or after withdrawal, the producer uses `visible=true`, `focused=false`, `scale=1`
+and no preferred size as hint defaults; its own policy may still ignore hints.
 No presentation verbs or capability flags exist in v1. Hints may be ignored,
 including `visible`; hiding a source never implies media pause. Focus hints do
 not admit a controller, advance an input epoch or confirm held-state release.

@@ -267,20 +267,23 @@ impl ArenaProducer {
     }
 
     pub(crate) fn signal_reconfiguration(&self) -> Result<(), ArenaError> {
-        if self
-            .control
-            .word(RECONFIGURATION_EPOCH)
-            .fetch_update(SeqCst, SeqCst, |epoch| epoch.checked_add(1))
-            .is_err()
-        {
-            // Epochs participate in the wait predicate. Reusing an old value
-            // could hide a transition; close acquisition without revoking any
-            // already acquired storage or discarding its retirement owner.
-            self.control.word(TERMINAL).store(1, SeqCst);
-            for claims in self.claims.values() {
-                claims.close();
+        let epoch_word = self.control.word(RECONFIGURATION_EPOCH);
+        let mut epoch = epoch_word.load(SeqCst);
+        loop {
+            let Some(next_epoch) = epoch.checked_add(1) else {
+                // Epochs participate in the wait predicate. Reusing an old value
+                // could hide a transition; close acquisition without revoking any
+                // already acquired storage or discarding its retirement owner.
+                self.control.word(TERMINAL).store(1, SeqCst);
+                for claims in self.claims.values() {
+                    claims.close();
+                }
+                return Err(ArenaError::GenerationsExhausted);
+            };
+            match epoch_word.compare_exchange(epoch, next_epoch, SeqCst, SeqCst) {
+                Ok(_) => break,
+                Err(current) => epoch = current,
             }
-            return Err(ArenaError::GenerationsExhausted);
         }
         for claims in self.claims.values() {
             claims.signal(wait::RECONFIGURATION)?;

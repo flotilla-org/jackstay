@@ -119,7 +119,7 @@ pub fn recv_fds(stream: &UnixStream, max_fds: usize) -> Result<Vec<OwnedFd>> {
         // reflects what the kernel actually delivered. Interpreting the
         // difference as fds would read bytes the kernel never wrote — and
         // then close whatever fd numbers those bytes happen to spell.
-        let control_message_len = ((*cmsg).cmsg_len as usize).min(message.msg_controllen as usize);
+        let control_message_len = ((*cmsg).cmsg_len as usize).min(message.msg_controllen as _);
         if control_message_len < cmsg_len(0) {
             return Err(CaptureTransferError::MissingPassedFd);
         }

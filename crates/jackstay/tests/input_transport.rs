@@ -101,3 +101,58 @@ fn maximum_text_survives_json_escaping_and_invalid_input_does_not_close_session(
         }
     ));
 }
+
+// Worker ticks must not expand a slow-polling presenter's consecutive motion
+// results into an overflowing client queue. Real local transport and heartbeats
+// span many ticks while the executor remains paused.
+#[test]
+fn slow_polling_motion_burst_aggregates_client_results() {
+    let target = Target::new(Config {
+        max_events: 4,
+        max_bytes: 384,
+        ..Config::default()
+    })
+    .unwrap();
+    let (a, b) = pair();
+    let _server = Server::start(target.clone(), a).unwrap();
+    let client = Client::connect(b, Mode::Cooperative).unwrap();
+    let mut last = 0;
+    for x in 1..=40 {
+        last = client
+            .send(Event::Motion(Position {
+                revision: 1,
+                x: x as f64,
+                y: 1.0,
+            }))
+            .unwrap();
+        // A slow producer spreads replies across worker ticks without flooding
+        // the independent producer-side send queue.
+        thread::sleep(Duration::from_millis(30));
+    }
+    let mut superseded = 0;
+    while superseded < 39 {
+        match wait(|| client.poll()) {
+            Status::Coalesced { count } => superseded += count,
+            other => panic!("unexpected motion burst result: {other:?}"),
+        }
+    }
+    assert_eq!(superseded, 39);
+    let work = wait(|| target.next());
+    assert_eq!(work.sequence, last);
+    assert_eq!(
+        work.operation,
+        Operation::Event(Event::Motion(Position {
+            revision: 1,
+            x: 40.0,
+            y: 1.0
+        }))
+    );
+    target.complete(work.id, Outcome::Executed).unwrap();
+    assert_eq!(
+        wait(|| client.poll()),
+        Status::Completed {
+            sequence: last,
+            outcome: Outcome::Executed
+        }
+    );
+}

@@ -173,8 +173,38 @@ pub struct Work {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Status {
-    Completed { sequence: u64, outcome: Outcome },
-    Rejected { sequence: u64, error: Error },
-    Reset { epoch: u64, geometry: Geometry },
-    Closed { reason: Reason, clean: bool },
+    /// This many accepted queued motions were superseded, not executed. Each
+    /// contributes one settled outstanding operation; no sequence IDs are retained.
+    Coalesced {
+        count: u64,
+    },
+    Completed {
+        sequence: u64,
+        outcome: Outcome,
+    },
+    Rejected {
+        sequence: u64,
+        error: Error,
+    },
+    Reset {
+        epoch: u64,
+        geometry: Geometry,
+    },
+    Closed {
+        reason: Reason,
+        clean: bool,
+    },
+}
+
+impl Status {
+    /// Fold adjacent superseded-count observations without retaining sequences.
+    pub(super) fn merge_coalesced(&mut self, newer: &Self) -> bool {
+        match (self, newer) {
+            (Self::Coalesced { count }, Self::Coalesced { count: delta }) => {
+                *count = count.saturating_add(*delta);
+                true
+            }
+            _ => false,
+        }
+    }
 }

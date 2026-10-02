@@ -38,7 +38,7 @@ keyboard holds. Pending pointer work is invalidated, in-flight work settles and
 pointer cleanup runs before further execution. Text has a bounded UTF-8 byte
 length independent of SDL's text event buffer. Scroll has fractional deltas and
 explicit units. Queues are bounded in bytes and events; transitions are never
-silently dropped. Initial code need not coalesce motion.
+silently dropped. Consecutive queued motions coalesce to the latest position.
 
 ## Implementation sequence and verification seams
 
@@ -109,8 +109,24 @@ to 128 KiB and queued wire bytes to 512 KiB, independently of configured event
 queues. Text commits are at most 16 KiB of valid UTF-8, including embedded NUL;
 the frame bound covers worst-case JSON escaping. Queue byte accounting charges
 96 bytes plus UTF-8 payload per event; it is not a promise about total allocator
-usage. Held keys and result queues are bounded too. Motion coalescing is not yet
-implemented; overflow terminates visibly instead of losing transitions.
+usage. Held keys and result queues are bounded too. Only consecutive queued
+`Event::Motion` entries coalesce: the tail is replaced with the latest validated
+position and sequence, charging one event and 96 bytes. In-flight work is never
+replaced, and button, key, scroll, text and cleanup boundaries are never crossed.
+The last motion before a transition is retained. Existing cancellation still
+invalidates queued motions on focus loss or geometry change; an in-flight motion
+settles before cleanup.
+
+`Status::Coalesced { count }` reports superseded accepted operations. Adjacent
+unread coalescing statuses aggregate in both target and client result queues,
+including across transport worker ticks; each count is a delta, not a lifetime total.
+This is cheaper than per-sequence superseded completions: one pending status
+covers an arbitrarily long uninterrupted burst without retaining sequence IDs.
+A presenter can subtract the count from its outstanding operations; the final
+motion still receives ordinary completion or rejection. C polling exposes
+`FT_INPUT_COALESCED` with the count in `ft_input_status.sequence`, with no signature
+or layout change. Non-motion overflow still terminates visibly instead of losing
+transitions. Transport framing and producer-side queue bounds are unchanged.
 
 Each connection has a worker with bounded nonblocking I/O and heartbeat handling.
 After requesting graceful close, the client stops sending heartbeats and keeps

@@ -165,6 +165,7 @@ impl Peer {
         if self.worker.is_some() {
             return true;
         }
+        // Media EOF leaves independent channel owners alive and counted.
         self.channels
             .lock()
             .unwrap()

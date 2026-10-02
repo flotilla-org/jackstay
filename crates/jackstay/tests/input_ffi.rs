@@ -137,7 +137,7 @@ fn c_input_poll_observes_motion_coalescing() {
             assert!(Instant::now() < deadline, "no coalescing count");
             thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!((status.kind, status.sequence), (5, 1));
+        assert_eq!((status.kind, status.sequence), (FT_INPUT_COALESCED, 1));
         let mut work = ptr::null_mut();
         assert_eq!(ft_input_target_next(target, &mut work), FT_STATUS_OK);
         let mut operation = FtInputOperation::default();

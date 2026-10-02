@@ -118,7 +118,8 @@ invalidates queued motions on focus loss or geometry change; an in-flight motion
 settles before cleanup.
 
 `Status::Coalesced { count }` reports superseded accepted operations. Adjacent
-unread coalescing statuses aggregate; each count is a delta, not a lifetime total.
+unread coalescing statuses aggregate in both target and client result queues,
+including across transport worker ticks; each count is a delta, not a lifetime total.
 This is cheaper than per-sequence superseded completions: one pending status
 covers an arbitrarily long uninterrupted burst without retaining sequence IDs.
 A presenter can subtract the count from its outstanding operations; the final

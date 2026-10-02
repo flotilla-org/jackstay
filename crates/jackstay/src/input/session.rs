@@ -358,11 +358,8 @@ impl State {
         };
         let mut mailbox = a.mailbox.lock().unwrap();
         // Aggregate adjacent unread observations so a motion burst uses one slot.
-        if let Status::Coalesced { count } = status {
-            if let Some(Status::Coalesced { count: pending }) = mailbox.back_mut() {
-                *pending += count;
-                return;
-            }
+        if mailbox.back_mut().is_some_and(|pending| pending.merge_coalesced(&status)) {
+            return;
         }
         if mailbox.len() >= self.config.max_events * 2 + 4 {
             mailbox.clear();

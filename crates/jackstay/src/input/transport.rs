@@ -412,6 +412,11 @@ fn drive_client(mut wire: Framed, state: Arc<Mutex<ClientState>>, stop: Arc<Atom
                         s.welcome.config.geometry = *geometry;
                     }
                     let closed = matches!(status, Status::Closed { .. });
+                    // Keep target-side count aggregation intact across worker ticks
+                    // when the presenter polls more slowly than the connection.
+                    if s.status.back_mut().is_some_and(|pending| pending.merge_coalesced(&status)) {
+                        continue;
+                    }
                     if s.status.len() >= s.welcome.config.max_events * 2 + 4 {
                         return Err(io::Error::other("unconsumed input results"));
                     }

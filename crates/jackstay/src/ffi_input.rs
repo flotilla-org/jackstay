@@ -130,6 +130,8 @@ pub struct FtInputServer {
     pub(crate) _server: Server,
 }
 pub struct FtInputClient(pub(crate) Client);
+/// A superseded-motion count in `FtInputStatus::sequence`, matching the C header.
+pub const FT_INPUT_COALESCED: u32 = 5;
 pub struct FtInputWork {
     target: Target,
     work: Work,
@@ -619,7 +621,7 @@ pub unsafe extern "C" fn ft_input_client_poll(client: *mut FtInputClient, out: *
     *out = FtInputStatus::default();
     match s {
         Status::Coalesced { count } => {
-            out.kind = 5;
+            out.kind = FT_INPUT_COALESCED;
             out.sequence = count;
         }
         Status::Completed { sequence, outcome } => {

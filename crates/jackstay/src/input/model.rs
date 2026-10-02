@@ -195,3 +195,16 @@ pub enum Status {
         clean: bool,
     },
 }
+
+impl Status {
+    /// Fold adjacent superseded-count observations without retaining sequences.
+    pub(super) fn merge_coalesced(&mut self, newer: &Self) -> bool {
+        match (self, newer) {
+            (Self::Coalesced { count }, Self::Coalesced { count: delta }) => {
+                *count = count.saturating_add(*delta);
+                true
+            }
+            _ => false,
+        }
+    }
+}

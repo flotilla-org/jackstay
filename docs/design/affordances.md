@@ -44,7 +44,9 @@ must close them explicitly and poll input through its cleanup barrier.
 
 ## Framing and exact envelope
 
-Use input framing: a four-byte unsigned big-endian JSON byte length followed by
+The toolkit reuses the Rust input framing implementation; C callers do not
+implement this wire encoding. Its affordances payload contract is specified here
+without making input JSON a public C contract. Use input framing: a four-byte unsigned big-endian JSON byte length followed by
 that many UTF-8 bytes. Length must be 1 through 131072 bytes; queued wire bytes
 are bounded to 524288 including prefixes. These are separate from media and
 input queue bounds. Invalid framing/JSON or invalid required field types closes
@@ -71,8 +73,8 @@ each fresh connection, then on change. No old state survives reconnect; verbs
 are never replayed. Absent domains are unavailable until their first snapshot.
 A snapshot with `body: null` withdraws a domain and its controls. The receiver
 clears all cached state and capabilities for it; the producer ignores verbs for
-a withdrawn domain until it publishes that domain again (the sole
-exception to the object body rule). Nullable fields explicitly clear values;
+a withdrawn domain until it publishes that domain again. A null snapshot body
+is the sole exception to the object body rule. Nullable fields explicitly clear values;
 missing required fields are malformed, not a partial update. Delivery order is
 stream order in each direction; there is no total order across directions or
 across channels. Hosts may display the latest snapshot without retaining history.
@@ -101,7 +103,8 @@ fields. Unsupported verbs, including ones disabled since the last snapshot, are
 ignored without error or reply. Validate known supported bodies before execution;
 malformed known messages close the channel. Unknown enum values are ignored at
 the affected field, preserving its prior known value (or its domain fallback
-below on first publication); never interpret them as another executable value.
+below on first publication or after withdrawal clears the cached value); never
+interpret them as another executable value.
 Future standard enum additions require a newer `domain_version`; vendors use
 `x-<vendor>-<name>` for domains, verbs, fields and enum values. An unrecognized
 extension cannot enable a standard capability. No generic widget escape hatch.

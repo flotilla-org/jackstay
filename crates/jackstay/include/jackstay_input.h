@@ -49,6 +49,8 @@ typedef struct ft_input_work ft_input_work;
 #define FT_INPUT_REFUSED 2
 #define FT_INPUT_RESET 3
 #define FT_INPUT_CLOSED 4
+/* sequence contains the number of superseded motions, not a sequence ID. */
+#define FT_INPUT_COALESCED 5
 #define FT_INPUT_REASON_FOCUS 1
 #define FT_INPUT_REASON_GEOMETRY 2
 #define FT_INPUT_REASON_DISCONNECT 3
@@ -132,6 +134,8 @@ _Static_assert(sizeof(ft_input_event) == 152, "input event ABI");
 _Static_assert(offsetof(ft_input_event, text) == 136, "input text pointer ABI");
 _Static_assert(sizeof(ft_input_operation) == 192, "input operation ABI");
 _Static_assert(sizeof(ft_input_status) == 56, "input status ABI");
+_Static_assert(offsetof(ft_input_status, sequence) == 8, "input coalesced count ABI");
+_Static_assert(FT_INPUT_COALESCED == 5, "input coalesced status ABI");
 #endif
 /* OK means transport worker ended, not that executor cleanup succeeded. */
 ft_status ft_input_server_poll(const ft_input_server *server);
@@ -145,7 +149,9 @@ ft_status ft_input_client_connect_local(ft_local_connection **connection, uint32
                                         ft_input_client **out);
 ft_status ft_input_client_describe(const ft_input_client *client, ft_input_config *out, uint64_t *controller, uint64_t *epoch);
 /* OK means copied into a bounded send queue, not received/executed. Sequence
- * identifies a later completion or rejection; lost outcomes must not be replayed.
+ * identifies a later completion or rejection, unless superseded by a motion.
+ * COALESCED reports a count of settled superseded operations; lost outcomes
+ * must not be replayed.
  * Physical mode rejects source repeats; source-text/cooperative use source repeat.
  */
 ft_status ft_input_client_send(ft_input_client *client, const ft_input_event *event, uint64_t *sequence);

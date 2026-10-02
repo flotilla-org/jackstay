@@ -618,6 +618,10 @@ pub unsafe extern "C" fn ft_input_client_poll(client: *mut FtInputClient, out: *
     let Some(s) = c.0.poll() else { return FT_STATUS_EMPTY };
     *out = FtInputStatus::default();
     match s {
+        Status::Coalesced { count } => {
+            out.kind = 5;
+            out.sequence = count;
+        }
         Status::Completed { sequence, outcome } => {
             out.kind = 1;
             out.sequence = sequence;

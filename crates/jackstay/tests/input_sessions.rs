@@ -293,3 +293,205 @@ fn release_after_geometry_cleanup_is_a_safe_noop_without_touching_local_input() 
         })
     );
 }
+
+fn motion(x: f64) -> Event {
+    Event::Motion(Position { revision: 1, x, y: 1.0 })
+}
+
+// Consecutive queued motions retain only the latest position and sequence, even
+// at both queue bounds. Explicit burst lengths span empty replacement, duplicate,
+// boundary and far-beyond-bound cases using the real public session.
+#[test]
+fn motion_bursts_charge_one_event_and_report_superseded_count() {
+    for length in [1, 2, 6, 257, 1024] {
+        let t = Target::new(Config {
+            max_events: 1,
+            max_bytes: 96,
+            ..Config::default()
+        })
+        .unwrap();
+        let c = t.admit(Mode::Cooperative).unwrap();
+        assert!(t.next().is_none());
+        for sequence in 1..=length {
+            c.submit(1, sequence, motion((sequence % 100) as f64)).unwrap();
+        }
+        if length > 1 {
+            assert_eq!(c.poll(), Some(Status::Coalesced { count: length - 1 }));
+        }
+        let w = finish(&t);
+        assert_eq!(w.sequence, length);
+        assert_eq!(w.operation, Operation::Event(motion((length % 100) as f64)));
+        assert_eq!(
+            c.poll(),
+            Some(Status::Completed {
+                sequence: length,
+                outcome: Outcome::Executed
+            })
+        );
+        assert!(c.poll().is_none());
+        assert!(t.next().is_none());
+    }
+}
+
+// Every non-motion family separates runs; neither last position may be lost.
+#[test]
+fn motions_do_not_merge_across_transitions() {
+    let p = Position {
+        revision: 1,
+        x: 2.0,
+        y: 1.0,
+    };
+    for separator in [
+        Event::Button {
+            button: 1,
+            action: Action::Down,
+            position: p,
+        },
+        down(1),
+        Event::Text("text".into()),
+        Event::Scroll {
+            x: 1.0,
+            y: 0.0,
+            position: p,
+            unit: ScrollUnit::Pixel,
+        },
+    ] {
+        let t = Target::new(Config {
+            max_events: 3,
+            max_bytes: 400,
+            ..Config::default()
+        })
+        .unwrap();
+        let c = t.admit(Mode::Cooperative).unwrap();
+        c.submit(1, 1, motion(1.0)).unwrap();
+        c.submit(1, 2, motion(2.0)).unwrap();
+        c.submit(1, 3, separator.clone()).unwrap();
+        c.submit(1, 4, motion(3.0)).unwrap();
+        c.submit(1, 5, motion(4.0)).unwrap();
+        for (sequence, event) in [(2, motion(2.0)), (3, separator), (5, motion(4.0))] {
+            let w = finish(&t);
+            assert_eq!(w.sequence, sequence);
+            assert_eq!(w.operation, Operation::Event(event));
+        }
+        assert!(t.next().is_none());
+    }
+}
+
+// Invalid motion cannot replace an accepted tail or contribute to coalescing.
+#[test]
+fn invalid_motion_preserves_the_queued_position() {
+    let t = Target::new(Config::default()).unwrap();
+    let c = t.admit(Mode::Cooperative).unwrap();
+    c.submit(1, 1, motion(1.0)).unwrap();
+    assert_eq!(c.submit(1, 2, motion(-1.0)), Err(Error::Invalid));
+    assert_eq!(finish(&t).operation, Operation::Event(motion(1.0)));
+    assert!(matches!(c.poll(), Some(Status::Completed { sequence: 1, .. })));
+    assert!(c.poll().is_none());
+}
+
+// Dispatched motions settle before cleanup. Queued coalesced motion remains
+// subject to the same focus/geometry cancellation as any queued pointer event.
+#[test]
+fn motion_in_flight_settles_before_cleanup_and_queued_motion_is_cancelled() {
+    for geometry_change in [false, true] {
+        let t = Target::new(Config::default()).unwrap();
+        let c = t.admit(Mode::Cooperative).unwrap();
+        c.submit(1, 1, motion(1.0)).unwrap();
+        let flight = t.next().unwrap();
+        c.submit(1, 2, motion(2.0)).unwrap();
+        c.submit(1, 3, motion(3.0)).unwrap();
+        assert_eq!(c.poll(), Some(Status::Coalesced { count: 1 }));
+        if geometry_change {
+            t.set_geometry(Geometry {
+                revision: 2,
+                width: 320.0,
+                height: 180.0,
+            })
+            .unwrap();
+        } else {
+            c.reset().unwrap();
+        }
+        assert_eq!(
+            c.poll(),
+            Some(Status::Rejected {
+                sequence: 3,
+                error: Error::Stale
+            })
+        );
+        assert!(t.next().is_none());
+        assert_eq!(c.submit(1, 4, motion(4.0)), Err(Error::Busy));
+        t.complete(flight.id, Outcome::Executed).unwrap();
+        assert_eq!(
+            c.poll(),
+            Some(Status::Completed {
+                sequence: 1,
+                outcome: Outcome::Executed
+            })
+        );
+        assert!(matches!(finish(&t).operation, Operation::Cleanup { .. }));
+        assert!(matches!(c.poll(), Some(Status::Reset { epoch: 2, .. })));
+        assert!(t.next().is_none());
+        c.submit(
+            2,
+            5,
+            Event::Motion(Position {
+                revision: if geometry_change { 2 } else { 1 },
+                x: 5.0,
+                y: 1.0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(finish(&t).sequence, 5);
+    }
+}
+
+// An in-flight motion is separately charged and cannot be replaced by submit.
+#[test]
+fn in_flight_motion_still_consumes_queue_capacity() {
+    let t = Target::new(Config {
+        max_events: 1,
+        max_bytes: 96,
+        ..Config::default()
+    })
+    .unwrap();
+    let c = t.admit(Mode::Cooperative).unwrap();
+    c.submit(1, 1, motion(1.0)).unwrap();
+    let w = t.next().unwrap();
+    assert_eq!(c.submit(1, 2, motion(2.0)), Err(Error::Overflow));
+    t.complete(w.id, Outcome::Executed).unwrap();
+    assert!(matches!(
+        finish(&t).operation,
+        Operation::Cleanup {
+            reason: Reason::Overflow,
+            ..
+        }
+    ));
+    assert_eq!(c.epoch(), Err(Error::Closed));
+}
+
+// Counts are deltas: consuming an observation starts a new count. Coalescing
+// frees no extra capacity for a non-motion transition at the byte bound.
+#[test]
+fn coalescing_counts_are_deltas_and_non_motion_byte_overflow_still_closes() {
+    let t = Target::new(Config {
+        max_events: 4,
+        max_bytes: 192,
+        ..Config::default()
+    })
+    .unwrap();
+    let c = t.admit(Mode::Cooperative).unwrap();
+    c.submit(1, 1, motion(1.0)).unwrap();
+    c.submit(1, 2, motion(2.0)).unwrap();
+    assert_eq!(c.poll(), Some(Status::Coalesced { count: 1 }));
+    c.submit(1, 3, motion(2.0)).unwrap();
+    assert_eq!(c.poll(), Some(Status::Coalesced { count: 1 }));
+    assert_eq!(c.submit(1, 4, down(1)), Err(Error::Overflow)); // 96 + key payload exceeds 192.
+    assert!(matches!(
+        finish(&t).operation,
+        Operation::Cleanup {
+            reason: Reason::Overflow,
+            ..
+        }
+    ));
+    assert_eq!(c.epoch(), Err(Error::Closed));
+}

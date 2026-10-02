@@ -12,6 +12,9 @@ fn c_input_layouts_and_recoverable_handle_destruction_match_header() {
         assert_eq!(std::mem::offset_of!(FtInputEvent, text), 136);
         assert_eq!(size_of::<FtInputOperation>(), 192);
         assert_eq!(size_of::<FtInputStatus>(), 56);
+        // Coalescing uses the existing sequence slot as a count, preserving layout.
+        assert_eq!(std::mem::offset_of!(FtInputStatus, sequence), 8);
+        assert_eq!(std::mem::offset_of!(FtInputStatus, epoch), 16);
     }
     // SAFETY: live disjoint stack storage, unique null-initialized handle slots.
     unsafe {
@@ -82,6 +85,67 @@ fn c_input_serves_and_connects_over_local_endpoint_connections() {
         let mut status = FtInputStatus::default();
         while ft_input_client_poll(client, &mut status) == FT_STATUS_EMPTY {
             assert!(Instant::now() < deadline, "no completion");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!((status.kind, status.sequence, status.result), (1, sequence, 0));
+        ft_input_client_destroy(&mut client);
+        ft_input_server_destroy(&mut server);
+        while ft_input_target_destroy(&mut target) != FT_STATUS_OK {
+            let mut work = ptr::null_mut();
+            if ft_input_target_next(target, &mut work) == FT_STATUS_OK {
+                assert_eq!(ft_input_work_complete(&mut work, 0), FT_STATUS_OK);
+            }
+            assert!(Instant::now() < deadline, "cleanup did not settle");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+// Public C polling reports a superseded count through the unchanged status
+// layout, then reports ordinary completion for the surviving motion.
+#[test]
+fn c_input_poll_observes_motion_coalescing() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let (mut accepted, mut connected) = local::c_pair();
+    // SAFETY: uniquely owned live handles and disjoint writable stack outputs.
+    unsafe {
+        let mut config = FtInputConfig::default();
+        ft_input_config_default(&mut config);
+        let mut target = ptr::null_mut();
+        assert_eq!(ft_input_target_create(&config, &mut target), FT_STATUS_OK);
+        let mut server = ptr::null_mut();
+        assert_eq!(ft_input_target_serve_local(target, &mut accepted, &mut server), FT_STATUS_OK);
+        let mut client = ptr::null_mut();
+        assert_eq!(ft_input_client_connect_local(&mut connected, 4, &mut client), FT_STATUS_OK);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sequence = 0;
+        for x in [1.0, 2.0] {
+            let event = FtInputEvent {
+                kind: 3,
+                geometry_revision: 1,
+                x,
+                y: 1.0,
+                ..Default::default()
+            };
+            assert_eq!(ft_input_client_send(client, &event, &mut sequence), FT_STATUS_OK);
+        }
+        let mut status = FtInputStatus::default();
+        while ft_input_client_poll(client, &mut status) == FT_STATUS_EMPTY {
+            assert!(Instant::now() < deadline, "no coalescing count");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!((status.kind, status.sequence), (5, 1));
+        let mut work = ptr::null_mut();
+        assert_eq!(ft_input_target_next(target, &mut work), FT_STATUS_OK);
+        let mut operation = FtInputOperation::default();
+        assert_eq!(ft_input_work_describe(work, &mut operation), FT_STATUS_OK);
+        assert_eq!((operation.sequence, operation.event.x), (sequence, 2.0));
+        assert_eq!(ft_input_work_complete(&mut work, 0), FT_STATUS_OK);
+        while ft_input_client_poll(client, &mut status) == FT_STATUS_EMPTY {
+            assert!(Instant::now() < deadline, "no motion completion");
             thread::sleep(Duration::from_millis(2));
         }
         assert_eq!((status.kind, status.sequence, status.result), (1, sequence, 0));

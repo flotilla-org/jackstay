@@ -173,8 +173,25 @@ pub struct Work {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Status {
-    Completed { sequence: u64, outcome: Outcome },
-    Rejected { sequence: u64, error: Error },
-    Reset { epoch: u64, geometry: Geometry },
-    Closed { reason: Reason, clean: bool },
+    /// This many accepted queued motions were superseded, not executed. Each
+    /// contributes one settled outstanding operation; no sequence IDs are retained.
+    Coalesced {
+        count: u64,
+    },
+    Completed {
+        sequence: u64,
+        outcome: Outcome,
+    },
+    Rejected {
+        sequence: u64,
+        error: Error,
+    },
+    Reset {
+        epoch: u64,
+        geometry: Geometry,
+    },
+    Closed {
+        reason: Reason,
+        clean: bool,
+    },
 }

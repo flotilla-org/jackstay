@@ -286,6 +286,19 @@ impl Controller {
             return Err(Error::Busy);
         }
         validate(&s.config, s.active.as_ref().unwrap().mode, &event)?;
+        // Only the queued tail can be superseded; dispatched work and transitions
+        // remain ordered. Validation above also prevents invalid motion replacing it.
+        if matches!(event, Event::Motion(_))
+            && s.queue
+                .back()
+                .is_some_and(|w| matches!(w.operation, Operation::Event(Event::Motion(_))))
+        {
+            let tail = s.queue.back_mut().unwrap();
+            tail.sequence = sequence;
+            tail.operation = Operation::Event(event);
+            s.status(Status::Coalesced { count: 1 });
+            return Ok(());
+        }
         let bytes: usize = s.queue.iter().map(work_bytes).sum::<usize>() + s.flight.as_ref().map_or(0, |f| work_bytes(&f.work));
         if s.queue.len() + usize::from(s.flight.is_some()) >= s.config.max_events || bytes + event.bytes() > s.config.max_bytes {
             s.cancel(Scope::All, Reason::Overflow, true);
@@ -344,6 +357,13 @@ impl State {
             return;
         };
         let mut mailbox = a.mailbox.lock().unwrap();
+        // Aggregate adjacent unread observations so a motion burst uses one slot.
+        if let Status::Coalesced { count } = status {
+            if let Some(Status::Coalesced { count: pending }) = mailbox.back_mut() {
+                *pending += count;
+                return;
+            }
+        }
         if mailbox.len() >= self.config.max_events * 2 + 4 {
             mailbox.clear();
             mailbox.push_back(Status::Closed {

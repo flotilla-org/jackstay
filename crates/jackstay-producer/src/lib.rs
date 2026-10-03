@@ -88,6 +88,7 @@ impl<P: Producer> Builder<P> {
                         continue;
                     }
                 };
+                // Internal owner poisoning needs the recovery policy tracked in #58.
                 let mut peers = peers.lock().unwrap();
                 peers.retain_mut(Peer::alive);
                 if flag.load(Ordering::Acquire) {

@@ -25,6 +25,8 @@ no input authority. Connections are bounded to eight by default; use
 `max_connections` to change the limit. A silent bootstrap cannot hold shutdown.
 At the limit, newly accepted connections are closed without negotiation. A peer
 continues to count after media EOF while input or affordances remains alive.
+Finished peer records and threads are reaped on the next accept or shutdown;
+the connection limit bounds this retained bookkeeping.
 Each accepted connection runs the explicit v2 bootstrap on a worker bounded
 by the existing five-second handshake deadline. Successful media streams keep
 their original peer identity and go to the CPU setup server.

@@ -5,8 +5,9 @@ use std::time::Duration;
 use jackstay::{
     acquisition::arena::{ArenaConfig, FrameDescriptor},
     affordances::{Snapshot, Window},
-    input::{Config, Outcome, Work},
+    input::{Config, Operation, Outcome, Work},
     local::{Endpoint, Scope, Transport},
+    model::PixelFormat,
 };
 use jackstay_producer::{Builder, Frame, Producer};
 struct Content;
@@ -17,13 +18,18 @@ impl Producer for Content {
                 width: 1,
                 height: 1,
                 stride: 4,
+                pixel_format: PixelFormat::Rgba8Unorm as u32,
                 ..Default::default()
             },
             bytes: vec![255, 0, 0, 255],
         })
     }
-    fn execute(&mut self, _: Work) -> Outcome {
-        Outcome::Unsupported
+    fn execute(&mut self, work: Work) -> Outcome {
+        // This example never executes input, so it has no held state to release.
+        match work.operation {
+            Operation::Cleanup { .. } => Outcome::Executed,
+            Operation::Event(_) => Outcome::Unsupported,
+        }
     }
     fn snapshots(&mut self) -> Vec<Snapshot> {
         vec![Snapshot::Window(Window {
@@ -44,7 +50,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_incarnations: 4,
         drain_timeout: Duration::from_secs(5),
     };
-    let source = Builder::new(endpoint, arena, Config::default(), Content).start()?;
+    let source = Builder::new(
+        endpoint,
+        arena,
+        Config {
+            capabilities: 0,
+            ..Config::default()
+        },
+        Content,
+    )
+    .start()?;
     std::thread::sleep(Duration::from_secs(10));
     source.stop()?;
     Ok(())

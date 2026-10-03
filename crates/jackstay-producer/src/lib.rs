@@ -344,6 +344,9 @@ fn pump<P: Producer>(
         }
         thread::sleep(Duration::from_millis(5));
     }
+    // Caller callback panics are isolated above. Recovery from a library-internal
+    // invariant panic/poisoned owner needs a separate ownership policy (#58):
+    // unlocking inconsistent arena/Target state is not proof of clean release.
     // Cancel accepts, interrupt setup/media, join workers, then drop input
     // servers before draining the executor and freeing its target.
     stop.store(true, Ordering::Release);

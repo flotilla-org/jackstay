@@ -242,3 +242,159 @@ impl Handshake {
         Ok(stream)
     }
 }
+
+/// Channel identities, independent of semantic domains.
+pub const INPUT: u32 = 1;
+pub const AFFORDANCES: u32 = 2;
+const MAGIC_V2: &[u8; 8] = b"JSBOOT02";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelRequest {
+    None,
+    Optional,
+    Required,
+}
+impl ChannelRequest {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Optional => 1,
+            Self::Required => 2,
+        }
+    }
+}
+pub struct AcceptedV2 {
+    pub media: Stream,
+    pub input: Option<Server>,
+    pub affordances: Option<crate::affordances::Producer>,
+}
+pub struct ConnectedV2 {
+    pub media: Stream,
+    pub input: Option<Client>,
+    pub input_error: Option<input::Error>,
+    pub affordances: Option<crate::affordances::Host>,
+    pub affordances_refused: bool,
+}
+/// Explicit v2; never retry or downgrade a consumed stream. The 24-byte
+/// request is magic[8], input mode, affordances request (0/1/2), affordances
+/// version, reserved zero. The 48-byte reply is magic[8], channel mask, input
+/// version, affordances version, reserved zero, then two 12-byte NUL-padded
+/// UTF-8 channel names (`input`, `affordances`). Integers are u32 BE. Descriptors follow
+/// in INPUT then AFFORDANCES order, with receipt within the five-second bound.
+pub fn accept_v2(stream: Stream, target: Option<Target>, affordances: bool) -> Result<AcceptedV2, Error> {
+    let mut h = Handshake::new(stream)?;
+    let mut r = [0u8; 24];
+    h.read(&mut r)?;
+    let word = |i| u32::from_be_bytes(r[i..i + 4].try_into().unwrap());
+    if &r[..8] != MAGIC_V2 || !matches!(word(8), 0 | 1 | 2 | 4) || word(12) > 2 || word(20) != 0 {
+        return Err(Error::Protocol("invalid v2 request"));
+    }
+    let input = if word(8) != 0 {
+        target
+            .map(|t| {
+                let (a, b) = channel_pair()?;
+                Ok::<_, io::Error>((Server::start(t, a)?, b))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let aff = if word(12) != 0 && word(16) == 1 && affordances {
+        let (a, b) = channel_pair()?;
+        Some((crate::affordances::Producer::start(a)?, b))
+    } else {
+        None
+    };
+    let mask = (if input.is_some() { INPUT } else { 0 }) | (if aff.is_some() { AFFORDANCES } else { 0 });
+    let mut reply = [0u8; 48];
+    reply[..8].copy_from_slice(MAGIC_V2);
+    reply[8..12].copy_from_slice(&mask.to_be_bytes());
+    reply[12..16].copy_from_slice(&u32::from(input.is_some()).to_be_bytes());
+    reply[16..20].copy_from_slice(&u32::from(aff.is_some()).to_be_bytes());
+    reply[24..36].copy_from_slice(b"input\0\0\0\0\0\0\0");
+    reply[36..48].copy_from_slice(b"affordances\0");
+    h.write(&reply)?;
+    let input = if let Some((s, p)) = input {
+        h.send_input(p)?;
+        Some(s)
+    } else {
+        None
+    };
+    let affordances = if let Some((s, p)) = aff {
+        h.send_input(p)?;
+        Some(s)
+    } else {
+        None
+    };
+    Ok(AcceptedV2 {
+        media: h.finish()?,
+        input,
+        affordances,
+    })
+}
+/// Optional clean refusals preserve media and other channels; malformed offers,
+/// uncertain transfers and required refusals close all newly owned channels.
+pub fn connect_v2(stream: Stream, input_request: InputRequest, request: ChannelRequest) -> Result<ConnectedV2, Error> {
+    let mut h = Handshake::new(stream)?;
+    let mode = match input_request {
+        InputRequest::None => None,
+        InputRequest::Optional(m) | InputRequest::Required(m) => Some(m),
+    };
+    let mut r = [0u8; 24];
+    r[..8].copy_from_slice(MAGIC_V2);
+    r[8..12].copy_from_slice(&mode.map_or(0, Mode::bit).to_be_bytes());
+    r[12..16].copy_from_slice(&request.code().to_be_bytes());
+    r[16..20].copy_from_slice(&1u32.to_be_bytes());
+    h.write(&r)?;
+    let mut r = [0u8; 48];
+    h.read(&mut r)?;
+    let word = |i| u32::from_be_bytes(r[i..i + 4].try_into().unwrap());
+    let mask = word(8);
+    if &r[..8] != MAGIC_V2
+        || &r[24..36] != b"input\0\0\0\0\0\0\0"
+        || &r[36..48] != b"affordances\0"
+        || mask & !(INPUT | AFFORDANCES) != 0
+        || word(12) != u32::from(mask & INPUT != 0)
+        || word(16) != u32::from(mask & AFFORDANCES != 0)
+        || word(20) != 0
+        || (mode.is_none() && mask & INPUT != 0)
+        || (request == ChannelRequest::None && mask & AFFORDANCES != 0)
+    {
+        return Err(Error::Protocol("invalid v2 offer"));
+    }
+    let input_stream = if mask & INPUT != 0 { Some(h.receive_input()?) } else { None };
+    let affordances = if mask & AFFORDANCES != 0 {
+        Some(crate::affordances::Host::start(h.receive_input()?)?)
+    } else {
+        None
+    };
+    let media = h.finish()?;
+    let mut input = None;
+    let mut input_error = None;
+    if let Some(mode) = mode {
+        if let Some(stream) = input_stream {
+            match Client::connect(stream, mode) {
+                Ok(c) => input = Some(c),
+                Err(ConnectError::Admission(e)) => input_error = Some(e),
+                Err(ConnectError::Transport(e)) => return Err(e.into()),
+            }
+        } else {
+            input_error = Some(input::Error::Unsupported)
+        }
+    }
+    if matches!(input_request, InputRequest::Required(_)) {
+        if let Some(e) = input_error {
+            return Err(Error::Input(e));
+        }
+    }
+    let affordances_refused = request != ChannelRequest::None && affordances.is_none();
+    if affordances_refused && request == ChannelRequest::Required {
+        return Err(Error::Protocol("required affordances refused"));
+    }
+    Ok(ConnectedV2 {
+        media,
+        input,
+        input_error,
+        affordances,
+        affordances_refused,
+    })
+}

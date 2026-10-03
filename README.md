@@ -123,3 +123,18 @@ expose one authorized endpoint for CPU media and optional shared input, while
 retaining independent channel ownership and processing. Rust uses `bootstrap`;
 C/Zig clients use `jackstay_bootstrap.h`. The SDL reference source and viewer
 exercise it with `--source-socket`; KS's connector adoption is a separate change.
+
+Native Rust producers can use the **`jackstay-producer`** workspace crate. It is
+convenience scaffolding over Jackstay, with no rendering dependency or desktop
+authority. `Builder::new(endpoint, arena_config, input_config, callbacks).start()`
+returns a running `Source`; `Source::stop()` performs ordered shutdown. Implement
+`Producer` for CPU frames, input execution (including cleanup), state snapshots,
+and affordance callbacks. See
+[the minimal example](crates/jackstay-producer/examples/minimal.rs) and
+[the toolkit contract](crates/jackstay-producer/README.md).
+
+Affordances are available through explicit `bootstrap::accept_v2` /
+`connect_v2` negotiation and the ABI 0.12 typed
+[`jackstay_affordances.h`](crates/jackstay/include/jackstay_affordances.h) surface.
+The legacy bootstrap entry points explicitly select v1. No automatic downgrade
+or retry occurs on a partially consumed stream.

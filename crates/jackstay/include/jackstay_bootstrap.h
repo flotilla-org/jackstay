@@ -1,6 +1,9 @@
 #ifndef JACKSTAY_BOOTSTRAP_H
 #define JACKSTAY_BOOTSTRAP_H
 #include "jackstay_input.h"
+/* V2 typed channel declarations are also checked by the existing C/Zig
+ * bootstrap-header compilation and translation checks. */
+#include "jackstay_affordances.h"
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -105,3 +105,8 @@ pub mod state;
 pub mod transfer_channel;
 
 pub use error::{CaptureTransferError, Result};
+
+pub mod affordances;
+mod framing;
+
+pub mod ffi_affordances;

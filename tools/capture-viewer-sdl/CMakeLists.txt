@@ -28,7 +28,7 @@ if(NOT EXISTS "${JACKSTAY_LIB}")
   message(FATAL_ERROR "Build Jackstay first (backend-macos on macOS), or set JACKSTAY_LIB to the built shared library")
 endif()
 
-set(VIEWER_SOURCES src/main.c src/viewer_input.c)
+set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c)
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
   # ft_acquisition_macos_* symbols this viewer links against are present.
@@ -44,11 +44,13 @@ target_include_directories(capture-viewer-sdl PRIVATE
   ${SDL2_INCLUDE_DIRS}
 )
 target_link_directories(capture-viewer-sdl PRIVATE ${SDL2_LIBRARY_DIRS})
-target_link_libraries(capture-viewer-sdl PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES})
+target_link_libraries(capture-viewer-sdl PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
 target_compile_options(capture-viewer-sdl PRIVATE ${SDL2_CFLAGS_OTHER})
 
 if(APPLE)
   target_link_libraries(capture-viewer-sdl PRIVATE
+    "-framework AppKit"
+    objc
     "-framework Metal"
     "-framework QuartzCore"
     "-framework IOSurface"
@@ -112,3 +114,32 @@ add_test(NAME cooperative_input_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/input_processes.py
   $<TARGET_FILE:capture-input-source> $<TARGET_FILE:capture-viewer-sdl>)
 set_tests_properties(cooperative_input_processes PROPERTIES TIMEOUT 20)
+
+add_executable(v2-source-fixture tests/v2_source.c)
+target_include_directories(v2-source-fixture PRIVATE "${JACKSTAY_INCLUDE_DIR}" src)
+target_compile_options(v2-source-fixture PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(v2-source-fixture PRIVATE ${JACKSTAY_LIB})
+add_test(NAME v2_affordances_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_processes.py
+  $<TARGET_FILE:v2-source-fixture> $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(v2_affordances_processes PROPERTIES TIMEOUT 30)
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+add_test(NAME v2_toolkit_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_toolkit.py
+  ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(v2_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+add_test(NAME typing_input_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/typing_processes.py
+  $<TARGET_FILE:capture-input-source> $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(typing_input_processes PROPERTIES TIMEOUT 30)
+
+add_executable(scroll-input-contract tests/scroll_input.c src/viewer_input.c)
+target_include_directories(scroll-input-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(scroll-input-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(scroll-input-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(scroll-input-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
+if(APPLE)
+  target_link_libraries(scroll-input-contract PRIVATE "-framework AppKit" objc)
+endif()
+add_test(NAME scroll_input_contract COMMAND scroll-input-contract)
+set_tests_properties(scroll_input_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)

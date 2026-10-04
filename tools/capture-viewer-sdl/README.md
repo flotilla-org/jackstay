@@ -120,8 +120,28 @@ uses synthetic native sources; authorized live capture acceptance is separate.
 
 ## Cooperative input reference
 
-ABI 0.8 bootstraps CPU media and optional shared input through one endpoint.
-Start the interactive synthetic source in a private directory:
+ABI 0.12 supports bootstrap v2 over named Local Endpoints. Start the toolkit
+example and connect to its user endpoint:
+
+```sh
+cargo run -p jackstay-producer --example minimal &
+# After the source starts (the example runs for ten seconds):
+./build/viewer/capture-viewer-sdl --source-endpoint minimal-producer --log-affordances
+```
+
+`--source-endpoint NAME` uses `ft_local_connect` and bootstrap v2; add
+`--session-scope` when the producer uses a session endpoint. `--affordances
+none|optional|required` defaults to `optional` and applies only to this path.
+Required absence fails setup; optional absence preserves media. `--observe`
+requests no input while still allowing affordances. `--log-affordances` prints
+each producer snapshot's domain and summary to stderr. The viewer publishes an
+initial `presentation` snapshot with visible=true, window focus, scale=1 and no
+preferred size. Media, input and affordances are independently owned and closed;
+affordances closure does not confirm input cleanup. Affordances are not rendered.
+
+`--source-socket PATH` retains bootstrap v1 for arbitrary POSIX paths; it cannot
+connect to a v2-only toolkit producer. Start the legacy interactive source in
+a private directory:
 
 ```sh
 demo_dir=$(mktemp -d /tmp/jackstay-input.XXXXXX)
@@ -144,7 +164,9 @@ This is a cooperative target, not native desktop injection.
 
 The source also listens on a [Local Endpoint](../../docs/design/local-endpoints.md)
 with `--endpoint NAME` (add `--session-scope` for a session endpoint), the only
-form on Windows. It needs no SDL, so build it there directly, for example from a
+form on Windows. This legacy source still uses bootstrap v1, including on named
+endpoints; the new viewer `--source-endpoint` path requires a v2 producer. It
+needs no SDL, so build it there directly, for example from a
 Visual Studio developer prompt:
 
 ```bat
@@ -159,18 +181,29 @@ the input geometry, to exercise consumer reconfiguration. `--repeat` keeps the
 endpoint and serves viewers one after another until the source is killed, so a
 viewer can reconnect, for example to request input again.
 
-`--source-socket` requests optional cooperative input. Use `--observe` to request
-only media, or `--require-input` to fail if control is unavailable. Optional
+`--source-socket` and `--source-endpoint` request optional cooperative input. Use `--observe` to request
+no input, or `--require-input` to fail if control is unavailable. Optional
 refusal is reported while observation continues. The source can withhold input
 with `--observe-only`. The low-level `--cpu-socket` plus `--input-socket` pair
 remains available for independent adapter tests. Without `--input-socket`, that
 low-level CPU connection is observation-only. The reference sender
-uses cooperative key events, separate committed text and source repeat. Focus
+uses `--typing cooperative|text|physical` on either bootstrap path (default
+`cooperative`). With `--observe`, typing has no effect because no input channel
+is requested. Text mode sends committed text and suppresses every key, including
+modifiers, Enter, Backspace and arrows; those keys do not become remote controls
+or editing commands. Physical mode
+sends physical keys, suppresses committed text and SDL repeat events (repeat belongs
+to the target). Cooperative mode sends physical keys, committed text and source
+repeat. Unsupported typing modes can be refused by the producer. The low-level
+input socket retains cooperative behavior. Focus
 loss clears held state but retains the controller; reconnecting starts empty.
 The input connection has its own heartbeat worker, independent of rendering.
 
 `ctest --test-dir build/viewer --output-on-failure` includes separate-process
-cooperative input and viewer-process-death cleanup. `--input-self-test` is a
+cooperative input, all typing modes, viewer-process-death cleanup, v2 channel
+negotiation/presentation/teardown, and the actual toolkit minimal example. The
+latter uses Cargo in offline mode and an isolated runtime directory; cached or
+vendored crates are required, and its first run may build the example. `--input-self-test` is a
 fixture for that test, not ordinary interactive behavior. The text fixture feeds
 the same event translator as live SDL input because sdl2-compat cannot translate
 pushed SDL2 text-input events. Native desktop input and live desktop capture are
@@ -178,3 +211,28 @@ separate acceptance work. See [the contract](../../docs/design/input.md) and
 [the C interface](../../crates/jackstay/include/jackstay_input.h).
 
 See [bootstrap ownership and failure semantics](../../docs/design/source-bootstrap.md).
+
+### Scroll units and SDL2 on macOS
+
+SDL2's [Cocoa wheel adapter](https://github.com/libsdl-org/SDL/blob/release-2.32.10/src/video/cocoa/SDL_cocoamouse.m#L509)
+passes Cocoa `deltaX/Y` to `SDL_SendMouseWheel`; `preciseX/Y` retain these float
+values. They are not AppKit's logical-pixel `scrollingDeltaX/Y`. SDL2 rounds
+non-precise wheel values away from zero and leaves precise values fractional,
+but it drops `hasPreciseScrollingDeltas`: an integral trackpad delta cannot be
+identified from `preciseX/Y` alone. This finding is from upstream source inspection,
+not a live hardware measurement. The Cocoa metadata capture and SDL event-filter
+rewrite were source-verified with SDL2 2.32.10; older Cocoa releases have not been
+verified.
+
+The C viewer captures precise wheel metadata during SDL's event filter, inside
+Cocoa dispatch. It reads the current `NSEvent` through the Objective-C C runtime: precise devices use
+`scrollingDeltaX/Y` as `Pixel`, scaled from window logical coordinates into target
+geometry. Value-only user events preserve ordering with focus and key events;
+notched wheels use SDL's `Line` values without a line-height multiplier.
+Positive deltas mean right/down after `SDL_MOUSEWHEEL_FLIPPED` inversion. Momentum
+arrives as further pixel events; no phases or momentum protocol is synthesized.
+Outside Cocoa, SDL2 provides no portable unit/device flag: the fallback treats
+fractional wheel values as continuous `Pixel` deltas and integral values as
+`Line`. Integral precise-device deltas remain ambiguous on that fallback, and
+SDL2 before 2.0.18 exposes only integer values. Live macOS trackpad/HiDPI checks
+remain separate from the dummy-video tests.

@@ -48,7 +48,7 @@ static void log_input(const ft_input_operation *op) {
     case FT_INPUT_TEXT: printf("input text \"%.*s\"\n", (int)e->text_len, (const char *)e->text); break;
     case FT_INPUT_BUTTON: printf("input button %u %s at %.1f,%.1f\n", e->button, action_name(e->action), e->x, e->y); break;
     case FT_INPUT_MOTION: printf("input motion %.1f,%.1f\n", e->x, e->y); break;
-    case FT_INPUT_SCROLL: printf("input scroll %.2f,%.2f at %.1f,%.1f\n", e->x, e->y, e->pointer_x, e->pointer_y); break;
+    case FT_INPUT_SCROLL: printf("input scroll %.2f,%.2f unit=%u at %.1f,%.1f\n", e->x, e->y, e->scroll_unit, e->pointer_x, e->pointer_y); break;
     case FT_INPUT_CLEANUP: printf("input cleanup scope=%u reason=%u\n", op->scope, op->reason); break;
     default: printf("input kind=%u\n", e->kind);
   }
@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
   ft_cpu_producer_config media_config = {6, 2, 1, 2, STRIDE * HEIGHT, 8 * 1024 * 1024, 5000000000ULL};
   checked(ft_cpu_producer_create(&media_config, &producer));
   ft_input_target *target = NULL;
-  ft_input_config config; ft_input_config_default(&config); config.independent_contributions = 1; config.interaction_cancel = 1;
+  ft_input_config config; ft_input_config_default(&config); config.modes = FT_INPUT_MODE_PHYSICAL | FT_INPUT_MODE_SOURCE_TEXT | FT_INPUT_MODE_COOPERATIVE; config.independent_contributions = 1; config.interaction_cancel = 1;
   config.geometry.width = WIDTH; config.geometry.height = HEIGHT; checked(ft_input_target_create(&config, &target));
   printf("ready\n"); fflush(stdout);
   uint8_t *pixels = malloc((size_t)LARGE_WIDTH * 4 * LARGE_HEIGHT); if (!pixels) return 1;

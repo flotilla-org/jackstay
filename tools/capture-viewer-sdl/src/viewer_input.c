@@ -1,5 +1,6 @@
 #include "viewer_input.h"
 #include <stdio.h>
+#include <stddef.h>
 #include <math.h>
 #ifdef __APPLE__
 #include <objc/message.h>
@@ -14,6 +15,8 @@
 /* A value-only SDL user event preserves wheel ordering with focus and keys.
  * No heap payload or extra queue needs ownership during shutdown. */
 typedef struct { Uint32 type, timestamp, window_id, direction; double x, y; } precise_wheel;
+/* SDL identifies queued events by the first type member of SDL_Event. */
+_Static_assert(offsetof(precise_wheel, type) == offsetof(SDL_CommonEvent, type), "SDL event type offset");
 _Static_assert(sizeof(precise_wheel) <= sizeof(SDL_Event), "precise wheel fits SDL event");
 #endif
 
@@ -174,7 +177,10 @@ void viewer_input_install_wheel_filter(viewer_input *input, SDL_Window *window) 
 #ifdef __APPLE__
   input->event_thread = SDL_ThreadID();
   input->precise_wheel_type = SDL_RegisterEvents(1);
-  if (input->precise_wheel_type == (Uint32)-1) { input->failed = 1; return; }
+  if (input->precise_wheel_type == (Uint32)-1) {
+    fprintf(stderr, "SDL precise wheel event registration failed: %s\n", SDL_GetError());
+    input->failed = 1; return;
+  }
   SDL_SetEventFilter(wheel_filter, input);
 #else
   (void)input;

@@ -171,7 +171,6 @@ set_tests_properties(scroll_geometry_contract PROPERTIES ENVIRONMENT "SDL_VIDEOD
 add_test(NAME scroll_toolkit_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/scroll_processes.py
   ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
-set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 
 add_executable(navigation-contract tests/navigation.c src/viewer_navigation.c src/viewer_affordances.c src/viewer_scroll.c)
 target_include_directories(navigation-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
@@ -192,3 +191,17 @@ target_compile_options(navigation-send-contract PRIVATE -Wall -Wextra -Werror ${
 target_link_libraries(navigation-send-contract PRIVATE ${SDL2_LIBRARIES})
 add_test(NAME navigation_send_contract COMMAND navigation-send-contract)
 set_tests_properties(navigation_send_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
+if(APPLE)
+  # Twenty consecutive writable/read-only pairs, each with a 10-second producer.
+  set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+else()
+  set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+endif()
+
+add_executable(scroll-self-test-contract tests/scroll_self_test.c)
+target_include_directories(scroll-self-test-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(scroll-self-test-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(scroll-self-test-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(scroll-self-test-contract PRIVATE ${SDL2_LIBRARIES})
+add_test(NAME scroll_self_test_contract COMMAND scroll-self-test-contract)
+set_tests_properties(scroll_self_test_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)

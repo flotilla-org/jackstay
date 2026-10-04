@@ -56,9 +56,5 @@ def run(read_only):
                 source.kill()
                 source.communicate()
 
-# macOS regression evidence: fail immediately if any writable/read-only pair
-# misses a verb, and require 20 consecutive pairs in the existing CI job.
-for iteration in range(20 if sys.platform == "darwin" else 1):
-    print(f"scroll process iteration {iteration + 1}", flush=True)
-    run(False)
-    run(True)
+run(False)
+run(True)

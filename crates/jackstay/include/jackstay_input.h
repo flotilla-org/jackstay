@@ -51,9 +51,11 @@ typedef struct ft_input_work ft_input_work;
 #define FT_INPUT_SCROLL_PIXEL 1
 /* Notched wheels: one unit per notch (Windows delta / 120; X11 buttons 4-7:
  * 4 = y -1 (up), 5 = y +1 (down), 6 = x -1 (left), 7 = x +1 (right);
- * macOS non-precise: line delta). Normalize signs to right/down: negate
- * positive-up vertical deltas (Windows WM_MOUSEWHEEL delta / 120 and macOS
- * positive-up line deltas), accounting for natural scrolling once. */
+ * macOS non-precise: line delta). For native positive-up sources (Windows
+ * WM_MOUSEWHEEL delta / 120 and macOS positive-up line deltas), negate the
+ * vertical delta to make it positive-down. X11 values above are already
+ * normalized. Apply platform natural-scrolling inversion before sending;
+ * do not reapply an inversion already included in the platform event. */
 #define FT_INPUT_SCROLL_LINE 2
 /* Explicit page-scroll gestures only; never synthesized from wheels. */
 #define FT_INPUT_SCROLL_PAGE 3

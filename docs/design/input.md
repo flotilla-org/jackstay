@@ -50,9 +50,11 @@ Controllers choose the scroll unit from the device's reported semantics:
 - Notched wheels send `Line`, one unit per notch: Windows wheel delta / 120,
   X11 buttons 4/5 emit `y = -1` (up) / `y = +1` (down), buttons 6/7 emit
   `x = -1` (left) / `x = +1` (right), and macOS non-precise
-  devices use the line delta. Normalize platform signs to right/down: negate
-  positive-up vertical deltas (including Windows `WM_MOUSEWHEEL` delta / 120
-  and macOS positive-up line deltas), accounting for natural scrolling once.
+  devices use the line delta. For native positive-up sources (Windows
+  `WM_MOUSEWHEEL` delta / 120 and macOS positive-up line deltas), negate the
+  vertical delta to make it positive-down. The X11 values above are already
+  normalized. Apply natural-scrolling inversion as described below; do not
+  reapply an inversion already included in the platform event.
   Fractions are allowed; controllers do not round.
 - `Page` is only for explicit page-scroll gestures, never synthesized from wheels.
 

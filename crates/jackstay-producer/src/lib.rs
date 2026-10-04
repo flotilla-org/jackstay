@@ -31,6 +31,14 @@ pub struct Frame {
 pub trait Producer: Send + 'static {
     fn frame(&mut self) -> Option<Frame>;
     fn execute(&mut self, work: Work) -> Outcome;
+    /// Return consumed storage after publication or a capacity-paused discard.
+    /// The toolkit no longer borrows these bytes when this callback runs.
+    fn recycle(&mut self, _frame: Frame) {}
+    /// Logical input dimensions for a replacement pixel buffer. Scaled renderers
+    /// can keep input coordinates independent of the capture's device pixels.
+    fn input_size(&mut self, width: u32, height: u32) -> (f64, f64) {
+        (f64::from(width), f64::from(height))
+    }
     /// Return only changed domains; an empty Vec requires no allocation.
     fn snapshots(&mut self) -> Vec<Snapshot> {
         Vec::new()
@@ -290,56 +298,62 @@ fn pump<P: Producer>(
             }
         };
         if let Some(frame) = frame {
-            let dims = (frame.descriptor.width, frame.descriptor.height, frame.descriptor.stride);
-            let mut a = arena.lock().unwrap();
-            // Avoid replacing the caller's correctly sized initial arena: a
-            // consumer may attach before the first callback supplies its frame.
-            if size.is_none() && pending.is_none() && frame.bytes.len() <= capacity {
-                size = Some(dims);
-            }
-            if pending.is_some() || size != Some(dims) || frame.bytes.len() > capacity {
-                let status = if pending.is_some() {
-                    a.advance_reconfiguration()
-                } else {
-                    pending = Some((dims, frame.bytes.len()));
-                    a.reconfigure_cpu(frame.bytes.len())
-                };
-                match status {
-                    Ok(ReconfigurationStatus::Ready { .. }) => {
-                        let (installed, bytes) = pending.take().unwrap();
-                        if size.is_some_and(|old| old != installed) {
-                            let old = target.config().geometry;
-                            let geometry = jackstay::input::Geometry {
-                                revision: old.revision.saturating_add(1),
-                                width: f64::from(installed.0),
-                                height: f64::from(installed.1),
-                            };
-                            if let Err(e) = target.set_geometry(geometry) {
-                                error = Some(io::Error::other(format!("geometry: {e:?}")));
-                                break;
+            let result = callback(|| {
+                let dims = (frame.descriptor.width, frame.descriptor.height, frame.descriptor.stride);
+                let mut a = arena.lock().unwrap();
+                // Avoid replacing the caller's correctly sized initial arena: a
+                // consumer may attach before the first callback supplies its frame.
+                if size.is_none() && pending.is_none() && frame.bytes.len() <= capacity {
+                    size = Some(dims);
+                }
+                if pending.is_some() || size != Some(dims) || frame.bytes.len() > capacity {
+                    let status = if pending.is_some() {
+                        a.advance_reconfiguration()
+                    } else {
+                        pending = Some((dims, frame.bytes.len()));
+                        a.reconfigure_cpu(frame.bytes.len())
+                    };
+                    match status {
+                        Ok(ReconfigurationStatus::Ready { .. }) => {
+                            let (installed, bytes) = pending.take().unwrap();
+                            if size.is_some_and(|old| old != installed) {
+                                let old = target.config().geometry;
+                                let (width, height) = p.input_size(installed.0, installed.1);
+                                let geometry = jackstay::input::Geometry {
+                                    revision: old.revision.saturating_add(1),
+                                    width,
+                                    height,
+                                };
+                                if old.width != width || old.height != height {
+                                    if let Err(e) = target.set_geometry(geometry) {
+                                        return Err(io::Error::other(format!("geometry: {e:?}")));
+                                    }
+                                }
+                            }
+                            size = Some(installed);
+                            capacity = bytes;
+                            if installed != dims || frame.bytes.len() > capacity {
+                                drop(a);
+                                thread::sleep(Duration::from_millis(5));
+                                return Ok(());
                             }
                         }
-                        size = Some(installed);
-                        capacity = bytes;
-                        if installed != dims || frame.bytes.len() > capacity {
+                        Ok(ReconfigurationStatus::PausedCapacity { .. }) => {
                             drop(a);
                             thread::sleep(Duration::from_millis(5));
-                            continue;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            return Err(io::Error::other(e));
                         }
                     }
-                    Ok(ReconfigurationStatus::PausedCapacity { .. }) => {
-                        drop(a);
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(e) => {
-                        error = Some(io::Error::other(e));
-                        break;
-                    }
                 }
-            }
-            if let Err(e) = a.publish(frame.descriptor, &frame.bytes) {
-                error = Some(io::Error::other(e));
+                a.publish(frame.descriptor, &frame.bytes).map(|_| ()).map_err(io::Error::other)
+            })
+            .and_then(|result| result);
+            let recycled = callback(|| p.recycle(frame));
+            if let Err(e) = result.and(recycled) {
+                error = Some(e);
                 break;
             }
         }

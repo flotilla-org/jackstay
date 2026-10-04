@@ -39,7 +39,12 @@ completed as uncertain where needed, and ordered shutdown still runs. Cleanup
 callbacks are attempted even after a panic; a failed cleanup is reported.
 `frame` returns owned bytes and a complete descriptor, or `None` for unchanged content. Size/stride changes
 reconfigure CPU storage; capacity pauses skip that publication and retry on
-later frames. Subsequent size changes advance the input geometry revision.
+later frames. `recycle` receives consumed frame storage after publication or
+capacity-paused discard, once the arena no longer borrows it. Pool these buffers
+to avoid allocating a pixel `Vec` on every frame. The default callback drops them.
+`input_size` maps replacement pixel dimensions to logical input dimensions; its
+default returns the pixel size. Scaled renderers can return their logical viewport.
+Only a change in logical dimensions advances the input geometry revision.
 `execute` receives `Work`, including cleanup: return `Executed` only after
 actual execution/release. Return `Uncertain` for execution uncertainty. Failed
 cleanup is reported, never silently treated as successful release.

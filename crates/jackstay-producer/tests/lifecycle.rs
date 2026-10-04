@@ -460,3 +460,89 @@ fn connection_limit_rejects_peers_while_bootstrap_stalls() {
     assert!(first.is_alive());
     source.stop().unwrap();
 }
+
+#[test]
+fn recycling_scaled_frames_preserves_storage_and_logical_geometry() {
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    struct Scaled {
+        width: Arc<AtomicU32>,
+        returned: Arc<AtomicUsize>,
+        bytes: Option<Vec<u8>>,
+        pointer: usize,
+    }
+    impl Producer for Scaled {
+        fn frame(&mut self) -> Option<Frame> {
+            let width = self.width.load(Ordering::Acquire);
+            if width == 0 {
+                return None;
+            }
+            let mut bytes = self.bytes.take().expect("previous storage returned");
+            assert_eq!(bytes.as_ptr() as usize, self.pointer);
+            bytes.resize(width as usize * 4, 7);
+            Some(Frame {
+                descriptor: FrameDescriptor {
+                    width,
+                    height: 1,
+                    stride: width * 4,
+                    ..Default::default()
+                },
+                bytes,
+            })
+        }
+        fn recycle(&mut self, frame: Frame) {
+            assert_eq!(frame.bytes.as_ptr() as usize, self.pointer);
+            self.bytes = Some(frame.bytes);
+            self.returned.fetch_add(1, Ordering::Release);
+        }
+        fn input_size(&mut self, _: u32, _: u32) -> (f64, f64) {
+            (1., 1.)
+        }
+        fn execute(&mut self, _: Work) -> Outcome {
+            Outcome::Executed
+        }
+    }
+    let width = Arc::new(AtomicU32::new(0));
+    let returned = Arc::new(AtomicUsize::new(0));
+    let bytes = Vec::with_capacity(8);
+    let pointer = bytes.as_ptr() as usize;
+    let ep = endpoint("scaled-recycle");
+    let source = Builder::new(
+        ep.clone(),
+        config(),
+        Config {
+            geometry: jackstay::input::Geometry {
+                revision: 1,
+                width: 1.,
+                height: 1.,
+            },
+            ..Default::default()
+        },
+        Scaled {
+            width: width.clone(),
+            returned: returned.clone(),
+            bytes: Some(bytes),
+            pointer,
+        },
+    )
+    .start()
+    .unwrap();
+    let connected = bootstrap::connect_v2(
+        local::connect(&ep).unwrap().into_stream(),
+        InputRequest::Required(Mode::Cooperative),
+        ChannelRequest::None,
+    )
+    .unwrap();
+    let input = connected.input.unwrap();
+    let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
+    let mut consumer = setup.attach(1).unwrap();
+    width.store(1, Ordering::Release);
+    wait(|| returned.load(Ordering::Acquire) >= 2);
+    width.store(2, Ordering::Release);
+    wait(|| setup.install_configuration(&mut consumer).unwrap().is_some());
+    wait(|| matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Frame(f) if f.descriptor().width == 2));
+    // Input remains in logical units even after replacement by a 2x buffer.
+    assert_eq!(input.welcome().config.geometry.width, 1.);
+    assert_eq!(input.welcome().config.geometry.height, 1.);
+    drop((input, consumer, setup));
+    source.stop().unwrap();
+}

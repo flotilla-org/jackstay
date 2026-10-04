@@ -446,7 +446,8 @@ fn callback_panics_still_run_ordered_shutdown() {
     }
 }
 // Review #57: a silent peer occupies the one worker slot. Additional peers are
-// visibly disconnected and stop interrupts the admitted peer's stalled read.
+// visibly rejected (connect error or disconnect), and stop interrupts the
+// admitted peer's stalled read.
 #[test]
 fn connection_limit_rejects_peers_while_bootstrap_stalls() {
     let ep = endpoint("limit");
@@ -455,8 +456,11 @@ fn connection_limit_rejects_peers_while_bootstrap_stalls() {
         .start()
         .unwrap();
     let first = local::connect(&ep).unwrap();
-    let second = local::connect(&ep).unwrap();
-    wait(|| !second.is_alive());
+    // Closing an over-limit peer can race connect on macOS, returning EINVAL.
+    // Either a connect error or a subsequent disconnect is visible rejection.
+    if let Ok(second) = local::connect(&ep) {
+        wait(|| !second.is_alive());
+    }
     assert!(first.is_alive());
     source.stop().unwrap();
 }

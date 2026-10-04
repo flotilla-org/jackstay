@@ -44,10 +44,10 @@ int main(int argc, char **argv) {
     ft_affordances_event *event = NULL;
     while (affordances && ft_affordances_producer_poll(affordances, &event) == FT_STATUS_OK) {
       ft_aff_event_view view; check(ft_affordances_event_view(event, &view));
-      /* The host publishes initial visibility, focus, scale and absent size. */
+      /* The host publishes visibility, focus, scale and logical preferred size. */
       if (view.kind == 1 && view.snapshot.domain == FT_AFF_DOMAIN_PRESENTATION) {
         const ft_aff_presentation *p = &view.snapshot.presentation;
-        if (p->visible != 1 || p->scale != 1 || p->preferred_size.present || p->focused > 1) return 1;
+        if (p->visible != 1 || p->scale != 1 || !p->preferred_size.present || p->preferred_size.width <= 0 || p->preferred_size.height <= 0 || p->focused > 1) return 1;
         presentation = 1;
       }
       if (view.kind == 3) closed = 1;

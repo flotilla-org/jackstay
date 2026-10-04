@@ -236,3 +236,27 @@ fractional wheel values as continuous `Pixel` deltas and integral values as
 `Line`. Integral precise-device deltas remain ambiguous on that fallback, and
 SDL2 before 2.0.18 exposes only integer values. Live macOS trackpad/HiDPI checks
 remain separate from the dummy-video tests.
+
+### Window and presentation affordances (CPU)
+
+Use `--source-endpoint minimal-producer` or
+`--source-socket /path/to/minimal-producer.sock --affordances optional` for v2
+window/presentation affordances. Raw source sockets without affordance flags
+retain v1 bootstrap. `--log-affordances` also selects v2 on raw source sockets.
+The CPU window is resizable and HiDPI capable, initially hidden. A published
+window domain supplies its requested logical size until the user resizes; ready
+shows the window, with a two-second deadline. With no window domain observed at
+initial polling it shows immediately. Titles fall back through navigation title,
+URL and the viewer default. There is no domain enumeration in the protocol, so a
+window domain first published after that initial poll cannot defer first show.
+
+The host reports logical preferred size, drawable/window scale, visibility and
+focus; resize publication is debounced 100 ms. Frames fit the drawable with black
+letterboxing. Pointer and pixel-scroll coordinates use that same fit rectangle;
+positions in the bars emit no pointer events. Releasing a held button over a bar
+resets held input through cleanup, so a drag cannot leave the source button latched.
+Focus loss still resets held input state.
+The minimal toolkit example follows preferred size and scale and draws a
+one-pixel checkerboard. On Retina, inspect its sharpness at a matching drawable
+size; dummy video tests cannot establish physical Retina output.
+`--window-self-test` is a test fixture that resizes to 800x600 after two frames.

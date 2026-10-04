@@ -9,6 +9,32 @@
 /* Event tags are documented in jackstay_affordances.h, without macros. */
 enum { AFF_EVENT_SNAPSHOT = 1, AFF_EVENT_CLOSED = 3 };
 
+int viewer_affordances_strip(viewer_affordances *a) {
+  int w, h, dw, dh;
+  if (!a->navigation.visible || !a->window || !a->renderer) return 0;
+  SDL_GetWindowSize(a->window, &w, &h);
+  if (h <= 0 || SDL_GetRendererOutputSize(a->renderer, &dw, &dh)) return 0;
+  return viewer_navigation_strip_height(dh, h, 1);
+}
+SDL_Rect viewer_affordances_fit(viewer_affordances *a, int fw, int fh) {
+  int dw = 0, dh = 0; SDL_GetRendererOutputSize(a->renderer, &dw, &dh);
+  return viewer_navigation_fit(dw, dh, fw, fh, viewer_affordances_strip(a));
+}
+static void navigation_snapshot(viewer_affordances *a, const ft_aff_navigation *state) {
+  int before = a->navigation.visible;
+  viewer_navigation_snapshot(&a->navigation, state);
+  if (a->input) a->input->strip_height = a->navigation.visible ? VIEWER_NAV_HEIGHT : 0;
+  if (a->window && before != a->navigation.visible) {
+    int w, h; SDL_GetWindowSize(a->window, &w, &h);
+    int next = a->navigation.visible ? (h <= INT_MAX - VIEWER_NAV_HEIGHT ? h + VIEWER_NAV_HEIGHT : h) : (h > VIEWER_NAV_HEIGHT ? h - VIEWER_NAV_HEIGHT : 1);
+    if (next > 0) {
+      a->requested_width = w; a->requested_height = next;
+      SDL_SetWindowSize(a->window, w, next);
+    }
+    a->dirty = 1;
+  }
+}
+
 /* Indexed by the public v1 CSS cursor tags; NONE uses visibility separately. */
 SDL_SystemCursor viewer_cursor_shape(uint32_t tag) {
   static const SDL_SystemCursor shapes[] = {
@@ -71,7 +97,7 @@ void viewer_affordances_cursor_update(viewer_affordances *a) {
       SDL_GetMouseFocus() == a->window) {
     SDL_GetMouseState(&x, &y); SDL_GetWindowSize(a->window, &w, &h);
     if (w > 0 && h > 0 && !SDL_GetRendererOutputSize(a->renderer, &dw, &dh) &&
-        viewer_map(viewer_fit(dw, dh, a->frame_width, a->frame_height),
+        viewer_map(viewer_affordances_fit(a, a->frame_width, a->frame_height),
                    (double)x * dw / w, (double)y * dh / h, 1, 1, &fx, &fy)) tag = a->cursor;
   }
   cursor_apply(a, tag);
@@ -119,15 +145,16 @@ void viewer_affordances_snapshot(viewer_affordances *a, const ft_aff_snapshot *s
     copy_title(&a->title, s->withdrawn ? (ft_aff_optional_string){0} : s->window.title);
     ft_aff_size size = s->window.requested_size;
     if (!s->withdrawn && size.present && !a->user_resized &&
-        size.width >= 1 && size.height >= 1 && size.width <= INT_MAX && size.height <= INT_MAX) {
+        size.width >= 1 && size.height >= 1 && size.width <= INT_MAX && size.height <= INT_MAX - VIEWER_NAV_HEIGHT) {
       int w, h; SDL_GetWindowSize(a->window, &w, &h);
-      if (w != (int)size.width || h != (int)size.height) {
-        a->requested_width = (int)size.width; a->requested_height = (int)size.height;
+      if (w != (int)size.width || h != (int)size.height + (a->navigation.visible ? VIEWER_NAV_HEIGHT : 0)) {
+        a->requested_width = (int)size.width; a->requested_height = (int)size.height + (a->navigation.visible ? VIEWER_NAV_HEIGHT : 0);
         SDL_SetWindowSize(a->window, a->requested_width, a->requested_height);
         a->dirty = 1;
       }
     }
   } else if (s->domain == FT_AFF_DOMAIN_NAVIGATION) {
+    navigation_snapshot(a, s->withdrawn ? NULL : &s->navigation);
     copy_title(&a->navigation_title, s->withdrawn ? (ft_aff_optional_string){0} : s->navigation.title);
     copy_title(&a->url, s->withdrawn ? (ft_aff_optional_string){0} : s->navigation.url);
   }
@@ -167,9 +194,11 @@ int viewer_affordances_tick(viewer_affordances *a) {
   if (!a->host || a->closed || !a->dirty || (a->resized_at && now - a->resized_at < 100)) return 0;
   int w, h, dw, dh; SDL_GetWindowSize(a->window, &w, &h);
   if (SDL_GetRendererOutputSize(a->renderer, &dw, &dh) || w <= 0 || h <= 0 || dw <= 0 || dh <= 0) return 0;
+  int content_h = h - (a->navigation.visible ? VIEWER_NAV_HEIGHT : 0);
+  if (content_h < 1) content_h = 1;
   ft_aff_snapshot s = {.domain = FT_AFF_DOMAIN_PRESENTATION,
     .presentation = {.visible = a->visible, .focused = a->focused,
-      .preferred_size = {.present = 1, .width = w, .height = h}, .scale = (double)dw / w}};
+      .preferred_size = {.present = 1, .width = w, .height = content_h}, .scale = (double)dw / w}};
   if (ft_affordances_host_publish(a->host, &s) != FT_STATUS_OK) return 1;
   a->dirty = 0; return 0;
 }
@@ -186,6 +215,7 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
         if (log_snapshots) log_snapshot(&view.snapshot);
       }
       if (view.kind == AFF_EVENT_CLOSED) {
+        navigation_snapshot(a, NULL);
         a->closed = 1; a->cursor = FT_AFF_CURSOR_DEFAULT; cursor_apply(a, a->cursor);
 
         viewer_scroll_snapshot(&a->scroll, NULL, SDL_GetTicks());
@@ -206,6 +236,7 @@ int viewer_affordances_close(viewer_affordances *a, int log_snapshots) {
   }
 
   viewer_scroll_snapshot(&a->scroll, NULL, SDL_GetTicks());
+  viewer_navigation_destroy(&a->navigation);
   free(a->title); free(a->navigation_title); free(a->url);
   a->title = a->navigation_title = a->url = NULL; a->window = NULL;
   if (!a->host) return 0;

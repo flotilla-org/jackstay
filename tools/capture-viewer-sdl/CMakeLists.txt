@@ -28,7 +28,7 @@ if(NOT EXISTS "${JACKSTAY_LIB}")
   message(FATAL_ERROR "Build Jackstay first (backend-macos on macOS), or set JACKSTAY_LIB to the built shared library")
 endif()
 
-set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c src/viewer_scroll.c)
+set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c src/viewer_scroll.c src/viewer_navigation.c)
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
   # ft_acquisition_macos_* symbols this viewer links against are present.
@@ -133,7 +133,7 @@ add_test(NAME typing_input_processes COMMAND ${Python3_EXECUTABLE}
   $<TARGET_FILE:capture-input-source> $<TARGET_FILE:capture-viewer-sdl>)
 set_tests_properties(typing_input_processes PROPERTIES TIMEOUT 30)
 
-add_executable(scroll-input-contract tests/scroll_input.c src/viewer_input.c)
+add_executable(scroll-input-contract tests/scroll_input.c src/viewer_input.c src/viewer_navigation.c)
 target_include_directories(scroll-input-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
 target_link_directories(scroll-input-contract PRIVATE ${SDL2_LIBRARY_DIRS})
 target_compile_options(scroll-input-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
@@ -144,7 +144,7 @@ endif()
 add_test(NAME scroll_input_contract COMMAND scroll-input-contract)
 set_tests_properties(scroll_input_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
 
-add_executable(window-presentation-contract tests/window_presentation.c src/viewer_affordances.c src/viewer_scroll.c)
+add_executable(window-presentation-contract tests/window_presentation.c src/viewer_affordances.c src/viewer_scroll.c src/viewer_navigation.c)
 target_include_directories(window-presentation-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
 target_link_directories(window-presentation-contract PRIVATE ${SDL2_LIBRARY_DIRS})
 target_compile_options(window-presentation-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
@@ -152,7 +152,7 @@ target_link_libraries(window-presentation-contract PRIVATE ${JACKSTAY_LIB} ${SDL
 add_test(NAME window_presentation_contract COMMAND window-presentation-contract)
 set_tests_properties(window_presentation_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
 
-add_executable(cursor-contract tests/cursor.c src/viewer_scroll.c)
+add_executable(cursor-contract tests/cursor.c src/viewer_scroll.c src/viewer_navigation.c)
 target_include_directories(cursor-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
 target_link_directories(cursor-contract PRIVATE ${SDL2_LIBRARY_DIRS})
 target_compile_options(cursor-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
@@ -172,3 +172,23 @@ add_test(NAME scroll_toolkit_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/scroll_processes.py
   ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
 set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+
+add_executable(navigation-contract tests/navigation.c src/viewer_navigation.c src/viewer_affordances.c src/viewer_scroll.c)
+target_include_directories(navigation-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(navigation-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(navigation-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(navigation-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
+add_test(NAME navigation_contract COMMAND navigation-contract)
+set_tests_properties(navigation_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
+add_test(NAME navigation_toolkit_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/navigation_processes.py
+  ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(navigation_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+
+add_executable(navigation-send-contract tests/navigation_send.c)
+target_include_directories(navigation-send-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(navigation-send-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(navigation-send-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(navigation-send-contract PRIVATE ${SDL2_LIBRARIES})
+add_test(NAME navigation_send_contract COMMAND navigation-send-contract)
+set_tests_properties(navigation_send_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)

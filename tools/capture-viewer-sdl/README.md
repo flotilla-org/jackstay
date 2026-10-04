@@ -260,3 +260,17 @@ The minimal toolkit example follows preferred size and scale and draws a
 one-pixel checkerboard. On Retina, inspect its sharpness at a matching drawable
 size; dummy video tests cannot establish physical Retina output.
 `--window-self-test` is a test fixture that resizes to 800x600 after two frames.
+
+The viewer applies producer CSS cursor shapes only over the fitted frame,
+including drawable scaling on HiDPI displays. Letterbox bars, pointer exit,
+cursor withdrawal and affordances closure restore a visible arrow. `none`
+hides the cursor over the frame. SDL system cursors are created once and freed
+on viewer exit; names without an SDL equivalent use the arrow.
+
+Until luchs publishes cursor snapshots, the toolkit `minimal` example above
+cycles through all SDL shapes and `none` every half-second during its ten-second
+run. Move the pointer between the checkerboard and the letterbox bars to inspect
+shape changes and restoration. On macOS, run the example with
+`--features jackstay/backend-macos` to preserve the viewer's native symbols.
+The dummy-video contract test verifies mapping and lifecycle through an SDL
+cursor boundary fake; it does not establish native macOS cursor appearance.

@@ -151,3 +151,11 @@ target_compile_options(window-presentation-contract PRIVATE -Wall -Wextra -Werro
 target_link_libraries(window-presentation-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
 add_test(NAME window_presentation_contract COMMAND window-presentation-contract)
 set_tests_properties(window_presentation_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
+
+add_executable(cursor-contract tests/cursor.c)
+target_include_directories(cursor-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(cursor-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(cursor-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(cursor-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
+add_test(NAME cursor_contract COMMAND cursor-contract)
+set_tests_properties(cursor_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)

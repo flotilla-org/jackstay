@@ -8,7 +8,12 @@ import time
 
 with tempfile.TemporaryDirectory(prefix="js-toolkit-") as runtime:
     env = {**os.environ, "XDG_RUNTIME_DIR": runtime, "SDL_VIDEODRIVER": "dummy"}
-    source = subprocess.Popen([sys.argv[1], "run", "--locked", "-p", "jackstay-producer", "--example", "minimal"],
+    command = [sys.argv[1], "run", "--locked", "--offline", "-p", "jackstay-producer", "--example", "minimal"]
+    # Preserve the macOS symbols needed by the already linked native viewer.
+    # Building the featureless dependency would replace its shared library.
+    if sys.platform == "darwin":
+        command += ["--features", "jackstay/backend-macos"]
+    source = subprocess.Popen(command,
                               cwd=sys.argv[2], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         endpoint = pathlib.Path(runtime) / f"jackstay-{os.geteuid()}" / "minimal-producer.sock"

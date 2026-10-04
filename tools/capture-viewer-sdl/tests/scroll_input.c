@@ -53,6 +53,12 @@ int main(void) {
   viewer_input_event(&input, &event, window);
   expect_scroll(target, FT_INPUT_SCROLL_PIXEL, -1, -.5);
 #endif
+  /* Cocoa's captured native pixel metadata uses this same conversion seam.
+   * Precise integral deltas must remain pixels, unlike the portable heuristic. */
+  viewer_input_scroll(&input, window, 1, 2, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_NORMAL);
+  expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 2, 4);
+  viewer_input_scroll(&input, window, -.5, .25, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_FLIPPED);
+  expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 1, -.5);
   /* Finish the actual executor cleanup before destroying independent handles. */
   ft_input_client_close(input.client);
   ft_input_work *work = NULL; uint32_t start = SDL_GetTicks();

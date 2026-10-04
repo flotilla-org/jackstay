@@ -10,6 +10,13 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+/* A value-only SDL user event preserves wheel ordering with focus and keys.
+ * No heap payload or extra queue needs ownership during shutdown. */
+typedef struct { Uint32 type, timestamp, window_id, direction; double x, y; } precise_wheel;
+_Static_assert(sizeof(precise_wheel) <= sizeof(SDL_Event), "precise wheel fits SDL event");
+#endif
+
 static int send_event(viewer_input *input, ft_input_event *event) {
   uint64_t sequence = 0;
   ft_status s = ft_input_client_send(input->client, event, &sequence);
@@ -68,6 +75,21 @@ static void position(viewer_input *input, SDL_Window *window, int x, int y, ft_i
   e->x = w > 0 ? x * input->config.geometry.width / w : 0;
   e->y = h > 0 ? y * input->config.geometry.height / h : 0;
 }
+void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, double y, uint32_t unit, uint32_t direction) {
+  if (!input || !input->client || input->failed || input->resetting) return;
+  ft_input_event e = {0};
+  int pointer_x, pointer_y; SDL_GetMouseState(&pointer_x, &pointer_y);
+  position(input, window, pointer_x, pointer_y, &e);
+  e.kind = FT_INPUT_SCROLL; e.scroll_unit = unit; e.pointer_x = e.x; e.pointer_y = e.y;
+  if (unit == FT_INPUT_SCROLL_PIXEL) {
+    int w, h; SDL_GetWindowSize(window, &w, &h);
+    x *= w > 0 ? input->config.geometry.width / w : 0;
+    y *= h > 0 ? input->config.geometry.height / h : 0;
+  }
+  e.x = x; e.y = y;
+  if (direction == SDL_MOUSEWHEEL_FLIPPED) { e.x = -e.x; e.y = -e.y; }
+  send_event(input, &e);
+}
 void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window *window) {
   if (!input || !input->client || input->failed) return;
   if (event->type == SDL_WINDOWEVENT && event->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
@@ -76,6 +98,13 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
   }
   if (input->resetting) return;
   ft_input_event e = {0};
+#ifdef __APPLE__
+  if (event->type == input->precise_wheel_type) {
+    precise_wheel wheel; memcpy(&wheel, event, sizeof(wheel));
+    viewer_input_scroll(input, window, wheel.x, wheel.y, FT_INPUT_SCROLL_PIXEL, wheel.direction);
+    return;
+  }
+#endif
   switch (event->type) {
     case SDL_KEYDOWN: case SDL_KEYUP: {
       if (input->mode == FT_INPUT_MODE_SOURCE_TEXT) return;
@@ -99,54 +128,57 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
       e.button = event->button.button == SDL_BUTTON_RIGHT ? 2 : event->button.button == SDL_BUTTON_MIDDLE ? 3 : event->button.button;
       position(input, window, event->button.x, event->button.y, &e); break;
     case SDL_MOUSEWHEEL: {
-      int x, y; SDL_GetMouseState(&x, &y); position(input, window, x, y, &e);
-      e.kind = FT_INPUT_SCROLL; e.scroll_unit = FT_INPUT_SCROLL_LINE; e.pointer_x = e.x; e.pointer_y = e.y;
+      double x, y; uint32_t unit = FT_INPUT_SCROLL_LINE;
 #if SDL_VERSION_ATLEAST(2, 0, 18)
-      e.x = event->wheel.preciseX; e.y = -event->wheel.preciseY;
+      x = event->wheel.preciseX; y = -event->wheel.preciseY;
 #else
-      e.x = event->wheel.x; e.y = -event->wheel.y;
+      x = event->wheel.x; y = -event->wheel.y;
 #endif
-#ifdef __APPLE__
-      /* The wheel filter runs inside SDL's Cocoa dispatch, while currentEvent
-       * is the NSEvent that generated this wheel. SDL2's preciseX/Y are deltaX/Y,
-       * not logical pixels, and omit the precise-device flag. Read both from
-       * AppKit via its C runtime rather than guessing from fractional values. */
-      id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-      id native = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("currentEvent"));
-      if (native && ((unsigned long (*)(id, SEL))objc_msgSend)(native, sel_registerName("type")) == 22 &&
-          ((BOOL (*)(id, SEL))objc_msgSend)(native, sel_registerName("hasPreciseScrollingDeltas"))) {
-        int w, h; SDL_GetWindowSize(window, &w, &h);
-        e.scroll_unit = FT_INPUT_SCROLL_PIXEL;
-        e.x = -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaX")) * (w > 0 ? input->config.geometry.width / w : 0);
-        e.y = -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaY")) * (h > 0 ? input->config.geometry.height / h : 0);
-      }
-#else
+#ifndef __APPLE__
       /* SDL2 has no portable device-unit flag. Fractional wheel values are the
        * best available continuous-device signal outside Cocoa; integral values
        * remain lines. This fallback cannot identify integral precise deltas. */
-      if (e.x != trunc(e.x) || e.y != trunc(e.y)) {
-        int w, h; SDL_GetWindowSize(window, &w, &h);
-        e.scroll_unit = FT_INPUT_SCROLL_PIXEL;
-        e.x *= w > 0 ? input->config.geometry.width / w : 0;
-        e.y *= h > 0 ? input->config.geometry.height / h : 0;
-      }
+      if (x != trunc(x) || y != trunc(y)) unit = FT_INPUT_SCROLL_PIXEL;
 #endif
-      if (event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { e.x = -e.x; e.y = -e.y; }
-      break;
+      viewer_input_scroll(input, window, x, y, unit, event->wheel.direction);
+      return;
     }
     default: return;
   }
   send_event(input, &e);
 }
+#ifdef __APPLE__
 static int wheel_filter(void *userdata, SDL_Event *event) {
   viewer_input *input = userdata;
-  if (event->type != SDL_MOUSEWHEEL) return 1;
-  viewer_input_event(input, event, input->window);
-  return 0;
+  /* SDL_PushEvent may invoke filters on another thread. Only the Cocoa pump
+   * thread may inspect AppKit; other events remain queued for normal handling. */
+  if (SDL_ThreadID() != input->event_thread || event->type != SDL_MOUSEWHEEL) return 1;
+  /* SDL calls the filter inside the Cocoa scrollWheel: dispatch. Capture the
+   * precise-device flag and logical deltas while currentEvent is still valid.
+   * SDL2 preciseX/Y alone contain deltaX/Y and omit that flag. */
+  id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+  id native = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("currentEvent"));
+  if (native && ((unsigned long (*)(id, SEL))objc_msgSend)(native, sel_registerName("type")) == 22 &&
+      ((BOOL (*)(id, SEL))objc_msgSend)(native, sel_registerName("hasPreciseScrollingDeltas"))) {
+    precise_wheel wheel = {input->precise_wheel_type, event->wheel.timestamp, event->wheel.windowID,
+      event->wheel.direction,
+      -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaX")),
+      -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaY"))};
+    memset(event, 0, sizeof(*event)); memcpy(event, &wheel, sizeof(wheel));
+  }
+  return 1;
 }
+#endif
 void viewer_input_install_wheel_filter(viewer_input *input, SDL_Window *window) {
-  input->window = window;
+  (void)window;
+#ifdef __APPLE__
+  input->event_thread = SDL_ThreadID();
+  input->precise_wheel_type = SDL_RegisterEvents(1);
+  if (input->precise_wheel_type == (Uint32)-1) { input->failed = 1; return; }
   SDL_SetEventFilter(wheel_filter, input);
+#else
+  (void)input;
+#endif
 }
 void viewer_input_poll(viewer_input *input) {
   if (!input || !input->client) return;

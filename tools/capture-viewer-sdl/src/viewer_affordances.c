@@ -2,9 +2,12 @@
 #include <SDL.h>
 #include <stdio.h>
 
+/* Event tags are documented in jackstay_affordances.h, without macros. */
+enum { AFF_EVENT_SNAPSHOT = 1, AFF_EVENT_CLOSED = 3 };
+
 static void log_snapshot(const ft_aff_snapshot *s) {
   static const char *names[] = {"unknown", "media", "navigation", "cursor", "scroll", "window", "presentation"};
-  fprintf(stderr, "affordances domain=%s withdrawn=%u", s->domain <= 6 ? names[s->domain] : names[0], s->withdrawn);
+  fprintf(stderr, "affordances domain=%s withdrawn=%u", s->domain <= FT_AFF_DOMAIN_PRESENTATION ? names[s->domain] : names[0], s->withdrawn);
   if (!s->withdrawn) switch (s->domain) {
     case FT_AFF_DOMAIN_MEDIA:
       fprintf(stderr, " status=%u rate=%g capabilities=%u", s->media.status, s->media.rate, s->media.capabilities); break;
@@ -32,8 +35,8 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
     ft_aff_event_view view = {0};
     ft_status described = ft_affordances_event_view(event, &view);
     if (described == FT_STATUS_OK) {
-      if (view.kind == 1 && log_snapshots) log_snapshot(&view.snapshot);
-      if (view.kind == 3) a->closed = 1;
+      if (view.kind == AFF_EVENT_SNAPSHOT && log_snapshots) log_snapshot(&view.snapshot);
+      if (view.kind == AFF_EVENT_CLOSED) a->closed = 1;
     }
     ft_affordances_event_destroy(&event);
     if (described != FT_STATUS_OK) { fprintf(stderr, "affordances event: %d\n", described); return 1; }
@@ -41,14 +44,14 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
   if (status != FT_STATUS_EMPTY) { fprintf(stderr, "affordances poll: %d\n", status); return 1; }
   return 0;
 }
-int viewer_affordances_close(viewer_affordances *a) {
+int viewer_affordances_close(viewer_affordances *a, int log_snapshots) {
   if (!a->host) return 0;
   /* Independent channel closure proves no input cleanup; input closes separately. */
   ft_affordances_host_close(a->host);
   uint32_t start = SDL_GetTicks();
   int failed = 0;
   while (!a->closed && SDL_GetTicks() - start < 3000) {
-    if (viewer_affordances_poll(a, 0)) { failed = 1; break; }
+    if (viewer_affordances_poll(a, log_snapshots)) { failed = 1; break; }
     if (!a->closed) SDL_Delay(2);
   }
   ft_affordances_host_destroy(&a->host);

@@ -6,15 +6,17 @@ import uuid
 
 env = {**os.environ, "SDL_VIDEODRIVER": "dummy"}
 # Covers offered, unrequested, optional absence, and required refusal.
-for offered, policy in (("offered", "required"), ("offered", "none"),
-                        ("absent", "optional"), ("absent", "required")):
+for offered, policy, session in (("offered", "required", False), ("offered", "none", False),
+                                 ("absent", "optional", False), ("absent", "required", False),
+                                 ("offered", "default", True)):
     name = "v2-test-" + uuid.uuid4().hex[:12]
-    source = subprocess.Popen([sys.argv[1], name, offered], stdout=subprocess.PIPE,
+    source = subprocess.Popen([sys.argv[1], name, offered, *(["session"] if session else [])], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)
     try:
         assert source.stdout.readline().strip() == "ready"
+        flags = ([] if policy == "default" else ["--affordances", policy]) + (["--session-scope"] if session else [])
         viewer = subprocess.run([sys.argv[2], "--source-endpoint", name, "--observe",
-                                 "--affordances", policy, "--log-affordances", "--frames", "10"],
+                                 *flags, "--log-affordances", "--frames", "10"],
                                 env=env, capture_output=True, text=True, timeout=12)
         out, err = source.communicate(timeout=5)
         # A required unavailable channel fails bootstrap clearly before media admission.

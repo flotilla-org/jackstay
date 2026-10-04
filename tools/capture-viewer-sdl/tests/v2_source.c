@@ -9,8 +9,8 @@
 static void check(ft_status s) { if (s != FT_STATUS_OK) { fprintf(stderr, "v2 fixture status=%d\n", s); exit(1); } }
 static void pause_ms(void) { struct timespec t = {0, 16000000}; nanosleep(&t, NULL); }
 int main(int argc, char **argv) {
-  if (argc != 3) return 1;
-  ft_local_endpoint endpoint = {FT_ENDPOINT_SCOPE_USER, FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, argv[1]};
+  if (argc != 3 && argc != 4) return 1;
+  ft_local_endpoint endpoint = {argc == 4 ? FT_ENDPOINT_SCOPE_SESSION : FT_ENDPOINT_SCOPE_USER, FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, argv[1]};
   ft_local_listener *listener = NULL; ft_local_connection *local = NULL;
   ft_cpu_producer *producer = NULL; ft_cpu_setup_server *server = NULL;
   ft_input_server *input = NULL; ft_affordances_producer *affordances = NULL;
@@ -48,7 +48,12 @@ int main(int argc, char **argv) {
       if (view.kind == 3) closed = 1;
       ft_affordances_event_destroy(&event);
     }
-    if (ft_cpu_setup_server_poll(server) != FT_STATUS_DRAINING) break;
+    /* Media and affordances close independently. A media EOF must not race
+     * the affordances worker's closure notification (observed on macOS). */
+    if (ft_cpu_setup_server_poll(server) != FT_STATUS_DRAINING) {
+      if (closed) break;
+      pause_ms(); continue;
+    }
     fill_frame(pixels, sequence);
     ft_acquired_frame_descriptor desc = {.sequence = sequence, .timestamp_ns = sequence * 16000000,
       .width = WIDTH, .height = HEIGHT, .stride = STRIDE, .pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM};

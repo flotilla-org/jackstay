@@ -492,7 +492,7 @@ static int run_cpu(const viewer_options *options) {
       .presentation = {.visible = 1, .focused = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS), .scale = 1}};
     if (require_ok(ft_affordances_host_publish(affordances.host, &presentation), "initial presentation")) goto cleanup;
   }
-  viewer_input_install_wheel_filter(&input, window);
+  if (input.client) viewer_input_install_wheel_filter(&input, window);
   int input_test_sent = 0;
   failed = 0;
   while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {
@@ -607,7 +607,7 @@ static int run_cpu(const viewer_options *options) {
   printf("acquired_frames=%" PRIu64 "\n", acquired);
 cleanup:
   SDL_SetEventFilter(NULL, NULL);
-  if (viewer_affordances_close(&affordances)) failed = 1;
+  if (viewer_affordances_close(&affordances, options->log_affordances)) failed = 1;
   if (viewer_input_close(&input)) failed = 1;
   SDL_DestroyTexture(texture);
   SDL_DestroyRenderer(renderer);

@@ -40,6 +40,39 @@ length independent of SDL's text event buffer. Scroll has fractional deltas and
 explicit units. Queues are bounded in bytes and events; transitions are never
 silently dropped. Consecutive queued motions coalesce to the latest position.
 
+### Scroll units
+
+Controllers choose the scroll unit from the device's reported semantics:
+
+- Precise/continuous devices (trackpads, Magic Mouse, and high-resolution wheels
+  reporting pixel deltas) send `Pixel` in the target's logical units: the same
+  coordinate space as `Geometry` and pointer positions, not device pixels.
+- Notched wheels send `Line`, one unit per notch: Windows wheel delta / 120,
+  X11 buttons 4/5 emit `y = -1` (up) / `y = +1` (down), buttons 6/7 emit
+  `x = -1` (left) / `x = +1` (right), and macOS non-precise
+  devices use the line delta. For native positive-up sources (Windows
+  `WM_MOUSEWHEEL` delta / 120 and macOS positive-up line deltas), negate the
+  vertical delta to make it positive-down. The X11 values above are already
+  normalized. Apply natural-scrolling inversion as described below; do not
+  reapply an inversion already included in the platform event.
+  Fractions are allowed; controllers do not round.
+- `Page` is only for explicit page-scroll gestures, never synthesized from wheels.
+
+Positive `y` scrolls content toward its end (down); positive `x` scrolls toward
+its right. The controller applies the platform's natural-scrolling inversion
+before sending. For the SDL reference, undo `SDL_MOUSEWHEEL_FLIPPED` by negating
+both SDL deltas when that flag is set, then convert SDL's positive-up `y` to
+positive-down by negating `y`; SDL's positive-right `x` keeps its sign.
+This sign handling does not determine the unit: precise/continuous device
+pixel deltas use `Pixel`, and notched-wheel deltas use `Line`.
+
+The executor owns the line height and page size and converts the received units
+as its platform requires. Controllers never pre-multiply line or page deltas by
+those sizes.
+
+Scroll phases and momentum metadata are deferred beyond v1. OS momentum arrives
+as further `Pixel` events; v1 adds no phase or momentum fields.
+
 ## Implementation sequence and verification seams
 
 1. Public Rust target/controller interface: admission, validation, ordered work,

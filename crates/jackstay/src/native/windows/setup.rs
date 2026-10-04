@@ -231,7 +231,7 @@ impl Session {
                 let (descriptor, handle) = consumer.into_parts()?;
                 Ok(Reply::Grant(
                     Response::Configuration { descriptor, native },
-                    vec![handle],
+                    Vec::from(handle),
                     (surface_handles, sync_handle),
                 ))
             }
@@ -437,9 +437,9 @@ impl D3d11SetupClient {
             if descriptor.payload_capacity != 0 {
                 return Err(SocketError::Protocol("D3D11 setup cannot import CPU resources").into());
             }
-            let arena: [OwnedHandle; 5] = receive_objects(&mut self.stream, 5)?
+            let arena: [OwnedHandle; 6] = receive_objects(&mut self.stream, 6)?
                 .try_into()
-                .map_err(|_| SocketError::Protocol("initial setup requires five handles"))?;
+                .map_err(|_| SocketError::Protocol("initial setup requires six handles"))?;
             let (surface_handles, sync_handle) = self.receive_native(native, descriptor.resources)?;
             // SAFETY: from_stream's sole-producer contract; send_handles closed
             // the producer's copies before the values reached this process.
@@ -487,7 +487,9 @@ impl D3d11SetupClient {
                 if descriptor.payload_capacity != 0 {
                     return Err(SocketError::Protocol("invalid D3D11 configuration resources").into());
                 }
-                let section = receive_objects(&mut self.stream, 1)?.pop().expect("one handle");
+                let section = receive_objects(&mut self.stream, 2)?
+                    .try_into()
+                    .map_err(|_| SocketError::Protocol("expected two replacement handles"))?;
                 let (surface_handles, sync_handle) = self.receive_native(native, descriptor.resources)?;
                 // SAFETY: same sole producer, process and incarnation as attachment.
                 let grant = unsafe { ConfigurationGrant::from_parts(consumer, descriptor, section) }?;

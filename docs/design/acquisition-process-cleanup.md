@@ -74,7 +74,7 @@ and completions to the cleanup owner. Each event has one reader, which resets it
 before rechecking shared state; signals coalesce exactly as a full nonblocking
 socket does. Events report no peer closure. Nothing depends on that: closure is
 in the shared claim page, and exit evidence only ever comes from the process
-watch. The grant's five setup objects are handles: the three section handles
+watch. The grant's six setup objects are handles: the four section handles
 and the consumer and producer events. The consumer needs `SYNCHRONIZE |
 EVENT_MODIFY_STATE` on its event and `EVENT_MODIFY_STATE` on the producer's, and
 `FILE_MAP_READ` (plus `FILE_MAP_WRITE` for the claim page) on the sections.

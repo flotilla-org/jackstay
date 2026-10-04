@@ -64,7 +64,7 @@ int jackstay_c_local_endpoint_smoke(void) {
       ft_input_target_serve_local;
   ft_status (*input_connect_fn)(ft_local_connection **, uint32_t, ft_input_client **) =
       ft_input_client_connect_local;
-  ft_status (*import_fn)(const uint8_t *, size_t, ft_os_object[5], ft_acquisition_consumer **) =
+  ft_status (*import_fn)(const uint8_t *, size_t, ft_os_object[6], ft_acquisition_consumer **) =
       ft_acquisition_import_cpu;
   char rendered[512];
   if (ft_local_endpoint_render(&endpoint, rendered, sizeof rendered) != FT_STATUS_OK) return -1;

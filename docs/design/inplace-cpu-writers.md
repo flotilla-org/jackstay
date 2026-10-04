@@ -7,8 +7,8 @@ owner. A CPU slot moves from unpublished/retired to reserved, then published,
 then retired. Reservation uses the existing sequentially consistent retirement
 and claim scan: no slot inside retained history or held by a consumer is handed
 out. Reservations are exclusive, identified by arena scope, allocation generation,
-slot and a monotonically increasing reservation serial. Commit validates all of
-these before publishing metadata, without copying pixels. Abandon returns the
+slot and a single-use owned reservation object. Commit validates allocation
+identity and scope before publishing metadata, without copying pixels. Abandon returns the
 reservation without publishing. Dropping a Rust reservation abandons it. Local
 mutable views borrow the reservation and cannot outlive commit.
 
@@ -65,7 +65,11 @@ by the receiving process. No control or claim handle is exported to the writer.
 
 Expose reserve/commit/abandon and a writer export on ArenaProducer; toolkit source
 handles expose the same arena operations for callers that fill slots locally or
-coordinate a child. C gets opaque reservation and export owners plus explicit
+coordinate a child. Rust ownership and opaque C handles make commit/abandon single-use without a
+replayable public reservation serial. Native-only pools use a duplicate record
+object for the unused sixth setup position; they allocate no payload object.
+
+C gets opaque reservation and export owners plus explicit
 layout and OS-object transfer functions, with an ABI minor bump beyond 0.12
 (which already includes #72). Preserve the copy-in convenience API.
 

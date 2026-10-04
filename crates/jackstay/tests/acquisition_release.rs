@@ -291,7 +291,7 @@ fn mapped_release_child() {
     };
     let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_RELEASE_TEST_SOCKET").unwrap());
     let (descriptor, registration): (GrantDescriptor, ReleaseTimelineRegistration) = stream.recv();
-    let mut fds = stream.recv_objects(6);
+    let mut fds = stream.recv_objects(7);
     let completion = Arc::new(SharedCompletion::from_fd(fds.pop().unwrap()));
     let fds = fds.try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer and this process is

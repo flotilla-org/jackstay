@@ -145,7 +145,7 @@ impl ServerState {
                         pool_id: grant.pool_id,
                         fence_id: grant.fence_id,
                     },
-                    &[fd],
+                    &fd,
                     &grant.surface_handles,
                     Some(&grant.sync_handle),
                 )
@@ -352,7 +352,7 @@ impl XpcArenaClient {
         let fds = reply
             .fds
             .try_into()
-            .map_err(|_| ArenaError::Mapping("acquisition attach requires five FDs"))?;
+            .map_err(|_| ArenaError::Mapping("acquisition attach requires six FDs"))?;
         // SAFETY: the XPC peer is this connection's authorized sole producer;
         // its callback bound the grant to the kernel-provided peer PID before
         // transferring these single-use mappings. This client never forwards
@@ -395,11 +395,14 @@ impl XpcArenaClient {
         else {
             return Err(ArenaError::Mapping("unexpected configuration reply"));
         };
-        if reply.surfaces.len() != descriptor.resources as usize || reply.fds.len() != 1 {
+        if reply.surfaces.len() != descriptor.resources as usize || reply.fds.len() != 2 {
             return Err(ArenaError::Mapping("configuration setup resource count mismatch"));
         }
         let sync_handle = reply.event.ok_or(ArenaError::Mapping("missing replacement readiness handle"))?;
-        let fd = reply.fds.into_iter().next().expect("one replacement FD");
+        let fd = reply
+            .fds
+            .try_into()
+            .map_err(|_| ArenaError::Mapping("expected two replacement FDs"))?;
         // SAFETY: this is the same conforming XPC producer and process-bound
         // incarnation as initial setup. The envelope's extra copies are gone;
         // the single-use offer is neither forwarded nor replayed.

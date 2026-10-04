@@ -130,7 +130,7 @@ The CPU arena now uses this ledger through `reconfigure_cpu` and
 The host retries advancement after retirement; allocation failure leaves the
 proposal paused for retry. `configuration_offer` supplies an opaque local setup
 grant, and `install_configuration` or dropping the grant disposes that offer.
-`ConfigurationGrant::into_parts` exports one resource FD with a
+`ConfigurationGrant::into_parts` exports resource and payload FDs with a
 `ConfigurationDescriptor`, only for a process-bound incarnation. Unsafe import
 uses the existing consumer's claim mapping and checks process, arena, incarnation,
 mapping slot, outstanding offer, and layout. It creates no new holding reservation

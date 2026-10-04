@@ -249,7 +249,7 @@ fn a_separate_consumer_process_retains_a_frame_with_no_per_frame_broker_exchange
 fn mapped_arena_child() {
     let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_ARENA_TEST_SOCKET").unwrap());
     let descriptor = stream.recv();
-    let fds = stream.recv_objects(5).try_into().unwrap();
+    let fds = stream.recv_objects(6).try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer; this process is the
     // only recipient of the single-use grant and does not fork its mappings.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
@@ -296,7 +296,7 @@ fn a_killed_producer_process_leaves_the_consumers_frames_and_mappings_intact() {
     );
     let mut stream = listener.accept();
     let descriptor = stream.recv();
-    let fds = stream.take_objects(&child, 5).try_into().unwrap();
+    let fds = stream.take_objects(&child, 6).try_into().unwrap();
     // SAFETY: the child is the sole conforming producer and bound this grant
     // to this process, which neither forks nor forwards it.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();

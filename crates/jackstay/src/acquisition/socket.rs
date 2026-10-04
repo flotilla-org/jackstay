@@ -187,7 +187,7 @@ impl ServerSession {
                 match producer.configuration_offer(incarnation)? {
                     Some(grant) => {
                         let (descriptor, fd) = grant.into_parts()?;
-                        Ok((Response::Configuration { descriptor }, vec![fd]))
+                        Ok((Response::Configuration { descriptor }, Vec::from(fd)))
                     }
                     None => Ok((Response::Empty, vec![])),
                 }
@@ -270,19 +270,20 @@ pub(crate) fn send_objects(stream: &mut Stream, handles: Vec<OwnedFd>) -> Result
 
     use crate::local::Access::Rights;
     // The order is fixed by ConsumerGrant::into_parts (see GrantDescriptor):
-    // control, resources, claims, consumer event, producer event. A
-    // configuration offer (ConfigurationGrant::into_parts) carries one resource
-    // section. Keep this list in step with those; import maps each object with
+    // control, resources, claims, consumer event, producer event, payload. A
+    // configuration offer (ConfigurationGrant::into_parts) carries resource and payload
+    // sections. Keep this list in step with those; import maps each object with
     // exactly this access (docs/design/acquisition-process-cleanup.md).
     let access: &[u32] = match handles.len() {
-        5 => &[
+        6 => &[
             FILE_MAP_READ,
             FILE_MAP_READ,
             FILE_MAP_READ | FILE_MAP_WRITE,
             SYNCHRONIZE | EVENT_MODIFY_STATE,
             EVENT_MODIFY_STATE,
+            FILE_MAP_READ,
         ],
-        1 => &[FILE_MAP_READ],
+        2 => &[FILE_MAP_READ, FILE_MAP_READ],
         _ => return Err(SocketError::Protocol("unexpected setup handle count")),
     };
     let objects = handles
@@ -373,8 +374,8 @@ impl CpuSetupClient {
             write_message(&mut self.stream, &request)?;
             let reply: Response = read_message(&mut self.stream)?.ok_or(SocketError::Protocol("missing reply"))?;
             let count = match &reply {
-                Response::Attached { .. } => 5,
-                Response::Configuration { .. } => 1,
+                Response::Attached { .. } => 6,
+                Response::Configuration { .. } => 2,
                 Response::Empty | Response::Rejected { .. } => 0,
             };
             let fds = if count == 0 {
@@ -415,7 +416,7 @@ impl CpuSetupClient {
             }
             let fds = fds
                 .try_into()
-                .map_err(|_| SocketError::Protocol("initial setup requires five FDs"))?;
+                .map_err(|_| SocketError::Protocol("initial setup requires six FDs"))?;
             // SAFETY: from_stream's sole-producer/process contract applies, and
             // the transfer protocol proves the sender relinquished its copies.
             let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }?;
@@ -445,10 +446,10 @@ impl CpuSetupClient {
             match reply {
                 Response::Empty => Ok(None),
                 Response::Configuration { descriptor } => {
-                    if descriptor.payload_capacity == 0 || fds.len() != 1 {
+                    if descriptor.payload_capacity == 0 || fds.len() != 2 {
                         return Err(SocketError::Protocol("invalid CPU configuration resources"));
                     }
-                    let fd = fds.into_iter().next().expect("one FD");
+                    let fd = fds.try_into().map_err(|_| SocketError::Protocol("expected two FDs"))?;
                     // SAFETY: same sole producer, process and incarnation as
                     // attachment. Sender copies dropped before the transfer finished.
                     let grant = unsafe { ConfigurationGrant::from_parts(consumer, descriptor, fd) }?;
@@ -549,7 +550,7 @@ mod tests {
             let (descriptor, handles) = grant.into_parts().unwrap();
             write_message(&mut server, &Response::Attached { descriptor }).unwrap();
             // Only the start of the handle message, then closure.
-            server.write_all(&5_u32.to_le_bytes()).unwrap();
+            server.write_all(&6_u32.to_le_bytes()).unwrap();
             drop(server);
             drop(handles);
         });

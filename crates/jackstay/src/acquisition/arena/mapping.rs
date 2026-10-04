@@ -4,7 +4,7 @@
 use std::{
     cell::UnsafeCell,
     mem::{align_of, size_of},
-    sync::atomic::AtomicU64,
+    sync::atomic::{AtomicBool, AtomicU64},
 };
 
 use super::{
@@ -38,6 +38,7 @@ pub(super) struct ResourceLayout {
     pub(super) records: usize,
     pub(super) payload: usize,
     pub(super) len: usize,
+    pub(super) payload_len: usize,
 }
 
 impl ResourceLayout {
@@ -46,8 +47,17 @@ impl ResourceLayout {
             return Err(ArenaError::Configuration("resources must exceed a nonzero history"));
         }
         let records = HEADER_LEN;
-        let payload = checked_add(records, checked_mul(resources, size_of::<ResourceRecord>())?)?;
-        let len = page_rounded(checked_add(payload, checked_mul(resources, payload_capacity)?)?)?;
+        let len = page_rounded(checked_add(records, checked_mul(resources, size_of::<ResourceRecord>())?)?)?;
+        let payload = 0;
+        let payload_len = if payload_capacity == 0 {
+            0
+        } else {
+            page_rounded(checked_mul(resources, payload_capacity)?)?
+        };
+        checked_add(len, payload_len)?;
+        if payload_capacity > isize::MAX as usize {
+            return Err(ArenaError::Configuration("payload slice exceeds addressable size"));
+        }
         Ok(Self {
             resources,
             history,
@@ -55,6 +65,7 @@ impl ResourceLayout {
             records,
             payload,
             len,
+            payload_len,
         })
     }
 
@@ -74,11 +85,18 @@ pub(super) struct ResourceMap {
     pub(super) storage: SharedMemorySegment,
     pub(super) layout: ResourceLayout,
     pub(super) generation: u64,
+    pub(super) payload_storage: SharedMemorySegment,
+    pub(super) reserved: Vec<AtomicBool>,
 }
 
 impl ResourceMap {
     pub(super) fn new(layout: ResourceLayout, scope: [u8; 16], generation: u64) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::new(layout.len)?;
+        let payload_storage = if layout.payload_len == 0 {
+            SharedMemorySegment::map_read_only(storage.try_clone_fd()?, layout.len)?
+        } else {
+            SharedMemorySegment::new(layout.payload_len)?
+        };
         let header = ResourceHeader {
             magic: RESOURCE_MAGIC,
             version: VERSION,
@@ -109,13 +127,29 @@ impl ResourceMap {
         }
         Ok(Self {
             storage,
+            payload_storage,
+            reserved: (0..layout.resources).map(|_| AtomicBool::new(false)).collect(),
             layout,
             generation,
         })
     }
 
-    pub(super) fn map(fd: OwnedFd, expected: ResourceLayout, scope: [u8; 16], generation: u64) -> Result<Self, ArenaError> {
+    pub(super) fn map(
+        fd: OwnedFd,
+        payload_fd: OwnedFd,
+        expected: ResourceLayout,
+        scope: [u8; 16],
+        generation: u64,
+    ) -> Result<Self, ArenaError> {
         let storage = SharedMemorySegment::map_read_only(fd, expected.len)?;
+        let payload_storage = SharedMemorySegment::map_read_only(
+            payload_fd,
+            if expected.payload_len == 0 {
+                expected.len
+            } else {
+                expected.payload_len
+            },
+        )?;
         // SAFETY: the opaque grant names an initialized arena. ResourceHeader bytes
         // are immutable after creation; no mutable atomic fields are copied.
         let header = unsafe { storage.as_ptr().cast::<ResourceHeader>().read() };
@@ -135,6 +169,8 @@ impl ResourceMap {
         }
         Ok(Self {
             storage,
+            payload_storage,
+            reserved: Vec::new(),
             layout: expected,
             generation,
         })

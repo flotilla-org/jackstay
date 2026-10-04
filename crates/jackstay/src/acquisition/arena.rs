@@ -8,7 +8,7 @@
 
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
-// Setup objects are handles on Windows: the same five mapping/notification
+// Setup objects are handles on Windows: the same six mapping/notification
 // objects, duplicated into a verified peer by the setup channel.
 #[cfg(windows)]
 use std::os::windows::io::OwnedHandle as OwnedFd;
@@ -29,6 +29,9 @@ use thiserror::Error;
 use super::{AdmissionBook, AdmissionError, AdmissionLimits, AllocationId, HoldingRequest, IncarnationId};
 use crate::{CaptureTransferError, shm::SharedMemorySegment};
 
+mod writer;
+pub use writer::{CpuReservation, DelegatedWriter, WriterDescriptor, WriterExport, WriterSlot};
+
 mod reconfiguration;
 use reconfiguration::RetiredAllocation;
 pub(crate) use reconfiguration::RetiredResource;
@@ -46,7 +49,7 @@ mod process;
 pub use cleanup::{CleanupFailure, RejectedDeferredRelease, ReleaseNotification, ReleaseTimeline, ReleaseTimelineRegistration};
 
 const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"JSCLM001");
-const VERSION: u64 = 7;
+const VERSION: u64 = 8;
 const HEADER_LEN: usize = 256;
 const LATEST: usize = 128;
 const TERMINAL: usize = 136;
@@ -383,6 +386,7 @@ pub struct ConsumerGrant {
     control_fd: Option<OwnedFd>,
     arena_scope: [u8; 16],
     resource_fd: Option<OwnedFd>,
+    payload_fd: Option<OwnedFd>,
     claim_fd: Option<OwnedFd>,
     reader_fd: Option<OwnedFd>,
     layout: ResourceLayout,
@@ -404,14 +408,14 @@ impl RemoteConsumerGrant {
         self.0.incarnation()
     }
 
-    pub fn into_parts(self) -> Result<(GrantDescriptor, [OwnedFd; 5]), ArenaError> {
+    pub fn into_parts(self) -> Result<(GrantDescriptor, [OwnedFd; 6]), ArenaError> {
         self.0.into_parts()
     }
 }
 
 /// Setup descriptor. Objects (FDs on Unix, handles on Windows): control,
 /// resources, claims, consumer notification endpoint, producer notification
-/// endpoint, in that order. Never resend a consumed grant. The Windows setup
+/// endpoint, payload, in that order. Never resend a consumed grant. The Windows setup
 /// channel grants each position its own access (`acquisition::socket`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantDescriptor {
@@ -439,7 +443,7 @@ impl ConsumerGrant {
         self.claims.incarnation
     }
 
-    fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 5]), ArenaError> {
+    fn into_parts(mut self) -> Result<(GrantDescriptor, [OwnedFd; 6]), ArenaError> {
         let writer_fd = wait::producer_endpoint(&self.claims.wake, &self.claims.release_wake)?;
         self.consumed = true;
         let descriptor = GrantDescriptor {
@@ -467,6 +471,7 @@ impl ConsumerGrant {
                 self.claim_fd.take().expect("single-use grant"),
                 self.reader_fd.take().expect("single-use grant"),
                 writer_fd,
+                self.payload_fd.take().expect("single-use grant"),
             ],
         ))
     }
@@ -481,8 +486,8 @@ impl ConsumerGrant {
     /// only to the lifetime admitted by the sender, never a reused PID.
     /// Length/header checks cannot prove
     /// another process follows a shared-memory lifetime protocol.
-    pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 5]) -> Result<Self, ArenaError> {
-        let [control_fd, resource_fd, claim_fd, reader_fd, writer_fd] = fds;
+    pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 6]) -> Result<Self, ArenaError> {
+        let [control_fd, resource_fd, claim_fd, reader_fd, writer_fd, payload_fd] = fds;
         if descriptor.drain_timeout.is_zero() || std::time::Instant::now().checked_add(descriptor.drain_timeout).is_none() {
             return Err(ArenaError::Mapping("invalid consumer drain interval"));
         }
@@ -530,6 +535,7 @@ impl ConsumerGrant {
             control_fd: Some(control_fd),
             arena_scope: descriptor.arena_scope,
             resource_fd: Some(resource_fd),
+            payload_fd: Some(payload_fd),
             claim_fd: Some(claim_fd),
             reader_fd: Some(reader_fd),
             layout,
@@ -546,6 +552,7 @@ impl Drop for ConsumerGrant {
     fn drop(&mut self) {
         if !self.consumed {
             drop(self.resource_fd.take());
+            drop(self.payload_fd.take());
             self.claims.mapping_slot(self.mapping_slot).store(0, SeqCst);
             self.claims.word(OFFERED_GENERATION).store(0, SeqCst);
             self.claims.close();
@@ -625,7 +632,7 @@ impl ArenaProducer {
             resource_capacity: config.resource_capacity,
             retained_history: config.retained_history,
             producer_reserve: config.producer_reserve,
-            allocated_bytes: (layout.len as u64)
+            allocated_bytes: ((layout.len + layout.payload_len) as u64)
                 .checked_add(external_bytes)
                 .ok_or(ArenaError::Configuration("allocation byte total overflow"))?,
             fixed_bytes: control_len as u64,
@@ -698,6 +705,7 @@ impl ArenaProducer {
             let control_fd = self.control.storage.try_clone_fd()?;
             let resources = self.resources.as_ref().expect("admission requires installed allocation");
             let resource_fd = resources.storage.try_clone_fd()?;
+            let payload_fd = resources.payload_storage.try_clone_fd()?;
             let claim_fd = claims.storage.try_clone_fd()?;
             claims.mapping_slot(0).store(resources.generation, SeqCst);
             claims.word(OFFERED_GENERATION).store(resources.generation, SeqCst);
@@ -705,6 +713,7 @@ impl ArenaProducer {
                 control_fd: Some(control_fd),
                 arena_scope: self.control.scope,
                 resource_fd: Some(resource_fd),
+                payload_fd: Some(payload_fd),
                 claim_fd: Some(claim_fd),
                 reader_fd: Some(receiver.into_fd()),
                 layout: resources.layout,
@@ -780,6 +789,9 @@ impl ArenaProducer {
         let oldest = self.cursor.saturating_sub(resources.layout.history as u64 - 1).max(1);
         for offset in 0..resources.layout.resources {
             let index = (self.next_slot + offset) % resources.layout.resources;
+            if resources.reserved[index].load(SeqCst) {
+                continue;
+            }
             let state = resources.state(index).load(SeqCst);
             let generation = state >> 1;
             if generation != 0 && generation >= oldest {
@@ -797,6 +809,7 @@ impl ArenaProducer {
             let cursor = self.cursor + 1;
             let payload_offset = resources.layout.payload_offset(index);
             descriptor.cursor = cursor;
+            descriptor.slot_id = index as u32;
             descriptor.config_generation = resources.generation;
             descriptor.payload_offset = payload_offset as u64;
             descriptor.payload_len = bytes.len() as u64;
@@ -807,7 +820,7 @@ impl ArenaProducer {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
-                    resources.storage.as_ptr().add(payload_offset).cast_mut(),
+                    resources.payload_storage.as_ptr().add(payload_offset).cast_mut(),
                     bytes.len(),
                 );
                 resources.descriptor_ptr(index).write(descriptor);
@@ -918,6 +931,7 @@ impl ArenaConsumer {
         )?;
         let map = ResourceMap::map(
             grant.resource_fd.take().expect("single-use grant"),
+            grant.payload_fd.take().expect("single-use grant"),
             grant.layout,
             control.scope,
             grant.generation,
@@ -1147,7 +1161,7 @@ impl FrameLease {
                     .as_ref()
                     .expect("live frame owns storage")
                     .map
-                    .storage
+                    .payload_storage
                     .as_ptr()
                     .add(self.descriptor.payload_offset as usize),
                 self.descriptor.payload_len as usize,

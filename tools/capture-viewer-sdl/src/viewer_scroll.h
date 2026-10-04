@@ -9,10 +9,11 @@ typedef struct {
 } viewer_scroll_geometry;
 typedef struct {
   ft_aff_scroll snapshot;
-  int present, hovered, changed, owned, dragging, pending, pending_axis;
+  int present, hovered, changed, owned, dragging, pending, pending_axis, cancelled_button;
   Uint32 changed_at;
   double grab, position;
 } viewer_scroll;
+int viewer_scroll_thickness(double drawable_scale);
 int viewer_scroll_geometry_for(ft_aff_axis axis, SDL_Rect frame, int vertical, int thickness, viewer_scroll_geometry *g);
 double viewer_scroll_position(ft_aff_axis axis, viewer_scroll_geometry g, double pointer, double grab);
 void viewer_scroll_snapshot(viewer_scroll *s, const ft_aff_scroll *snapshot, Uint32 now);

@@ -1,6 +1,7 @@
 #include "viewer_scroll.h"
 #include <math.h>
 #include <string.h>
+int viewer_scroll_thickness(double drawable_scale) { return (int)ceil(8.0 * drawable_scale); }
 static double clamp(double value, double max) { return fmax(0, fmin(value, max)); }
 int viewer_scroll_geometry_for(ft_aff_axis a, SDL_Rect frame, int vertical, int thickness, viewer_scroll_geometry *g) {
   memset(g, 0, sizeof(*g));
@@ -51,13 +52,25 @@ int viewer_scroll_event(viewer_scroll *s, ft_affordances_host *host, const SDL_E
       e->window.event == SDL_WINDOWEVENT_FOCUS_LOST)) {
     s->hovered = 0;
     if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
-      s->pending = s->dragging = 0; SDL_CaptureMouse(SDL_FALSE);
+      s->cancelled_button = s->owned; s->owned = s->pending = s->dragging = 0;
+      SDL_CaptureMouse(SDL_FALSE);
     }
     return 0;
   }
   if (e->type != SDL_MOUSEMOTION && e->type != SDL_MOUSEBUTTONDOWN && e->type != SDL_MOUSEBUTTONUP) return 0;
   double x = (e->type == SDL_MOUSEMOTION ? e->motion.x : e->button.x) * sx;
   double y = (e->type == SDL_MOUSEMOTION ? e->motion.y : e->button.y) * sy;
+  /* Remember an abandoned release without blocking subsequent motion. A new
+   * down of that button starts a fresh gesture and makes the tombstone obsolete. */
+  if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == s->cancelled_button)
+    s->cancelled_button = 0;
+  if (!s->owned && e->type == SDL_MOUSEBUTTONUP && e->button.button == s->cancelled_button) {
+    s->cancelled_button = 0; return 1;
+  }
+  if (s->owned && e->type == SDL_MOUSEMOTION && !(e->motion.state & SDL_BUTTON(s->owned))) {
+    s->cancelled_button = s->owned; s->owned = s->pending = s->dragging = 0;
+    SDL_CaptureMouse(SDL_FALSE);
+  }
   s->hovered = contains(frame, x, y);
   if (s->owned) {
     if (s->dragging && (e->type == SDL_MOUSEMOTION ||
@@ -65,7 +78,7 @@ int viewer_scroll_event(viewer_scroll *s, ft_affordances_host *host, const SDL_E
       int vertical = s->dragging == 2;
       ft_aff_axis a = vertical ? s->snapshot.y : s->snapshot.x;
       viewer_scroll_geometry g;
-      if (viewer_scroll_geometry_for(a, frame, vertical, (int)ceil(8 * sx), &g)) {
+      if (viewer_scroll_geometry_for(a, frame, vertical, viewer_scroll_thickness(sx), &g)) {
         s->position = viewer_scroll_position(a, g, vertical ? y : x, s->grab);
         s->pending = 1; s->pending_axis = vertical;
       }
@@ -81,7 +94,7 @@ int viewer_scroll_event(viewer_scroll *s, ft_affordances_host *host, const SDL_E
   for (int vertical = 1; vertical >= 0; vertical--) {
     ft_aff_axis a = vertical ? s->snapshot.y : s->snapshot.x;
     viewer_scroll_geometry g;
-    if (!viewer_scroll_geometry_for(a, frame, vertical, (int)ceil(8 * sx), &g) || !contains(g.track, x, y)) continue;
+    if (!viewer_scroll_geometry_for(a, frame, vertical, viewer_scroll_thickness(sx), &g) || !contains(g.track, x, y)) continue;
     if (e->type == SDL_MOUSEBUTTONUP) return 0;
     if (e->type == SDL_MOUSEBUTTONDOWN) {
       double pointer = vertical ? y : x;

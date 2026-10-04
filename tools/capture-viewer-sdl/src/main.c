@@ -8,7 +8,6 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -203,7 +202,10 @@ static int viewer_event(viewer_input *input, SDL_Window *window, viewer_affordan
   return consumed < 0;
 }
 
-/* Offline integration driver uses the real SDL queue and normal routing. */
+/* Offline integration driver uses the real SDL queue and normal routing.
+ * The scroll toolkit fixture requests a 640x480 window with an unletterboxed
+ * frame, 1000-unit content, 200-unit viewports, and initial positions x=50/y=100.
+ * Fixed pointer points and thresholds below intentionally test that geometry. */
 static void scroll_self_test(viewer_affordances *a, SDL_Window *window, int *stage) {
   viewer_scroll *s = &a->scroll;
   if (!s->present) return;
@@ -226,7 +228,7 @@ static void scroll_self_test(viewer_affordances *a, SDL_Window *window, int *sta
     if (*stage == 0 || *stage == 2) {
       for (int i = 0; i < 3; i++) {
         SDL_Event motion = {.motion = {.type = SDL_MOUSEMOTION,
-          .x = *stage == 0 ? px : 380 + 10 * i, .y = *stage == 0 ? 300 + 10 * i : py}};
+          .state = SDL_BUTTON_LMASK, .x = *stage == 0 ? px : 380 + 10 * i, .y = *stage == 0 ? 300 + 10 * i : py}};
         SDL_PushEvent(&motion);
       }
       e.button.x = *stage == 0 ? px : 400; e.button.y = *stage == 0 ? 320 : py;
@@ -650,7 +652,7 @@ static int run_cpu(const viewer_options *options) {
       }
       int window_w, window_h; SDL_GetWindowSize(window, &window_w, &window_h);
       if (viewer_scroll_draw(&affordances.scroll, affordances.host, renderer, fit,
-          window_w > 0 ? (int)ceil(8.0 * dw / window_w) : 8, SDL_GetTicks())) {
+          window_w > 0 ? viewer_scroll_thickness((double)dw / window_w) : 8, SDL_GetTicks())) {
         fprintf(stderr, "scroll overlay render/send failed\n"); failed = 1; break;
       }
       SDL_RenderPresent(renderer);

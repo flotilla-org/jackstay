@@ -65,7 +65,7 @@ int main(void) {
   SDL_Event down = {.button = {.type = SDL_MOUSEBUTTONDOWN, .button = SDL_BUTTON_LEFT, .x = 85, .y = 25}};
   assert(viewer_scroll_event(&state, NULL, &down, frame, 1, 1, 0, 2000) == 1);
   assert(state.dragging == 2);
-  motion.motion.x = 85; motion.motion.y = 45;
+  motion.motion.x = 85; motion.motion.y = 45; motion.motion.state = SDL_BUTTON_LMASK;
   assert(viewer_scroll_event(&state, NULL, &motion, frame, 1, 1, 0, 2000) == 1);
   motion.motion.y = 65;
   assert(viewer_scroll_event(&state, NULL, &motion, frame, 1, 1, 0, 2000) == 1);
@@ -98,7 +98,7 @@ int main(void) {
   assert(!viewer_scroll_event(&state, NULL, &down, frame, 1, 1, 1, 2000));
   assert(!viewer_scroll_event(&state, NULL, &up, frame, 1, 1, 0, 2000));
   /* HiDPI event conversion hits the same drawable track. Focus loss ends the
-   * drag and reveal, while preserving release ownership. */
+   * drag and reveal, while suppressing a late matching release. */
   snapshot.capabilities = FT_AFF_SCROLL_SET_POSITION;
   viewer_scroll_snapshot(&state, &snapshot, 2000);
   SDL_Rect retina = {20,20,160,160};
@@ -108,6 +108,23 @@ int main(void) {
   assert(!viewer_scroll_event(&state, NULL, &focus, retina, 2, 2, 0, 3000));
   assert(!state.dragging && !state.pending && !viewer_scroll_visible(&state, 3000));
   assert(viewer_scroll_event(&state, NULL, &up, retina, 2, 2, 0, 3000) == 1);
+  /* A release lost outside the window cannot swallow later ordinary motion.
+   * This holds for focus loss and withdrawal, and for every captured button. */
+  for (int button = SDL_BUTTON_LEFT; button <= SDL_BUTTON_RIGHT; button++) {
+    down.button.button = button;
+    motion.motion.state = SDL_BUTTON(button);
+    viewer_scroll_snapshot(&state, &snapshot, 4000);
+    assert(viewer_scroll_event(&state, NULL, &down, frame, 1, 1, 0, 4000) == 1);
+    assert(!viewer_scroll_event(&state, NULL, &focus, frame, 1, 1, 0, 4000));
+    motion.motion.x = 50; motion.motion.y = 50; motion.motion.state = 0;
+    assert(!viewer_scroll_event(&state, NULL, &motion, frame, 1, 1, 0, 4000));
+    assert(!state.owned);
+    assert(viewer_scroll_event(&state, NULL, &down, frame, 1, 1, 0, 4000) == 1);
+    viewer_scroll_snapshot(&state, NULL, 4000);
+    assert(!viewer_scroll_event(&state, NULL, &motion, frame, 1, 1, 0, 4000));
+    assert(!state.owned && !state.pending);
+  }
+  viewer_scroll_snapshot(&state, &snapshot, 3000);
   /* Drawing uses host pixels only within the fitted frame, restores SDL state,
    * and disappears on withdrawal. Inspect actual software-rendered pixels. */
   state.hovered = 1;

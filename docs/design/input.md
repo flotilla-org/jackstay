@@ -48,7 +48,8 @@ Controllers choose the scroll unit from the device's reported semantics:
   reporting pixel deltas) send `Pixel` in the target's logical units: the same
   coordinate space as `Geometry` and pointer positions, not device pixels.
 - Notched wheels send `Line`, one unit per notch: Windows wheel delta / 120,
-  X11 buttons 4–7 emit ±1 on the corresponding axis, and macOS non-precise
+  X11 buttons 4/5 emit `y = -1` (up) / `y = +1` (down), buttons 6/7 emit
+  `x = -1` (left) / `x = +1` (right), and macOS non-precise
   devices use the line delta. Fractions are allowed; controllers do not round.
 - `Page` is only for explicit page-scroll gestures, never synthesized from wheels.
 

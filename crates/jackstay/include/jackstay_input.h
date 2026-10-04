@@ -35,7 +35,8 @@ typedef struct ft_input_work ft_input_work;
 #define FT_INPUT_REPEAT 3
 #define FT_INPUT_PHYSICAL_KEY 1
 #define FT_INPUT_LOGICAL_KEY 2
-/* Scroll signs after controller-applied platform natural-scrolling inversion:
+/* Scroll contract (all units): signs after controller-applied platform
+ * natural-scrolling inversion:
  * positive y moves content toward its end (down), positive x toward the right.
  * SDL reference: negate both deltas for SDL_MOUSEWHEEL_FLIPPED, then negate y
  * to convert SDL positive-up to positive-down; x remains positive-right.
@@ -49,7 +50,8 @@ typedef struct ft_input_work ft_input_work;
  * never device pixels. */
 #define FT_INPUT_SCROLL_PIXEL 1
 /* Notched wheels: one unit per notch (Windows delta / 120; X11 buttons 4-7:
- * +/-1 on the corresponding axis; macOS non-precise: line delta). */
+ * 4 = y -1 (up), 5 = y +1 (down), 6 = x -1 (left), 7 = x +1 (right);
+ * macOS non-precise: line delta). */
 #define FT_INPUT_SCROLL_LINE 2
 /* Explicit page-scroll gestures only; never synthesized from wheels. */
 #define FT_INPUT_SCROLL_PAGE 3

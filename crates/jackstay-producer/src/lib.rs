@@ -326,12 +326,12 @@ fn pump<P: Producer>(
                             let (installed, bytes) = pending.take().unwrap();
                             if let Some((width, height)) = logical {
                                 let old = target.config().geometry;
-                                let geometry = jackstay::input::Geometry {
-                                    revision: old.revision.saturating_add(1),
-                                    width,
-                                    height,
-                                };
                                 if old.width != width || old.height != height {
+                                    let geometry = jackstay::input::Geometry {
+                                        revision: old.revision.saturating_add(1),
+                                        width,
+                                        height,
+                                    };
                                     if let Err(e) = target.set_geometry(geometry) {
                                         return Err(io::Error::other(format!("geometry: {e:?}")));
                                     }

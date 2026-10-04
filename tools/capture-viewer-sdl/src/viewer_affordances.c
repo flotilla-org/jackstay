@@ -1,6 +1,9 @@
 #include "viewer_affordances.h"
 #include <SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
 
 /* Event tags are documented in jackstay_affordances.h, without macros. */
 enum { AFF_EVENT_SNAPSHOT = 1, AFF_EVENT_CLOSED = 3 };
@@ -27,6 +30,70 @@ static void log_snapshot(const ft_aff_snapshot *s) {
   }
   fputc('\n', stderr);
 }
+static void copy_title(char **to, ft_aff_optional_string from) {
+  free(*to); *to = NULL;
+  if (from.present) {
+    *to = malloc(from.value.len + 1);
+    if (*to) { memcpy(*to, from.value.data, from.value.len); (*to)[from.value.len] = 0; }
+  }
+}
+void viewer_affordances_snapshot(viewer_affordances *a, const ft_aff_snapshot *s) {
+  if (!a->window) return;
+  if (s->domain == FT_AFF_DOMAIN_WINDOW) {
+    a->has_window = !s->withdrawn;
+    a->ready = !s->withdrawn && s->window.ready;
+    copy_title(&a->title, s->withdrawn ? (ft_aff_optional_string){0} : s->window.title);
+    ft_aff_size size = s->window.requested_size;
+    if (!s->withdrawn && size.present && !a->user_resized &&
+        size.width >= 1 && size.height >= 1 && size.width <= INT_MAX && size.height <= INT_MAX) {
+      int w, h; SDL_GetWindowSize(a->window, &w, &h);
+      if (w != (int)size.width || h != (int)size.height) {
+        SDL_SetWindowSize(a->window, (int)size.width, (int)size.height);
+        a->dirty = 1;
+      }
+    }
+  } else if (s->domain == FT_AFF_DOMAIN_NAVIGATION) {
+    copy_title(&a->navigation_title, s->withdrawn ? (ft_aff_optional_string){0} : s->navigation.title);
+    copy_title(&a->url, s->withdrawn ? (ft_aff_optional_string){0} : s->navigation.url);
+  }
+  SDL_SetWindowTitle(a->window, a->title ? a->title : a->navigation_title ? a->navigation_title :
+                     a->url ? a->url : "capture-viewer-sdl");
+}
+void viewer_affordances_event(viewer_affordances *a, const SDL_Event *event) {
+  if (!a->window || event->type != SDL_WINDOWEVENT) return;
+  switch (event->window.event) {
+    case SDL_WINDOWEVENT_RESIZED:
+      a->user_resized = 1;
+      /* fall through */
+    case SDL_WINDOWEVENT_SIZE_CHANGED:
+      a->resized_at = SDL_GetTicks(); a->dirty = 1; break;
+    case SDL_WINDOWEVENT_MINIMIZED: case SDL_WINDOWEVENT_HIDDEN: a->visible = 0; a->dirty = 1; break;
+    case SDL_WINDOWEVENT_RESTORED: case SDL_WINDOWEVENT_SHOWN: a->visible = 1; a->dirty = 1; break;
+    case SDL_WINDOWEVENT_MOVED:
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    case SDL_WINDOWEVENT_DISPLAY_CHANGED:
+#endif
+      a->dirty = 1; break;
+    case SDL_WINDOWEVENT_FOCUS_GAINED: a->focused = 1; a->dirty = 1; break;
+    case SDL_WINDOWEVENT_FOCUS_LOST: a->focused = 0; a->dirty = 1; break;
+    default: break;
+  }
+}
+int viewer_affordances_tick(viewer_affordances *a) {
+  if (!a->window) return 0;
+  Uint32 now = SDL_GetTicks();
+  if (!a->shown && (!a->has_window || a->ready || now - a->started >= 2000)) {
+    SDL_ShowWindow(a->window); a->shown = 1; a->visible = 1; a->dirty = 1;
+  }
+  if (!a->host || a->closed || !a->dirty || (a->resized_at && now - a->resized_at < 100)) return 0;
+  int w, h, dw, dh; SDL_GetWindowSize(a->window, &w, &h);
+  if (SDL_GetRendererOutputSize(a->renderer, &dw, &dh) || w <= 0 || h <= 0) return 1;
+  ft_aff_snapshot s = {.domain = FT_AFF_DOMAIN_PRESENTATION,
+    .presentation = {.visible = a->visible, .focused = a->focused,
+      .preferred_size = {.present = 1, .width = w, .height = h}, .scale = (double)dw / w}};
+  if (ft_affordances_host_publish(a->host, &s) != FT_STATUS_OK) return 1;
+  a->dirty = 0; return 0;
+}
 int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
   if (!a->host || a->closed) return 0;
   ft_affordances_event *event = NULL;
@@ -35,7 +102,10 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
     ft_aff_event_view view = {0};
     ft_status described = ft_affordances_event_view(event, &view);
     if (described == FT_STATUS_OK) {
-      if (view.kind == AFF_EVENT_SNAPSHOT && log_snapshots) log_snapshot(&view.snapshot);
+      if (view.kind == AFF_EVENT_SNAPSHOT) {
+        viewer_affordances_snapshot(a, &view.snapshot);
+        if (log_snapshots) log_snapshot(&view.snapshot);
+      }
       if (view.kind == AFF_EVENT_CLOSED) a->closed = 1;
     }
     ft_affordances_event_destroy(&event);
@@ -45,6 +115,8 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
   return 0;
 }
 int viewer_affordances_close(viewer_affordances *a, int log_snapshots) {
+  free(a->title); free(a->navigation_title); free(a->url);
+  a->title = a->navigation_title = a->url = NULL; a->window = NULL;
   if (!a->host) return 0;
   /* Independent channel closure proves no input cleanup; input closes separately. */
   ft_affordances_host_close(a->host);

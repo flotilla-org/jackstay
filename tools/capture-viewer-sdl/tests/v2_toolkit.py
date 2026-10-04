@@ -1,4 +1,4 @@
-"""The unmodified toolkit minimal example is the real v2 producer collaborator."""
+"""The presentation-aware toolkit minimal example is the real v2 producer collaborator."""
 import os
 import pathlib
 import subprocess
@@ -22,16 +22,19 @@ with tempfile.TemporaryDirectory(prefix="js-toolkit-") as runtime:
             if source.poll() is not None or time.monotonic() >= deadline:
                 raise AssertionError(source.communicate(timeout=1))
             time.sleep(.02)
-        viewer = subprocess.run([sys.argv[3], "--source-endpoint", "minimal-producer", "--observe",
-                                 "--affordances", "required", "--log-affordances", "--frames", "10"],
+        viewer = subprocess.run([sys.argv[3], "--source-socket", str(endpoint), "--observe",
+                                 "--affordances", "required", "--log-affordances", "--window-self-test", "--frames", "25"],
                                 env=env, capture_output=True, text=True, timeout=10)
         # The actual toolkit produces media and its window snapshot; the host closes independently.
         assert viewer.returncode == 0, (viewer.stdout, viewer.stderr)
-        assert "acquired_frames=10" in viewer.stdout, viewer.stdout
+        assert "acquired_frames=25" in viewer.stdout, viewer.stdout
         assert "domain=window" in viewer.stderr and "Minimal producer" in viewer.stderr, viewer.stderr
+        # A real host resize must reach the producer and change the acquired frame.
+        assert "source frame=800x600" in viewer.stderr, viewer.stderr
         assert "affordances_cleanup=completed" in viewer.stdout, viewer.stdout
         out, err = source.communicate(timeout=12)
         assert source.returncode == 0, (out, err)
+        assert "presentation frame=800x600 scale=1" in err, err
         print(viewer.stdout, viewer.stderr)
     finally:
         if source.poll() is None:

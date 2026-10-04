@@ -21,6 +21,7 @@
 #include "metal_present.h"
 #include "viewer_input.h"
 #include "viewer_affordances.h"
+#include "viewer_fit.h"
 #include "jackstay_bootstrap.h"
 
 #include "synthetic.h"
@@ -64,6 +65,7 @@ typedef struct viewer_options {
   int input_policy_set;
   const char *input_socket;
   int input_self_test;
+  int window_self_test;
   const char *porthole_socket;
   const char *session_id;
   int native;
@@ -75,7 +77,9 @@ typedef struct viewer_options {
 static viewer_options parse_options(int argc, char **argv) {
   viewer_options options = {.bootstrap_input = FT_BOOTSTRAP_INPUT_OPTIONAL, .affordances = 1, .typing = FT_INPUT_MODE_COOPERATIVE};
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--input-self-test") == 0) {
+    if (strcmp(argv[i], "--window-self-test") == 0) {
+      options.window_self_test = 1;
+    } else if (strcmp(argv[i], "--input-self-test") == 0) {
       options.input_self_test = 1;
     } else if (strcmp(argv[i], "--source-endpoint") == 0) {
       if (++i >= argc || !argv[i][0]) { fprintf(stderr, "--source-endpoint requires a name\n"); options.invalid = 1; return options; }
@@ -163,9 +167,10 @@ static viewer_options parse_options(int argc, char **argv) {
     options.invalid = 1;
   }
   if ((options.source_endpoint && (options.source_socket || options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
-      ((options.affordances_policy_set || options.log_affordances || options.session_scope) && !options.source_endpoint) ||
+      ((options.affordances_policy_set || options.log_affordances) && !options.source_endpoint && !options.source_socket) ||
+      (options.session_scope && !options.source_endpoint) ||
       (options.typing_set && !options.source_endpoint && !options.source_socket)) {
-    fprintf(stderr, "--source-endpoint selects one source; affordances/session scope require it; typing requires a bootstrap source\n"); options.invalid = 1;
+    fprintf(stderr, "--source-endpoint selects one source; affordances require a bootstrap source; session scope requires an endpoint\n"); options.invalid = 1;
   }
   if ((options.source_socket && (options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
       (options.input_policy_set && !options.source_socket && !options.source_endpoint)) {
@@ -188,9 +193,9 @@ static int hold_frame(uint32_t remaining_ms, viewer_input *input, SDL_Window *wi
     SDL_Delay(chunk);
     remaining_ms -= chunk;
     SDL_Event event;
-    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) return 0; viewer_input_event(input, &event, window); }
+    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) return 0; viewer_input_event(input, &event, window); if (affordances) viewer_affordances_event(affordances, &event); }
     viewer_input_poll(input);
-    if (affordances && viewer_affordances_poll(affordances, log_affordances)) return -1;
+    if (affordances && (viewer_affordances_poll(affordances, log_affordances) || viewer_affordances_tick(affordances))) return -1;
   }
   return 1;
 }
@@ -363,7 +368,7 @@ static int run_native(const viewer_options *options) {
 /* Generic CPU setup belongs to the connecting process. Selection and desktop
  * authorization, when needed, remain with the host that supplies this path. */
 static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **connection,
-                              ft_acquisition_consumer **consumer, const viewer_options *options, viewer_input *input) {
+                              ft_acquisition_consumer **consumer, const viewer_options *options, viewer_input *input, viewer_affordances *affordances) {
   struct sockaddr_un address = {0};
   address.sun_family = AF_UNIX;
   if (strlen(path) >= sizeof(address.sun_path)) {
@@ -399,7 +404,12 @@ static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **
   if (options->source_socket) {
     ft_status input_status;
     uint32_t mode = options->bootstrap_input == FT_BOOTSTRAP_INPUT_NONE ? 0 : options->typing;
-    if (require_ok(ft_source_bootstrap_connect(&fd, options->bootstrap_input, mode, &input->client, &input_status), "ft_source_bootstrap_connect")) goto cleanup;
+    if (options->affordances_policy_set || options->log_affordances) {
+      ft_status aff_status;
+      if (require_ok(ft_source_bootstrap_connect_v2(&fd, options->bootstrap_input, mode,
+          options->affordances, &input->client, &input_status, &affordances->host, &aff_status), "source bootstrap v2")) goto cleanup;
+    } else if (require_ok(ft_source_bootstrap_connect(&fd, options->bootstrap_input, mode,
+                 &input->client, &input_status), "ft_source_bootstrap_connect")) goto cleanup;
     if (input->client) {
       uint64_t controller, epoch;
       if (require_ok(ft_input_client_describe(input->client, &input->config, &controller, &epoch), "ft_input_client_describe")) goto cleanup;
@@ -460,7 +470,7 @@ static int run_cpu(const viewer_options *options) {
     ft_local_connection_destroy(&local);
     if (require_ok(setup, "CPU local setup") || require_ok(ft_acquisition_cpu_attach(connection, 1, &consumer), "CPU attach")) goto cleanup;
   } else if (options->cpu_socket != NULL || options->source_socket != NULL) {
-    if (connect_cpu_socket(options->source_socket ? options->source_socket : options->cpu_socket, &connection, &consumer, options, &input)) goto cleanup;
+    if (connect_cpu_socket(options->source_socket ? options->source_socket : options->cpu_socket, &connection, &consumer, options, &input, &affordances)) goto cleanup;
   } else if (options->porthole_socket != NULL) {
     if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
                       options->token != NULL ? options->token : getenv("PORTHOLE_AGENT_TOKEN"), 2,
@@ -479,7 +489,7 @@ static int run_cpu(const viewer_options *options) {
   if (require_ok(ft_acquisition_cancellation_create(&cancellation), "ft_acquisition_cancellation_create")) goto cleanup;
   if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL init: %s\n", SDL_GetError()); goto cleanup; }
   sdl_started = 1;
-  window = SDL_CreateWindow("capture-viewer-sdl", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
+  window = SDL_CreateWindow("capture-viewer-sdl", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
   if (window != NULL) {
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (renderer == NULL) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
@@ -487,22 +497,26 @@ static int run_cpu(const viewer_options *options) {
   if (renderer == NULL) { fprintf(stderr, "SDL setup: %s\n", SDL_GetError()); goto cleanup; }
   if (options->input_socket && viewer_input_open(&input, options->input_socket) != 0) { fprintf(stderr, "input connection failed\n"); goto cleanup; }
   if (input.client && input.mode != FT_INPUT_MODE_PHYSICAL) SDL_StartTextInput();
-  if (affordances.host) {
-    ft_aff_snapshot presentation = {.domain = FT_AFF_DOMAIN_PRESENTATION,
-      .presentation = {.visible = 1, .focused = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS), .scale = 1}};
-    if (require_ok(ft_affordances_host_publish(affordances.host, &presentation), "initial presentation")) goto cleanup;
-  }
+  input.renderer = renderer;
+  affordances.window = window; affordances.renderer = renderer;
+  affordances.started = SDL_GetTicks(); affordances.dirty = 1;
+  affordances.focused = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
   if (input.client) viewer_input_install_wheel_filter(&input, window);
-  int input_test_sent = 0;
+  int input_test_sent = 0, window_test_sent = 0;
   failed = 0;
   while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {
     SDL_Event event;
-    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; viewer_input_event(&input, &event, window); }
+    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; viewer_input_event(&input, &event, window); viewer_affordances_event(&affordances, &event); }
     viewer_input_poll(&input);
     if (viewer_affordances_poll(&affordances, options->log_affordances)) { failed = 1; break; }
-    if (input.failed) { failed = 1; break; }
+    if (viewer_affordances_tick(&affordances) || input.failed) { failed = 1; break; }
     if (options->input_self_test && !input_test_sent && acquired >= 2 && !input.resetting) {
       viewer_input_self_test(&input, window); input_test_sent = 1;
+    }
+    if (options->window_self_test && !window_test_sent && acquired >= 2) {
+      SDL_SetWindowSize(window, 800, 600);
+      SDL_Event resize = {.window = {.type = SDL_WINDOWEVENT, .event = SDL_WINDOWEVENT_RESIZED}};
+      viewer_affordances_event(&affordances, &resize); window_test_sent = 1;
     }
     if (!running) break;
     uint64_t published_cursor = 0;
@@ -567,13 +581,16 @@ static int run_cpu(const viewer_options *options) {
         if (!replacement) { fprintf(stderr, "SDL texture: %s\n", SDL_GetError()); ft_acquired_frame_release(&frame); failed = 1; break; }
         SDL_DestroyTexture(texture); texture = replacement;
         width = desc.width; height = desc.height; format = pixel_format;
-        SDL_SetWindowSize(window, width < WIDTH ? WIDTH : (int)width, height < HEIGHT ? HEIGHT : (int)height);
+        if (options->log_affordances) fprintf(stderr, "source frame=%ux%u\n", width, height);
+        input.frame_width = (int)width; input.frame_height = (int)height;
       }
+      int dw, dh; SDL_GetRendererOutputSize(renderer, &dw, &dh);
+      SDL_Rect fit = viewer_fit(dw, dh, (int)width, (int)height);
       int updated = SDL_UpdateTexture(texture, NULL, bytes, (int)desc.stride);
       // SDL_UpdateTexture copies the CPU bytes. Subsequent rendering uses SDL's
       // texture, so no submitted GPU work retains this acquisition mapping.
       if (require_ok(ft_acquired_frame_release(&frame), "ft_acquired_frame_release") || updated != 0 ||
-          SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, NULL, NULL) != 0) {
+          SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, NULL, &fit) != 0) {
         fprintf(stderr, "SDL render: %s\n", SDL_GetError()); failed = 1; break;
       }
       SDL_RenderPresent(renderer);

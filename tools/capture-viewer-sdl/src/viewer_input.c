@@ -1,4 +1,5 @@
 #include "viewer_input.h"
+#include "viewer_fit.h"
 #include <stdio.h>
 #include <stddef.h>
 #include <math.h>
@@ -72,22 +73,28 @@ static uint32_t modifiers(SDL_Keymod m) {
     ((m & KMOD_MODE) ? FT_INPUT_ALT_GRAPH : 0) | ((m & KMOD_CAPS) ? FT_INPUT_CAPS_LOCK : 0) |
     ((m & KMOD_NUM) ? FT_INPUT_NUM_LOCK : 0);
 }
-static void position(viewer_input *input, SDL_Window *window, int x, int y, ft_input_event *e) {
-  int w, h; SDL_GetWindowSize(window, &w, &h);
+static SDL_Rect input_fit(viewer_input *input, SDL_Window *window, int *w, int *h, int *dw, int *dh) {
+  SDL_GetWindowSize(window, w, h); *dw = *w; *dh = *h;
+  if (input->renderer) SDL_GetRendererOutputSize(input->renderer, dw, dh);
+  return input->frame_width ? viewer_fit(*dw, *dh, input->frame_width, input->frame_height) : (SDL_Rect){0, 0, *dw, *dh};
+}
+static int position(viewer_input *input, SDL_Window *window, int x, int y, ft_input_event *e) {
+  int w, h, dw, dh; SDL_Rect r = input_fit(input, window, &w, &h, &dw, &dh);
+  if (w <= 0 || h <= 0) return 0;
   e->geometry_revision = input->config.geometry.revision;
-  e->x = w > 0 ? x * input->config.geometry.width / w : 0;
-  e->y = h > 0 ? y * input->config.geometry.height / h : 0;
+  return viewer_map(r, (double)x * dw / w, (double)y * dh / h,
+                    input->config.geometry.width, input->config.geometry.height, &e->x, &e->y);
 }
 void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, double y, uint32_t unit, uint32_t direction) {
   if (!input || !input->client || input->failed || input->resetting) return;
   ft_input_event e = {0};
   int pointer_x, pointer_y; SDL_GetMouseState(&pointer_x, &pointer_y);
-  position(input, window, pointer_x, pointer_y, &e);
+  if (!position(input, window, pointer_x, pointer_y, &e)) return;
   e.kind = FT_INPUT_SCROLL; e.scroll_unit = unit; e.pointer_x = e.x; e.pointer_y = e.y;
   if (unit == FT_INPUT_SCROLL_PIXEL) {
-    int w, h; SDL_GetWindowSize(window, &w, &h);
-    x *= w > 0 ? input->config.geometry.width / w : 0;
-    y *= h > 0 ? input->config.geometry.height / h : 0;
+    int w, h, dw, dh; SDL_Rect r = input_fit(input, window, &w, &h, &dw, &dh);
+    x *= w > 0 && r.w > 0 ? input->config.geometry.width * dw / (w * (double)r.w) : 0;
+    y *= h > 0 && r.h > 0 ? input->config.geometry.height * dh / (h * (double)r.h) : 0;
   }
   /* Zero logical displacement is no input operation. */
   if (x == 0 && y == 0) return;
@@ -126,12 +133,13 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
       return;
     }
     case SDL_TEXTINPUT: if (input->mode == FT_INPUT_MODE_PHYSICAL) return; e.kind = FT_INPUT_TEXT; e.text = (const uint8_t *)event->text.text; e.text_len = strlen(event->text.text); break;
-    case SDL_MOUSEMOTION: e.kind = FT_INPUT_MOTION; position(input, window, event->motion.x, event->motion.y, &e); break;
+    case SDL_MOUSEMOTION: e.kind = FT_INPUT_MOTION; if (!position(input, window, event->motion.x, event->motion.y, &e)) return; break;
     case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP:
       e.kind = FT_INPUT_BUTTON; e.action = event->type == SDL_MOUSEBUTTONDOWN ? FT_INPUT_DOWN : FT_INPUT_UP;
       /* Canonical buttons: primary=1, secondary=2, auxiliary=3, back=4, forward=5. */
       e.button = event->button.button == SDL_BUTTON_RIGHT ? 2 : event->button.button == SDL_BUTTON_MIDDLE ? 3 : event->button.button;
-      position(input, window, event->button.x, event->button.y, &e); break;
+      if (!position(input, window, event->button.x, event->button.y, &e)) return;
+      break;
     case SDL_MOUSEWHEEL: {
       double x, y; uint32_t unit = FT_INPUT_SCROLL_LINE;
 #if SDL_VERSION_ATLEAST(2, 0, 18)

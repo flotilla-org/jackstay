@@ -1,6 +1,6 @@
 //! Run `cargo run -p jackstay-producer --example minimal` then attach using
 //! bootstrap::connect_v2. Source selection and authorization remain host policy.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jackstay::{
     acquisition::arena::{ArenaConfig, FrameDescriptor},
@@ -14,6 +14,8 @@ struct Content {
     width: u32,
     height: u32,
     announced: bool,
+    cursor_started: Instant,
+    last_cursor: Option<usize>,
 }
 impl Producer for Content {
     fn frame(&mut self) -> Option<Frame> {
@@ -44,15 +46,39 @@ impl Producer for Content {
         }
     }
     fn snapshots(&mut self) -> Vec<Snapshot> {
+        // Cycle visible shapes every half-second, then hide, then restore default.
+        const CURSORS: &[&str] = &[
+            "default",
+            "pointer",
+            "text",
+            "wait",
+            "progress",
+            "crosshair",
+            "not-allowed",
+            "move",
+            "ew-resize",
+            "ns-resize",
+            "nwse-resize",
+            "nesw-resize",
+            "none",
+        ];
+        let index = (self.cursor_started.elapsed().as_millis() / 500) as usize % CURSORS.len();
+        let mut snapshots = Vec::new();
+        if self.last_cursor != Some(index) {
+            self.last_cursor = Some(index);
+            eprintln!("cursor={}", CURSORS[index]);
+            snapshots.push(Snapshot::Cursor(CURSORS[index].into()));
+        }
         if self.announced {
-            return Vec::new();
+            return snapshots;
         }
         self.announced = true;
-        vec![Snapshot::Window(Window {
+        snapshots.push(Snapshot::Window(Window {
             title: Some("Minimal producer".into()),
             requested_size: Some(Size { width: 640., height: 480. }),
             ready: true,
-        })]
+        }));
+        snapshots
     }
     fn affordance(&mut self, event: Event) {
         if let Event::Snapshot(Snapshot::Presentation(p)) = event {
@@ -88,6 +114,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             width: 640,
             height: 480,
             announced: false,
+            cursor_started: Instant::now(),
+            last_cursor: None,
         },
     )
     .start()?;

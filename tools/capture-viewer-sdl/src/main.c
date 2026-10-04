@@ -498,6 +498,7 @@ static int run_cpu(const viewer_options *options) {
   if (options->input_socket && viewer_input_open(&input, options->input_socket) != 0) { fprintf(stderr, "input connection failed\n"); goto cleanup; }
   if (input.client && input.mode != FT_INPUT_MODE_PHYSICAL) SDL_StartTextInput();
   input.renderer = renderer;
+  viewer_affordances_cursor_init(&affordances);
   affordances.window = window; affordances.renderer = renderer;
   affordances.started = SDL_GetTicks(); affordances.dirty = 1;
   affordances.focused = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
@@ -584,6 +585,8 @@ static int run_cpu(const viewer_options *options) {
         if (options->log_affordances) fprintf(stderr, "source frame=%ux%u\n", width, height);
         input.frame_width = (int)width; input.frame_height = (int)height;
       }
+      affordances.frame_width = (int)width; affordances.frame_height = (int)height;
+      viewer_affordances_cursor_update(&affordances);
       int dw = 0, dh = 0; SDL_GetRendererOutputSize(renderer, &dw, &dh);
       SDL_Rect fit = viewer_fit(dw, dh, (int)width, (int)height);
       int updated = SDL_UpdateTexture(texture, NULL, bytes, (int)desc.stride);

@@ -1,4 +1,5 @@
 #include "viewer_affordances.h"
+#include "viewer_fit.h"
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,73 @@
 /* Event tags are documented in jackstay_affordances.h, without macros. */
 enum { AFF_EVENT_SNAPSHOT = 1, AFF_EVENT_CLOSED = 3 };
 
+/* Indexed by the public v1 CSS cursor tags; NONE uses visibility separately. */
+SDL_SystemCursor viewer_cursor_shape(uint32_t tag) {
+  static const SDL_SystemCursor shapes[] = {
+    [FT_AFF_CURSOR_AUTO] = SDL_SYSTEM_CURSOR_ARROW,
+    [FT_AFF_CURSOR_DEFAULT] = SDL_SYSTEM_CURSOR_ARROW,
+    [FT_AFF_CURSOR_NONE] = SDL_SYSTEM_CURSOR_ARROW,
+    [FT_AFF_CURSOR_CONTEXT_MENU] = SDL_SYSTEM_CURSOR_ARROW,
+    [FT_AFF_CURSOR_HELP] = SDL_SYSTEM_CURSOR_ARROW,
+    [FT_AFF_CURSOR_POINTER] = SDL_SYSTEM_CURSOR_HAND,
+    [FT_AFF_CURSOR_PROGRESS] = SDL_SYSTEM_CURSOR_WAITARROW,
+    [FT_AFF_CURSOR_WAIT] = SDL_SYSTEM_CURSOR_WAIT,
+    [FT_AFF_CURSOR_CELL] = SDL_SYSTEM_CURSOR_CROSSHAIR,
+    [FT_AFF_CURSOR_CROSSHAIR] = SDL_SYSTEM_CURSOR_CROSSHAIR,
+    [FT_AFF_CURSOR_TEXT] = SDL_SYSTEM_CURSOR_IBEAM,
+    [FT_AFF_CURSOR_VERTICAL_TEXT] = SDL_SYSTEM_CURSOR_IBEAM,
+    [FT_AFF_CURSOR_ALIAS] = SDL_SYSTEM_CURSOR_HAND,
+    [FT_AFF_CURSOR_COPY] = SDL_SYSTEM_CURSOR_ARROW,
+    [FT_AFF_CURSOR_MOVE] = SDL_SYSTEM_CURSOR_SIZEALL,
+    [FT_AFF_CURSOR_NO_DROP] = SDL_SYSTEM_CURSOR_NO,
+    [FT_AFF_CURSOR_NOT_ALLOWED] = SDL_SYSTEM_CURSOR_NO,
+    [FT_AFF_CURSOR_GRAB] = SDL_SYSTEM_CURSOR_SIZEALL,
+    [FT_AFF_CURSOR_GRABBING] = SDL_SYSTEM_CURSOR_SIZEALL,
+    [FT_AFF_CURSOR_E_RESIZE] = SDL_SYSTEM_CURSOR_SIZEWE,
+    [FT_AFF_CURSOR_N_RESIZE] = SDL_SYSTEM_CURSOR_SIZENS,
+    [FT_AFF_CURSOR_NE_RESIZE] = SDL_SYSTEM_CURSOR_SIZENESW,
+    [FT_AFF_CURSOR_NW_RESIZE] = SDL_SYSTEM_CURSOR_SIZENWSE,
+    [FT_AFF_CURSOR_S_RESIZE] = SDL_SYSTEM_CURSOR_SIZENS,
+    [FT_AFF_CURSOR_SE_RESIZE] = SDL_SYSTEM_CURSOR_SIZENWSE,
+    [FT_AFF_CURSOR_SW_RESIZE] = SDL_SYSTEM_CURSOR_SIZENESW,
+    [FT_AFF_CURSOR_W_RESIZE] = SDL_SYSTEM_CURSOR_SIZEWE,
+    [FT_AFF_CURSOR_EW_RESIZE] = SDL_SYSTEM_CURSOR_SIZEWE,
+    [FT_AFF_CURSOR_NS_RESIZE] = SDL_SYSTEM_CURSOR_SIZENS,
+    [FT_AFF_CURSOR_NESW_RESIZE] = SDL_SYSTEM_CURSOR_SIZENESW,
+    [FT_AFF_CURSOR_NWSE_RESIZE] = SDL_SYSTEM_CURSOR_SIZENWSE,
+    [FT_AFF_CURSOR_COL_RESIZE] = SDL_SYSTEM_CURSOR_SIZEWE,
+    [FT_AFF_CURSOR_ROW_RESIZE] = SDL_SYSTEM_CURSOR_SIZENS,
+    [FT_AFF_CURSOR_ALL_SCROLL] = SDL_SYSTEM_CURSOR_SIZEALL,
+    [FT_AFF_CURSOR_ZOOM_IN] = SDL_SYSTEM_CURSOR_ARROW,
+    [FT_AFF_CURSOR_ZOOM_OUT] = SDL_SYSTEM_CURSOR_ARROW,
+  };
+  return tag < sizeof(shapes) / sizeof(shapes[0]) ? shapes[tag] : SDL_SYSTEM_CURSOR_ARROW;
+}
+static void cursor_apply(viewer_affordances *a, uint32_t tag) {
+  SDL_Cursor *cursor = a->cursors[viewer_cursor_shape(tag)];
+  if (!cursor) cursor = SDL_GetDefaultCursor();
+  int visible = tag == FT_AFF_CURSOR_NONE ? SDL_DISABLE : SDL_ENABLE;
+  if (!a->cursor_applied || cursor != a->applied_cursor) SDL_SetCursor(cursor);
+  if (!a->cursor_applied || visible != a->applied_visible) SDL_ShowCursor(visible);
+  a->applied_cursor = cursor; a->applied_visible = visible; a->cursor_applied = 1;
+}
+void viewer_affordances_cursor_init(viewer_affordances *a) {
+  for (int i = 0; i < SDL_NUM_SYSTEM_CURSORS; ++i)
+    a->cursors[i] = SDL_CreateSystemCursor((SDL_SystemCursor)i);
+}
+void viewer_affordances_cursor_update(viewer_affordances *a) {
+  int x, y, w, h, dw, dh; double fx, fy;
+  uint32_t tag = FT_AFF_CURSOR_DEFAULT;
+  /* No producer shape applies before the first valid frame establishes its fit. */
+  if (a->window && !a->closed && a->frame_width > 0 && a->frame_height > 0 &&
+      SDL_GetMouseFocus() == a->window) {
+    SDL_GetMouseState(&x, &y); SDL_GetWindowSize(a->window, &w, &h);
+    if (w > 0 && h > 0 && !SDL_GetRendererOutputSize(a->renderer, &dw, &dh) &&
+        viewer_map(viewer_fit(dw, dh, a->frame_width, a->frame_height),
+                   (double)x * dw / w, (double)y * dh / h, 1, 1, &fx, &fy)) tag = a->cursor;
+  }
+  cursor_apply(a, tag);
+}
 static void log_snapshot(const ft_aff_snapshot *s) {
   static const char *names[] = {"unknown", "media", "navigation", "cursor", "scroll", "window", "presentation"};
   fprintf(stderr, "affordances domain=%s withdrawn=%u", s->domain <= FT_AFF_DOMAIN_PRESENTATION ? names[s->domain] : names[0], s->withdrawn);
@@ -39,6 +107,10 @@ static void copy_title(char **to, ft_aff_optional_string from) {
 }
 void viewer_affordances_snapshot(viewer_affordances *a, const ft_aff_snapshot *s) {
   if (!a->window) return;
+  if (s->domain == FT_AFF_DOMAIN_CURSOR) {
+    a->cursor = s->withdrawn ? FT_AFF_CURSOR_DEFAULT : s->cursor;
+    viewer_affordances_cursor_update(a);
+  }
   if (s->domain == FT_AFF_DOMAIN_WINDOW) {
     a->has_window = !s->withdrawn;
     a->ready = !s->withdrawn && s->window.ready;
@@ -85,6 +157,7 @@ void viewer_affordances_event(viewer_affordances *a, const SDL_Event *event) {
 }
 int viewer_affordances_tick(viewer_affordances *a) {
   if (!a->window) return 0;
+  viewer_affordances_cursor_update(a);
   Uint32 now = SDL_GetTicks();
   if (!a->shown && (!a->has_window || a->ready || now - a->started >= 2000)) {
     SDL_ShowWindow(a->window); a->shown = 1; a->visible = 1; a->dirty = 1;
@@ -110,7 +183,9 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
         viewer_affordances_snapshot(a, &view.snapshot);
         if (log_snapshots) log_snapshot(&view.snapshot);
       }
-      if (view.kind == AFF_EVENT_CLOSED) a->closed = 1;
+      if (view.kind == AFF_EVENT_CLOSED) {
+        a->closed = 1; a->cursor = FT_AFF_CURSOR_DEFAULT; cursor_apply(a, a->cursor);
+      }
     }
     ft_affordances_event_destroy(&event);
     if (described != FT_STATUS_OK) { fprintf(stderr, "affordances event: %d\n", described); return 1; }
@@ -119,6 +194,12 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
   return 0;
 }
 int viewer_affordances_close(viewer_affordances *a, int log_snapshots) {
+  a->cursor = FT_AFF_CURSOR_DEFAULT;
+  SDL_SetCursor(SDL_GetDefaultCursor()); SDL_ShowCursor(SDL_ENABLE);
+  a->applied_cursor = NULL; a->cursor_applied = 0;
+  for (int i = 0; i < SDL_NUM_SYSTEM_CURSORS; ++i) {
+    SDL_FreeCursor(a->cursors[i]); a->cursors[i] = NULL;
+  }
   free(a->title); free(a->navigation_title); free(a->url);
   a->title = a->navigation_title = a->url = NULL; a->window = NULL;
   if (!a->host) return 0;

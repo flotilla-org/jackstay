@@ -48,7 +48,8 @@ void viewer_affordances_snapshot(viewer_affordances *a, const ft_aff_snapshot *s
         size.width >= 1 && size.height >= 1 && size.width <= INT_MAX && size.height <= INT_MAX) {
       int w, h; SDL_GetWindowSize(a->window, &w, &h);
       if (w != (int)size.width || h != (int)size.height) {
-        SDL_SetWindowSize(a->window, (int)size.width, (int)size.height);
+        a->requested_width = (int)size.width; a->requested_height = (int)size.height;
+        SDL_SetWindowSize(a->window, a->requested_width, a->requested_height);
         a->dirty = 1;
       }
     }
@@ -63,7 +64,10 @@ void viewer_affordances_event(viewer_affordances *a, const SDL_Event *event) {
   if (!a->window || event->type != SDL_WINDOWEVENT) return;
   switch (event->window.event) {
     case SDL_WINDOWEVENT_RESIZED:
-      a->user_resized = 1;
+      /* Some window managers acknowledge a requested size with RESIZED.
+       * Only a different size establishes user ownership of the window size. */
+      if (event->window.data1 != a->requested_width || event->window.data2 != a->requested_height)
+        a->user_resized = 1;
       /* fall through */
     case SDL_WINDOWEVENT_SIZE_CHANGED:
       a->resized_at = SDL_GetTicks(); a->dirty = 1; break;
@@ -87,7 +91,7 @@ int viewer_affordances_tick(viewer_affordances *a) {
   }
   if (!a->host || a->closed || !a->dirty || (a->resized_at && now - a->resized_at < 100)) return 0;
   int w, h, dw, dh; SDL_GetWindowSize(a->window, &w, &h);
-  if (SDL_GetRendererOutputSize(a->renderer, &dw, &dh) || w <= 0 || h <= 0) return 1;
+  if (SDL_GetRendererOutputSize(a->renderer, &dw, &dh) || w <= 0 || h <= 0 || dw <= 0 || dh <= 0) return 0;
   ft_aff_snapshot s = {.domain = FT_AFF_DOMAIN_PRESENTATION,
     .presentation = {.visible = a->visible, .focused = a->focused,
       .preferred_size = {.present = 1, .width = w, .height = h}, .scale = (double)dw / w}};

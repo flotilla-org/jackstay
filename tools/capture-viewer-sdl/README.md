@@ -253,7 +253,9 @@ window domain first published after that initial poll cannot defer first show.
 The host reports logical preferred size, drawable/window scale, visibility and
 focus; resize publication is debounced 100 ms. Frames fit the drawable with black
 letterboxing. Pointer and pixel-scroll coordinates use that same fit rectangle;
-positions in the bars emit no input. Focus loss still resets held input state.
+positions in the bars emit no pointer events. Releasing a held button over a bar
+resets held input through cleanup, so a drag cannot leave the source button latched.
+Focus loss still resets held input state.
 The minimal toolkit example follows preferred size and scale and draws a
 one-pixel checkerboard. On Retina, inspect its sharpness at a matching drawable
 size; dummy video tests cannot establish physical Retina output.

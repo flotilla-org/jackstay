@@ -515,7 +515,7 @@ static int run_cpu(const viewer_options *options) {
     }
     if (options->window_self_test && !window_test_sent && acquired >= 2) {
       SDL_SetWindowSize(window, 800, 600);
-      SDL_Event resize = {.window = {.type = SDL_WINDOWEVENT, .event = SDL_WINDOWEVENT_RESIZED}};
+      SDL_Event resize = {.window = {.type = SDL_WINDOWEVENT, .event = SDL_WINDOWEVENT_RESIZED, .data1 = 800, .data2 = 600}};
       viewer_affordances_event(&affordances, &resize); window_test_sent = 1;
     }
     if (!running) break;
@@ -584,7 +584,7 @@ static int run_cpu(const viewer_options *options) {
         if (options->log_affordances) fprintf(stderr, "source frame=%ux%u\n", width, height);
         input.frame_width = (int)width; input.frame_height = (int)height;
       }
-      int dw, dh; SDL_GetRendererOutputSize(renderer, &dw, &dh);
+      int dw = 0, dh = 0; SDL_GetRendererOutputSize(renderer, &dw, &dh);
       SDL_Rect fit = viewer_fit(dw, dh, (int)width, (int)height);
       int updated = SDL_UpdateTexture(texture, NULL, bytes, (int)desc.stride);
       // SDL_UpdateTexture copies the CPU bytes. Subsequent rendering uses SDL's

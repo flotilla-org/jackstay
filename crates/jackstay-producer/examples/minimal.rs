@@ -66,6 +66,8 @@ impl Producer for Content {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = Endpoint::new(Scope::User, "minimal-producer", Transport::LocalStream)?;
+    // The toolkit reconfigures payload capacity on demand when presentation
+    // grows the frame; the 2048-pixel clamp keeps each frame at most 16 MiB.
     let arena = ArenaConfig {
         resource_capacity: 6,
         retained_history: 2,

@@ -102,11 +102,14 @@ void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, doub
   if (direction == SDL_MOUSEWHEEL_FLIPPED) { e.x = -e.x; e.y = -e.y; }
   send_event(input, &e);
 }
+static void reset_input(viewer_input *input) {
+  if (ft_input_client_reset(input->client) != FT_STATUS_OK) input->failed = 1;
+  input->resetting = 1; input->buttons = 0; memset(input->keys, 0, sizeof(input->keys));
+}
 void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window *window) {
   if (!input || !input->client || input->failed) return;
   if (event->type == SDL_WINDOWEVENT && event->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
-    if (ft_input_client_reset(input->client) != FT_STATUS_OK) input->failed = 1;
-    input->resetting = 1; memset(input->keys, 0, sizeof(input->keys)); return;
+    reset_input(input); return;
   }
   if (input->resetting) return;
   ft_input_event e = {0};
@@ -138,7 +141,17 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
       e.kind = FT_INPUT_BUTTON; e.action = event->type == SDL_MOUSEBUTTONDOWN ? FT_INPUT_DOWN : FT_INPUT_UP;
       /* Canonical buttons: primary=1, secondary=2, auxiliary=3, back=4, forward=5. */
       e.button = event->button.button == SDL_BUTTON_RIGHT ? 2 : event->button.button == SDL_BUTTON_MIDDLE ? 3 : event->button.button;
-      if (!position(input, window, event->button.x, event->button.y, &e)) return;
+      if (!position(input, window, event->button.x, event->button.y, &e)) {
+        /* No pointer event in the bars, but an outside release must not leave
+         * source input held. Reset releases all held state through cleanup. */
+        if (event->type == SDL_MOUSEBUTTONUP && e.button < 32 && (input->buttons & (1u << e.button))) reset_input(input);
+        return;
+      }
+      if (send_event(input, &e) && e.button < 32) {
+        if (e.action == FT_INPUT_DOWN) input->buttons |= 1u << e.button;
+        else input->buttons &= ~(1u << e.button);
+      }
+      return;
       break;
     case SDL_MOUSEWHEEL: {
       double x, y; uint32_t unit = FT_INPUT_SCROLL_LINE;

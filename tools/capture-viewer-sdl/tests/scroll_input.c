@@ -62,6 +62,32 @@ int main(void) {
   expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 2, 4);
   viewer_input_scroll(&input, window, -.5, .25, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_FLIPPED);
   expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 1, -.5);
+  /* A drag starting inside and released in a letterbox bar emits no outside
+   * pointer event, but executes reset cleanup so the source button cannot latch.
+   * The real socket target's next operation also proves outside motion is absent. */
+  input.frame_width = 100; input.frame_height = 100;
+  SDL_Event button = {.button = {.type = SDL_MOUSEBUTTONDOWN, .button = SDL_BUTTON_LEFT, .x = 50, .y = 25}};
+  viewer_input_event(&input, &button, window);
+  ft_input_work *drag = NULL; uint32_t drag_start = SDL_GetTicks();
+  while (ft_input_target_next(target, &drag) == FT_STATUS_EMPTY && SDL_GetTicks() - drag_start < 2000) SDL_Delay(1);
+  check(drag != NULL);
+  ft_input_operation drag_op; check(ft_input_work_describe(drag, &drag_op) == FT_STATUS_OK);
+  check(drag_op.event.kind == FT_INPUT_BUTTON && drag_op.event.action == FT_INPUT_DOWN);
+  check(drag_op.event.x == 100 && drag_op.event.y == 50);
+  check(ft_input_work_complete(&drag, FT_INPUT_EXECUTED) == FT_STATUS_OK);
+  SDL_Event motion = {.motion = {.type = SDL_MOUSEMOTION, .x = 0, .y = 25}};
+  viewer_input_event(&input, &motion, window);
+  button.button.type = SDL_MOUSEBUTTONUP; button.button.x = 0;
+  viewer_input_event(&input, &button, window);
+  drag_start = SDL_GetTicks();
+  while (ft_input_target_next(target, &drag) == FT_STATUS_EMPTY && SDL_GetTicks() - drag_start < 2000) SDL_Delay(1);
+  check(drag != NULL);
+  check(ft_input_work_describe(drag, &drag_op) == FT_STATUS_OK);
+  check(drag_op.event.kind == FT_INPUT_CLEANUP);
+  check(ft_input_work_complete(&drag, FT_INPUT_EXECUTED) == FT_STATUS_OK);
+  drag_start = SDL_GetTicks();
+  while (input.resetting && SDL_GetTicks() - drag_start < 2000) { viewer_input_poll(&input); SDL_Delay(1); }
+  check(!input.resetting && !input.failed && input.buttons == 0);
   /* Finish the actual executor cleanup before destroying independent handles. */
   ft_input_client_close(input.client);
   ft_input_work *work = NULL; uint32_t start = SDL_GetTicks();

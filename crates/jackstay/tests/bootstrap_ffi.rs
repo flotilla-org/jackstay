@@ -230,3 +230,29 @@ fn local_bootstrap_delivers_required_input_through_the_c_api() {
         }
     }
 }
+
+// V2 basic argument refusal preserves caller ownership; a peer EOF during
+// negotiation consumes the descriptor and leaves independently owned outputs null.
+#[cfg(unix)]
+#[test]
+fn v2_fd_validation_preserves_ownership_but_peer_eof_consumes_it() {
+    let (host, peer) = UnixStream::pair().unwrap();
+    let mut fd = peer.into_raw_fd();
+    let original = fd;
+    let mut input = ptr::null_mut();
+    let mut aff = ptr::null_mut();
+    let mut input_status = FT_STATUS_ERROR;
+    let mut aff_status = FT_STATUS_ERROR;
+    assert_eq!(
+        unsafe { ft_source_bootstrap_connect_v2(&mut fd, 0, 0, 99, &mut input, &mut input_status, &mut aff, &mut aff_status) },
+        FT_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(fd, original);
+    drop(host);
+    assert_ne!(
+        unsafe { ft_source_bootstrap_connect_v2(&mut fd, 0, 0, 1, &mut input, &mut input_status, &mut aff, &mut aff_status) },
+        FT_STATUS_OK
+    );
+    assert_eq!(fd, -1);
+    assert!(input.is_null() && aff.is_null());
+}

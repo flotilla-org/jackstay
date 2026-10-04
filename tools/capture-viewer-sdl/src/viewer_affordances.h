@@ -7,6 +7,7 @@ typedef struct {
   SDL_Window *window; SDL_Renderer *renderer;
   Uint32 started, resized_at; int shown, user_resized;
   int has_window, ready, dirty, visible, focused;
+  int requested_width, requested_height;
   char *title, *navigation_title, *url;
 } viewer_affordances;
 void viewer_affordances_snapshot(viewer_affordances *a, const ft_aff_snapshot *snapshot);

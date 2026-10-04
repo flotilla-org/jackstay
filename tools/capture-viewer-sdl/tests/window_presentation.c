@@ -39,7 +39,11 @@ int main(void) {
   int width, height; SDL_GetWindowSize(window, &width, &height);
   assert(width == 400 && height == 300);
   SDL_Event event = {.window = {.type = SDL_WINDOWEVENT, .event = SDL_WINDOWEVENT_RESIZED}};
-  viewer_affordances_event(&a, &event);
+  event.window.data1 = 400; event.window.data2 = 300;
+  /* A window-manager acknowledgement of our requested size is not user resize. */
+  viewer_affordances_event(&a, &event); assert(!a.user_resized);
+  event.window.data1 = 401;
+  viewer_affordances_event(&a, &event); assert(a.user_resized);
   s.window.requested_size.width = 500; viewer_affordances_snapshot(&a, &s);
   SDL_GetWindowSize(window, &width, &height); assert(width == 400);
   s.window.ready = 1; viewer_affordances_snapshot(&a, &s);
@@ -67,7 +71,7 @@ int main(void) {
     if (i < 4) assert(a.visible == (int)(i % 2));
     else assert(a.focused == (i == 4));
   }
-  viewer_affordances_close(&a, 0);
+  assert(viewer_affordances_close(&a, 0) == 0);
   SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit();
   return 0;
 }

@@ -274,3 +274,27 @@ shape changes and restoration. On macOS, run the example with
 `--features jackstay/backend-macos` to preserve the viewer's native symbols.
 The dummy-video contract test verifies mapping and lifecycle through an SDL
 cursor boundary fake; it does not establish native macOS cursor appearance.
+
+### Overlay scrollbars
+
+Bootstrap v2 sources can publish the `scroll` domain. The viewer draws thin
+horizontal and vertical overlays inside the fitted frame, using the producer's
+content length, viewport length, and position. They appear while the frame is
+hovered or for one second after a position update. Withdrawal and channel closure
+hide them immediately.
+
+Drag a thumb to set its position; click its track to request a large step toward
+the click. Each verb is gated by the corresponding published capability. Drag
+updates coalesce to one command per presented frame. Scrollbar pointer gestures
+stay in the host; wheel/trackpad input still travels through the input channel.
+
+Run `cargo run -p jackstay-producer --example scroll`, then attach using
+`capture-viewer-sdl --source-endpoint scroll-producer --affordances required` to
+try both axes. Pass `-- --read-only` to the example to disable both scroll verbs. The example applies
+scroll verbs and input wheel deltas and republishes state. CTest's
+`scroll_toolkit_processes` runs this producer and the viewer as separate processes
+with dummy SDL video; `--scroll-self-test` injects its gestures into SDL's event
+queue. `scroll_geometry_contract` covers proportional geometry, producer-unit
+drag mapping, capability changes, pointer ownership, HiDPI, expiry, and actual
+software-rendered overlay pixels. Live luchs evidence belongs to luchs#3, which
+adds that producer's scroll publication.

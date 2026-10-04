@@ -28,7 +28,7 @@ if(NOT EXISTS "${JACKSTAY_LIB}")
   message(FATAL_ERROR "Build Jackstay first (backend-macos on macOS), or set JACKSTAY_LIB to the built shared library")
 endif()
 
-set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c)
+set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c src/viewer_scroll.c)
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
   # ft_acquisition_macos_* symbols this viewer links against are present.
@@ -144,7 +144,7 @@ endif()
 add_test(NAME scroll_input_contract COMMAND scroll-input-contract)
 set_tests_properties(scroll_input_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
 
-add_executable(window-presentation-contract tests/window_presentation.c src/viewer_affordances.c)
+add_executable(window-presentation-contract tests/window_presentation.c src/viewer_affordances.c src/viewer_scroll.c)
 target_include_directories(window-presentation-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
 target_link_directories(window-presentation-contract PRIVATE ${SDL2_LIBRARY_DIRS})
 target_compile_options(window-presentation-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
@@ -152,10 +152,23 @@ target_link_libraries(window-presentation-contract PRIVATE ${JACKSTAY_LIB} ${SDL
 add_test(NAME window_presentation_contract COMMAND window-presentation-contract)
 set_tests_properties(window_presentation_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
 
-add_executable(cursor-contract tests/cursor.c)
+add_executable(cursor-contract tests/cursor.c src/viewer_scroll.c)
 target_include_directories(cursor-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
 target_link_directories(cursor-contract PRIVATE ${SDL2_LIBRARY_DIRS})
 target_compile_options(cursor-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
 target_link_libraries(cursor-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
 add_test(NAME cursor_contract COMMAND cursor-contract)
 set_tests_properties(cursor_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
+
+add_executable(scroll-geometry-contract tests/scroll_geometry.c src/viewer_scroll.c)
+target_include_directories(scroll-geometry-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(scroll-geometry-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(scroll-geometry-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(scroll-geometry-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
+add_test(NAME scroll_geometry_contract COMMAND scroll-geometry-contract)
+set_tests_properties(scroll_geometry_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
+
+add_test(NAME scroll_toolkit_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/scroll_processes.py
+  ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)

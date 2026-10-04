@@ -89,6 +89,8 @@ void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, doub
     x *= w > 0 ? input->config.geometry.width / w : 0;
     y *= h > 0 ? input->config.geometry.height / h : 0;
   }
+  /* Zero logical displacement is no input operation. */
+  if (x == 0 && y == 0) return;
   e.x = x; e.y = y;
   if (direction == SDL_MOUSEWHEEL_FLIPPED) { e.x = -e.x; e.y = -e.y; }
   send_event(input, &e);
@@ -191,8 +193,9 @@ void viewer_input_poll(viewer_input *input) {
   ft_input_status s;
   while (ft_input_client_poll(input->client, &s) == FT_STATUS_OK) {
     if (s.kind == FT_INPUT_COALESCED) {
-      /* The replaced sequence needs no retirement: this viewer keeps no
-       * in-flight operation list. The surviving event completes separately. */
+      /* Count-only notification: the C ABI stores the count in sequence and
+       * carries no failure result. This viewer keeps no in-flight list, so no
+       * retirement is needed; the surviving latest motion completes separately. */
       continue;
     }
     if (s.kind == FT_INPUT_RESET) { input->config.geometry = s.geometry; input->resetting = 0; }

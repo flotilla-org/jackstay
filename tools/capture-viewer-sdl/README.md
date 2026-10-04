@@ -189,7 +189,9 @@ remains available for independent adapter tests. Without `--input-socket`, that
 low-level CPU connection is observation-only. The reference sender
 uses `--typing cooperative|text|physical` on either bootstrap path (default
 `cooperative`). With `--observe`, typing has no effect because no input channel
-is requested. Text mode sends committed text and suppresses keys. Physical mode
+is requested. Text mode sends committed text and suppresses every key, including
+modifiers, Enter, Backspace and arrows; those keys do not become remote controls
+or editing commands. Physical mode
 sends physical keys, suppresses committed text and SDL repeat events (repeat belongs
 to the target). Cooperative mode sends physical keys, committed text and source
 repeat. Unsupported typing modes can be refused by the producer. The low-level
@@ -218,7 +220,9 @@ values. They are not AppKit's logical-pixel `scrollingDeltaX/Y`. SDL2 rounds
 non-precise wheel values away from zero and leaves precise values fractional,
 but it drops `hasPreciseScrollingDeltas`: an integral trackpad delta cannot be
 identified from `preciseX/Y` alone. This finding is from upstream source inspection,
-not a live hardware measurement.
+not a live hardware measurement. The Cocoa metadata capture and SDL event-filter
+rewrite were source-verified with SDL2 2.32.10; older Cocoa releases have not been
+verified.
 
 The C viewer captures precise wheel metadata during SDL's event filter, inside
 Cocoa dispatch. It reads the current `NSEvent` through the Objective-C C runtime: precise devices use

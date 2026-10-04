@@ -606,7 +606,9 @@ static int run_cpu(const viewer_options *options) {
   if (options->max_frames > 0 && acquired != (uint64_t)options->max_frames) failed = 1;
   printf("acquired_frames=%" PRIu64 "\n", acquired);
 cleanup:
+#ifdef __APPLE__
   SDL_SetEventFilter(NULL, NULL);
+#endif
   if (viewer_affordances_close(&affordances, options->log_affordances)) failed = 1;
   if (viewer_input_close(&input)) failed = 1;
   SDL_DestroyTexture(texture);

@@ -55,6 +55,9 @@ int main(void) {
 #endif
   /* Cocoa's captured native pixel metadata uses this same conversion seam.
    * Precise integral deltas must remain pixels, unlike the portable heuristic. */
+  /* Zero displacement creates no operation; the next nonzero scroll is the
+   * executor's next work, so this checks absence without a timing sleep. */
+  viewer_input_scroll(&input, window, 0, 0, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_NORMAL);
   viewer_input_scroll(&input, window, 1, 2, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_NORMAL);
   expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 2, 4);
   viewer_input_scroll(&input, window, -.5, .25, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_FLIPPED);

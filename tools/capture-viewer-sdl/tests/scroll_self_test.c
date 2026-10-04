@@ -35,6 +35,13 @@ int main(void) {
     assert(!SDL_HasEvents(SDL_MOUSEMOTION, SDL_MOUSEWHEEL));
     SDL_SetWindowSize(window, 640, 480);
     drain();
+    /* A navigation strip reserves rows, so fixed scroll fixture points must
+     * wait even when frame and window dimensions otherwise match. */
+    a.navigation.visible = 1;
+    scroll_self_test(&a, window, 640, 480, &next);
+    assert(next == stage);
+    assert(!SDL_HasEvents(SDL_MOUSEMOTION, SDL_MOUSEWHEEL));
+    a.navigation.visible = 0;
     scroll_self_test(&a, window, 640, 480, &next);
     assert(next == stage + 1);
     assert(SDL_HasEvents(SDL_MOUSEMOTION, SDL_MOUSEWHEEL));

@@ -179,7 +179,6 @@ if(APPLE)
 endif()
 set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT ${SCROLL_PROC_TIMEOUT} RUN_SERIAL TRUE)
 
-
 add_executable(navigation-contract tests/navigation.c src/viewer_navigation.c src/viewer_affordances.c src/viewer_scroll.c)
 target_include_directories(navigation-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
 target_link_directories(navigation-contract PRIVATE ${SDL2_LIBRARY_DIRS})

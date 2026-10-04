@@ -195,7 +195,6 @@ static viewer_options parse_options(int argc, char **argv) {
 static int viewer_event(viewer_input *input, SDL_Window *window, viewer_affordances *a, const SDL_Event *event) {
   int w, h, dw = 0, dh = 0; SDL_GetWindowSize(window, &w, &h);
   SDL_GetRendererOutputSize(a->renderer, &dw, &dh);
-  input->strip_height = a->navigation.visible ? VIEWER_NAV_HEIGHT : 0;
   /* A frame drag retains its release even when it crosses the toolbar. */
   int frame_drag = input->buttons && (event->type == SDL_MOUSEMOTION || event->type == SDL_MOUSEBUTTONUP);
   int frame_keyup = event->type == SDL_KEYUP && event->key.keysym.scancode > SDL_SCANCODE_UNKNOWN &&

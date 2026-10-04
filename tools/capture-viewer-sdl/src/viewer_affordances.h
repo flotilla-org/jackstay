@@ -3,9 +3,11 @@
 #include "jackstay_affordances.h"
 #include <SDL.h>
 #include "viewer_scroll.h"
+#include "viewer_navigation.h"
 typedef struct {
   ft_affordances_host *host; int closed;
   viewer_scroll scroll;
+  viewer_navigation navigation;
   SDL_Window *window; SDL_Renderer *renderer;
   Uint32 started, resized_at; int shown, user_resized;
   int has_window, ready, dirty, visible, focused;
@@ -15,6 +17,8 @@ typedef struct {
   uint32_t cursor; int frame_width, frame_height;
   char *title, *navigation_title, *url;
 } viewer_affordances;
+int viewer_affordances_strip(viewer_affordances *a);
+SDL_Rect viewer_affordances_fit(viewer_affordances *a, int fw, int fh);
 SDL_SystemCursor viewer_cursor_shape(uint32_t tag);
 void viewer_affordances_cursor_init(viewer_affordances *a);
 void viewer_affordances_cursor_update(viewer_affordances *a);

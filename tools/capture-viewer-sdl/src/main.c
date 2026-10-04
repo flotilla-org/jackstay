@@ -67,6 +67,7 @@ typedef struct viewer_options {
   int input_self_test;
   int window_self_test;
   int scroll_self_test;
+  int navigation_self_test;
   const char *porthole_socket;
   const char *session_id;
   int native;
@@ -89,6 +90,8 @@ static viewer_options parse_options(int argc, char **argv) {
       options.source_endpoint = argv[i];
     } else if (strcmp(argv[i], "--session-scope") == 0) {
       options.session_scope = 1;
+    } else if (strcmp(argv[i], "--navigation-self-test") == 0) {
+      options.navigation_self_test = 1;
     } else if (strcmp(argv[i], "--log-affordances") == 0) {
       options.log_affordances = 1;
     } else if (strcmp(argv[i], "--affordances") == 0) {
@@ -192,14 +195,44 @@ static viewer_options parse_options(int argc, char **argv) {
 static int viewer_event(viewer_input *input, SDL_Window *window, viewer_affordances *a, const SDL_Event *event) {
   int w, h, dw = 0, dh = 0; SDL_GetWindowSize(window, &w, &h);
   SDL_GetRendererOutputSize(a->renderer, &dw, &dh);
-  int consumed = 0;
-  if (w > 0 && h > 0)
+  input->strip_height = a->navigation.visible ? VIEWER_NAV_HEIGHT : 0;
+  /* A frame drag retains its release even when it crosses the toolbar. */
+  int frame_drag = input->buttons && (event->type == SDL_MOUSEMOTION || event->type == SDL_MOUSEBUTTONUP);
+  int frame_keyup = event->type == SDL_KEYUP && event->key.keysym.scancode > SDL_SCANCODE_UNKNOWN &&
+    event->key.keysym.scancode < SDL_NUM_SCANCODES && input->keys[event->key.keysym.scancode];
+  int consumed = frame_drag || frame_keyup ? 0 : viewer_navigation_event(&a->navigation, a->host, event);
+  if (!consumed && a->navigation.visible && (event->type == SDL_MOUSEWHEEL || event->type == input->precise_wheel_type)) {
+    int mx, my; SDL_GetMouseState(&mx, &my); consumed = my < VIEWER_NAV_HEIGHT;
+  }
+  if (!consumed && w > 0 && h > 0)
     consumed = viewer_scroll_event(&a->scroll, a->host, event,
-      viewer_fit(dw, dh, input->frame_width, input->frame_height),
+      viewer_affordances_fit(a, input->frame_width, input->frame_height),
       (double)dw / w, (double)dh / h, input->buttons != 0, SDL_GetTicks());
   if (!consumed) viewer_input_event(input, event, window);
   viewer_affordances_event(a, event);
   return consumed < 0;
+}
+
+static void navigation_self_test(viewer_input *input, viewer_affordances *a, int *stage) {
+  viewer_navigation *n = &a->navigation;
+  if (!n->visible) return;
+  SDL_Event e = {.button = {.type = SDL_MOUSEBUTTONDOWN, .button = SDL_BUTTON_LEFT, .y = 10}};
+  if (*stage == 0 && n->state.can_go_back) e.button.x = 10;
+  else if (*stage == 1 && n->state.can_go_forward) e.button.x = 38;
+  else if (*stage == 2 && !n->state.loading && n->state.can_go_back) e.button.x = 66;
+  else if (*stage == 3 && n->state.loading) e.button.x = 66;
+  else if (*stage == 4 && !n->state.loading) {
+    e.button.x = 100; viewer_event(input, a->window, a, &e);
+    e = (SDL_Event){.text = {.type = SDL_TEXTINPUT}};
+    SDL_strlcpy(e.text.text, "https://example.test/typed", sizeof(e.text.text));
+    viewer_event(input, a->window, a, &e);
+    e = (SDL_Event){.key = {.type = SDL_KEYDOWN, .keysym = {.sym = SDLK_RETURN}}};
+  } else return;
+  if (viewer_event(input, a->window, a, &e)) input->failed = 1;
+  if (e.type == SDL_MOUSEBUTTONDOWN) {
+    e.type = SDL_MOUSEBUTTONUP; viewer_event(input, a->window, a, &e);
+  }
+  ++*stage;
 }
 
 /* Offline integration driver uses the real SDL queue and normal routing.
@@ -487,6 +520,7 @@ static int run_cpu(const viewer_options *options) {
   }
   viewer_input input = {.mode = options->typing};
   viewer_affordances affordances = {0};
+  int navigation_test_stage = 0;
   ft_cpu_acquisition_connection *connection = NULL;
   ft_cpu_producer *producer = NULL;
   uint8_t *pixels = NULL;
@@ -572,6 +606,7 @@ static int run_cpu(const viewer_options *options) {
       SDL_Event resize = {.window = {.type = SDL_WINDOWEVENT, .event = SDL_WINDOWEVENT_RESIZED, .data1 = 800, .data2 = 600}};
       viewer_affordances_event(&affordances, &resize); window_test_sent = 1;
     }
+    if (options->navigation_self_test && acquired >= 2) navigation_self_test(&input, &affordances, &navigation_test_stage);
     if (options->scroll_self_test && acquired >= 2) scroll_self_test(&affordances, window, &scroll_test_stage);
     if (!running) break;
     uint64_t published_cursor = 0;
@@ -642,7 +677,7 @@ static int run_cpu(const viewer_options *options) {
       affordances.frame_width = (int)width; affordances.frame_height = (int)height;
       viewer_affordances_cursor_update(&affordances);
       int dw = 0, dh = 0; SDL_GetRendererOutputSize(renderer, &dw, &dh);
-      SDL_Rect fit = viewer_fit(dw, dh, (int)width, (int)height);
+      SDL_Rect fit = viewer_affordances_fit(&affordances, (int)width, (int)height);
       int updated = SDL_UpdateTexture(texture, NULL, bytes, (int)desc.stride);
       // SDL_UpdateTexture copies the CPU bytes. Subsequent rendering uses SDL's
       // texture, so no submitted GPU work retains this acquisition mapping.
@@ -655,6 +690,7 @@ static int run_cpu(const viewer_options *options) {
           window_w > 0 ? viewer_scroll_thickness((double)dw / window_w) : 8, SDL_GetTicks())) {
         fprintf(stderr, "scroll overlay render/send failed\n"); failed = 1; break;
       }
+      if (viewer_navigation_draw(&affordances.navigation, renderer, dw, viewer_affordances_strip(&affordances))) { failed = 1; break; }
       SDL_RenderPresent(renderer);
       acquired++;
       SDL_Delay(16);

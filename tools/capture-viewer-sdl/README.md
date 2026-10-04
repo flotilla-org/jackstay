@@ -298,3 +298,25 @@ queue. `scroll_geometry_contract` covers proportional geometry, producer-unit
 drag mapping, capability changes, pointer ownership, HiDPI, expiry, and actual
 software-rendered overlay pixels. Live luchs evidence belongs to luchs#3, which
 adds that producer's scroll publication.
+
+### Navigation toolbar
+
+Publishing `navigation` adds a 28 logical pixel strip above the frame with back,
+forward, reload (stop while loading), and the current URL. Every action requires
+its capability, and history buttons also require the corresponding state.
+Click the URL to edit (initially selected); type to replace, Backspace to delete,
+Enter to load, or Escape to cancel. Keyboard events belong to the editor while
+it is active. Clicking the frame or losing focus cancels editing.
+
+The window grows when navigation appears and shrinks on withdrawal or channel
+closure. Rendering, input, cursors, and scroll overlays share the remaining
+frame rectangle; presentation size hints exclude the strip. The original
+embedded 5x7 ASCII bitmap font needs no SDL_ttf or other new dependency; non-ASCII
+bytes display as `?`, while typed UTF-8 is preserved for the producer to interpret.
+
+Try `cargo run -p jackstay-producer --example navigation`, then attach with
+`--source-endpoint navigation-producer --affordances required`. The example
+publishes synthetic history/loading state and prints each received verb; it does
+not access the network. `navigation_toolkit_processes` drives all five verbs
+through ordinary viewer routing in separate producer/viewer processes using
+SDL's dummy video driver. Live luchs evidence belongs to luchs#3.

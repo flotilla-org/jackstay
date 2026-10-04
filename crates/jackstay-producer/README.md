@@ -42,9 +42,10 @@ reconfigure CPU storage; capacity pauses skip that publication and retry on
 later frames. `recycle` receives consumed frame storage after publication or
 capacity-paused discard, once the arena no longer borrows it. Pool these buffers
 to avoid allocating a pixel `Vec` on every frame. The default callback drops them.
-`input_size` maps replacement pixel dimensions to logical input dimensions; its
+`input_size` maps reconfigured pixel dimensions to logical input dimensions; its
 default returns the pixel size. Scaled renderers can return their logical viewport.
-Only a change in logical dimensions advances the input geometry revision.
+The initial allocation keeps the builder geometry; a first frame exceeding its
+capacity also calls `input_size` during reconfiguration. Only a change in logical dimensions advances the input geometry revision.
 `execute` receives `Work`, including cleanup: return `Executed` only after
 actual execution/release. Return `Uncertain` for execution uncertainty. Failed
 cleanup is reported, never silently treated as successful release.

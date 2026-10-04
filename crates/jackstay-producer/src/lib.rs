@@ -298,8 +298,16 @@ fn pump<P: Producer>(
             }
         };
         if let Some(frame) = frame {
-            let result = callback(|| {
+            let result = (|| {
                 let dims = (frame.descriptor.width, frame.descriptor.height, frame.descriptor.stride);
+                let replacing = pending.map_or(dims, |(dims, _)| dims);
+                // User callbacks run before taking the arena mutex. Catching a
+                // callback panic must not poison an internal ownership lock.
+                let logical = if pending.is_some() || size.is_some_and(|old| old != dims) || frame.bytes.len() > capacity {
+                    Some(callback(|| p.input_size(replacing.0, replacing.1))?)
+                } else {
+                    None
+                };
                 let mut a = arena.lock().unwrap();
                 // Avoid replacing the caller's correctly sized initial arena: a
                 // consumer may attach before the first callback supplies its frame.
@@ -316,9 +324,8 @@ fn pump<P: Producer>(
                     match status {
                         Ok(ReconfigurationStatus::Ready { .. }) => {
                             let (installed, bytes) = pending.take().unwrap();
-                            if size.is_some_and(|old| old != installed) {
+                            if let Some((width, height)) = logical {
                                 let old = target.config().geometry;
-                                let (width, height) = p.input_size(installed.0, installed.1);
                                 let geometry = jackstay::input::Geometry {
                                     revision: old.revision.saturating_add(1),
                                     width,
@@ -349,9 +356,10 @@ fn pump<P: Producer>(
                     }
                 }
                 a.publish(frame.descriptor, &frame.bytes).map(|_| ()).map_err(io::Error::other)
-            })
-            .and_then(|result| result);
+            })();
             let recycled = callback(|| p.recycle(frame));
+            // Always recycle, retaining a publication error as the root cause
+            // if recycling also fails during shutdown.
             if let Err(e) = result.and(recycled) {
                 error = Some(e);
                 break;

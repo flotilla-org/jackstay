@@ -236,7 +236,12 @@ fn frame_resize_reconfigures_existing_consumer() {
     let source = Builder::new(ep.clone(), config(), Config::default(), Resizing(width.clone()))
         .start()
         .unwrap();
-    let c = bootstrap::connect_v2(local::connect(&ep).unwrap().into_stream(), InputRequest::None, ChannelRequest::None).unwrap();
+    let c = bootstrap::connect_v2(
+        local::connect(&ep).unwrap().into_stream(),
+        InputRequest::Required(Mode::Cooperative),
+        ChannelRequest::None,
+    )
+    .unwrap();
     let mut setup = unsafe { CpuSetupClient::from_stream(c.media) };
     let mut consumer = setup.attach(1).unwrap();
     width.store(1, Ordering::Release);
@@ -250,6 +255,11 @@ fn frame_resize_reconfigures_existing_consumer() {
             false
         }
     });
+    wait(|| c.input.as_ref().unwrap().welcome().config.geometry.width == 2.);
+    let geometry = c.input.as_ref().unwrap().welcome().config.geometry;
+    assert_eq!(geometry.height, 1.);
+    assert_eq!(geometry.revision, 2);
+    drop(c.input);
     drop(consumer);
     drop(setup);
     source.stop().unwrap();
@@ -390,7 +400,26 @@ fn callback_panics_still_run_ordered_shutdown() {
     impl Producer for Panics {
         fn frame(&mut self) -> Option<Frame> {
             self.fire(1);
-            None
+            if self.stage >= 4 && self.trigger.load(Ordering::Acquire) {
+                Some(Frame {
+                    descriptor: FrameDescriptor {
+                        width: 2,
+                        height: 1,
+                        stride: 8,
+                        ..Default::default()
+                    },
+                    bytes: vec![0; 8],
+                })
+            } else {
+                None
+            }
+        }
+        fn input_size(&mut self, width: u32, height: u32) -> (f64, f64) {
+            self.fire(4);
+            (width.into(), height.into())
+        }
+        fn recycle(&mut self, _: Frame) {
+            self.fire(5);
         }
         fn snapshots(&mut self) -> Vec<jackstay::affordances::Snapshot> {
             self.fire(2);
@@ -408,7 +437,7 @@ fn callback_panics_still_run_ordered_shutdown() {
             Outcome::Executed
         }
     }
-    for stage in 0..4 {
+    for stage in 0..6 {
         let ep = endpoint(&format!("panic-{stage}"));
         let trigger = Arc::new(AtomicBool::new(false));
         let cleanups = Arc::new(AtomicU32::new(0));
@@ -463,12 +492,18 @@ fn connection_limit_rejects_peers_while_bootstrap_stalls() {
 
 #[test]
 fn recycling_scaled_frames_preserves_storage_and_logical_geometry() {
+    for logical_width in [1., 3.] {
+        scaled_recycling(logical_width);
+    }
+}
+fn scaled_recycling(logical_width: f64) {
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     struct Scaled {
         width: Arc<AtomicU32>,
         returned: Arc<AtomicUsize>,
         bytes: Option<Vec<u8>>,
         pointer: usize,
+        logical_width: f64,
     }
     impl Producer for Scaled {
         fn frame(&mut self) -> Option<Frame> {
@@ -495,7 +530,7 @@ fn recycling_scaled_frames_preserves_storage_and_logical_geometry() {
             self.returned.fetch_add(1, Ordering::Release);
         }
         fn input_size(&mut self, _: u32, _: u32) -> (f64, f64) {
-            (1., 1.)
+            (self.logical_width, 1.)
         }
         fn execute(&mut self, _: Work) -> Outcome {
             Outcome::Executed
@@ -503,9 +538,10 @@ fn recycling_scaled_frames_preserves_storage_and_logical_geometry() {
     }
     let width = Arc::new(AtomicU32::new(0));
     let returned = Arc::new(AtomicUsize::new(0));
+    // Both 1x1 and 2x1 fit this allocation, so replacement must reuse its pointer.
     let bytes = Vec::with_capacity(8);
     let pointer = bytes.as_ptr() as usize;
-    let ep = endpoint("scaled-recycle");
+    let ep = endpoint(&format!("scaled-recycle-{logical_width}"));
     let source = Builder::new(
         ep.clone(),
         config(),
@@ -522,6 +558,7 @@ fn recycling_scaled_frames_preserves_storage_and_logical_geometry() {
             returned: returned.clone(),
             bytes: Some(bytes),
             pointer,
+            logical_width,
         },
     )
     .start()
@@ -541,8 +578,9 @@ fn recycling_scaled_frames_preserves_storage_and_logical_geometry() {
     wait(|| setup.install_configuration(&mut consumer).unwrap().is_some());
     wait(|| matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Frame(f) if f.descriptor().width == 2));
     // Input remains in logical units even after replacement by a 2x buffer.
-    assert_eq!(input.welcome().config.geometry.width, 1.);
+    wait(|| input.welcome().config.geometry.width == logical_width);
     assert_eq!(input.welcome().config.geometry.height, 1.);
+    assert_eq!(input.welcome().config.geometry.revision, if logical_width == 1. { 1 } else { 2 });
     drop((input, consumer, setup));
     source.stop().unwrap();
 }

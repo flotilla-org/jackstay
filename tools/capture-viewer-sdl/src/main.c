@@ -66,6 +66,7 @@ typedef struct viewer_options {
   const char *input_socket;
   int input_self_test;
   int window_self_test;
+  int scroll_self_test;
   const char *porthole_socket;
   const char *session_id;
   int native;
@@ -77,7 +78,9 @@ typedef struct viewer_options {
 static viewer_options parse_options(int argc, char **argv) {
   viewer_options options = {.bootstrap_input = FT_BOOTSTRAP_INPUT_OPTIONAL, .affordances = 1, .typing = FT_INPUT_MODE_COOPERATIVE};
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--window-self-test") == 0) {
+    if (strcmp(argv[i], "--scroll-self-test") == 0) {
+      options.scroll_self_test = 1;
+    } else if (strcmp(argv[i], "--window-self-test") == 0) {
       options.window_self_test = 1;
     } else if (strcmp(argv[i], "--input-self-test") == 0) {
       options.input_self_test = 1;
@@ -185,6 +188,56 @@ static viewer_options parse_options(int argc, char **argv) {
   return options;
 }
 
+/* Route overlay gestures before input, using the same drawable fit as rendering. */
+static int viewer_event(viewer_input *input, SDL_Window *window, viewer_affordances *a, const SDL_Event *event) {
+  int w, h, dw = 0, dh = 0; SDL_GetWindowSize(window, &w, &h);
+  SDL_GetRendererOutputSize(a->renderer, &dw, &dh);
+  int consumed = 0;
+  if (w > 0 && h > 0)
+    consumed = viewer_scroll_event(&a->scroll, a->host, event,
+      viewer_fit(dw, dh, input->frame_width, input->frame_height),
+      (double)dw / w, (double)dh / h, input->buttons != 0, SDL_GetTicks());
+  if (!consumed) viewer_input_event(input, event, window);
+  viewer_affordances_event(a, event);
+  return consumed < 0;
+}
+
+/* Offline integration driver uses the real SDL queue and normal routing.
+ * The scroll toolkit fixture requests a 640x480 window with an unletterboxed
+ * frame, 1000-unit content, 200-unit viewports, and initial positions x=50/y=100.
+ * Fixed pointer points and thresholds below intentionally test that geometry. */
+static void scroll_self_test(viewer_affordances *a, SDL_Window *window, int *stage) {
+  viewer_scroll *s = &a->scroll;
+  if (!s->present) return;
+  double x = s->snapshot.x.position, y = s->snapshot.y.position;
+  if (((s->snapshot.capabilities & 3) == 3 && ((*stage == 1 && y < 500) || (*stage == 2 && y > 500) ||
+      (*stage == 3 && x < 500) || (*stage == 4 && x > 500))) || *stage >= 5) return;
+  int px = *stage < 2 ? 636 : *stage < 4 ? 96 : 636;
+  int py = *stage == 0 ? 96 : *stage == 1 ? 5 : *stage < 4 ? 476 : 200;
+  if (*stage == 3) px = 5;
+  SDL_Event e = {.button = {.type = SDL_MOUSEBUTTONDOWN, .button = SDL_BUTTON_LEFT, .x = px, .y = py}};
+  if (*stage == 4) {
+    SDL_WarpMouseInWindow(window, px, py);
+    e = (SDL_Event){.wheel = {.type = SDL_MOUSEWHEEL, .y = -2}};
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    e.wheel.preciseY = -2;
+#endif
+    SDL_PushEvent(&e);
+  } else {
+    SDL_PushEvent(&e);
+    if (*stage == 0 || *stage == 2) {
+      for (int i = 0; i < 3; i++) {
+        SDL_Event motion = {.motion = {.type = SDL_MOUSEMOTION,
+          .state = SDL_BUTTON_LMASK, .x = *stage == 0 ? px : 380 + 10 * i, .y = *stage == 0 ? 300 + 10 * i : py}};
+        SDL_PushEvent(&motion);
+      }
+      e.button.x = *stage == 0 ? px : 400; e.button.y = *stage == 0 ? 320 : py;
+    }
+    e.type = SDL_MOUSEBUTTONUP; SDL_PushEvent(&e);
+  }
+  (*stage)++;
+}
+
 /* Keep the actual lease while deliberately delaying consumption. Pump events
  * so even a long requested delay can be cancelled by closing this window. */
 static int hold_frame(uint32_t remaining_ms, viewer_input *input, SDL_Window *window, viewer_affordances *affordances, int log_affordances) {
@@ -193,7 +246,7 @@ static int hold_frame(uint32_t remaining_ms, viewer_input *input, SDL_Window *wi
     SDL_Delay(chunk);
     remaining_ms -= chunk;
     SDL_Event event;
-    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) return 0; viewer_input_event(input, &event, window); if (affordances) viewer_affordances_event(affordances, &event); }
+    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) return 0; if (viewer_event(input, window, affordances, &event)) return -1; }
     viewer_input_poll(input);
     if (affordances && (viewer_affordances_poll(affordances, log_affordances) || viewer_affordances_tick(affordances))) return -1;
   }
@@ -503,11 +556,11 @@ static int run_cpu(const viewer_options *options) {
   affordances.started = SDL_GetTicks(); affordances.dirty = 1;
   affordances.focused = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
   if (input.client) viewer_input_install_wheel_filter(&input, window);
-  int input_test_sent = 0, window_test_sent = 0;
+  int input_test_sent = 0, window_test_sent = 0, scroll_test_stage = 0;
   failed = 0;
   while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {
     SDL_Event event;
-    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; viewer_input_event(&input, &event, window); viewer_affordances_event(&affordances, &event); }
+    while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; if (viewer_event(&input, window, &affordances, &event)) { failed = 1; running = 0; } }
     viewer_input_poll(&input);
     if (viewer_affordances_poll(&affordances, options->log_affordances)) { failed = 1; break; }
     if (viewer_affordances_tick(&affordances) || input.failed) { failed = 1; break; }
@@ -519,6 +572,7 @@ static int run_cpu(const viewer_options *options) {
       SDL_Event resize = {.window = {.type = SDL_WINDOWEVENT, .event = SDL_WINDOWEVENT_RESIZED, .data1 = 800, .data2 = 600}};
       viewer_affordances_event(&affordances, &resize); window_test_sent = 1;
     }
+    if (options->scroll_self_test && acquired >= 2) scroll_self_test(&affordances, window, &scroll_test_stage);
     if (!running) break;
     uint64_t published_cursor = 0;
     if (producer != NULL) {
@@ -595,6 +649,11 @@ static int run_cpu(const viewer_options *options) {
       if (require_ok(ft_acquired_frame_release(&frame), "ft_acquired_frame_release") || updated != 0 ||
           SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, NULL, &fit) != 0) {
         fprintf(stderr, "SDL render: %s\n", SDL_GetError()); failed = 1; break;
+      }
+      int window_w, window_h; SDL_GetWindowSize(window, &window_w, &window_h);
+      if (viewer_scroll_draw(&affordances.scroll, affordances.host, renderer, fit,
+          window_w > 0 ? viewer_scroll_thickness((double)dw / window_w) : 8, SDL_GetTicks())) {
+        fprintf(stderr, "scroll overlay render/send failed\n"); failed = 1; break;
       }
       SDL_RenderPresent(renderer);
       acquired++;

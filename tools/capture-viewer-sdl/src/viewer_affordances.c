@@ -106,6 +106,8 @@ static void copy_title(char **to, ft_aff_optional_string from) {
   }
 }
 void viewer_affordances_snapshot(viewer_affordances *a, const ft_aff_snapshot *s) {
+  if (s->domain == FT_AFF_DOMAIN_SCROLL)
+    viewer_scroll_snapshot(&a->scroll, s->withdrawn ? NULL : &s->scroll, SDL_GetTicks());
   if (!a->window) return;
   if (s->domain == FT_AFF_DOMAIN_CURSOR) {
     a->cursor = s->withdrawn ? FT_AFF_CURSOR_DEFAULT : s->cursor;
@@ -185,6 +187,8 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
       }
       if (view.kind == AFF_EVENT_CLOSED) {
         a->closed = 1; a->cursor = FT_AFF_CURSOR_DEFAULT; cursor_apply(a, a->cursor);
+
+        viewer_scroll_snapshot(&a->scroll, NULL, SDL_GetTicks());
       }
     }
     ft_affordances_event_destroy(&event);
@@ -200,6 +204,8 @@ int viewer_affordances_close(viewer_affordances *a, int log_snapshots) {
   for (int i = 0; i < SDL_NUM_SYSTEM_CURSORS; ++i) {
     SDL_FreeCursor(a->cursors[i]); a->cursors[i] = NULL;
   }
+
+  viewer_scroll_snapshot(&a->scroll, NULL, SDL_GetTicks());
   free(a->title); free(a->navigation_title); free(a->url);
   a->title = a->navigation_title = a->url = NULL; a->window = NULL;
   if (!a->host) return 0;

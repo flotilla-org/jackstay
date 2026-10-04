@@ -184,3 +184,11 @@ add_test(NAME navigation_toolkit_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/navigation_processes.py
   ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
 set_tests_properties(navigation_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+
+add_executable(navigation-send-contract tests/navigation_send.c)
+target_include_directories(navigation-send-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(navigation-send-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(navigation-send-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(navigation-send-contract PRIVATE ${SDL2_LIBRARIES})
+add_test(NAME navigation_send_contract COMMAND navigation-send-contract)
+set_tests_properties(navigation_send_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)

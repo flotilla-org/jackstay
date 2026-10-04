@@ -241,7 +241,12 @@ static void navigation_self_test(viewer_input *input, viewer_affordances *a, int
  * Fixed pointer points and thresholds below intentionally test that geometry. */
 static void scroll_self_test(viewer_affordances *a, SDL_Window *window, int *stage) {
   viewer_scroll *s = &a->scroll;
-  if (!s->present) return;
+  /* Resize and presentation updates are asynchronous on macOS. Do not drive
+   * fixed fixture coordinates until both frame and renderer have caught up. */
+  int w, h, dw = 0, dh = 0; SDL_GetWindowSize(window, &w, &h);
+  SDL_GetRendererOutputSize(a->renderer, &dw, &dh);
+  if (!s->present || w != 640 || h != 480 || a->frame_width != dw || a->frame_height != dh ||
+      (int64_t)dw * h != (int64_t)dh * w) return;
   double x = s->snapshot.x.position, y = s->snapshot.y.position;
   if (((s->snapshot.capabilities & 3) == 3 && ((*stage == 1 && y < 500) || (*stage == 2 && y > 500) ||
       (*stage == 3 && x < 500) || (*stage == 4 && x > 500))) || *stage >= 5) return;
@@ -690,7 +695,7 @@ static int run_cpu(const viewer_options *options) {
           window_w > 0 ? viewer_scroll_thickness((double)dw / window_w) : 8, SDL_GetTicks())) {
         fprintf(stderr, "scroll overlay render/send failed\n"); failed = 1; break;
       }
-      if (viewer_navigation_draw(&affordances.navigation, renderer, dw, viewer_affordances_strip(&affordances))) { failed = 1; break; }
+      if (viewer_navigation_draw(&affordances.navigation, renderer, window)) { failed = 1; break; }
       SDL_RenderPresent(renderer);
       acquired++;
       SDL_Delay(16);

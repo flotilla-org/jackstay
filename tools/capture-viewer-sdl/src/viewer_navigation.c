@@ -18,6 +18,16 @@ static char *copy_bytes(const uint8_t *bytes, size_t len) {
   if (text) { if (len) memcpy(text, bytes, len); text[len] = 0; }
   return text;
 }
+static void end_edit(viewer_navigation *n) {
+  if (n->editing) {
+    SDL_StopTextInput();
+    /* Cooperative/source-text input may already own SDL text input. Restore
+     * that owner rather than disabling committed text delivery to the frame. */
+    if (n->restore_text_input) SDL_StartTextInput();
+  }
+  n->editing = n->selected = n->restore_text_input = 0;
+  free(n->edit); n->edit = NULL;
+}
 void viewer_navigation_snapshot(viewer_navigation *n, const ft_aff_navigation *state) {
   free(n->url); n->url = NULL;
   n->visible = state != NULL;
@@ -26,11 +36,11 @@ void viewer_navigation_snapshot(viewer_navigation *n, const ft_aff_navigation *s
   n->state.url = n->state.title = (ft_aff_optional_string){0};
   if (state && state->url.present) n->url = copy_bytes(state->url.value.data, state->url.value.len);
   if (!viewer_navigation_enabled(n, FT_AFF_NAVIGATION_LOAD)) {
-    n->editing = n->selected = 0; free(n->edit); n->edit = NULL;
+    end_edit(n);
   }
 }
 void viewer_navigation_destroy(viewer_navigation *n) {
-  free(n->url); free(n->edit); *n = (viewer_navigation){0};
+  end_edit(n); free(n->url); *n = (viewer_navigation){0};
 }
 SDL_Rect viewer_navigation_fit(int w, int h, int fw, int fh, int strip) {
   if (strip < 0) strip = 0;
@@ -54,17 +64,17 @@ int viewer_navigation_event(viewer_navigation *n, ft_affordances_host *host, con
     n->buttons &= ~(1u << e->button.button); return 1;
   }
   if (e->type == SDL_WINDOWEVENT && e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
-    n->editing = n->selected = 0; memset(n->keys, 0, sizeof(n->keys)); n->buttons = 0;
+    end_edit(n); memset(n->keys, 0, sizeof(n->keys)); n->buttons = 0;
   }
   if (!n->visible) return 0;
   if (n->editing && (e->type == SDL_KEYDOWN || e->type == SDL_KEYUP || e->type == SDL_TEXTINPUT || e->type == SDL_TEXTEDITING)) {
     if (e->type == SDL_KEYDOWN) {
       if (e->key.keysym.scancode < SDL_NUM_SCANCODES) n->keys[e->key.keysym.scancode] = 1;
       SDL_Keycode key = e->key.keysym.sym;
-      if (key == SDLK_ESCAPE) { n->editing = n->selected = 0; }
+      if (key == SDLK_ESCAPE) { end_edit(n); }
       else if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
         int result = send_verb(n, host, FT_AFF_NAVIGATION_LOAD);
-        n->editing = n->selected = 0; return result < 0 ? -1 : 1;
+        end_edit(n); return result < 0 ? -1 : 1;
       } else if (key == SDLK_BACKSPACE && n->edit) {
         size_t len = strlen(n->edit);
         if (n->selected) n->edit[0] = 0;
@@ -83,7 +93,7 @@ int viewer_navigation_event(viewer_navigation *n, ft_affordances_host *host, con
   if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP) { x = e->button.x; y = e->button.y; }
   else if (e->type == SDL_MOUSEMOTION) { x = e->motion.x; y = e->motion.y; }
   if (y < 0 || y >= VIEWER_NAV_HEIGHT) {
-    if (e->type == SDL_MOUSEBUTTONDOWN) n->editing = n->selected = 0;
+    if (e->type == SDL_MOUSEBUTTONDOWN) end_edit(n);
     return 0;
   }
   if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button < 32) n->buttons |= 1u << e->button.button;
@@ -92,8 +102,9 @@ int viewer_navigation_event(viewer_navigation *n, ft_affordances_host *host, con
       x < VIEWER_NAV_BUTTON * 2 ? FT_AFF_NAVIGATION_FORWARD :
       x < VIEWER_NAV_BUTTON * 3 ? (n->state.loading ? FT_AFF_NAVIGATION_STOP : FT_AFF_NAVIGATION_RELOAD) : FT_AFF_NAVIGATION_LOAD;
     if (verb == FT_AFF_NAVIGATION_LOAD && viewer_navigation_enabled(n, verb)) {
-      free(n->edit); n->edit = copy_bytes((const uint8_t *)(n->url ? n->url : ""), n->url ? strlen(n->url) : 0);
+      end_edit(n); n->edit = copy_bytes((const uint8_t *)(n->url ? n->url : ""), n->url ? strlen(n->url) : 0);
       if (!n->edit) return -1;
+      n->restore_text_input = SDL_IsTextInputActive();
       n->editing = n->selected = 1; SDL_StartTextInput();
     } else if (verb != FT_AFF_NAVIGATION_LOAD && send_verb(n, host, verb)) return -1;
   }
@@ -207,15 +218,15 @@ static int text_draw(SDL_Renderer *r, const char *text, int x, int y, int right)
   }
   return 0;
 }
-int viewer_navigation_draw(const viewer_navigation *n, SDL_Renderer *r, int w, int strip) {
-  if (!n->visible || strip <= 0) return 0;
-  SDL_Rect bar = {0, 0, w, strip};
-  if (SDL_SetRenderDrawColor(r, 35, 38, 42, 255) || SDL_RenderFillRect(r, &bar)) return -1;
-  double scale = (double)strip / VIEWER_NAV_HEIGHT;
+int viewer_navigation_draw(const viewer_navigation *n, SDL_Renderer *r, SDL_Window *window) {
+  if (!n->visible) return 0;
+  int w, h, dw, dh; SDL_GetWindowSize(window, &w, &h);
+  if (w <= 0 || h <= 0 || SDL_GetRendererOutputSize(r, &dw, &dh)) return -1;
   /* SDL logical scaling keeps glyphs and hit targets in window coordinates. */
   float sx, sy; SDL_RenderGetScale(r, &sx, &sy);
-  if (SDL_RenderSetScale(r, (float)scale, (float)scale)) return -1;
-  int result = 0;
+  if (SDL_RenderSetScale(r, (float)dw / w, (float)dh / h)) return -1;
+  SDL_Rect bar = {0, 0, w, VIEWER_NAV_HEIGHT};
+  int result = SDL_SetRenderDrawColor(r, 35, 38, 42, 255) || SDL_RenderFillRect(r, &bar) ? -1 : 0;
   uint32_t verbs[] = {FT_AFF_NAVIGATION_BACK, FT_AFF_NAVIGATION_FORWARD,
     n->state.loading ? FT_AFF_NAVIGATION_STOP : FT_AFF_NAVIGATION_RELOAD};
   const char *labels[] = {"<", ">", n->state.loading ? "X" : "R"};
@@ -224,7 +235,7 @@ int viewer_navigation_draw(const viewer_navigation *n, SDL_Renderer *r, int w, i
     if (SDL_SetRenderDrawColor(r, enabled ? 235 : 95, enabled ? 235 : 95, enabled ? 235 : 95, 255) ||
         text_draw(r, labels[i], i * VIEWER_NAV_BUTTON + 11, 10, (i + 1) * VIEWER_NAV_BUTTON)) result = -1;
   }
-  SDL_Rect url = {VIEWER_NAV_BUTTON * 3, 3, (int)(w / scale) - VIEWER_NAV_BUTTON * 3, VIEWER_NAV_HEIGHT - 6};
+  SDL_Rect url = {VIEWER_NAV_BUTTON * 3, 3, w - VIEWER_NAV_BUTTON * 3, VIEWER_NAV_HEIGHT - 6};
   if (url.w > 0) {
     if (SDL_SetRenderDrawColor(r, n->editing ? 65 : 48, n->selected ? 85 : 55, 65, 255) || SDL_RenderFillRect(r, &url) ||
         SDL_SetRenderDrawColor(r, 235, 235, 235, 255)) result = -1;

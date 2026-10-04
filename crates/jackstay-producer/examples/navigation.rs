@@ -64,6 +64,7 @@ impl Producer for Content {
             snapshots.push(Snapshot::Navigation(Navigation {
                 url: Some(self.url.clone()),
                 title: None,
+                // This synthetic history has exactly two entries: indices 0 and 1.
                 can_go_back: self.index > 0,
                 can_go_forward: self.index == 0,
                 loading: self.loading,
@@ -83,7 +84,10 @@ impl Producer for Content {
                     "forward" => self.index = 1,
                     "reload" => self.loading = true,
                     "stop" => self.loading = false,
-                    "load" => self.url = verb.body["url"].as_str().unwrap().into(),
+                    "load" => {
+                        let Some(url) = verb.body["url"].as_str() else { return };
+                        self.url = url.into();
+                    }
                     _ => return,
                 }
                 self.dirty = true;

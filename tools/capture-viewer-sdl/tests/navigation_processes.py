@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 
-with tempfile.TemporaryDirectory(prefix="js-navigation-") as runtime:
+with tempfile.TemporaryDirectory(prefix="js-nav-", dir="/tmp") as runtime:
     env = {**os.environ, "XDG_RUNTIME_DIR": runtime, "SDL_VIDEODRIVER": "dummy"}
     command = [sys.argv[1], "run", "--locked", "--offline", "-p", "jackstay-producer", "--example", "navigation"]
     if sys.platform == "darwin":

@@ -35,8 +35,23 @@ typedef struct ft_input_work ft_input_work;
 #define FT_INPUT_REPEAT 3
 #define FT_INPUT_PHYSICAL_KEY 1
 #define FT_INPUT_LOGICAL_KEY 2
+/* Scroll signs after controller-applied platform natural-scrolling inversion:
+ * positive y moves content toward its end (down), positive x toward the right.
+ * SDL reference: negate both deltas for SDL_MOUSEWHEEL_FLIPPED, then negate y
+ * to convert SDL positive-up to positive-down; x remains positive-right.
+ * Executors own line height/page size and platform conversion; controllers
+ * never pre-multiply. Fractions are allowed and controllers never round.
+ * Phases/momentum metadata are deferred beyond v1; OS momentum is further
+ * PIXEL events. See docs/design/input.md, "Scroll units".
+ */
+/* Precise/continuous devices (trackpads, Magic Mouse, high-resolution wheels
+ * reporting pixel deltas): target logical units, as geometry/pointer positions,
+ * never device pixels. */
 #define FT_INPUT_SCROLL_PIXEL 1
+/* Notched wheels: one unit per notch (Windows delta / 120; X11 buttons 4-7:
+ * +/-1 on the corresponding axis; macOS non-precise: line delta). */
 #define FT_INPUT_SCROLL_LINE 2
+/* Explicit page-scroll gestures only; never synthesized from wheels. */
 #define FT_INPUT_SCROLL_PAGE 3
 #define FT_INPUT_SCOPE_ALL 1
 #define FT_INPUT_SCOPE_POINTER 2

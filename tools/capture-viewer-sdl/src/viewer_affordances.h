@@ -4,10 +4,12 @@
 #include <SDL.h>
 #include "viewer_scroll.h"
 #include "viewer_navigation.h"
+#include "viewer_input.h"
 typedef struct {
   ft_affordances_host *host; int closed;
   viewer_scroll scroll;
   viewer_navigation navigation;
+  viewer_input *input;
   SDL_Window *window; SDL_Renderer *renderer;
   Uint32 started, resized_at; int shown, user_resized;
   int has_window, ready, dirty, visible, focused;

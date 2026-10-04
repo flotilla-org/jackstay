@@ -221,7 +221,13 @@ static int text_draw(SDL_Renderer *r, const char *text, int x, int y, int right)
 int viewer_navigation_draw(const viewer_navigation *n, SDL_Renderer *r, SDL_Window *window) {
   if (!n->visible) return 0;
   int w, h, dw, dh; SDL_GetWindowSize(window, &w, &h);
-  if (w <= 0 || h <= 0 || SDL_GetRendererOutputSize(r, &dw, &dh)) return -1;
+  if (w <= 0 || h <= 0) return -1;
+  SDL_Texture *target = SDL_GetRenderTarget(r);
+  /* An active texture target owns the drawable dimensions. Query it
+   * explicitly instead of relying on window output size. */
+  if (target) {
+    if (SDL_QueryTexture(target, NULL, NULL, &dw, &dh)) return -1;
+  } else if (SDL_GetRendererOutputSize(r, &dw, &dh)) return -1;
   /* SDL logical scaling keeps glyphs and hit targets in window coordinates. */
   float sx, sy; SDL_RenderGetScale(r, &sx, &sy);
   if (SDL_RenderSetScale(r, (float)dw / w, (float)dh / h)) return -1;

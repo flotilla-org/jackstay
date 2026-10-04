@@ -524,7 +524,7 @@ static int run_cpu(const viewer_options *options) {
     session_id = synthetic.session_id;
   }
   viewer_input input = {.mode = options->typing};
-  viewer_affordances affordances = {0};
+  viewer_affordances affordances = {.input = &input};
   int navigation_test_stage = 0;
   ft_cpu_acquisition_connection *connection = NULL;
   ft_cpu_producer *producer = NULL;

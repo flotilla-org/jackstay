@@ -5,6 +5,7 @@
 #endif
 #include <assert.h>
 #include <string.h>
+#include <stdio.h>
 int main(void) {
   /* Exhaustively generate publication, boolean state triples, all capability
    * combinations and verbs. Both state and capability must permit a verb. */
@@ -30,16 +31,29 @@ int main(void) {
     assert(!viewer_map(a, a.x, VIEWER_NAV_HEIGHT * scale - 1, 640, 480, &x, &y));
     assert(!viewer_map(a, a.x + a.w, a.y, 640, 480, &x, &y));
   }
+  /* Generate fractional/integer DPI ratios and invalid dimensions. The strip
+   * reserves the minimal integer row boundary beyond the logical 28 pixels. */
+  for (int dh = 1; dh <= 777; dh += 7) for (int h = 1; h <= 641; h += 9) {
+    int strip = viewer_navigation_strip_height(dh, h, 1);
+    assert((int64_t)strip * h >= (int64_t)dh * VIEWER_NAV_HEIGHT);
+    assert((int64_t)(strip - 1) * h < (int64_t)dh * VIEWER_NAV_HEIGHT);
+    assert(!viewer_navigation_strip_height(dh, h, 0));
+  }
+  assert(!viewer_navigation_strip_height(0, 100, 1));
+  assert(!viewer_navigation_strip_height(100, 0, 1));
   assert(SDL_Init(SDL_INIT_VIDEO) == 0);
   SDL_Window *window = SDL_CreateWindow("navigation", 0, 0, 320, 240, SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE); assert(window);
   SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE); assert(renderer);
-  viewer_affordances a = {.window = window, .renderer = renderer};
+  viewer_input input = {0};
+  viewer_affordances a = {.window = window, .renderer = renderer, .input = &input};
   ft_aff_snapshot s = {.domain = FT_AFF_DOMAIN_NAVIGATION, .navigation = {
     .url = {.present = 1, .value = {.data = (const uint8_t *)"https://example.test", .len = 20}}, .capabilities = 16}};
   /* Duplicate snapshots, withdrawal, and re-publication preserve content size
    * and do not turn resize acknowledgements into user ownership. */
   for (int i = 0; i < 6; ++i) {
     s.withdrawn = i == 2 || i == 5; viewer_affordances_snapshot(&a, &s);
+    /* Input geometry updates at snapshot time, before any pointer event. */
+    assert(input.strip_height == (s.withdrawn ? 0 : VIEWER_NAV_HEIGHT));
     int w, h; SDL_GetWindowSize(window, &w, &h);
     assert(w == 320 && h == 240 + (s.withdrawn ? 0 : VIEWER_NAV_HEIGHT));
     SDL_Event e = {.window = {.type = SDL_WINDOWEVENT, .event = SDL_WINDOWEVENT_RESIZED, .data1 = w, .data2 = h}};
@@ -81,13 +95,20 @@ int main(void) {
   assert(!viewer_navigation_draw(&a.navigation, renderer, window));
   /* A 1.25x drawable target simulates fractional DPI. The strip fills exactly
    * 35 device rows, and the first frame row below it remains untouched. */
-  SDL_SetWindowSize(window, 320, 240); SDL_PumpEvents();
+  SDL_SetWindowSize(window, 320, 240); SDL_PumpEvents(); assert(!SDL_RenderClear(renderer));
   SDL_Texture *target = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, 400, 300); assert(target);
   assert(!SDL_SetRenderTarget(renderer, target));
+  assert(!SDL_RenderSetViewport(renderer, NULL));
   assert(!SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)); assert(!SDL_RenderClear(renderer));
   assert(!viewer_navigation_draw(&a.navigation, renderer, window));
   unsigned char pixels[8]; SDL_Rect boundary = {10, 34, 1, 2};
   assert(!SDL_RenderReadPixels(renderer, &boundary, SDL_PIXELFORMAT_RGBA32, pixels, 4));
+  if (pixels[0] != 35 || pixels[1] != 38 || pixels[2] != 42 || pixels[4] || pixels[5] || pixels[6]) {
+    int dw, dh, w, h; SDL_RendererInfo info;
+    SDL_GetRendererOutputSize(renderer, &dw, &dh); SDL_GetWindowSize(window, &w, &h); SDL_GetRendererInfo(renderer, &info);
+    fprintf(stderr, "fractional strip renderer=%s window=%dx%d output=%dx%d rows=%u,%u,%u / %u,%u,%u\n",
+      info.name, w, h, dw, dh, pixels[0], pixels[1], pixels[2], pixels[4], pixels[5], pixels[6]);
+  }
   assert(pixels[0] == 35 && pixels[1] == 38 && pixels[2] == 42);
   assert(pixels[4] == 0 && pixels[5] == 0 && pixels[6] == 0);
   assert(!SDL_SetRenderTarget(renderer, NULL)); SDL_DestroyTexture(target);

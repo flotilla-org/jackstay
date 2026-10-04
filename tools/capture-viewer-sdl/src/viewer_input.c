@@ -77,7 +77,7 @@ static uint32_t modifiers(SDL_Keymod m) {
 static SDL_Rect input_fit(viewer_input *input, SDL_Window *window, int *w, int *h, int *dw, int *dh) {
   SDL_GetWindowSize(window, w, h); *dw = *w; *dh = *h;
   if (input->renderer) SDL_GetRendererOutputSize(input->renderer, dw, dh);
-  return input->frame_width ? viewer_navigation_fit(*dw, *dh, input->frame_width, input->frame_height, *h > 0 ? (int)((double)*dh * input->strip_height / *h) : 0) : (SDL_Rect){0, 0, *dw, *dh};
+  return input->frame_width ? viewer_navigation_fit(*dw, *dh, input->frame_width, input->frame_height, viewer_navigation_strip_height(*dh, *h, input->strip_height != 0)) : (SDL_Rect){0, 0, *dw, *dh};
 }
 static int position(viewer_input *input, SDL_Window *window, int x, int y, ft_input_event *e) {
   int w, h, dw, dh; SDL_Rect r = input_fit(input, window, &w, &h, &dw, &dh);

@@ -14,7 +14,7 @@ int viewer_affordances_strip(viewer_affordances *a) {
   if (!a->navigation.visible || !a->window || !a->renderer) return 0;
   SDL_GetWindowSize(a->window, &w, &h);
   if (h <= 0 || SDL_GetRendererOutputSize(a->renderer, &dw, &dh)) return 0;
-  return (int)((double)dh * VIEWER_NAV_HEIGHT / h);
+  return viewer_navigation_strip_height(dh, h, 1);
 }
 SDL_Rect viewer_affordances_fit(viewer_affordances *a, int fw, int fh) {
   int dw = 0, dh = 0; SDL_GetRendererOutputSize(a->renderer, &dw, &dh);
@@ -23,6 +23,7 @@ SDL_Rect viewer_affordances_fit(viewer_affordances *a, int fw, int fh) {
 static void navigation_snapshot(viewer_affordances *a, const ft_aff_navigation *state) {
   int before = a->navigation.visible;
   viewer_navigation_snapshot(&a->navigation, state);
+  if (a->input) a->input->strip_height = a->navigation.visible ? VIEWER_NAV_HEIGHT : 0;
   if (a->window && before != a->navigation.visible) {
     int w, h; SDL_GetWindowSize(a->window, &w, &h);
     int next = a->navigation.visible ? (h <= INT_MAX - VIEWER_NAV_HEIGHT ? h + VIEWER_NAV_HEIGHT : h) : (h > VIEWER_NAV_HEIGHT ? h - VIEWER_NAV_HEIGHT : 1);

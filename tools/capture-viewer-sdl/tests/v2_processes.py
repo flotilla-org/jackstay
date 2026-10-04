@@ -10,7 +10,9 @@ for offered, policy, session in (("offered", "required", False), ("offered", "no
                                  ("absent", "optional", False), ("absent", "required", False),
                                  ("offered", "default", True)):
     name = "v2-test-" + uuid.uuid4().hex[:12]
-    source = subprocess.Popen([sys.argv[1], name, offered, *(["session"] if session else [])], stdout=subprocess.PIPE,
+    refusal = policy == "required" and offered == "absent"
+    source_flags = ["refusal"] if refusal else ["session"] if session else []
+    source = subprocess.Popen([sys.argv[1], name, offered, *source_flags], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True)
     try:
         assert source.stdout.readline().strip() == "ready"
@@ -20,9 +22,10 @@ for offered, policy, session in (("offered", "required", False), ("offered", "no
                                 env=env, capture_output=True, text=True, timeout=12)
         out, err = source.communicate(timeout=5)
         # A required unavailable channel fails bootstrap clearly before media admission.
-        if policy == "required" and offered == "absent":
+        if refusal:
             assert viewer.returncode != 0 and "required affordances" in viewer.stderr, viewer
             assert "acquired_frames=" not in viewer.stdout, viewer.stdout
+            assert "bootstrap refused" in out, (out, err)
         else:
             # Media remains available when affordances are optional or unrequested.
             assert viewer.returncode == 0 and "acquired_frames=10" in viewer.stdout, (viewer.stdout, viewer.stderr)

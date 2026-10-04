@@ -6,11 +6,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-static void check(ft_status s) { if (s != FT_STATUS_OK) { fprintf(stderr, "v2 fixture status=%d\n", s); exit(1); } }
+static void checked(ft_status s, const char *operation) {
+  if (s != FT_STATUS_OK) { fprintf(stderr, "v2 fixture %s: status=%d\n", operation, s); exit(1); }
+}
+#define check(status) checked((status), #status)
 static void pause_ms(void) { struct timespec t = {0, 16000000}; nanosleep(&t, NULL); }
 int main(int argc, char **argv) {
   if (argc != 3 && argc != 4) return 1;
-  ft_local_endpoint endpoint = {argc == 4 ? FT_ENDPOINT_SCOPE_SESSION : FT_ENDPOINT_SCOPE_USER, FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, argv[1]};
+  ft_local_endpoint endpoint = {(argc == 4 && !strcmp(argv[3], "session")) ? FT_ENDPOINT_SCOPE_SESSION : FT_ENDPOINT_SCOPE_USER, FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, argv[1]};
   ft_local_listener *listener = NULL; ft_local_connection *local = NULL;
   ft_cpu_producer *producer = NULL; ft_cpu_setup_server *server = NULL;
   ft_input_server *input = NULL; ft_affordances_producer *affordances = NULL;
@@ -21,7 +24,9 @@ int main(int argc, char **argv) {
   check(ft_local_listener_accept(listener, &local));
   ft_status bootstrap = ft_source_bootstrap_accept_v2_local(&local, NULL, !strcmp(argv[2], "offered"), &input, &affordances);
   ft_local_listener_destroy(&listener);
-  if (bootstrap != FT_STATUS_OK) {
+  /* A required-refusal scenario ends at bootstrap. Starting CPU setup after
+   * the viewer rejects and closes can fail peer identification on macOS. */
+  if (bootstrap != FT_STATUS_OK || (argc == 4 && !strcmp(argv[3], "refusal"))) {
     ft_local_connection_destroy(&local); check(ft_cpu_producer_destroy(&producer));
     puts("bootstrap refused"); return 0;
   }

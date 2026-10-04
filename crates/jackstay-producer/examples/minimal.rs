@@ -1,6 +1,6 @@
 //! Run `cargo run -p jackstay-producer --example minimal` then attach using
 //! bootstrap::connect_v2. Source selection and authorization remain host policy.
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jackstay::{
     acquisition::arena::{ArenaConfig, FrameDescriptor},
@@ -14,7 +14,7 @@ struct Content {
     width: u32,
     height: u32,
     announced: bool,
-    cursor_started: std::time::Instant,
+    cursor_started: Instant,
     last_cursor: Option<usize>,
 }
 impl Producer for Content {
@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             width: 640,
             height: 480,
             announced: false,
-            cursor_started: std::time::Instant::now(),
+            cursor_started: Instant::now(),
             last_cursor: None,
         },
     )

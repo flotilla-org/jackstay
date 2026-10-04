@@ -1,14 +1,17 @@
 #include "viewer_affordances.h"
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 #include <stdint.h>
 /* SDL cursor and pointer APIs are the OS boundary; dummy SDL has no cursors. */
 static SDL_Window *focus;
-static int mx, my, shown, created, freed;
+static int mx, my, shown, created, freed, sets, shows;
 static SDL_Cursor *selected;
 static SDL_Cursor *create_cursor(SDL_SystemCursor id) { ++created; return (SDL_Cursor *)(uintptr_t)(id + 1); }
 static void free_cursor(SDL_Cursor *cursor) { if (cursor) ++freed; }
-static void set_cursor(SDL_Cursor *cursor) { selected = cursor; }
-static int show_cursor(int toggle) { shown = toggle; return toggle; }
+static void set_cursor(SDL_Cursor *cursor) { selected = cursor; ++sets; }
+static int show_cursor(int toggle) { shown = toggle; ++shows; return toggle; }
 static SDL_Window *mouse_focus(void) { return focus; }
 static Uint32 mouse_state(int *x, int *y) { *x = mx; *y = my; return 0; }
 #define SDL_CreateSystemCursor create_cursor
@@ -71,10 +74,19 @@ int main(void) {
   viewer_affordances_cursor_init(&a);
   assert(created == SDL_NUM_SYSTEM_CURSORS);
   focus = window; mx = 50; my = 50;
+  /* Until a frame size is known the producer cursor must not apply. */
+  a.frame_width = 0; a.cursor = FT_AFF_CURSOR_POINTER;
+  viewer_affordances_cursor_update(&a);
+  assert(selected == a.cursors[SDL_SYSTEM_CURSOR_ARROW]);
+  a.frame_width = 100;
   /* Cursor snapshots apply inside the shared fit; letterbox and exclusive edges restore arrow. */
   ft_aff_snapshot s = {.domain = FT_AFF_DOMAIN_CURSOR, .cursor = FT_AFF_CURSOR_POINTER};
   viewer_affordances_snapshot(&a, &s);
   assert(selected == a.cursors[SDL_SYSTEM_CURSOR_HAND] && shown == SDL_ENABLE);
+  /* Repeated ticks with the same shape/visibility avoid redundant OS calls. */
+  int previous_sets = sets, previous_shows = shows;
+  viewer_affordances_cursor_update(&a); viewer_affordances_cursor_update(&a);
+  assert(sets == previous_sets && shows == previous_shows);
   const int points[][3] = {{0,25,1},{99,74,1},{50,24,0},{50,75,0},{100,50,0},{-1,50,0}};
   for (size_t i = 0; i < sizeof(points)/sizeof(points[0]); ++i) {
     mx = points[i][0]; my = points[i][1]; viewer_affordances_cursor_update(&a);
@@ -91,6 +103,7 @@ int main(void) {
   a.closed = 1; viewer_affordances_cursor_update(&a);
   assert(shown == SDL_ENABLE && selected == a.cursors[SDL_SYSTEM_CURSOR_ARROW]);
   viewer_affordances_close(&a, 0); assert(freed == created);
+  assert(!a.cursor_applied && a.applied_cursor == NULL && shown == SDL_ENABLE);
   SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit();
   return 0;
 }

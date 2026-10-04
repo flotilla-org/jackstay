@@ -53,8 +53,11 @@ SDL_SystemCursor viewer_cursor_shape(uint32_t tag) {
 }
 static void cursor_apply(viewer_affordances *a, uint32_t tag) {
   SDL_Cursor *cursor = a->cursors[viewer_cursor_shape(tag)];
-  SDL_SetCursor(cursor ? cursor : SDL_GetDefaultCursor());
-  SDL_ShowCursor(tag == FT_AFF_CURSOR_NONE ? SDL_DISABLE : SDL_ENABLE);
+  if (!cursor) cursor = SDL_GetDefaultCursor();
+  int visible = tag == FT_AFF_CURSOR_NONE ? SDL_DISABLE : SDL_ENABLE;
+  if (!a->cursor_applied || cursor != a->applied_cursor) SDL_SetCursor(cursor);
+  if (!a->cursor_applied || visible != a->applied_visible) SDL_ShowCursor(visible);
+  a->applied_cursor = cursor; a->applied_visible = visible; a->cursor_applied = 1;
 }
 void viewer_affordances_cursor_init(viewer_affordances *a) {
   for (int i = 0; i < SDL_NUM_SYSTEM_CURSORS; ++i)
@@ -63,7 +66,9 @@ void viewer_affordances_cursor_init(viewer_affordances *a) {
 void viewer_affordances_cursor_update(viewer_affordances *a) {
   int x, y, w, h, dw, dh; double fx, fy;
   uint32_t tag = FT_AFF_CURSOR_DEFAULT;
-  if (a->window && !a->closed && SDL_GetMouseFocus() == a->window) {
+  /* No producer shape applies before the first valid frame establishes its fit. */
+  if (a->window && !a->closed && a->frame_width > 0 && a->frame_height > 0 &&
+      SDL_GetMouseFocus() == a->window) {
     SDL_GetMouseState(&x, &y); SDL_GetWindowSize(a->window, &w, &h);
     if (w > 0 && h > 0 && !SDL_GetRendererOutputSize(a->renderer, &dw, &dh) &&
         viewer_map(viewer_fit(dw, dh, a->frame_width, a->frame_height),
@@ -191,6 +196,7 @@ int viewer_affordances_poll(viewer_affordances *a, int log_snapshots) {
 int viewer_affordances_close(viewer_affordances *a, int log_snapshots) {
   a->cursor = FT_AFF_CURSOR_DEFAULT;
   SDL_SetCursor(SDL_GetDefaultCursor()); SDL_ShowCursor(SDL_ENABLE);
+  a->applied_cursor = NULL; a->cursor_applied = 0;
   for (int i = 0; i < SDL_NUM_SYSTEM_CURSORS; ++i) {
     SDL_FreeCursor(a->cursors[i]); a->cursors[i] = NULL;
   }

@@ -9,6 +9,7 @@ typedef struct {
   int has_window, ready, dirty, visible, focused;
   int requested_width, requested_height;
   SDL_Cursor *cursors[SDL_NUM_SYSTEM_CURSORS];
+  SDL_Cursor *applied_cursor; int applied_visible, cursor_applied;
   uint32_t cursor; int frame_width, frame_height;
   char *title, *navigation_title, *url;
 } viewer_affordances;

@@ -23,7 +23,7 @@ fn a_stale_offer_with_a_contradictory_resource_header_is_an_error() {
     let (descriptor, fds) = producer.attach_process(1, std::process::id()).unwrap().into_parts().unwrap();
     // Keep a copy only while the consumer's current mapping still retains this
     // generation. It is consumed/dropped before that mapping is relinquished.
-    let old_fd = fds[1].try_clone().unwrap();
+    let old_fd = [fds[1].try_clone().unwrap(), fds[5].try_clone().unwrap()];
     // SAFETY: this process is the sole admitted recipient of this local producer.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
     let mut consumer = ArenaConsumer::from_grant(grant).unwrap();
@@ -97,7 +97,7 @@ fn a_separate_process_installs_replacement_storage_while_retaining_its_old_frame
             .unwrap();
     }
     stream.send(&replacement);
-    stream.send_objects(&child, std::slice::from_ref(&fd));
+    stream.send_objects(&child, &fd);
     drop(fd);
     assert!(child.wait().unwrap().success());
     assert_ne!(producer.attach(1).unwrap().incarnation(), incarnation);
@@ -109,7 +109,7 @@ fn mapped_configuration_child() {
     use jackstay::acquisition::arena::{ConfigurationGrant, ConsumerGrant};
     let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_CONFIGURATION_TEST_SOCKET").unwrap());
     let descriptor = stream.recv();
-    let fds = stream.recv_objects(5).try_into().unwrap();
+    let fds = stream.recv_objects(6).try_into().unwrap();
     // SAFETY: the parent is the sole conforming producer. This process is the
     // admitted sole recipient and does not fork or forward any setup grant.
     let grant = unsafe { ConsumerGrant::from_parts(descriptor, fds) }.unwrap();
@@ -119,7 +119,7 @@ fn mapped_configuration_child() {
     };
     stream.write_byte(1);
     let descriptor = stream.recv();
-    let fd = stream.recv_objects(1).pop().unwrap();
+    let fd = stream.recv_objects(2).try_into().unwrap();
     // SAFETY: this is the parent's single-use replacement offer for the same
     // admitted process. It retains its allocation until this recipient retires it.
     let offer = unsafe { ConfigurationGrant::from_parts(&consumer, descriptor, fd) }.unwrap();

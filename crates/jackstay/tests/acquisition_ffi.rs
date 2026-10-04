@@ -91,7 +91,7 @@ fn malformed_cpu_grant_consumes_all_transferred_fds_without_returning_a_consumer
     #[cfg(windows)]
     let sender = sender.into_handle().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-    let mut fds: [FtOsObject; 5] = std::array::from_fn(|_| into_raw(sender.try_clone().unwrap()));
+    let mut fds: [FtOsObject; 6] = std::array::from_fn(|_| into_raw(sender.try_clone().unwrap()));
     drop(sender);
     let mut consumer = ptr::null_mut();
     // SAFETY: the malformed JSON is rejected before maps are accessed. All five
@@ -100,9 +100,9 @@ fn malformed_cpu_grant_consumes_all_transferred_fds_without_returning_a_consumer
         unsafe { ft_acquisition_import_cpu(b"!".as_ptr(), 1, fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_INVALID_ARGUMENT
     );
-    assert_eq!(fds, [FT_OS_OBJECT_NONE; 5]);
+    assert_eq!(fds, [FT_OS_OBJECT_NONE; 6]);
     assert!(consumer.is_null());
-    assert_eq!(peer.read(&mut [0]).unwrap(), 0, "one of the five transferred FDs leaked");
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0, "one of the six transferred FDs leaked");
 }
 
 fn producer() -> ArenaProducer {
@@ -131,7 +131,7 @@ fn imported_consumer(producer: &mut ArenaProducer, holding: u32) -> (jackstay::a
         unsafe { ft_acquisition_import_cpu(json.as_ptr(), json.len(), fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_OK
     );
-    assert_eq!(fds, [FT_OS_OBJECT_NONE; 5]);
+    assert_eq!(fds, [FT_OS_OBJECT_NONE; 6]);
     (incarnation, consumer)
 }
 
@@ -162,24 +162,24 @@ fn c_replacement_distinguishes_stale_offers_and_preserves_old_frames_and_credit(
         let (stale, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
         producer.reconfigure_cpu(12).unwrap();
         let json = serde_json::to_vec(&stale).unwrap();
-        let mut fd = into_raw(fd);
+        let mut fd = fd.map(into_raw);
         assert_eq!(
-            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), &mut fd),
+            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), fd.as_mut_ptr()),
             FT_STATUS_STALE
         );
-        assert_eq!(fd, FT_OS_OBJECT_NONE);
+        assert_eq!(fd, [FT_OS_OBJECT_NONE; 2]);
         assert_eq!(
             ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut new, &mut range),
             FT_STATUS_RECONFIGURATION
         );
         let (current, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
         let json = serde_json::to_vec(&current).unwrap();
-        let mut fd = into_raw(fd);
+        let mut fd = fd.map(into_raw);
         assert_eq!(
-            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), &mut fd),
+            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), fd.as_mut_ptr()),
             FT_STATUS_OK
         );
-        assert_eq!(fd, FT_OS_OBJECT_NONE);
+        assert_eq!(fd, [FT_OS_OBJECT_NONE; 2]);
         producer
             .publish(
                 FrameDescriptor {
@@ -322,13 +322,13 @@ fn c_selection_preserves_misses_gaps_and_empty_results() {
     let json = serde_json::to_vec(&grant).unwrap();
     let mut fds = fds.map(into_raw);
     let mut consumer = ptr::null_mut();
-    // SAFETY: conforming producer, intended recipient, five uniquely owned FDs,
+    // SAFETY: conforming producer, intended recipient, six uniquely owned FDs,
     // one import, and no fork or other copies of the transferred mappings.
     assert_eq!(
         unsafe { ft_acquisition_import_cpu(json.as_ptr(), json.len(), fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_OK
     );
-    assert_eq!(fds, [FT_OS_OBJECT_NONE; 5]);
+    assert_eq!(fds, [FT_OS_OBJECT_NONE; 6]);
     for _ in 0..5 {
         producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
     }

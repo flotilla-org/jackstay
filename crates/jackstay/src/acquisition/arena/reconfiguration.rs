@@ -38,6 +38,7 @@ pub enum ConfigurationInstall {
 /// credit and cannot be used to create a consumer incarnation.
 pub struct ConfigurationGrant {
     fd: Option<OwnedFd>,
+    payload_fd: Option<OwnedFd>,
     layout: ResourceLayout,
     generation: u64,
     arena_scope: [u8; 16],
@@ -46,7 +47,7 @@ pub struct ConfigurationGrant {
     consumed: bool,
 }
 
-/// Setup metadata accompanying one replacement resource FD. Control, claim,
+/// Setup metadata accompanying replacement resource/payload FDs. Control, claim,
 /// and notification mappings remain those of the existing incarnation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigurationDescriptor {
@@ -67,7 +68,7 @@ impl ConfigurationGrant {
     /// Export only to the incarnation's already monitored process. The host
     /// must transfer this single-use offer to that process and relinquish its
     /// setup FD. Dropping an exported FD is not recipient retirement proof.
-    pub fn into_parts(mut self) -> Result<(ConfigurationDescriptor, OwnedFd), ArenaError> {
+    pub fn into_parts(mut self) -> Result<(ConfigurationDescriptor, [OwnedFd; 2]), ArenaError> {
         if self.claims.recipient_pid == 0 {
             return Err(ArenaError::Configuration("replacement export requires a process-bound incarnation"));
         }
@@ -86,7 +87,7 @@ impl ConfigurationGrant {
         };
         let fd = self.fd.take().expect("single-use offer");
         self.consumed = true;
-        Ok((descriptor, fd))
+        Ok((descriptor, [fd, self.payload_fd.take().expect("single-use offer")]))
     }
 
     /// Import a replacement for an already mapped consumer incarnation.
@@ -98,7 +99,8 @@ impl ConfigurationGrant {
     /// initialized until this recipient's mapping/lease retirement or verified
     /// process exit. Header checks cannot prove another process obeys that
     /// lifetime protocol. Drop all other copies of the received resource FD.
-    pub unsafe fn from_parts(consumer: &ArenaConsumer, descriptor: ConfigurationDescriptor, fd: OwnedFd) -> Result<Self, ArenaError> {
+    pub unsafe fn from_parts(consumer: &ArenaConsumer, descriptor: ConfigurationDescriptor, fds: [OwnedFd; 2]) -> Result<Self, ArenaError> {
+        let [fd, payload_fd] = fds;
         let claims = &consumer.lifetime.claims;
         if descriptor.version != VERSION
             || descriptor.generation == 0
@@ -127,6 +129,7 @@ impl ConfigurationGrant {
         }
         Ok(Self {
             fd: Some(fd),
+            payload_fd: Some(payload_fd),
             layout,
             generation: descriptor.generation,
             arena_scope: descriptor.arena_scope,
@@ -177,7 +180,7 @@ impl ArenaProducer {
         let old = self.resources.as_ref().expect("installed allocation");
         let layout = ResourceLayout::new(old.layout.resources, old.layout.history, payload_capacity)?;
         let old_id = self.admission.current_allocation().expect("installed allocation is charged");
-        let bytes = (layout.len as u64)
+        let bytes = ((layout.len + layout.payload_len) as u64)
             .checked_add(external_bytes)
             .ok_or(ArenaError::Configuration("replacement allocation byte total overflow"))?;
         self.admission.begin_reconfiguration(bytes)?;
@@ -249,7 +252,7 @@ impl ArenaProducer {
                 return Err(error);
             }
         };
-        let installed = (map.storage.len() as u64)
+        let installed = ((map.layout.len + map.layout.payload_len) as u64)
             .checked_add(external_bytes)
             .ok_or(AdmissionError::InvalidAllocationSize)
             .and_then(|bytes| self.admission.install_reconfiguration(bytes));
@@ -323,6 +326,7 @@ impl ArenaProducer {
             return Ok(None);
         }
         let fd = resources.storage.try_clone_fd()?;
+        let payload_fd = resources.payload_storage.try_clone_fd()?;
         let mapping_slot = (0..claims.frames + 2)
             .find(|index| {
                 claims
@@ -334,6 +338,7 @@ impl ArenaProducer {
         claims.word(OFFERED_GENERATION).store(resources.generation, SeqCst);
         let grant = ConfigurationGrant {
             fd: Some(fd),
+            payload_fd: Some(payload_fd),
             layout: resources.layout,
             generation: resources.generation,
             arena_scope: self.control.scope,
@@ -358,7 +363,7 @@ impl ArenaProducer {
                         cursor != 0 && claims.contains(cursor)
                     })
             });
-            if retained || !native.as_ref().map(|resource| resource.ready()).transpose()?.unwrap_or(true) {
+            if retained || Arc::strong_count(map) != 1 || !native.as_ref().map(|resource| resource.ready()).transpose()?.unwrap_or(true) {
                 index += 1;
             } else {
                 let id = *id;
@@ -404,6 +409,7 @@ impl ArenaConsumer {
         }
         let map = ResourceMap::map(
             grant.fd.take().expect("single-use offer"),
+            grant.payload_fd.take().expect("single-use offer"),
             grant.layout,
             grant.arena_scope,
             grant.generation,
@@ -460,6 +466,7 @@ impl Drop for ConfigurationGrant {
     fn drop(&mut self) {
         if !self.consumed {
             drop(self.fd.take());
+            drop(self.payload_fd.take());
             self.claims.mapping_slot(self.mapping_slot).store(0, SeqCst);
             self.claims.word(OFFERED_GENERATION).store(0, SeqCst);
             let _ = self.claims.release_wake.signal();

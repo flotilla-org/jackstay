@@ -315,3 +315,275 @@ pub unsafe extern "C" fn ft_cpu_producer_destroy(producer: *mut *mut FtCpuProduc
         Err(error) => status(error),
     }
 }
+
+use super::{FT_OS_OBJECT_NONE, FtOsObject};
+use crate::acquisition::arena::{CpuReservation, DelegatedWriter, WriterDescriptor, WriterExport, WriterSlot};
+
+pub struct FtCpuReservation {
+    reservation: CpuReservation,
+    producer: Arc<Mutex<ArenaProducer>>,
+}
+pub struct FtCpuWriterExport {
+    export: WriterExport,
+    _producer: Arc<Mutex<ArenaProducer>>,
+}
+pub struct FtCpuWriter(DelegatedWriter);
+
+/// Reserve an unleased CPU slot. DROPPED clears view/length and leaves *out null.
+///
+/// # Safety
+/// All pointers are live, writable and disjoint; *out starts null. Serialize
+/// producer calls. The returned view is exclusive until commit/abandon; cease
+/// local access while a delegate writes and finish delegate writes before either.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_producer_reserve(
+    producer: *mut FtCpuProducer,
+    out: *mut *mut FtCpuReservation,
+    bytes: *mut *mut u8,
+    len: *mut usize,
+    slot: *mut WriterSlot,
+) -> FtStatus {
+    // SAFETY: pointer validity and exclusivity are caller obligations.
+    let (Some(producer), Some(out), Some(bytes), Some(len), Some(slot)) = (
+        unsafe { producer.as_ref() },
+        unsafe { out.as_mut() },
+        unsafe { bytes.as_mut() },
+        unsafe { len.as_mut() },
+        unsafe { slot.as_mut() },
+    ) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    *bytes = ptr::null_mut();
+    *len = 0;
+    let Ok(mut arena) = producer.0.lock() else { return FT_STATUS_ERROR };
+    match arena.reserve() {
+        Ok(Some(mut reservation)) => {
+            *slot = reservation.slot();
+            let view = reservation.bytes_mut();
+            *bytes = view.as_mut_ptr();
+            *len = view.len();
+            *out = Box::into_raw(Box::new(FtCpuReservation {
+                reservation,
+                producer: producer.0.clone(),
+            }));
+            FT_STATUS_OK
+        }
+        Ok(None) => FT_STATUS_DROPPED,
+        Err(error) => status(error),
+    }
+}
+
+/// Commit completed pixels. Consumes/clears reservation on success or error
+/// after pointer validation. payload_len must equal stride * height.
+///
+/// # Safety
+/// Reservation is exclusively owned; descriptor/cursor are valid and disjoint.
+/// No writer or local view may access the slot during or after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_producer_commit(
+    handle: *mut *mut FtCpuReservation,
+    descriptor: *const FrameDescriptor,
+    cursor: *mut u64,
+) -> FtStatus {
+    // SAFETY: caller provides valid exclusive pointers.
+    let (Some(handle), Some(descriptor), Some(cursor)) = (unsafe { handle.as_mut() }, unsafe { descriptor.as_ref() }, unsafe {
+        cursor.as_mut()
+    }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if handle.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    *cursor = 0;
+    // SAFETY: handle exclusively owns this live reservation.
+    let owner = unsafe { Box::from_raw(std::mem::replace(handle, ptr::null_mut())) };
+    if descriptor.payload_kind != 0
+        || descriptor.width == 0
+        || descriptor.height == 0
+        || u64::from(descriptor.width) * 4 > u64::from(descriptor.stride)
+        || u64::from(descriptor.stride) * u64::from(descriptor.height) != descriptor.payload_len
+        || !matches!(descriptor.pixel_format, FT_PIXEL_FORMAT_BGRA8_UNORM | FT_PIXEL_FORMAT_RGBA8_UNORM)
+    {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    let mut descriptor = *descriptor;
+    descriptor.sync_kind = FT_FRAME_SYNC_CPU_COPY_COMPLETE;
+    descriptor.fence_id = 0;
+    descriptor.fence_value = 0;
+    descriptor.modifier = 0;
+    let Ok(mut arena) = owner.producer.lock() else {
+        return FT_STATUS_ERROR;
+    };
+    match arena.commit(owner.reservation, descriptor) {
+        Ok(PublishOutcome::Published { cursor: value }) => {
+            *cursor = value;
+            FT_STATUS_OK
+        }
+        Ok(PublishOutcome::Dropped) => FT_STATUS_DROPPED,
+        Err(error) => status(error),
+    }
+}
+
+/// # Safety
+/// Exclusively owns *handle. All delegate writes/local views have finished.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_producer_abandon(handle: *mut *mut FtCpuReservation) -> FtStatus {
+    // SAFETY: valid exclusive handle pointer is required.
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !handle.is_null() {
+        // SAFETY: caller transfers sole live ownership.
+        drop(unsafe { Box::from_raw(std::mem::replace(handle, ptr::null_mut())) });
+    }
+    FT_STATUS_OK
+}
+
+/// Export payload-only storage. Retain owner until every duplicate object and
+/// child view is closed. Re-export on each installed allocation generation.
+///
+/// # Safety
+/// Pointers are valid/disjoint, *out is null, *object is NONE. Child is trusted
+/// and obeys reservation completion; host tracks all duplicate object lifetimes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_producer_export_writer(
+    producer: *mut FtCpuProducer,
+    out: *mut *mut FtCpuWriterExport,
+    descriptor: *mut WriterDescriptor,
+    object: *mut FtOsObject,
+) -> FtStatus {
+    // SAFETY: caller supplies live exclusive pointers.
+    let (Some(producer), Some(out), Some(descriptor), Some(object)) = (
+        unsafe { producer.as_ref() },
+        unsafe { out.as_mut() },
+        unsafe { descriptor.as_mut() },
+        unsafe { object.as_mut() },
+    ) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !out.is_null() || *object != FT_OS_OBJECT_NONE {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    let Ok(mut arena) = producer.0.lock() else { return FT_STATUS_ERROR };
+    let export = match arena.export_writer() {
+        Ok(Some(export)) => export,
+        Ok(None) => return FT_STATUS_DROPPED,
+        Err(error) => return status(error),
+    };
+    // SAFETY: exported lifetime/completion is the caller's obligation.
+    let fd = match unsafe { export.duplicate_object() } {
+        Ok(fd) => fd,
+        Err(error) => return status(error),
+    };
+    *descriptor = export.descriptor();
+    #[cfg(unix)]
+    {
+        use std::os::fd::IntoRawFd;
+        *object = fd.into_raw_fd();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::IntoRawHandle;
+        *object = fd.into_raw_handle();
+    }
+    *out = Box::into_raw(Box::new(FtCpuWriterExport {
+        export,
+        _producer: producer.0.clone(),
+    }));
+    FT_STATUS_OK
+}
+
+/// # Safety
+/// *handle is exclusively owned. All exported objects/views are already closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_writer_export_destroy(handle: *mut *mut FtCpuWriterExport) -> FtStatus {
+    // SAFETY: caller supplies exclusive handle storage.
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !handle.is_null() {
+        // SAFETY: caller transfers sole live ownership after remote unmap.
+        let owner = unsafe { Box::from_raw(std::mem::replace(handle, ptr::null_mut())) };
+        drop(owner.export);
+    }
+    FT_STATUS_OK
+}
+
+/// # Safety
+/// Descriptor/object are a conforming producer's export; its lifetime owner
+/// outlives this writer. Pointers are valid/disjoint and *out starts null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_writer_import(
+    descriptor: *const WriterDescriptor,
+    object: *mut FtOsObject,
+    out: *mut *mut FtCpuWriter,
+) -> FtStatus {
+    // SAFETY: caller supplies live exclusive pointers.
+    let (Some(descriptor), Some(object), Some(out)) = (unsafe { descriptor.as_ref() }, unsafe { object.as_mut() }, unsafe { out.as_mut() })
+    else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !out.is_null() || super::invalid_object(*object) {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: sole live ownership is transferred.
+    let fd = unsafe { super::own_object(std::mem::replace(object, FT_OS_OBJECT_NONE)) };
+    // SAFETY: trusted producer/lifetime contract is required of the caller.
+    match unsafe { DelegatedWriter::from_parts(*descriptor, fd) } {
+        Ok(writer) => {
+            *out = Box::into_raw(Box::new(FtCpuWriter(writer)));
+            FT_STATUS_OK
+        }
+        Err(error) => status(error),
+    }
+}
+
+/// # Safety
+/// Valid/disjoint pointers and exclusive writer; slot is currently reserved
+/// exclusively for this delegate. Finish writes before acknowledging completion.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_writer_slot_view(
+    writer: *mut FtCpuWriter,
+    slot: *const WriterSlot,
+    bytes: *mut *mut u8,
+    len: *mut usize,
+) -> FtStatus {
+    // SAFETY: caller supplies live exclusive pointers.
+    let (Some(writer), Some(slot), Some(bytes), Some(len)) = (
+        unsafe { writer.as_mut() },
+        unsafe { slot.as_ref() },
+        unsafe { bytes.as_mut() },
+        unsafe { len.as_mut() },
+    ) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    *bytes = ptr::null_mut();
+    *len = 0;
+    // SAFETY: caller obeys the producer's live reservation protocol.
+    match unsafe { writer.0.bytes_mut(*slot) } {
+        Ok(view) => {
+            *bytes = view.as_mut_ptr();
+            *len = view.len();
+            FT_STATUS_OK
+        }
+        Err(_) => FT_STATUS_STALE,
+    }
+}
+
+/// # Safety
+/// Exclusive live handle; no outstanding borrowed writer view.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_cpu_writer_destroy(handle: *mut *mut FtCpuWriter) -> FtStatus {
+    // SAFETY: caller supplies exclusive handle storage.
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if !handle.is_null() {
+        // SAFETY: sole live ownership is transferred.
+        drop(unsafe { Box::from_raw(std::mem::replace(handle, ptr::null_mut())) });
+    }
+    FT_STATUS_OK
+}

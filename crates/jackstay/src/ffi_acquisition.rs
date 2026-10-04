@@ -129,7 +129,7 @@ fn status(error: ArenaError) -> FtStatus {
 }
 
 /// Import a single-use CPU grant serialized as GrantDescriptor JSON, with its
-/// five owned setup objects (FDs, or Windows handles with the access listed in
+/// six owned setup objects (FDs, or Windows handles with the access listed in
 /// docs/design/acquisition-process-cleanup.md). After argument validation they
 /// are consumed on success OR failure, and their entries become
 /// [`FT_OS_OBJECT_NONE`]. No extra transport copies may remain.
@@ -138,7 +138,7 @@ fn status(error: ArenaError) -> FtStatus {
 /// The producer must obey ConsumerGrant::from_parts' shared-memory protocol.
 /// This process must be the sole intended recipient; never replay, forward or
 /// fork its grant/mappings. `json` must reference `len` readable bytes. `fds`
-/// must reference five distinct, exclusively owned live objects; `out` must
+/// must reference six distinct, exclusively owned live objects; `out` must
 /// point to null. All arguments must be non-aliasing and valid throughout.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_import_cpu(
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
     if json.is_null() || fds.is_null() || len == 0 || len > 1024 * 1024 {
         return FT_STATUS_INVALID_ARGUMENT;
     }
-    // SAFETY: caller supplies a valid output and a writable array of five FDs.
+    // SAFETY: caller supplies a valid output and a writable array of six FDs.
     let Some(out) = (unsafe { out.as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
@@ -158,7 +158,7 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
         return FT_STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: checked non-null; array size/alignment/lifetime are caller obligations.
-    let fds = unsafe { &mut *fds.cast::<[FtOsObject; 5]>() };
+    let fds = unsafe { &mut *fds.cast::<[FtOsObject; 6]>() };
     if fds
         .iter()
         .enumerate()
@@ -166,7 +166,7 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
     {
         return FT_STATUS_INVALID_ARGUMENT;
     }
-    let owned = std::mem::replace(fds, [FT_OS_OBJECT_NONE; 5]).map(|fd| {
+    let owned = std::mem::replace(fds, [FT_OS_OBJECT_NONE; 6]).map(|fd| {
         // SAFETY: each live object is distinct and its sole ownership moves.
         unsafe { own_object(fd) }
     });
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
 /// The producer, recipient and mapping lifetime must obey
 /// ConfigurationGrant::from_parts. No replay, forwarding, fork or other FD
 /// copies are allowed. `consumer` must be live and exclusively accessed; `json`
-/// must reference `len` readable bytes and `fd` must point to one exclusively
+/// must reference `len` readable bytes and `fd` must point to two distinct exclusively
 /// owned live object. All arguments must be non-aliasing. After basic validation
 /// it is consumed on every outcome and its slot becomes [`FT_OS_OBJECT_NONE`].
 #[unsafe(no_mangle)]
@@ -211,18 +211,18 @@ pub unsafe extern "C" fn ft_acquisition_install_cpu_configuration(
     len: usize,
     fd: *mut FtOsObject,
 ) -> FtStatus {
-    if json.is_null() || len == 0 || len > 1024 * 1024 {
+    if json.is_null() || fd.is_null() || len == 0 || len > 1024 * 1024 {
         return FT_STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: validity, exclusivity and non-aliasing are caller obligations.
-    let (Some(consumer), Some(fd)) = (unsafe { consumer.as_mut() }, unsafe { fd.as_mut() }) else {
+    let (Some(consumer), Some(fd)) = (unsafe { consumer.as_mut() }, unsafe { fd.cast::<[FtOsObject; 2]>().as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    if invalid_object(*fd) {
+    if fd.iter().any(|object| invalid_object(*object)) || fd[0] == fd[1] {
         return FT_STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: sole ownership of this live object is transferred exactly once.
-    let owned = unsafe { own_object(std::mem::replace(fd, FT_OS_OBJECT_NONE)) };
+    let owned = std::mem::replace(fd, [FT_OS_OBJECT_NONE; 2]).map(|object| unsafe { own_object(object) });
     // SAFETY: caller guarantees the readable byte range; length is bounded above.
     let bytes = unsafe { std::slice::from_raw_parts(json, len) };
     let descriptor: ConfigurationDescriptor = match serde_json::from_slice(bytes) {

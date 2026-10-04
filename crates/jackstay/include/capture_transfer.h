@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 12
+#define FT_ABI_VERSION_MINOR 13
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -236,27 +236,27 @@ typedef struct ft_acquisition_events {
   uint32_t reserved;
 } ft_acquisition_events;
 
-/* Import GrantDescriptor JSON and its five owned setup objects (FDs; on Windows
+/* Import GrantDescriptor JSON and its six owned setup objects (FDs; on Windows
  * HANDLEs owned by this process). The trusted producer must follow Jackstay's
  * shared-memory protocol and bind the grant to this PID. Grants are single-use:
  * no replay, forwarding, fork or retained transport copies. JSON length must be
  * 1..1048576; *out must start NULL. Invalid pointers, lengths, occupied outputs
  * or invalid/duplicate objects reject without transfer. Once these argument
- * checks pass, all five are consumed and set to FT_OS_OBJECT_NONE, including on
+ * checks pass, all six are consumed and set to FT_OS_OBJECT_NONE, including on
  * malformed JSON or failed mapping. Import CPU grants only; native resources
  * require the backend setup that retains their handles with leases. */
-ft_status ft_acquisition_import_cpu(const uint8_t *json, size_t len, ft_os_object fds[5],
+ft_status ft_acquisition_import_cpu(const uint8_t *json, size_t len, ft_os_object fds[6],
                                    ft_acquisition_consumer **out);
-/* Install ConfigurationDescriptor JSON plus its single owned resource object on
+/* Install ConfigurationDescriptor JSON plus its two owned resource/payload objects on
  * this already admitted consumer. The same single-use, no-fork and no-extra-copy
- * rules apply. Invalid pointers, lengths or an invalid object reject without
- * transfer. After basic validation the object is consumed and set to
+ * rules apply. Invalid pointers, lengths or invalid/duplicate objects reject without
+ * transfer. After basic validation both objects are consumed and set to
  * FT_OS_OBJECT_NONE on every outcome. OK installs it; STALE disposes a valid
  * superseded offer so the host can offer the current generation. Contradictory
  * mappings remain ERROR. Existing frame handles keep their original storage and
  * holding credit. */
 ft_status ft_acquisition_install_cpu_configuration(ft_acquisition_consumer *,
-                                                  const uint8_t *json, size_t len, ft_os_object *fd);
+                                                  const uint8_t *json, size_t len, ft_os_object fds[2]);
 /* Drop the consumer's unleased current mapping, e.g. during a capacity pause.
  * Frame handles and deferred uses retain their own mappings; admission and
  * notification state survive. The host retries allocation once budget permits. */
@@ -484,6 +484,34 @@ ft_status ft_cpu_producer_publish(ft_cpu_producer *, const ft_acquired_frame_des
                                   const uint8_t *bytes, size_t len, uint64_t *out_cursor);
 /* PAUSED_CAPACITY reports the pending transition's overlap budget. CAPACITY
  * rejects a proposal that cannot fit after old resources retire. */
+/* In-place CPU slots. Views cease to be valid at commit/abandon. Delegate writes
+ * must finish before either. Commit consumes reservation even on failure after
+ * pointer validation; descriptor.payload_len must equal stride * height. */
+typedef struct ft_cpu_reservation ft_cpu_reservation;
+typedef struct ft_cpu_writer_export ft_cpu_writer_export;
+typedef struct ft_cpu_writer ft_cpu_writer;
+typedef struct ft_cpu_writer_slot {
+    uint8_t arena_scope[16]; uint64_t generation; uint32_t slot;
+} ft_cpu_writer_slot;
+typedef struct ft_cpu_writer_descriptor {
+    uint8_t arena_scope[16]; uint64_t generation, map_len, slot_capacity; uint32_t slots;
+} ft_cpu_writer_descriptor;
+ft_status ft_cpu_producer_reserve(ft_cpu_producer *, ft_cpu_reservation **out,
+    uint8_t **bytes, size_t *len, ft_cpu_writer_slot *slot);
+ft_status ft_cpu_producer_commit(ft_cpu_reservation **, const ft_acquired_frame_descriptor *, uint64_t *cursor);
+ft_status ft_cpu_producer_abandon(ft_cpu_reservation **);
+/* Only payload storage escapes. Keep export owner alive until ALL duplicate
+ * objects and child views are closed. Re-export after reconfiguration. Writer
+ * is trusted, same-user, and writes only its currently assigned reservation.
+ * It can corrupt pixels; it has no access to lease/admission bookkeeping.
+ * *out starts NULL and *object starts FT_OS_OBJECT_NONE. On Windows duplicate
+ * object into verified child with FILE_MAP_READ | FILE_MAP_WRITE. */
+ft_status ft_cpu_producer_export_writer(ft_cpu_producer *, ft_cpu_writer_export **out,
+    ft_cpu_writer_descriptor *, ft_os_object *object);
+ft_status ft_cpu_writer_export_destroy(ft_cpu_writer_export **);
+ft_status ft_cpu_writer_import(const ft_cpu_writer_descriptor *, ft_os_object *, ft_cpu_writer **out);
+ft_status ft_cpu_writer_slot_view(ft_cpu_writer *, const ft_cpu_writer_slot *, uint8_t **, size_t *);
+ft_status ft_cpu_writer_destroy(ft_cpu_writer **);
 ft_status ft_cpu_producer_reconfigure(ft_cpu_producer *, uint64_t payload_capacity, ft_cpu_reconfiguration *out);
 ft_status ft_cpu_producer_advance(ft_cpu_producer *, ft_cpu_reconfiguration *out);
 ft_status ft_cpu_producer_configure_consumer(ft_cpu_producer *, ft_acquisition_consumer *);
@@ -531,6 +559,9 @@ _Static_assert(offsetof(ft_acquired_frame_descriptor, flags) == 140, "acquired f
 _Static_assert(sizeof(ft_acquisition_range) == 16, "acquisition range size");
 _Static_assert(sizeof(ft_acquisition_events) == 32, "acquisition events size");
 _Static_assert(sizeof(ft_cpu_producer_config) == 40, "CPU producer config size");
+_Static_assert(sizeof(ft_cpu_writer_slot) == 32, "CPU writer slot size");
+_Static_assert(sizeof(ft_cpu_writer_descriptor) == 48, "CPU writer descriptor size");
+_Static_assert(offsetof(ft_cpu_writer_descriptor, slots) == 40, "CPU writer layout packing");
 _Static_assert(sizeof(ft_cpu_reconfiguration) == 24, "CPU reconfiguration size");
 #endif
 #endif

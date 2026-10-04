@@ -18,14 +18,14 @@ APIs. Request metadata cannot choose a PID or inherit an incarnation. The server
 calls `attach_process` before exporting anything, so the kernel lifetime watch
 exists before the grant escapes.
 
-Initial setup sends the versioned `GrantDescriptor`, five `NSFileHandle` objects
-(control, resources, claims, notification reader, notification writer), the
+Initial setup sends the versioned `GrantDescriptor`, six `NSFileHandle` objects
+(control, resources, claims, notification reader, notification writer, payload), the
 pool's typed IOSurfaces, and its typed `MTLSharedEventHandle`.
 The client validates resource counts and the process/scopes, then consumes the
 bundle into the common `ArenaConsumer`. Mapping FDs are duplicated into Rust
 ownership; the received envelope's copies disappear before grant installation.
 
-Replacement uses a `ConfigurationDescriptor` and one resource FD, plus the new
+Replacement uses a `ConfigurationDescriptor` and resource and payload FDs, plus the new
 pool's native handles. The client checks its connection's incarnation and random
 claim scope before requesting or installing setup. The common native installer
 keeps map and handle ownership together and disposes stale offers through the

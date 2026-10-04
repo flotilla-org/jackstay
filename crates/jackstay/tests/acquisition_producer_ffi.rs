@@ -1,3 +1,5 @@
+#[path = "support/page_size.rs"]
+mod allocation_pages;
 use std::ptr;
 
 use jackstay::{
@@ -187,6 +189,191 @@ fn a_drain_timeout_keeps_the_owner_and_storage_until_actual_release() {
         assert_eq!(ft_acquired_frame_bytes(frame, &mut bytes, &mut len), FT_STATUS_OK);
         assert_eq!(std::slice::from_raw_parts(bytes, len), b"held");
         assert_eq!(ft_acquired_frame_release(&mut frame), FT_STATUS_OK);
+        assert_eq!(ft_cpu_producer_destroy(&mut producer), FT_STATUS_OK);
+    }
+}
+
+// Issue #75: the C reserve/commit path publishes without copy-in, preserves
+// leased bytes across reuse, and abandon makes reservation capacity available.
+#[test]
+fn c_reservations_publish_and_preserve_live_leases() {
+    use jackstay::acquisition::arena::{WriterDescriptor, WriterSlot};
+    // SAFETY: serialized exclusive owners, disjoint output buffers. All views
+    // finish before commit/abandon and exported views are closed before owners.
+    unsafe {
+        let mut producer = ptr::null_mut();
+        let mut consumer = ptr::null_mut();
+        assert_eq!(ft_cpu_producer_create(&config(4, 1 << 20), &mut producer), FT_STATUS_OK);
+        assert_eq!(ft_cpu_producer_attach(producer, 1, &mut consumer), FT_STATUS_OK);
+        assert_eq!(publish(producer, b"held"), FT_STATUS_OK);
+        let mut held = ptr::null_mut();
+        let mut range = FtAcquisitionRange::default();
+        assert_eq!(
+            ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &mut held, &mut range),
+            FT_STATUS_OK
+        );
+        for value in 0..32u8 {
+            let mut reservation = ptr::null_mut();
+            let mut bytes = ptr::null_mut();
+            let mut len = 0;
+            let mut slot = WriterSlot {
+                arena_scope: [0; 16],
+                generation: 0,
+                slot: 0,
+            };
+            assert_eq!(
+                ft_cpu_producer_reserve(producer, &mut reservation, &mut bytes, &mut len, &mut slot),
+                FT_STATUS_OK
+            );
+            assert_eq!(len, 4);
+            if value % 3 == 0 {
+                assert_eq!(ft_cpu_producer_abandon(&mut reservation), FT_STATUS_OK);
+            } else {
+                std::slice::from_raw_parts_mut(bytes, len).fill(value);
+                let descriptor = FrameDescriptor {
+                    payload_len: 4,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    pixel_format: FT_PIXEL_FORMAT_BGRA8_UNORM,
+                    ..Default::default()
+                };
+                let mut cursor = 0;
+                assert_eq!(ft_cpu_producer_commit(&mut reservation, &descriptor, &mut cursor), FT_STATUS_OK);
+                assert!(cursor > 1);
+            }
+            assert!(reservation.is_null());
+            let mut bytes = ptr::null();
+            let mut len = 0;
+            assert_eq!(ft_acquired_frame_bytes(held, &mut bytes, &mut len), FT_STATUS_OK);
+            assert_eq!(std::slice::from_raw_parts(bytes, len), b"held");
+        }
+        let mut export = ptr::null_mut();
+        let mut object = FT_OS_OBJECT_NONE;
+        let mut layout = WriterDescriptor {
+            arena_scope: [0; 16],
+            generation: 0,
+            map_len: 0,
+            slot_capacity: 0,
+            slots: 0,
+        };
+        assert_eq!(
+            ft_cpu_producer_export_writer(producer, &mut export, &mut layout, &mut object),
+            FT_STATUS_OK
+        );
+        let mut writer = ptr::null_mut();
+        assert_eq!(ft_cpu_writer_import(&layout, &mut object, &mut writer), FT_STATUS_OK);
+        let mut reservation = ptr::null_mut();
+        let mut bytes = ptr::null_mut();
+        let mut len = 0;
+        let mut slot = WriterSlot {
+            arena_scope: [0; 16],
+            generation: 0,
+            slot: 0,
+        };
+        assert_eq!(
+            ft_cpu_producer_reserve(producer, &mut reservation, &mut bytes, &mut len, &mut slot),
+            FT_STATUS_OK
+        );
+        let mut transition = FtCpuReconfiguration::default();
+        assert_eq!(ft_cpu_producer_reconfigure(producer, 8, &mut transition), FT_STATUS_OK);
+        let descriptor = FrameDescriptor {
+            payload_len: 4,
+            width: 1,
+            height: 1,
+            stride: 4,
+            pixel_format: FT_PIXEL_FORMAT_BGRA8_UNORM,
+            ..Default::default()
+        };
+        let mut cursor = 0;
+        assert_eq!(
+            ft_cpu_producer_commit(&mut reservation, &descriptor, &mut cursor),
+            FT_STATUS_INVALID_ARGUMENT
+        );
+        assert!(reservation.is_null());
+        assert_eq!(
+            ft_cpu_producer_reserve(producer, &mut reservation, &mut bytes, &mut len, &mut slot),
+            FT_STATUS_OK
+        );
+        assert_eq!(ft_cpu_writer_slot_view(writer, &slot, &mut bytes, &mut len), FT_STATUS_STALE);
+        assert!(bytes.is_null());
+        assert_eq!(len, 0);
+        ft_cpu_producer_abandon(&mut reservation);
+        ft_cpu_writer_destroy(&mut writer);
+        ft_cpu_writer_export_destroy(&mut export);
+        ft_acquired_frame_release(&mut held);
+        ft_acquisition_consumer_destroy(&mut consumer);
+        assert_eq!(ft_cpu_producer_destroy(&mut producer), FT_STATUS_OK);
+    }
+}
+
+// Issue #75: C reserve/export return no object during a capacity pause, and
+// export lifetime keeps old payload charged until every child mapping closes.
+#[test]
+fn c_reserve_and_export_pause_until_old_export_retires() {
+    let page = allocation_pages::page_size();
+    use jackstay::acquisition::arena::{WriterDescriptor, WriterSlot};
+    // SAFETY: exclusive handles and disjoint outputs; duplicate object is closed
+    // before its export owner, with no outstanding delegate writes or views.
+    unsafe {
+        let mut producer = ptr::null_mut();
+        assert_eq!(
+            ft_cpu_producer_create(&config(page as u64, (16 * page) as u64), &mut producer),
+            FT_STATUS_OK
+        );
+        let mut export = ptr::null_mut();
+        let mut object = FT_OS_OBJECT_NONE;
+        let mut layout = WriterDescriptor {
+            arena_scope: [0; 16],
+            generation: 0,
+            map_len: 0,
+            slot_capacity: 0,
+            slots: 0,
+        };
+        assert_eq!(
+            ft_cpu_producer_export_writer(producer, &mut export, &mut layout, &mut object),
+            FT_STATUS_OK
+        );
+        let mut writer = ptr::null_mut();
+        assert_eq!(ft_cpu_writer_import(&layout, &mut object, &mut writer), FT_STATUS_OK);
+        let mut transition = FtCpuReconfiguration::default();
+        // Replacement: 12 payload pages + records/control = 14 pages.
+        // Old export retains 7 more pages, exceeding the 16-page budget.
+        assert_eq!(
+            ft_cpu_producer_reconfigure(producer, (2 * page) as u64, &mut transition),
+            FT_STATUS_PAUSED_CAPACITY
+        );
+        let mut reservation = ptr::null_mut();
+        let mut bytes = ptr::null_mut();
+        let mut len = 0;
+        let mut slot = WriterSlot {
+            arena_scope: [0; 16],
+            generation: 0,
+            slot: 0,
+        };
+        assert_eq!(
+            ft_cpu_producer_reserve(producer, &mut reservation, &mut bytes, &mut len, &mut slot),
+            FT_STATUS_DROPPED
+        );
+        assert!(reservation.is_null());
+        assert!(bytes.is_null());
+        assert_eq!(len, 0);
+        let mut paused_export = ptr::null_mut();
+        assert_eq!(
+            ft_cpu_producer_export_writer(producer, &mut paused_export, &mut layout, &mut object),
+            FT_STATUS_DROPPED
+        );
+        assert!(paused_export.is_null());
+        assert_eq!(object, FT_OS_OBJECT_NONE);
+        assert_eq!(ft_cpu_writer_destroy(&mut writer), FT_STATUS_OK);
+        assert_eq!(ft_cpu_writer_export_destroy(&mut export), FT_STATUS_OK);
+        assert_eq!(ft_cpu_producer_advance(producer, &mut transition), FT_STATUS_OK);
+        assert_eq!(
+            ft_cpu_producer_reserve(producer, &mut reservation, &mut bytes, &mut len, &mut slot),
+            FT_STATUS_OK
+        );
+        assert_eq!(len, 2 * page);
+        ft_cpu_producer_abandon(&mut reservation);
         assert_eq!(ft_cpu_producer_destroy(&mut producer), FT_STATUS_OK);
     }
 }

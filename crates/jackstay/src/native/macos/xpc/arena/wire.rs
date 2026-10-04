@@ -90,7 +90,7 @@ impl Envelope {
             .map_err(|_| ArenaError::Mapping("invalid XPC setup metadata"))?;
         let fd_count = unsafe { ffi::jsa_message_fd_count(self.0.as_ptr()) };
         let surface_count = unsafe { ffi::jsa_message_surface_count(self.0.as_ptr()) };
-        if fd_count > 5 || surface_count > 65536 {
+        if fd_count > 6 || surface_count > 65536 {
             return Err(ArenaError::Mapping("invalid XPC setup resource count"));
         }
         let mut fds = Vec::with_capacity(fd_count);
@@ -128,5 +128,37 @@ impl Envelope {
 impl Drop for Envelope {
     fn drop(&mut self) {
         unsafe { ffi::jsa_object_release(self.0.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shm::SharedMemorySegment;
+
+    // Arena protocol 8: envelopes must admit all six initial-grant objects,
+    // including payload storage, while rejecting counts beyond that bound.
+    // Generate empty, replacement (two), initial (six), and off-by-one counts
+    // through the real Objective-C message builder/decoder without GPU surfaces.
+    #[test]
+    fn envelopes_round_trip_up_to_six_setup_objects_and_reject_seven() {
+        let storage = SharedMemorySegment::new(1).unwrap();
+        for count in 0..=7usize {
+            let objects: Vec<_> = (0..count).map(|_| storage.try_clone_fd().unwrap()).collect();
+            let envelope = Envelope::new(&count, &objects, &[], None).unwrap();
+            match envelope.decode::<usize>() {
+                Ok(payload) => {
+                    assert!(count <= 6);
+                    assert_eq!(payload.metadata, count);
+                    assert_eq!(payload.fds.len(), count);
+                    assert!(payload.surfaces.is_empty());
+                    assert!(payload.event.is_none());
+                }
+                Err(error) => {
+                    assert_eq!(count, 7, "count {count} rejected: {error}");
+                    assert!(matches!(error, ArenaError::Mapping("invalid XPC setup resource count")));
+                }
+            }
+        }
     }
 }

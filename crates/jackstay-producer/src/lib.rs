@@ -133,6 +133,7 @@ impl<P: Producer> Builder<P> {
                 }
             }
         })?;
+        let source_arena = arena.clone();
         let flag = stop.clone();
         let peers = workers.clone();
         let pump_listener = listener.clone();
@@ -149,6 +150,7 @@ impl<P: Producer> Builder<P> {
             }
         };
         Ok(Source {
+            arena: source_arena,
             listener,
             stop,
             accept: Some(accept),
@@ -187,12 +189,19 @@ fn callback<T>(f: impl FnOnce() -> T) -> io::Result<T> {
 }
 /// Running source. Drop performs the same ordered shutdown as stop.
 pub struct Source {
+    arena: Arc<Mutex<ArenaProducer>>,
     listener: Arc<Listener>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
     worker: Option<JoinHandle<io::Result<()>>>,
 }
 impl Source {
+    /// Serialize in-place reserve/commit/reconfigure and trusted writer exports
+    /// with the source pump. Do not hold this lock while waiting for peers.
+    pub fn with_arena<T>(&self, f: impl FnOnce(&mut ArenaProducer) -> T) -> T {
+        f(&mut self.arena.lock().unwrap())
+    }
+
     /// Whether the pump has ended, after its ordered teardown. Call stop to
     /// retrieve completion/failure; this accessor grants no cleanup authority.
     pub fn is_finished(&self) -> bool {
@@ -442,6 +451,18 @@ mod tests {
             Ok(())
         });
         let mut source = Source {
+            arena: Arc::new(Mutex::new(
+                ArenaProducer::new(ArenaConfig {
+                    resource_capacity: 3,
+                    retained_history: 1,
+                    producer_reserve: 1,
+                    payload_capacity: 4,
+                    memory_budget: 1 << 20,
+                    max_incarnations: 1,
+                    drain_timeout: Duration::from_secs(5),
+                })
+                .unwrap(),
+            )),
             listener,
             stop,
             accept: Some(accept),

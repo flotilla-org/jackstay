@@ -175,7 +175,7 @@ fn a_consumer_admitted_by_process_handle_is_reclaimed_when_that_process_is_kille
 fn mapped_crash_child() {
     let mut stream = setup::Link::connect(&std::env::var("JACKSTAY_CRASH_TEST_SOCKET").unwrap());
     let (descriptor, registration): (_, Option<jackstay::acquisition::arena::ReleaseTimelineRegistration>) = stream.recv();
-    let mut fds = stream.recv_objects(5 + usize::from(registration.is_some()));
+    let mut fds = stream.recv_objects(6 + usize::from(registration.is_some()));
     let completion = registration
         .as_ref()
         .map(|_| Arc::new(SharedCompletion::from_fd(fds.pop().unwrap())));

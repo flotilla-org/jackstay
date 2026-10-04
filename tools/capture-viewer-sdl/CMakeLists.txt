@@ -171,6 +171,14 @@ set_tests_properties(scroll_geometry_contract PROPERTIES ENVIRONMENT "SDL_VIDEOD
 add_test(NAME scroll_toolkit_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/scroll_processes.py
   ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
+# Twenty macOS pairs use two 10-second producers each (~400 seconds).
+# Allow 500 seconds more for compilation, bootstrap, and scheduling overhead.
+set(SCROLL_PROC_TIMEOUT 90)
+if(APPLE)
+  set(SCROLL_PROC_TIMEOUT 900)
+endif()
+set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT ${SCROLL_PROC_TIMEOUT} RUN_SERIAL TRUE)
+
 
 add_executable(navigation-contract tests/navigation.c src/viewer_navigation.c src/viewer_affordances.c src/viewer_scroll.c)
 target_include_directories(navigation-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
@@ -191,12 +199,6 @@ target_compile_options(navigation-send-contract PRIVATE -Wall -Wextra -Werror ${
 target_link_libraries(navigation-send-contract PRIVATE ${SDL2_LIBRARIES})
 add_test(NAME navigation_send_contract COMMAND navigation-send-contract)
 set_tests_properties(navigation_send_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
-if(APPLE)
-  # Twenty consecutive writable/read-only pairs, each with a 10-second producer.
-  set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
-else()
-  set_tests_properties(scroll_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
-endif()
 
 add_executable(scroll-self-test-contract tests/scroll_self_test.c)
 target_include_directories(scroll-self-test-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})

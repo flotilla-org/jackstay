@@ -7,7 +7,7 @@
  * The scroll toolkit fixture requests a 640x480 window with an unletterboxed
  * frame, 1000-unit content, 200-unit viewports, and initial positions x=50/y=100.
  * Fixed pointer points and thresholds below intentionally test that geometry. */
-static void scroll_self_test(viewer_affordances *a, SDL_Window *window, int frame_width, int frame_height, int *stage) {
+static inline void scroll_self_test(viewer_affordances *a, SDL_Window *window, int frame_width, int frame_height, int *stage) {
   int w, h, dw = 0, dh = 0;
   SDL_GetWindowSize(window, &w, &h);
   SDL_GetRendererOutputSize(a->renderer, &dw, &dh);

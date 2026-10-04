@@ -192,3 +192,11 @@ target_compile_options(navigation-send-contract PRIVATE -Wall -Wextra -Werror ${
 target_link_libraries(navigation-send-contract PRIVATE ${SDL2_LIBRARIES})
 add_test(NAME navigation_send_contract COMMAND navigation-send-contract)
 set_tests_properties(navigation_send_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)
+
+add_executable(scroll-self-test-contract tests/scroll_self_test.c)
+target_include_directories(scroll-self-test-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(scroll-self-test-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(scroll-self-test-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(scroll-self-test-contract PRIVATE ${SDL2_LIBRARIES})
+add_test(NAME scroll_self_test_contract COMMAND scroll-self-test-contract)
+set_tests_properties(scroll_self_test_contract PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy" TIMEOUT 10)

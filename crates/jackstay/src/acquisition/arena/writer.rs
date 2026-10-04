@@ -141,6 +141,9 @@ impl ArenaProducer {
             return Err(ArenaError::GenerationsExhausted);
         }
         let Some(map) = &self.resources else { return Ok(None) };
+        if map.layout.payload_capacity == 0 {
+            return Err(ArenaError::Configuration("CPU reservation requires nonzero storage"));
+        }
         let oldest = self.cursor.saturating_sub(map.layout.history as u64 - 1).max(1);
         for offset in 0..map.layout.resources {
             let index = (self.next_slot + offset) % map.layout.resources;
@@ -173,6 +176,9 @@ impl ArenaProducer {
         if reservation.scope != self.control.scope || self.resources.as_ref().is_none_or(|map| !Arc::ptr_eq(map, &reservation.map)) {
             return Err(ArenaError::Configuration("stale or foreign CPU reservation"));
         }
+        // reserve already polled cleanup before acquiring exclusive storage.
+        // commit neither selects/reuses storage nor changes admission; this
+        // owner pins its allocation, so idle cleanup can run independently.
         let map = &reservation.map;
         if descriptor.payload_len > map.layout.payload_capacity as u64 {
             return Err(ArenaError::PayloadTooLarge);

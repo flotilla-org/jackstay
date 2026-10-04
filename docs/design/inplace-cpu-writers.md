@@ -13,7 +13,8 @@ reservation without publishing. Dropping a Rust reservation abandons it. Local
 mutable views borrow the reservation and cannot outlive commit.
 
 Capacity exhaustion returns a dropped/no-slot outcome, as copy-in publication
-does. Copy-in and native publication must skip reserved slots. Descriptor payload
+does. CPU arenas with zero payload capacity reject both reservation and writer
+export; native-only arenas keep their existing publication path. Copy-in and native publication must skip reserved slots. Descriptor payload
 length is validated against slot capacity; arena-owned cursor, slot, generation
 and offset fields are stamped at commit. Delegate completion is a host protocol:
 the producer must wait for its child to finish writing before committing or

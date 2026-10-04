@@ -1,3 +1,5 @@
+#[path = "support/page_size.rs"]
+mod allocation_pages;
 use std::{process::Command, time::Duration};
 
 use jackstay::acquisition::arena::*;
@@ -57,13 +59,15 @@ fn reservations_exclude_leases_and_each_other() {
 #[test]
 fn reconfiguration_retains_writer_owners_and_refuses_stale_slots() {
     let mut cfg = config();
-    cfg.memory_budget = 32 * 1024;
+    let page = allocation_pages::page_size();
+    cfg.payload_capacity = page;
+    cfg.memory_budget = (8 * page) as u64;
     let mut producer = ArenaProducer::new(cfg).unwrap();
     let reservation = producer.reserve().unwrap().unwrap();
     let export = producer.export_writer().unwrap().unwrap();
     let old = reservation.slot();
     assert!(matches!(
-        producer.reconfigure_cpu(6 * 1024).unwrap(),
+        producer.reconfigure_cpu(page).unwrap(),
         ReconfigurationStatus::PausedCapacity { .. }
     ));
     assert!(producer.reserve().unwrap().is_none());
@@ -347,6 +351,14 @@ fn invalid_writer_layouts_slots_and_commits_are_rejected() {
     // SAFETY: actual live producer object; malformed metadata must be rejected
     // before a writable view escapes. Export owner outlives all imported views.
     assert!(unsafe { DelegatedWriter::from_parts(layout, export.duplicate_object().unwrap()) }.is_err());
+    let mut oversized = export.descriptor();
+    oversized.map_len += allocation_pages::page_size() as u64;
+    // The mapping boundary validates actual backing extent on Unix and Windows;
+    // a descriptor cannot expose bytes beyond the mapped object.
+    assert!(matches!(
+        unsafe { DelegatedWriter::from_parts(oversized, export.duplicate_object().unwrap()) },
+        Err(ArenaError::Storage(_))
+    ));
     let mut writer = unsafe { DelegatedWriter::from_parts(export.descriptor(), export.duplicate_object().unwrap()) }.unwrap();
     let slot = producer.reserve().unwrap().unwrap();
     let mut invalid = slot.slot();
@@ -365,4 +377,18 @@ fn invalid_writer_layouts_slots_and_commits_are_rejected() {
     assert!(foreign.abandon(slot).is_err());
     drop(writer);
     drop(export);
+}
+
+// A CPU arena without payload storage cannot hand out a usable writer view;
+// reserve and export reject it consistently, without taking any slot ownership.
+#[test]
+fn zero_capacity_cpu_reserve_and_export_are_consistently_rejected() {
+    let mut cfg = config();
+    cfg.payload_capacity = 0;
+    let mut producer = ArenaProducer::new(cfg).unwrap();
+    assert!(matches!(producer.reserve(), Err(ArenaError::Configuration(_))));
+    assert!(matches!(producer.export_writer(), Err(ArenaError::Configuration(_))));
+    producer.reconfigure_cpu(16).unwrap();
+    assert!(producer.reserve().unwrap().is_some());
+    assert!(producer.export_writer().unwrap().is_some());
 }

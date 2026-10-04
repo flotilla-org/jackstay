@@ -1,3 +1,5 @@
+#[path = "support/page_size.rs"]
+mod allocation_pages;
 use std::ptr;
 
 use jackstay::{
@@ -309,12 +311,16 @@ fn c_reservations_publish_and_preserve_live_leases() {
 // export lifetime keeps old payload charged until every child mapping closes.
 #[test]
 fn c_reserve_and_export_pause_until_old_export_retires() {
+    let page = allocation_pages::page_size();
     use jackstay::acquisition::arena::{WriterDescriptor, WriterSlot};
     // SAFETY: exclusive handles and disjoint outputs; duplicate object is closed
     // before its export owner, with no outstanding delegate writes or views.
     unsafe {
         let mut producer = ptr::null_mut();
-        assert_eq!(ft_cpu_producer_create(&config(16, 48 * 1024), &mut producer), FT_STATUS_OK);
+        assert_eq!(
+            ft_cpu_producer_create(&config(page as u64, (16 * page) as u64), &mut producer),
+            FT_STATUS_OK
+        );
         let mut export = ptr::null_mut();
         let mut object = FT_OS_OBJECT_NONE;
         let mut layout = WriterDescriptor {
@@ -331,9 +337,10 @@ fn c_reserve_and_export_pause_until_old_export_retires() {
         let mut writer = ptr::null_mut();
         assert_eq!(ft_cpu_writer_import(&layout, &mut object, &mut writer), FT_STATUS_OK);
         let mut transition = FtCpuReconfiguration::default();
-        // 6 * 6 KiB payload + record/control = 44 KiB; old 8 KiB makes it pause.
+        // Replacement: 12 payload pages + records/control = 14 pages.
+        // Old export retains 7 more pages, exceeding the 16-page budget.
         assert_eq!(
-            ft_cpu_producer_reconfigure(producer, 6 * 1024, &mut transition),
+            ft_cpu_producer_reconfigure(producer, (2 * page) as u64, &mut transition),
             FT_STATUS_PAUSED_CAPACITY
         );
         let mut reservation = ptr::null_mut();
@@ -365,7 +372,7 @@ fn c_reserve_and_export_pause_until_old_export_retires() {
             ft_cpu_producer_reserve(producer, &mut reservation, &mut bytes, &mut len, &mut slot),
             FT_STATUS_OK
         );
-        assert_eq!(len, 6 * 1024);
+        assert_eq!(len, 2 * page);
         ft_cpu_producer_abandon(&mut reservation);
         assert_eq!(ft_cpu_producer_destroy(&mut producer), FT_STATUS_OK);
     }

@@ -20,6 +20,7 @@
 #include "capture_transfer.h"
 #include "metal_present.h"
 #include "viewer_input.h"
+#include "viewer_affordances.h"
 #include "jackstay_bootstrap.h"
 
 #include "synthetic.h"
@@ -52,6 +53,13 @@ typedef struct viewer_options {
   int invalid;
   const char *cpu_socket;
   const char *source_socket;
+  const char *source_endpoint;
+  int session_scope;
+  uint32_t affordances;
+  int affordances_policy_set;
+  int log_affordances;
+  uint32_t typing;
+  int typing_set;
   uint32_t bootstrap_input;
   int input_policy_set;
   const char *input_socket;
@@ -65,10 +73,31 @@ typedef struct viewer_options {
 } viewer_options;
 
 static viewer_options parse_options(int argc, char **argv) {
-  viewer_options options = {.bootstrap_input = FT_BOOTSTRAP_INPUT_OPTIONAL};
+  viewer_options options = {.bootstrap_input = FT_BOOTSTRAP_INPUT_OPTIONAL, .affordances = 1, .typing = FT_INPUT_MODE_COOPERATIVE};
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--input-self-test") == 0) {
       options.input_self_test = 1;
+    } else if (strcmp(argv[i], "--source-endpoint") == 0) {
+      if (++i >= argc || !argv[i][0]) { fprintf(stderr, "--source-endpoint requires a name\n"); options.invalid = 1; return options; }
+      options.source_endpoint = argv[i];
+    } else if (strcmp(argv[i], "--session-scope") == 0) {
+      options.session_scope = 1;
+    } else if (strcmp(argv[i], "--log-affordances") == 0) {
+      options.log_affordances = 1;
+    } else if (strcmp(argv[i], "--affordances") == 0) {
+      options.affordances_policy_set = 1;
+      if (++i >= argc) { fprintf(stderr, "--affordances requires none|optional|required\n"); options.invalid = 1; return options; }
+      if (!strcmp(argv[i], "none")) options.affordances = 0;
+      else if (!strcmp(argv[i], "optional")) options.affordances = 1;
+      else if (!strcmp(argv[i], "required")) options.affordances = 2;
+      else { fprintf(stderr, "invalid --affordances: %s\n", argv[i]); options.invalid = 1; return options; }
+    } else if (strcmp(argv[i], "--typing") == 0) {
+      options.typing_set = 1;
+      if (++i >= argc) { fprintf(stderr, "--typing requires cooperative|text|physical\n"); options.invalid = 1; return options; }
+      if (!strcmp(argv[i], "cooperative")) options.typing = FT_INPUT_MODE_COOPERATIVE;
+      else if (!strcmp(argv[i], "text")) options.typing = FT_INPUT_MODE_SOURCE_TEXT;
+      else if (!strcmp(argv[i], "physical")) options.typing = FT_INPUT_MODE_PHYSICAL;
+      else { fprintf(stderr, "invalid --typing: %s\n", argv[i]); options.invalid = 1; return options; }
     } else if (strcmp(argv[i], "--source-socket") == 0) {
       if (++i >= argc || !argv[i][0]) { options.invalid = 1; return options; }
       options.source_socket = argv[i];
@@ -133,22 +162,27 @@ static viewer_options parse_options(int argc, char **argv) {
     fprintf(stderr, "--cpu-socket cannot be combined with native or Porthole session selection\n");
     options.invalid = 1;
   }
+  if ((options.source_endpoint && (options.source_socket || options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
+      ((options.affordances_policy_set || options.log_affordances || options.session_scope) && !options.source_endpoint) ||
+      (options.typing_set && !options.source_endpoint && !options.source_socket)) {
+    fprintf(stderr, "--source-endpoint selects one source; affordances/session scope require it; typing requires a bootstrap source\n"); options.invalid = 1;
+  }
   if ((options.source_socket && (options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
-      (options.input_policy_set && !options.source_socket)) {
-    fprintf(stderr, "bootstrap input policy requires --source-socket, which selects one source\n"); options.invalid = 1;
+      (options.input_policy_set && !options.source_socket && !options.source_endpoint)) {
+    fprintf(stderr, "bootstrap input policy requires --source-socket or --source-endpoint\n"); options.invalid = 1;
   }
   if ((options.input_socket && (options.native || !options.cpu_socket)) ||
-      (options.input_self_test && !options.input_socket && (!options.source_socket || options.bootstrap_input == FT_BOOTSTRAP_INPUT_NONE))) {
+      (options.input_self_test && !options.input_socket && ((!options.source_socket && !options.source_endpoint) || options.bootstrap_input == FT_BOOTSTRAP_INPUT_NONE))) {
     fprintf(stderr, "input requires a generic CPU socket source; self-test requires input\n"); options.invalid = 1;
   }
   /* The input self-test cannot succeed with observation-only fallback. */
-  if (options.input_self_test && options.source_socket) options.bootstrap_input = FT_BOOTSTRAP_INPUT_REQUIRED;
+  if (options.input_self_test && (options.source_socket || options.source_endpoint)) options.bootstrap_input = FT_BOOTSTRAP_INPUT_REQUIRED;
   return options;
 }
 
 /* Keep the actual lease while deliberately delaying consumption. Pump events
  * so even a long requested delay can be cancelled by closing this window. */
-static int hold_frame(uint32_t remaining_ms, viewer_input *input, SDL_Window *window) {
+static int hold_frame(uint32_t remaining_ms, viewer_input *input, SDL_Window *window, viewer_affordances *affordances, int log_affordances) {
   while (remaining_ms != 0) {
     uint32_t chunk = remaining_ms < 16 ? remaining_ms : 16;
     SDL_Delay(chunk);
@@ -156,6 +190,7 @@ static int hold_frame(uint32_t remaining_ms, viewer_input *input, SDL_Window *wi
     SDL_Event event;
     while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) return 0; viewer_input_event(input, &event, window); }
     viewer_input_poll(input);
+    if (affordances && viewer_affordances_poll(affordances, log_affordances)) return -1;
   }
   return 1;
 }
@@ -232,7 +267,7 @@ static int run_native(const viewer_options *options) {
     ft_status status = ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, last_cursor, &frame, &range);
     uint32_t interest = FT_WAIT_DATA;
     if (status == FT_STATUS_OK) {
-      if (!hold_frame(options->hold_ms, NULL, window)) {
+      if (!hold_frame(options->hold_ms, NULL, window, NULL, 0)) {
         ft_acquired_frame_release(&frame);
         break;
       }
@@ -363,7 +398,7 @@ static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **
   if (uid != geteuid()) { fprintf(stderr, "CPU socket peer is not the current user\n"); goto cleanup; }
   if (options->source_socket) {
     ft_status input_status;
-    uint32_t mode = options->bootstrap_input == FT_BOOTSTRAP_INPUT_NONE ? 0 : FT_INPUT_MODE_COOPERATIVE;
+    uint32_t mode = options->bootstrap_input == FT_BOOTSTRAP_INPUT_NONE ? 0 : options->typing;
     if (require_ok(ft_source_bootstrap_connect(&fd, options->bootstrap_input, mode, &input->client, &input_status), "ft_source_bootstrap_connect")) goto cleanup;
     if (input->client) {
       uint64_t controller, epoch;
@@ -387,7 +422,8 @@ static int run_cpu(const viewer_options *options) {
     if (require_ok(ft_create_synthetic_session(options->porthole_socket, &synthetic), "ft_create_synthetic_session")) return 1;
     session_id = synthetic.session_id;
   }
-  viewer_input input = {0};
+  viewer_input input = {.mode = options->typing};
+  viewer_affordances affordances = {0};
   ft_cpu_acquisition_connection *connection = NULL;
   ft_cpu_producer *producer = NULL;
   uint8_t *pixels = NULL;
@@ -399,7 +435,31 @@ static int run_cpu(const viewer_options *options) {
   SDL_Window *window = NULL;
   SDL_Renderer *renderer = NULL;
   SDL_Texture *texture = NULL;
-  if (options->cpu_socket != NULL || options->source_socket != NULL) {
+  if (options->source_endpoint) {
+    ft_local_connection *local = NULL;
+    ft_local_endpoint endpoint = {options->session_scope ? FT_ENDPOINT_SCOPE_SESSION : FT_ENDPOINT_SCOPE_USER,
+                                  FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, options->source_endpoint};
+    ft_status input_status, affordances_status;
+    ft_status setup = ft_local_connect(&endpoint, &local);
+    if (setup == FT_STATUS_OK) setup = ft_source_bootstrap_connect_v2_local(&local, options->bootstrap_input,
+        options->bootstrap_input == FT_BOOTSTRAP_INPUT_NONE ? 0 : options->typing,
+        options->affordances, &input.client, &input_status, &affordances.host, &affordances_status);
+    if (setup != FT_STATUS_OK) {
+      fprintf(stderr, "source endpoint bootstrap v2 failed: status=%d%s\n", setup,
+              options->affordances == 2 ? "; required affordances must be offered by a v2 source" : "");
+      ft_local_connection_destroy(&local); goto cleanup;
+    }
+    if (input.client) {
+      uint64_t controller, epoch;
+      if (require_ok(ft_input_client_describe(input.client, &input.config, &controller, &epoch), "input describe")) {
+        ft_local_connection_destroy(&local); goto cleanup;
+      }
+    } else if (input_status != FT_STATUS_EMPTY) fprintf(stderr, "source input unavailable: %d; continuing observation\n", input_status);
+    if (affordances_status == FT_STATUS_UNSUPPORTED) fprintf(stderr, "source affordances unavailable; continuing media\n");
+    setup = ft_acquisition_cpu_connection_create_local(&local, &connection);
+    ft_local_connection_destroy(&local);
+    if (require_ok(setup, "CPU local setup") || require_ok(ft_acquisition_cpu_attach(connection, 1, &consumer), "CPU attach")) goto cleanup;
+  } else if (options->cpu_socket != NULL || options->source_socket != NULL) {
     if (connect_cpu_socket(options->source_socket ? options->source_socket : options->cpu_socket, &connection, &consumer, options, &input)) goto cleanup;
   } else if (options->porthole_socket != NULL) {
     if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
@@ -426,13 +486,20 @@ static int run_cpu(const viewer_options *options) {
   }
   if (renderer == NULL) { fprintf(stderr, "SDL setup: %s\n", SDL_GetError()); goto cleanup; }
   if (options->input_socket && viewer_input_open(&input, options->input_socket) != 0) { fprintf(stderr, "input connection failed\n"); goto cleanup; }
-  if (input.client) SDL_StartTextInput();
+  if (input.client && input.mode != FT_INPUT_MODE_PHYSICAL) SDL_StartTextInput();
+  if (affordances.host) {
+    ft_aff_snapshot presentation = {.domain = FT_AFF_DOMAIN_PRESENTATION,
+      .presentation = {.visible = 1, .focused = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS), .scale = 1}};
+    if (require_ok(ft_affordances_host_publish(affordances.host, &presentation), "initial presentation")) goto cleanup;
+  }
+  viewer_input_install_wheel_filter(&input, window);
   int input_test_sent = 0;
   failed = 0;
   while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; viewer_input_event(&input, &event, window); }
     viewer_input_poll(&input);
+    if (viewer_affordances_poll(&affordances, options->log_affordances)) { failed = 1; break; }
     if (input.failed) { failed = 1; break; }
     if (options->input_self_test && !input_test_sent && acquired >= 2 && !input.resetting) {
       viewer_input_self_test(&input, window); input_test_sent = 1;
@@ -473,10 +540,11 @@ static int run_cpu(const viewer_options *options) {
           ft_acquired_frame_release(&frame); failed = 1; break;
         }
         memcpy(before_hold, bytes, len);
-        int continuing = hold_frame(options->hold_ms, &input, window);
+        int continuing = hold_frame(options->hold_ms, &input, window, &affordances, options->log_affordances);
         int unchanged = memcmp(before_hold, bytes, len) == 0;
         free(before_hold);
-        if (!unchanged || !continuing) {
+        if (!unchanged || continuing <= 0) {
+          if (continuing < 0) failed = 1;
           if (!unchanged) { fprintf(stderr, "acquired CPU pixels changed while held\n"); failed = 1; }
           ft_acquired_frame_release(&frame);
           break;
@@ -538,6 +606,8 @@ static int run_cpu(const viewer_options *options) {
   if (options->max_frames > 0 && acquired != (uint64_t)options->max_frames) failed = 1;
   printf("acquired_frames=%" PRIu64 "\n", acquired);
 cleanup:
+  SDL_SetEventFilter(NULL, NULL);
+  if (viewer_affordances_close(&affordances)) failed = 1;
   if (viewer_input_close(&input)) failed = 1;
   SDL_DestroyTexture(texture);
   SDL_DestroyRenderer(renderer);

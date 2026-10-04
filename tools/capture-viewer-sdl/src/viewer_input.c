@@ -1,5 +1,10 @@
 #include "viewer_input.h"
 #include <stdio.h>
+#include <math.h>
+#ifdef __APPLE__
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -24,7 +29,7 @@ int viewer_input_open(viewer_input *input, const char *path) {
   if (status != FT_STATUS_OK) return -1;
   uint64_t controller, epoch;
   if (ft_input_client_describe(input->client, &input->config, &controller, &epoch) != FT_STATUS_OK) return -1;
-  SDL_StartTextInput(); return 0;
+  input->mode = FT_INPUT_MODE_COOPERATIVE; SDL_StartTextInput(); return 0;
 }
 /* DOM code vocabulary at the SDL adapter, never SDL numeric values on the wire. */
 static int key_name(SDL_Scancode key, char out[64]) {
@@ -73,6 +78,8 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
   ft_input_event e = {0};
   switch (event->type) {
     case SDL_KEYDOWN: case SDL_KEYUP: {
+      if (input->mode == FT_INPUT_MODE_SOURCE_TEXT) return;
+      if (input->mode == FT_INPUT_MODE_PHYSICAL && event->key.repeat) return;
       SDL_Scancode sc = event->key.keysym.scancode;
       if (sc <= SDL_SCANCODE_UNKNOWN || sc >= SDL_NUM_SCANCODES || !key_name(sc, e.key)) {
         fprintf(stderr, "unmapped SDL physical key: %d\n", sc); return;
@@ -84,7 +91,7 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
       if (send_event(input, &e)) input->keys[sc] = event->type == SDL_KEYDOWN;
       return;
     }
-    case SDL_TEXTINPUT: e.kind = FT_INPUT_TEXT; e.text = (const uint8_t *)event->text.text; e.text_len = strlen(event->text.text); break;
+    case SDL_TEXTINPUT: if (input->mode == FT_INPUT_MODE_PHYSICAL) return; e.kind = FT_INPUT_TEXT; e.text = (const uint8_t *)event->text.text; e.text_len = strlen(event->text.text); break;
     case SDL_MOUSEMOTION: e.kind = FT_INPUT_MOTION; position(input, window, event->motion.x, event->motion.y, &e); break;
     case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP:
       e.kind = FT_INPUT_BUTTON; e.action = event->type == SDL_MOUSEBUTTONDOWN ? FT_INPUT_DOWN : FT_INPUT_UP;
@@ -99,6 +106,31 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
 #else
       e.x = event->wheel.x; e.y = -event->wheel.y;
 #endif
+#ifdef __APPLE__
+      /* The wheel filter runs inside SDL's Cocoa dispatch, while currentEvent
+       * is the NSEvent that generated this wheel. SDL2's preciseX/Y are deltaX/Y,
+       * not logical pixels, and omit the precise-device flag. Read both from
+       * AppKit via its C runtime rather than guessing from fractional values. */
+      id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+      id native = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("currentEvent"));
+      if (native && ((unsigned long (*)(id, SEL))objc_msgSend)(native, sel_registerName("type")) == 22 &&
+          ((BOOL (*)(id, SEL))objc_msgSend)(native, sel_registerName("hasPreciseScrollingDeltas"))) {
+        int w, h; SDL_GetWindowSize(window, &w, &h);
+        e.scroll_unit = FT_INPUT_SCROLL_PIXEL;
+        e.x = -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaX")) * (w > 0 ? input->config.geometry.width / w : 0);
+        e.y = -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaY")) * (h > 0 ? input->config.geometry.height / h : 0);
+      }
+#else
+      /* SDL2 has no portable device-unit flag. Fractional wheel values are the
+       * best available continuous-device signal outside Cocoa; integral values
+       * remain lines. This fallback cannot identify integral precise deltas. */
+      if (e.x != trunc(e.x) || e.y != trunc(e.y)) {
+        int w, h; SDL_GetWindowSize(window, &w, &h);
+        e.scroll_unit = FT_INPUT_SCROLL_PIXEL;
+        e.x *= w > 0 ? input->config.geometry.width / w : 0;
+        e.y *= h > 0 ? input->config.geometry.height / h : 0;
+      }
+#endif
       if (event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { e.x = -e.x; e.y = -e.y; }
       break;
     }
@@ -106,10 +138,25 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
   }
   send_event(input, &e);
 }
+static int wheel_filter(void *userdata, SDL_Event *event) {
+  viewer_input *input = userdata;
+  if (event->type != SDL_MOUSEWHEEL) return 1;
+  viewer_input_event(input, event, input->window);
+  return 0;
+}
+void viewer_input_install_wheel_filter(viewer_input *input, SDL_Window *window) {
+  input->window = window;
+  SDL_SetEventFilter(wheel_filter, input);
+}
 void viewer_input_poll(viewer_input *input) {
   if (!input || !input->client) return;
   ft_input_status s;
   while (ft_input_client_poll(input->client, &s) == FT_STATUS_OK) {
+    if (s.kind == FT_INPUT_COALESCED) {
+      /* The replaced sequence needs no retirement: this viewer keeps no
+       * in-flight operation list. The surviving event completes separately. */
+      continue;
+    }
     if (s.kind == FT_INPUT_RESET) { input->config.geometry = s.geometry; input->resetting = 0; }
     if (s.kind == FT_INPUT_REFUSED || (s.kind == FT_INPUT_COMPLETED && s.result != FT_INPUT_EXECUTED)) {
       fprintf(stderr, "input operation %llu result=%d\n", (unsigned long long)s.sequence, s.result);
@@ -141,5 +188,5 @@ void viewer_input_self_test(viewer_input *input, SDL_Window *window) {
   memset(&e, 0, sizeof(e)); e.type = SDL_KEYDOWN; e.key.state = SDL_PRESSED; e.key.windowID = SDL_GetWindowID(window); e.key.keysym.scancode = SDL_SCANCODE_LSHIFT; SDL_PushEvent(&e);
   memset(&e, 0, sizeof(e)); e.type = SDL_MOUSEBUTTONDOWN; e.button.button = SDL_BUTTON_LEFT; e.button.x = 20; e.button.y = 30; SDL_PushEvent(&e);
   uint8_t text[1024]; memset(text, 'x', sizeof(text));
-  ft_input_event long_text = {.kind = FT_INPUT_TEXT, .text = text, .text_len = sizeof(text)}; send_event(input, &long_text);
+  ft_input_event long_text = {.kind = FT_INPUT_TEXT, .text = text, .text_len = sizeof(text)}; if (input->mode != FT_INPUT_MODE_PHYSICAL) send_event(input, &long_text);
 }

@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
 # The real macOS NativeFrameBackend (IOSurface + Metal). A feature rather

@@ -100,6 +100,45 @@ integration and native presentation, and [verification](docs/verification.md)
 for offline versus hardware checks. API stability, Windows continuous capture
 and direct Katzensteg integration are separate later milestones.
 
+## Swift
+
+On macOS, `import Jackstay` exposes the C ABI through
+`crates/jackstay/include/module.modulemap`. Build the CPU library and put the
+archive in a directory of its own so `-ljackstay` selects it rather than the
+dylib Cargo also produces:
+
+```sh
+cargo build --locked -p jackstay --release
+mkdir -p build/swift/lib
+cp target/release/libjackstay.a build/swift/lib/
+swiftc main.swift -I crates/jackstay/include -L build/swift/lib -ljackstay -o build/swift/main
+```
+
+`-I` finds both the public headers and the module map automatically. No bridging
+header is needed. Check the header/library version at startup; Swift cannot
+import the cast in the C `FT_ABI_VERSION` macro, so use its components:
+
+```swift
+import Jackstay
+let FT_ABI_VERSION = UInt32((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR)
+precondition(ft_abi_version() == FT_ABI_VERSION)
+```
+
+The executable embeds Jackstay and the Rust runtime; it needs no Jackstay dylib.
+The archive adds build work and disk space alongside the existing `rlib` and
+`cdylib` outputs. CPU-only builds need no native backend feature. With
+`--features backend-macos`, also pass `-framework Foundation -framework Metal
+-framework IOSurface -framework CoreFoundation` to `swiftc`.
+
+Run `scripts/smoke-swift.sh` for the macOS CI check: a Rust producer exports a
+payload object and reserves a slot, the Swift child calls `ft_cpu_writer_import`,
+`ft_cpu_writer_slot_view` and `ft_cpu_writer_destroy`, and Rust verifies the
+written bytes after the child exits. Keep the export and reservation alive until
+delegate writes finish; never reuse a slot while the delegate is writing it.
+The check also compiles a disposable header copy with a broken bootstrap include
+and requires Swift to reject it. On macOS, `cargo test` runs this script through
+the `swift_bindings` integration test with an isolated Cargo target directory.
+
 ## Origin and license
 
 Extracted with source history from [porthole](https://github.com/flotilla-org/porthole).

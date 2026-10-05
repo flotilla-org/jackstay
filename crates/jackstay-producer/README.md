@@ -47,7 +47,15 @@ default returns the pixel size. Scaled renderers can return their logical viewpo
 Capacity pauses can call `input_size` more than once for the same resize; keep
 it cheap and idempotent.
 The initial allocation keeps the builder geometry; a first frame exceeding its
-capacity also calls `input_size` during reconfiguration. Only a change in logical dimensions advances the input geometry revision.
+capacity also calls `input_size` during reconfiguration. Only a change in logical
+dimensions advances the input geometry revision.
+`input_geometry` optionally reports the current logical viewport on every pump
+turn, before input execution, even when `frame` returns `None`. Direct arena
+producers use it after applying a viewport change. Changed dimensions advance
+the revision and trigger the normal pointer cleanup barrier; unchanged dimensions
+retain the revision. When it returns `Some`, it also overrides `input_size` for
+copied frames, so the two paths cannot alternate logical sizes. Invalid
+dimensions end the pump with an error.
 `execute` receives `Work`, including cleanup: return `Executed` only after
 actual execution/release. Return `Uncertain` for execution uncertainty. Failed
 cleanup is reported, never silently treated as successful release.

@@ -16,7 +16,7 @@ use jackstay::{
     },
     affordances::{Event, Snapshot},
     bootstrap,
-    input::{Config, Outcome, Target, Work},
+    input::{Config, Geometry, Outcome, Target, Work},
     local::{Endpoint, Listener, ShutdownHandle},
 };
 
@@ -38,6 +38,14 @@ pub trait Producer: Send + 'static {
     /// can keep input coordinates independent of the capture's device pixels.
     fn input_size(&mut self, width: u32, height: u32) -> (f64, f64) {
         (f64::from(width), f64::from(height))
+    }
+    /// Current logical viewport for producers publishing directly into the arena.
+    /// Called before input execution, independently of `frame`. A dimension change
+    /// advances the geometry revision and uses the normal pointer cleanup barrier.
+    /// When Some, this overrides `input_size` for copied frames too.
+    /// Return None to retain geometry until a copied frame calls `input_size`.
+    fn input_geometry(&mut self) -> Option<(f64, f64)> {
+        None
     }
     /// Return only changed domains; an empty Vec requires no allocation.
     fn snapshots(&mut self) -> Vec<Snapshot> {
@@ -232,6 +240,24 @@ impl Drop for Source {
         let _ = self.shutdown();
     }
 }
+// Only the pump changes geometry. Cache it here rather than taking the target
+// mutex every turn, and share revision/error handling with copied frames.
+fn apply_logical(target: &Target, current: &mut Geometry, width: f64, height: f64) -> io::Result<()> {
+    if current.width == width && current.height == height {
+        return Ok(());
+    }
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("geometry revision exhausted"))?;
+    let next = Geometry { revision, width, height };
+    target
+        .set_geometry(next)
+        .map_err(|e| io::Error::other(format!("geometry: {e:?}")))?;
+    *current = next;
+    Ok(())
+}
+
 fn pump<P: Producer>(
     mut p: P,
     arena: Arc<Mutex<ArenaProducer>>,
@@ -245,7 +271,21 @@ fn pump<P: Producer>(
     let mut size = None;
     let mut pending = None;
     let mut error = None;
+    let mut geometry = target.config().geometry;
     while !stop.load(Ordering::Acquire) {
+        let reported_geometry = match callback(|| p.input_geometry()) {
+            Ok(logical) => logical,
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        };
+        if let Some((width, height)) = reported_geometry {
+            if let Err(e) = apply_logical(&target, &mut geometry, width, height) {
+                error = Some(e);
+                break;
+            }
+        }
         target.tick();
         while let Some(work) = target.next() {
             let id = work.id;
@@ -313,7 +353,10 @@ fn pump<P: Producer>(
                 // User callbacks run before taking the arena mutex. Catching a
                 // callback panic must not poison an internal ownership lock.
                 let logical = if pending.is_some() || size.is_some_and(|old| old != dims) || frame.bytes.len() > capacity {
-                    Some(callback(|| p.input_size(replacing.0, replacing.1))?)
+                    Some(match reported_geometry {
+                        Some(logical) => logical,
+                        None => callback(|| p.input_size(replacing.0, replacing.1))?,
+                    })
                 } else {
                     None
                 };
@@ -334,17 +377,7 @@ fn pump<P: Producer>(
                         Ok(ReconfigurationStatus::Ready { .. }) => {
                             let (installed, bytes) = pending.take().unwrap();
                             if let Some((width, height)) = logical {
-                                let old = target.config().geometry;
-                                if old.width != width || old.height != height {
-                                    let geometry = jackstay::input::Geometry {
-                                        revision: old.revision.saturating_add(1),
-                                        width,
-                                        height,
-                                    };
-                                    if let Err(e) = target.set_geometry(geometry) {
-                                        return Err(io::Error::other(format!("geometry: {e:?}")));
-                                    }
-                                }
+                                apply_logical(&target, &mut geometry, width, height)?;
                             }
                             size = Some(installed);
                             capacity = bytes;

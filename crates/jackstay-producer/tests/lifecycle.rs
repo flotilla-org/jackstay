@@ -588,3 +588,120 @@ fn scaled_recycling(logical_width: f64) {
     drop((input, consumer, setup));
     source.stop().unwrap();
 }
+
+#[test]
+fn direct_arena_geometry_updates_without_copied_frames() {
+    struct Direct {
+        logical: Arc<Mutex<(f64, f64)>>,
+        operations: Arc<Mutex<Vec<Operation>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Producer for Direct {
+        fn frame(&mut self) -> Option<Frame> {
+            None
+        }
+        fn execute(&mut self, work: Work) -> Outcome {
+            self.operations.lock().unwrap().push(work.operation);
+            Outcome::Executed
+        }
+        fn input_geometry(&mut self) -> Option<(f64, f64)> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(*self.logical.lock().unwrap())
+        }
+    }
+    let ep = endpoint("direct-geometry");
+    let logical = Arc::new(Mutex::new((1., 1.)));
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = Builder::new(
+        ep.clone(),
+        config(),
+        Config {
+            geometry: jackstay::input::Geometry {
+                revision: 1,
+                width: 1.,
+                height: 1.,
+            },
+            ..Config::default()
+        },
+        Direct {
+            logical: logical.clone(),
+            operations: operations.clone(),
+            calls: calls.clone(),
+        },
+    )
+    .start()
+    .unwrap();
+    let c = bootstrap::connect_v2(
+        local::connect(&ep).unwrap().into_stream(),
+        InputRequest::Required(Mode::Cooperative),
+        ChannelRequest::None,
+    )
+    .unwrap();
+    let input = c.input.as_ref().unwrap();
+    input
+        .send(Event::Button {
+            button: 1,
+            action: jackstay::input::Action::Down,
+            position: jackstay::input::Position { revision: 1, x: 0., y: 0. },
+        })
+        .unwrap();
+    wait(|| {
+        operations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| matches!(o, Operation::Event(Event::Button { .. })))
+    });
+    *logical.lock().unwrap() = (320., 240.);
+    wait(|| input.welcome().config.geometry.width == 320.);
+    assert_eq!(input.welcome().config.geometry.height, 240.);
+    assert_eq!(input.welcome().config.geometry.revision, 2);
+    wait(|| {
+        operations.lock().unwrap().iter().any(|o| {
+            matches!(
+                o,
+                Operation::Cleanup {
+                    scope: jackstay::input::Scope::Pointer,
+                    reason: jackstay::input::Reason::Geometry,
+                    ..
+                }
+            )
+        })
+    });
+    let start = calls.load(std::sync::atomic::Ordering::Relaxed);
+    wait(|| calls.load(std::sync::atomic::Ordering::Relaxed) >= start + 6);
+    assert_eq!(input.welcome().config.geometry.revision, 2);
+    *logical.lock().unwrap() = (1., 1.);
+    wait(|| input.welcome().config.geometry.revision == 3);
+    drop(c);
+    source.stop().unwrap();
+}
+
+#[test]
+fn invalid_direct_geometry_and_callback_panic_end_the_pump() {
+    struct Invalid(Option<(f64, f64)>);
+    impl Producer for Invalid {
+        fn frame(&mut self) -> Option<Frame> {
+            None
+        }
+        fn execute(&mut self, _: Work) -> Outcome {
+            Outcome::Executed
+        }
+        fn input_geometry(&mut self) -> Option<(f64, f64)> {
+            Some(self.0.expect("geometry callback panic"))
+        }
+    }
+    for (i, logical) in [Some((0., 0.)), Some((f64::NAN, 1.)), None].into_iter().enumerate() {
+        let source = Builder::new(
+            endpoint(&format!("invalid-direct-{i}")),
+            config(),
+            Config::default(),
+            Invalid(logical),
+        )
+        .start()
+        .unwrap();
+        wait(|| source.is_finished());
+        assert!(source.stop().is_err());
+    }
+}

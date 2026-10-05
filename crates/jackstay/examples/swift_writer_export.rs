@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: export stays alive until the child exits and all object copies
     // close. Only the child writes the reserved slot, before the parent reads.
     let object = unsafe { export.duplicate_object()? };
+    // Inheritance preserves this fd number in the child; no remapping occurs.
     let fd = object.as_raw_fd();
     let message = serde_json::to_vec(&serde_json::json!({
         "descriptor": export.descriptor(),

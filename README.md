@@ -110,7 +110,7 @@ dylib Cargo also produces:
 ```sh
 cargo build --locked -p jackstay --release
 mkdir -p build/swift/lib
-cp target/release/libjackstay.a build/swift/lib/
+cp "${CARGO_TARGET_DIR:-target}/release/libjackstay.a" build/swift/lib/
 swiftc main.swift -I crates/jackstay/include -L build/swift/lib -ljackstay -o build/swift/main
 ```
 
@@ -126,7 +126,8 @@ precondition(ft_abi_version() == FT_ABI_VERSION)
 
 The executable embeds Jackstay and the Rust runtime; it needs no Jackstay dylib.
 The archive adds build work and disk space alongside the existing `rlib` and
-`cdylib` outputs. CPU-only builds need no native backend feature. With
+`cdylib` outputs on every platform, including Linux and Windows. CPU-only builds
+need no native backend feature. With
 `--features backend-macos`, also pass `-framework Foundation -framework Metal
 -framework IOSurface -framework CoreFoundation` to `swiftc`.
 
@@ -138,6 +139,8 @@ delegate writes finish; never reuse a slot while the delegate is writing it.
 The check also compiles a disposable header copy with a broken bootstrap include
 and requires Swift to reject it. On macOS, `cargo test` runs this script through
 the `swift_bindings` integration test with an isolated Cargo target directory.
+Each invocation builds the CPU library and exporter again in that fresh directory,
+adding a debug build to both the CPU-only and native-feature CI test passes.
 
 ## Origin and license
 

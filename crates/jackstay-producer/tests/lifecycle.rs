@@ -588,3 +588,53 @@ fn scaled_recycling(logical_width: f64) {
     drop((input, consumer, setup));
     source.stop().unwrap();
 }
+
+#[test]
+fn direct_arena_geometry_updates_without_copied_frames() {
+    struct Direct(Arc<Mutex<(f64, f64)>>);
+    impl Producer for Direct {
+        fn frame(&mut self) -> Option<Frame> {
+            None
+        }
+        fn execute(&mut self, _: Work) -> Outcome {
+            Outcome::Executed
+        }
+        fn input_geometry(&mut self) -> Option<(f64, f64)> {
+            Some(*self.0.lock().unwrap())
+        }
+    }
+    let ep = endpoint("direct-geometry");
+    let logical = Arc::new(Mutex::new((1., 1.)));
+    let source = Builder::new(
+        ep.clone(),
+        config(),
+        Config {
+            geometry: jackstay::input::Geometry {
+                revision: 1,
+                width: 1.,
+                height: 1.,
+            },
+            ..Config::default()
+        },
+        Direct(logical.clone()),
+    )
+    .start()
+    .unwrap();
+    let c = bootstrap::connect_v2(
+        local::connect(&ep).unwrap().into_stream(),
+        InputRequest::Required(Mode::Cooperative),
+        ChannelRequest::None,
+    )
+    .unwrap();
+    let input = c.input.as_ref().unwrap();
+    *logical.lock().unwrap() = (320., 240.);
+    wait(|| input.welcome().config.geometry.width == 320.);
+    assert_eq!(input.welcome().config.geometry.height, 240.);
+    assert_eq!(input.welcome().config.geometry.revision, 2);
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(input.welcome().config.geometry.revision, 2);
+    *logical.lock().unwrap() = (1., 1.);
+    wait(|| input.welcome().config.geometry.revision == 3);
+    drop(c);
+    source.stop().unwrap();
+}

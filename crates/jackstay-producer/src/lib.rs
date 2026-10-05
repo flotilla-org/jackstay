@@ -39,6 +39,13 @@ pub trait Producer: Send + 'static {
     fn input_size(&mut self, width: u32, height: u32) -> (f64, f64) {
         (f64::from(width), f64::from(height))
     }
+    /// Current logical viewport for producers publishing directly into the arena.
+    /// Called before input execution, independently of `frame`. A dimension change
+    /// advances the geometry revision and uses the normal pointer cleanup barrier.
+    /// Return None to retain geometry until a copied frame calls `input_size`.
+    fn input_geometry(&mut self) -> Option<(f64, f64)> {
+        None
+    }
     /// Return only changed domains; an empty Vec requires no allocation.
     fn snapshots(&mut self) -> Vec<Snapshot> {
         Vec::new()
@@ -246,6 +253,25 @@ fn pump<P: Producer>(
     let mut pending = None;
     let mut error = None;
     while !stop.load(Ordering::Acquire) {
+        let geometry = callback(|| p.input_geometry()).and_then(|logical| {
+            if let Some((width, height)) = logical {
+                let old = target.config().geometry;
+                if old.width != width || old.height != height {
+                    let revision = old
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("geometry revision exhausted"))?;
+                    target
+                        .set_geometry(jackstay::input::Geometry { revision, width, height })
+                        .map_err(|e| io::Error::other(format!("geometry: {e:?}")))?;
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = geometry {
+            error = Some(e);
+            break;
+        }
         target.tick();
         while let Some(work) = target.next() {
             let id = work.id;

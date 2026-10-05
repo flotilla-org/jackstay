@@ -6,6 +6,11 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let backend_macos = std::env::var_os("CARGO_FEATURE_BACKEND_MACOS").is_some();
     let backend_linux = std::env::var_os("CARGO_FEATURE_BACKEND_LINUX").is_some();
+    if target_os == "macos" {
+        // Consumers can install the dylib beside their executable and supply
+        // an @executable_path rpath, independent of this checkout's build path.
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-install_name,@rpath/libjackstay.dylib");
+    }
     if target_os == "macos" && backend_macos {
         build_macos_shim();
     }

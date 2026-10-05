@@ -3,7 +3,7 @@
 // running workspace tests and their selected backend features.
 #[cfg(target_os = "macos")]
 #[test]
-fn swift_import_static_link_and_delegated_writer() {
+fn swift_import_dylib_link_and_delegated_writer() {
     let target = tempfile::tempdir().expect("temporary Swift build directory");
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/smoke-swift.sh");
     let status = std::process::Command::new("bash")

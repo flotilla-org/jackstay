@@ -104,14 +104,16 @@ and direct Katzensteg integration are separate later milestones.
 
 On macOS, `import Jackstay` exposes the C ABI through
 `crates/jackstay/include/module.modulemap`. Build the CPU library and put the
-archive in a directory of its own so `-ljackstay` selects it rather than the
-dylib Cargo also produces:
+dylib beside the Swift executable:
 
 ```sh
 cargo build --locked -p jackstay --release
-mkdir -p build/swift/lib
-cp "${CARGO_TARGET_DIR:-target}/release/libjackstay.a" build/swift/lib/
-swiftc main.swift -I crates/jackstay/include -L build/swift/lib -ljackstay -o build/swift/main
+mkdir -p build/swift
+cp "${CARGO_TARGET_DIR:-target}/release/libjackstay.dylib" build/swift/
+otool -D build/swift/libjackstay.dylib # install name: @rpath/libjackstay.dylib
+swiftc main.swift -I crates/jackstay/include -L build/swift -ljackstay \
+  -Xlinker -rpath -Xlinker @executable_path -o build/swift/main
+build/swift/main
 ```
 
 `-I` finds both the public headers and the module map automatically. No bridging
@@ -124,23 +126,28 @@ let FT_ABI_VERSION = UInt32((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR)
 precondition(ft_abi_version() == FT_ABI_VERSION)
 ```
 
-The executable embeds Jackstay and the Rust runtime; it needs no Jackstay dylib.
-The archive adds build work and disk space alongside the existing `rlib` and
-`cdylib` outputs on every platform, including Linux and Windows. CPU-only builds
-need no native backend feature. With
-`--features backend-macos`, also pass `-framework Foundation -framework Metal
--framework IOSurface -framework CoreFoundation` to `swiftc`.
+Ship the executable and `libjackstay.dylib` together from the same Jackstay
+revision. The dylib's install name is `@rpath/libjackstay.dylib`; the executable's
+`@executable_path` rpath finds it in the executable's directory, independent of
+the working directory or checkout. `otool -L build/swift/main` must show
+`@rpath/libjackstay.dylib`. If the library is missing, dyld reports
+`Library not loaded: @rpath/libjackstay.dylib` before Swift starts.
+CPU-only builds need no native backend feature; use `--features backend-macos`
+when native capture is required. This uses the existing `cdylib` output and
+avoids adding a static archive to every platform's builds.
 
 Run `scripts/smoke-swift.sh` for the macOS CI check: a Rust producer exports a
 payload object and reserves a slot, the Swift child calls `ft_cpu_writer_import`,
 `ft_cpu_writer_slot_view` and `ft_cpu_writer_destroy`, and Rust verifies the
 written bytes after the child exits. Keep the export and reservation alive until
 delegate writes finish; never reuse a slot while the delegate is writing it.
-The check also compiles a disposable header copy with a broken bootstrap include
-and requires Swift to reject it. On macOS, `cargo test` runs this script through
-the `swift_bindings` integration test with an isolated Cargo target directory.
-Each invocation builds the CPU library and exporter again in that fresh directory,
-adding a debug build to both the CPU-only and native-feature CI test passes.
+The check also verifies the dylib install name and executable rpath, requires
+loading to fail when the packaged dylib is removed, and requires Swift to reject
+a disposable header copy with a broken bootstrap include. On macOS, `cargo test`
+runs this script through the `swift_bindings` integration test with an isolated
+Cargo target directory. Each invocation builds the CPU library and exporter
+again in that fresh directory, adding a debug build to both the CPU-only and
+native-feature CI test passes.
 
 ## Origin and license
 

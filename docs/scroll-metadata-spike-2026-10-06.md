@@ -2,7 +2,10 @@
 
 Run on 2026-10-06 on arm64 macOS 26.6 (25G72), Xcode 27.0 (27A266a).
 The standalone Swift source and executable stayed under a temporary directory
-outside the checkout. The design PR records the source for reproduction.
+outside the checkout. The full Swift source and observed output are in the
+collapsible **Reproduce the macOS spike (source outside the repository)**
+section of the [PR #93 body](https://github.com/flotilla-org/jackstay/pull/93),
+not in the repository diff. Expand that section to reproduce the experiment.
 Nothing was posted to the system event stream; this test constructs CGEvents
 and inspects NSEvents in process. It requires no desktop capture or event tap.
 

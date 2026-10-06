@@ -108,9 +108,10 @@ is no content movement. Metadata applies to every scroll unit, not just `Pixel`.
 
 The direction policy is the accepted design in
 [#88](https://github.com/flotilla-org/jackstay/issues/88), which supersedes the
-v1 inversion-flag rule above: normalize platform coordinates to Jackstay's
-positive-right/down content direction, retaining the platform's natural-scroll
-preference. Neither controller nor executor negates deltas because of
+instruction in [Scroll units](#scroll-units) to undo
+`SDL_MOUSEWHEEL_FLIPPED` by negating both SDL deltas. Normalize platform
+coordinates to Jackstay's positive-right/down content direction, retaining the
+platform's natural-scroll preference. Neither controller nor executor negates deltas because of
 `inverted_from_device`, `SDL_MOUSEWHEEL_FLIPPED` or the destination's preference.
 The new bit is information for native/application APIs that expose it; it never
 changes the existing meaning of `x` and `y`.
@@ -122,9 +123,18 @@ phases. Only consecutive queued pointer motions continue to coalesce; no queue
 may sum scroll deltas, replace a scroll event or cross a scroll boundary. This
 also preserves inversion-bit changes and the last delta before an end. An
 overflow remains a visible assignment-ending failure with executor-confirmed
-cleanup, rather than dropping an end event to fit the bound. Charge 112 bytes
-per event instead of 96 in the implementation, plus the existing key/text
-payload charge; keep the event count and wire framing limits bounded.
+cleanup, rather than dropping an end event to fit the bound. The current
+`Event::bytes` in `crates/jackstay/src/input/model.rs` charges 96 bytes per event
+plus key/text payload. Raise that fixed charge to 112: the three new C fields
+occupy 12 bytes, rounded to a 16-byte layout increase on 64-bit targets. This
+remains a queue accounting allowance, not a promise about allocator usage.
+Apply the new charge consistently to target and client queues, retaining their
+event count and wire framing bounds. Also raise `Target::new`'s minimum
+`Config::max_bytes` in `input/session.rs` from 96 to 112; smaller configurations
+must fail construction, not pass construction and fail their first event.
+The C target constructor shares that Rust validation. Existing configurations
+with a byte limit of 96 through 111 need a larger limit when adopting the new
+ABI; do not silently enlarge a caller's configured queue.
 
 A geometry change **ends the destination gesture**, even when the next stale
 event is its end. It uses the existing pointer cleanup barrier: discard queued
@@ -139,10 +149,26 @@ deliver stale deltas to a different view.
 Stale positional scroll events, including zero-delta end events, are rejected
 under the existing geometry rule. Rejection does not execute the stale event,
 replay it with a new revision or close the viewer. The target's geometry-change
-barrier already owns cancellation; a late rejection must not enqueue another
-cleanup after that barrier completes. This extends
+barrier already owns cancellation. The target owns the active epoch, cleanup
+barrier and per-epoch gate for known scroll continuations. On successful
+cleanup completion it advances that epoch and closes the gate; the controller
+learns the new values from `Status::Reset`. An `Error::Stale` rejection itself
+changes neither the epoch nor the gate and never schedules cleanup, whether
+the client rejects locally or the target rejects a submitted operation. This extends
 [#89's viewer behaviour](https://github.com/flotilla-org/jackstay/issues/89),
 not its fatal-error policy.
+
+For example, a gesture begins at epoch 7 / geometry 10. Setting geometry 11
+creates pointer cleanup while epoch 7 is still active; submissions during the
+barrier retain the existing busy/stale rejection rules. Once cleanup succeeds,
+the target publishes epoch 8 / geometry 11 with its scroll gate closed. An end
+tagged epoch 7 is stale because of its epoch; an old end tagged epoch 8 but
+geometry 10 is stale because of its geometry. An orphan `Changed` retagged
+epoch 8 / geometry 11 is stale because the gate is closed. None schedules a
+second cleanup. A fresh `MayBegin` or `Began` at epoch 8 / geometry 11 opens
+the gate; a late epoch-7 end after that start still cannot cancel the new
+gesture. The target's epoch and gate, not a controller-side guess that cleanup
+has completed, distinguish these cases.
 
 At admission and after reset, a phase-aware controller discards any already
 running source gesture and its momentum until a fresh physical `MayBegin` or
@@ -158,7 +184,7 @@ before starting the new interaction. Executors keep physical and momentum
 activity separately so that the combined `Ended`/`Began` handoff stays active.
 
 All-state cleanup on focus loss, disconnect, expiry,
-overflow or uncertain execution also close scroll state. For Luchs, send
+overflow or uncertain execution also closes scroll state. For Luchs, send
 zero-delta `Cancelled` to a live physical gesture and zero-delta momentum
 `Ended` to active momentum at the retained recipient, then clear the binding.
 Do not manufacture momentum on cancellation. Cleanup completion means those
@@ -217,8 +243,9 @@ public CoreGraphics fields preserve physical and momentum phases through
 `NSEvent(cgEvent:)`, provided the executor translates the enums. CoreGraphics
 and AppKit raw values differ. `Stationary` has no public `CGScrollPhase` value;
 Luchs completes a zero-delta stationary sample as a no-op while retaining its
-binding, rather than issuing a fake phase. A nonzero stationary sample is
-invalid. Unknown phase fields become native `.none` without guessing.
+binding, rather than issuing a fake phase. Shared pre-admission validation
+rejects nonzero stationary samples as specified below; they never reach Luchs.
+Unknown phase fields become native `.none` without guessing.
 
 No supported inversion setter was found in the public SDK, and the tested
 candidate fields did not carry it through conversion. Luchs therefore keeps
@@ -249,7 +276,17 @@ Their proposed C encodings are:
 Zero-initialized events thus retain unknown metadata. These are constants,
 not C enums in the struct and not bit masks. Reject out-of-range values as
 invalid before queue admission; other event kinds require all three to be
-zero. On 64-bit targets `ft_input_event` grows from 152 to 168 bytes and its
+zero. Validate `Stationary`'s zero-delta requirement in the shared semantic
+validation (`input::session::validate`) that the local `Client::send` and
+target `Controller::submit` both use before queue admission. Rust callers can
+construct an `Event` with nonzero stationary deltas, but submission returns
+`Error::Invalid`; no constructor-side guarantee is implied. C decoding checks
+the scalar enum encodings, then client send runs the same semantic validation.
+Wire decoding checks enum shape; target submission checks deltas and phases.
+Every entry path thus rejects the invalid event before execution, without
+changing the live scroll binding or scheduling cleanup.
+
+On 64-bit targets `ft_input_event` grows from 152 to 168 bytes and its
 embedding `ft_input_operation` from 192 to 208 bytes. Update Rust `repr(C)`
 layouts, C static assertions, FFI conversions, C/Zig consumers and all exact
 version checks together. This is an ABI break, not an append-only promise to
@@ -265,20 +302,36 @@ The follow-up implementation must verify:
 
 - Rust, local transport and C round trips for absent versus known-none/false,
   all supported enum values, the combined handoff and invalid C values; C/Zig
-  layout checks and mismatched wire/ABI versions.
+  layout checks and mismatched wire/ABI versions. Nonzero stationary samples
+  must return invalid through Rust controller submission, local client send,
+  C send and structurally valid wire submission, with no work dispatched or
+  mutation of an existing scroll binding. Zero-delta stationary samples must
+  round-trip and complete the Luchs no-op while retaining that binding.
 - Ordered zero-delta starts and ends, repeated changes with no coalescing,
   pointer-motion coalescing on either side without crossing the scroll, and
   overflow cleanup while gesture or momentum is active.
+  Configurations with `max_bytes` 96 or 111 must fail target creation in Rust
+  and C; 112 must permit one payload-free scroll event in both bounded queues
+  when otherwise valid, and a second event must overflow visibly if neither
+  has been drained.
 - Resize racing a dispatched change or queued end, rejection without viewer
   shutdown, cancellation at the retained recipient, separate keyboard holds,
   suppression of the old gesture tail, and a fresh gesture after reset. Include
   focus loss, disconnect and failed cleanup through the public contract.
+  Explicitly exercise the epoch-7 / geometry-10 race above: complete cleanup,
+  reject an old-epoch end, reject a current-epoch stale-geometry end and a
+  current-epoch orphan change, then begin the new gesture and reject another
+  late old-epoch end. Observe exactly one cleanup, no extra reset or epoch
+  advance, and an intact new interaction; also cover a local client rejection
+  before it receives `Reset`.
 - macOS native capture through SDL2 and sdl2-compat with no duplicate deltas,
   the enum translation below the Luchs helper protocol, and zero-delta cleanup.
   Keep a platform-independent fixture for the portable unknown-phase fallback.
   Physical-device acceptance separately checks rubber-band release, CSS snap,
   momentum interruption and navigation, plus #88's natural-scroll cases; the
   CGEvent conversion spike does not prove those WebKit behaviours.
+  When the combined implementation lands, change ADR 0003's status from
+  proposed to accepted.
 
 ## Implementation sequence and verification seams
 

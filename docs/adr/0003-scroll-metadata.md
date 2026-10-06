@@ -8,6 +8,8 @@ before implementation. Extend each scroll event with independent optional
 physical phase, momentum phase and device-inversion information, in one public
 ABI release. The [input contract](../design/input.md#planned-scroll-metadata)
 defines the field shapes, C encodings, mappings and acceptance cases.
+Keep this ADR proposed while the implementation is pending; the combined
+implementation changes its status to accepted when it lands.
 
 Unknown differs from a known unphased event and from a known false inversion
 bit. Keep native phase numbers out of the shared contract. The

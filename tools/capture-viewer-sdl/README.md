@@ -229,8 +229,10 @@ Cocoa dispatch. It reads the current `NSEvent` through the Objective-C C runtime
 `scrollingDeltaX/Y` as `Pixel`, scaled from window logical coordinates into target
 geometry. Value-only user events preserve ordering with focus and key events;
 notched wheels use SDL's `Line` values without a line-height multiplier.
-Positive deltas mean right/down after `SDL_MOUSEWHEEL_FLIPPED` inversion. Momentum
-arrives as further pixel events; no phases or momentum protocol is synthesized.
+Positive deltas mean right/down after coordinate conversion. Platform deltas
+already include the user's natural-scrolling setting; `SDL_MOUSEWHEEL_FLIPPED`
+is informational and never negates them. Momentum arrives as further pixel
+events; no phases or momentum protocol is synthesized.
 Outside Cocoa, SDL2 provides no portable unit/device flag: the fallback treats
 fractional wheel values as continuous `Pixel` deltas and integral values as
 `Line`. Integral precise-device deltas remain ambiguous on that fallback, and

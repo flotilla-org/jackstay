@@ -103,7 +103,8 @@ void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, doub
   /* Zero logical displacement is no input operation. */
   if (x == 0 && y == 0) return;
   e.x = x; e.y = y;
-  if (direction == SDL_MOUSEWHEEL_FLIPPED) { e.x = -e.x; e.y = -e.y; }
+  /* Platform deltas already include natural scrolling; direction is metadata. */
+  (void)direction;
   send_event(input, &e);
 }
 static void reset_input(viewer_input *input) {

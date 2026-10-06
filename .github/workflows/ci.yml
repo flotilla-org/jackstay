@@ -26,8 +26,13 @@ jobs:
         include:
           - os: macos-latest
             feature: backend-macos
+            sdl: sdl2
+          - os: macos-latest
+            feature: backend-macos
+            sdl: sdl2-compat
           - os: ubuntu-latest
             feature: backend-linux
+            sdl: sdl2
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +42,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libsdl2-dev cmake pkg-config
       - if: runner.os == 'macOS'
-        run: brew install sdl2 pkg-config cmake
+        run: brew install ${{ matrix.sdl }} pkg-config cmake
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings

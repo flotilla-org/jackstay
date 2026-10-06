@@ -72,8 +72,292 @@ The executor owns the line height and page size and converts the received units
 as its platform requires. Controllers never pre-multiply line or page deltas by
 those sizes.
 
-Scroll phases and momentum metadata are deferred beyond v1. OS momentum arrives
-as further `Pixel` events; v1 adds no phase or momentum fields.
+V1 has no phase or momentum fields; OS momentum arrives as further `Pixel`
+events. The following design extends that vocabulary in one later ABI slice.
+
+### Planned scroll metadata
+
+[Issue #90](https://github.com/flotilla-org/jackstay/issues/90) is a design slice.
+[ADR 0003](../adr/0003-scroll-metadata.md) records the decisions below. This PR
+changes no event structs, version constants or executors. Implementation in
+Jackstay and Luchs is filed after this design merges.
+
+Add these independent fields to Rust `Event::Scroll`:
+
+| Field | Rust shape | Meaning when absent |
+| --- | --- | --- |
+| `phase` | `Option<ScrollPhase>` | The source cannot report the physical gesture phase. |
+| `momentum_phase` | `Option<MomentumPhase>` | The source cannot distinguish momentum from direct input. |
+| `inverted_from_device` | `Option<bool>` | The source cannot report whether its preference reversed device direction. |
+
+`ScrollPhase` has `None`, `MayBegin`, `Began`, `Stationary`, `Changed`, `Ended`
+and `Cancelled`. `Stationary` requires both deltas to be zero.
+`MomentumPhase` has `None`, `Began`, `Changed` and `Ended`.
+These are closed, platform-neutral enums, not native integer masks. A present
+`None` means the source knows that this event has no phase in that domain;
+Rust `Option::None` means unknown. Likewise, `Some(false)` differs from an
+unknown inversion bit. Unknown metadata preserves phaseless delta execution;
+it never authorizes inventing a beginning, ending or momentum timer. Controllers
+map an unrecognized native phase, including an unsupported combination, to
+absence for that field while retaining the deltas and other known fields.
+
+Gesture and momentum phases are independent. A physical `Ended` can accompany
+momentum `Began` in one event; do not split or reorder it. Momentum `Ended`
+closes momentum without inventing a new physical gesture. Zero deltas are valid
+for every phase, particularly `MayBegin`, `Ended` and `Cancelled`; these events
+must pass through capture, admission, transport and execution even when there
+is no content movement. Metadata applies to every scroll unit, not just `Pixel`.
+
+The direction policy is the accepted design in
+[#88](https://github.com/flotilla-org/jackstay/issues/88), which supersedes the
+instruction in [Scroll units](#scroll-units) to undo
+`SDL_MOUSEWHEEL_FLIPPED` by negating both SDL deltas. Normalize platform
+coordinates to Jackstay's positive-right/down content direction, retaining the
+platform's natural-scroll preference. Neither controller nor executor negates deltas because of
+`inverted_from_device`, `SDL_MOUSEWHEEL_FLIPPED` or the destination's preference.
+The new bit is information for native/application APIs that expose it; it never
+changes the existing meaning of `x` and `y`.
+
+#### Ordering, geometry and cleanup
+
+Keep scroll events uncoalesced, including repeated `Changed` events and unknown
+phases. Only consecutive queued pointer motions continue to coalesce; no queue
+may sum scroll deltas, replace a scroll event or cross a scroll boundary. This
+also preserves inversion-bit changes and the last delta before an end. An
+overflow remains a visible assignment-ending failure with executor-confirmed
+cleanup, rather than dropping an end event to fit the bound. The current
+`Event::bytes` in `crates/jackstay/src/input/model.rs` charges 96 bytes per event
+plus key/text payload. Raise that fixed charge to 112: the three new C fields
+occupy 12 bytes, rounded to a 16-byte layout increase on 64-bit targets. This
+remains a queue accounting allowance, not a promise about allocator usage.
+Apply the new charge consistently to target and client queues, retaining their
+event count and wire framing bounds. Also raise `Target::new`'s minimum
+`Config::max_bytes` in `input/session.rs` from 96 to 112; smaller configurations
+must fail construction, not pass construction and fail their first event.
+The C target constructor shares that Rust validation. Existing configurations
+with a byte limit of 96 through 111 need a larger limit when adopting the new
+ABI; do not silently enlarge a caller's configured queue.
+
+A geometry change **ends the destination gesture**, even when the next stale
+event is its end. It uses the existing pointer cleanup barrier: discard queued
+pointer work, let any in-flight operation settle, cancel the executor's active
+controller-owned scroll interaction, then acknowledge cleanup and publish the
+new epoch/geometry. Cleanup covers gesture and momentum as well as pointer
+buttons, even if no button is held. Keyboard holds remain intact. The executor
+retains its actual scroll recipient and last successfully executed native
+binding until cleanup; cancellation must not hit-test the new geometry or
+deliver stale deltas to a different view.
+
+Stale positional scroll events, including zero-delta end events, are rejected
+under the existing geometry rule. Rejection does not execute the stale event,
+replay it with a new revision or close the viewer. The target's geometry-change
+barrier already owns cancellation. The target owns the active epoch, cleanup
+barrier and per-epoch gate for known scroll continuations. On successful
+cleanup completion it advances that epoch and closes the gate; the controller
+learns the new values from `Status::Reset`. An `Error::Stale` rejection itself
+changes neither the epoch nor the gate and never schedules cleanup, whether
+the client rejects locally or the target rejects a submitted operation. This extends
+[#89's viewer behaviour](https://github.com/flotilla-org/jackstay/issues/89),
+not its fatal-error policy.
+
+For example, a gesture begins at epoch 7 / geometry 10. Setting geometry 11
+creates pointer cleanup while epoch 7 is still active; submissions during the
+barrier retain the existing busy/stale rejection rules. Once cleanup succeeds,
+the target publishes epoch 8 / geometry 11 with its scroll gate closed. An end
+tagged epoch 7 is stale because of its epoch; an old end tagged epoch 8 but
+geometry 10 is stale because of its geometry. An orphan `Changed` retagged
+epoch 8 / geometry 11 is stale because the gate is closed. None schedules a
+second cleanup. A fresh `MayBegin` or `Began` at epoch 8 / geometry 11 opens
+the gate; a late epoch-7 end after that start still cannot cancel the new
+gesture. The target's epoch and gate, not a controller-side guess that cleanup
+has completed, distinguish these cases.
+
+At admission and after reset, a phase-aware controller discards any already
+running source gesture and its momentum until a fresh physical `MayBegin` or
+`Began`.
+It must not relabel an old `Changed` as a new `Began`. The target enforces the
+same rule at admission and after its cleanup barrier, rejecting orphan physical
+continuations and momentum starts/continuations cleanly as stale until a fresh
+physical start. With the gate closed and no fresh physical `MayBegin` or
+`Began` in the same event, reject physical `Ended`/`Cancelled` and momentum
+`Ended` as stale too, including when both deltas are zero. A momentum `Ended`
+with physical `None` is an orphan terminal event, not an accepted no-op.
+These rejections never schedule cleanup or alter the gate/epoch.
+Unknown/known-unphased wheel input can resume after reset using current
+geometry, with no inferred interaction. In particular, present
+`Some(ScrollPhase::None)` with `Some(MomentumPhase::None)` is unphased and may
+be admitted while the gate is closed, just as a sample with both fields absent
+may be admitted. Normal epoch, geometry and input validation still apply.
+These samples neither open the gate nor create a phased native binding.
+There is at most one remote scroll interaction per controller/epoch; no device
+or gesture ID is added. A fresh physical start terminates any prior momentum
+before starting the new interaction. Executors keep physical and momentum
+activity separately so that the combined `Ended`/`Began` handoff stays active.
+
+All-state cleanup on focus loss, disconnect, expiry,
+overflow or uncertain execution also closes scroll state. For Luchs, send
+zero-delta `Cancelled` to a live physical gesture and zero-delta momentum
+`Ended` to active momentum at the retained recipient, then clear the binding.
+Do not manufacture momentum on cancellation. Cleanup completion means those
+operations have settled, not merely that they were enqueued. Failure retains
+the existing quarantine rule; cancellation cannot claim to undo a navigation
+or content change that has already committed.
+
+#### Source and executor mappings
+
+On macOS, translate `NSEvent.phase` and `momentumPhase` by named values.
+Native `.none` maps to present `None` for each field. Read
+`isDirectionInvertedFromDevice` directly, including `false`. The existing SDL
+filter can read metadata alongside precise deltas for nonzero wheel events,
+but it is insufficient for terminal events:
+[SDL2's `SDL_SendMouseWheel`](https://github.com/libsdl-org/SDL/blob/SDL2/src/events/SDL_mouse.c)
+returns before queueing when both deltas are zero. The implementation needs
+window-scoped native scroll capture before that drop, on the AppKit event
+thread, putting value-only events into SDL's ordered queue. It must suppress
+the corresponding SDL wheel event to avoid duplicates and preserve ordering
+with focus, keys and geometry resets. Test both SDL2 and sdl2-compat; merely
+extending `precise_wheel` in the current filter does not satisfy acceptance.
+
+The [portable SDL2 wheel struct](https://wiki.libsdl.org/SDL2/SDL_MouseWheelEvent)
+has no gesture or momentum phase. Without native capture, send both as unknown.
+Its explicit `direction` field supplies `Some(true)` for `FLIPPED` and
+`Some(false)` for `NORMAL`; do not infer phases from fractional deltas or idle
+gaps. Synthetic adapters lacking even that information send all fields absent.
+
+Windows precision touchpads delivered as ordinary wheel messages also send
+unknown phases. Microsoft's
+[precision-touchpad input overview](https://learn.microsoft.com/en-us/windows/win32/input-precisiontouchpad/precision-touchpad-portal)
+describes default wheel promotion and opt-in gesture APIs. A future native
+adapter may translate verified direct-input/inertia lifecycle callbacks, but
+this slice does not infer a macOS lifecycle from wheel timing, touch contact
+count or a Direct Manipulation viewport state alone. Report inversion only
+when the source API explicitly supplies it. No Windows-specific adapter is
+required by this implementation slice.
+
+For a future direct libinput adapter, map the first nonzero finger-scroll
+sample to physical `Began`, subsequent samples to `Changed`, and the guaranteed
+zero-valued stop to `Ended`. Track horizontal and vertical activity separately;
+a stop on one axis ends the gesture only when neither axis remains active.
+An absent axis is not a stop. This is an adapter-defined sequence boundary,
+not proof of first touch-down. Use present momentum `None` because libinput
+does not generate kinetic scrolling; never add a momentum timer in Jackstay.
+Wheel and unclassified continuous sources remain phaseless in this slice.
+These mappings follow the
+[libinput pointer API](https://wayland.freedesktop.org/libinput/doc/latest/api/group__event__pointer.html).
+Its natural-scroll configuration can supply the inversion bit only when the
+adapter controls that configuration and knows it applies to the delivered
+deltas; otherwise leave the bit unknown. Existing portable SDL input still
+uses the fallback above. A direct libinput adapter is not added by this slice.
+
+For Luchs, the [macOS spike](../scroll-metadata-spike-2026-10-06.md) confirms that
+public CoreGraphics fields preserve physical and momentum phases through
+`NSEvent(cgEvent:)`, provided the executor translates the enums. CoreGraphics
+and AppKit raw values differ. `Stationary` has no public `CGScrollPhase` value;
+Luchs treats that physical component as a no-op rather than issuing a fake
+phase. A stationary-only sample completes as `Executed` for its sequence but
+neither creates nor advances the retained native recipient or last successful
+native position used for cleanup. Any supported momentum transition in the
+same event still executes at the retained binding before completion; the
+physical no-op must not swallow a momentum end. Shared pre-admission validation
+rejects nonzero stationary samples as specified below; they never reach Luchs.
+Unknown phase fields become native `.none` without guessing.
+
+No supported inversion setter was found in the public SDK, and the tested
+candidate fields did not carry it through conversion. Luchs therefore keeps
+the informational bit in its command data but does not claim to expose
+`Some(true)` as WebKit's native inversion property. Execute the deltas and
+supported phases anyway; do not reverse them, use private field numbers,
+subclass `NSEvent`, or inject a separate DOM wheel event to compensate. This
+documented executor limitation does not change the transport's optional bit.
+
+#### ABI and implementation acceptance
+
+Plan one bump from the current public ABI **0.13 to 0.14** for all three fields.
+Reserve that release for the combined slice; if another change consumes 0.14
+before implementation, update this plan to the next unused minor and still
+land all three together. The design PR leaves `ft_abi_version()`, headers and
+consumer pins at their current values.
+
+Append three `uint32_t` fields to `ft_input_event`, in this order:
+`scroll_phase`, `scroll_momentum_phase`, `scroll_inverted_from_device`.
+Their proposed C encodings are:
+
+| Field | Values |
+| --- | --- |
+| `scroll_phase` | 0 unknown, 1 none, 2 may-begin, 3 began, 4 stationary, 5 changed, 6 ended, 7 cancelled |
+| `scroll_momentum_phase` | 0 unknown, 1 none, 2 began, 3 changed, 4 ended |
+| `scroll_inverted_from_device` | 0 unknown, 1 false, 2 true |
+
+Zero-initialized events thus retain unknown metadata. These are constants,
+not C enums in the struct and not bit masks. Reject out-of-range values as
+invalid before queue admission; other event kinds require all three to be
+zero. Validate `Stationary`'s zero-delta requirement in the shared semantic
+validation (`input::session::validate`) that the local `Client::send` and
+target `Controller::submit` both use before queue admission. Rust callers can
+construct an `Event` with nonzero stationary deltas, but submission returns
+`Error::Invalid`; no constructor-side guarantee is implied. C decoding checks
+the scalar enum encodings, then client send runs the same semantic validation.
+Wire decoding checks enum shape; target submission checks deltas and phases.
+Every entry path thus rejects the invalid event before execution, without
+changing the live scroll binding or scheduling cleanup.
+
+On 64-bit targets `ft_input_event` grows from 152 to 168 bytes and its
+embedding `ft_input_operation` from 192 to 208 bytes. Update Rust `repr(C)`
+layouts, C static assertions, FFI conversions, C/Zig consumers and all exact
+version checks together. This is an ABI break, not an append-only promise to
+old callers. No compatibility shim or second inversion-only bump is planned.
+
+Use input wire protocol **version 2** in `Hello` and `Welcome`, preserving the
+existing framing and bounds. Version 1 peers must fail connection before
+submission, rather than accepting deltas while silently ignoring the new
+lifecycle fields. Serialize the Rust enums and independent optional values;
+the encoding remains internal to Rust, with no new C-side JSON implementation.
+
+The follow-up implementation must verify:
+
+- Rust, local transport and C round trips for absent versus known-none/false,
+  all supported enum values, the combined handoff and invalid C values; C/Zig
+  layout checks and mismatched wire/ABI versions. Nonzero stationary samples
+  must return invalid through Rust controller submission, local client send,
+  C send and structurally valid wire submission, with no work dispatched or
+  mutation of an existing scroll binding. Zero-delta stationary samples must
+  round-trip and complete the Luchs no-op while retaining that binding. Send
+  a stationary-only sample at a different valid position and verify that its
+  successful completion does not move the cleanup recipient or native position;
+  a stationary sample with momentum `Ended` must still dispatch that end once
+  at the retained binding.
+- Ordered zero-delta starts and ends, repeated changes with no coalescing,
+  pointer-motion coalescing on either side without crossing the scroll, and
+  overflow cleanup while gesture or momentum is active.
+  Configurations with `max_bytes` 96 or 111 must fail target creation in Rust
+  and C; 112 must permit one payload-free scroll event in both bounded queues
+  when otherwise valid, and a second event must overflow visibly if neither
+  has been drained.
+- Resize racing a dispatched change or queued end, rejection without viewer
+  shutdown, cancellation at the retained recipient, separate keyboard holds,
+  suppression of the old gesture tail, and a fresh gesture after reset. Include
+  focus loss, disconnect and failed cleanup through the public contract.
+  Explicitly exercise the epoch-7 / geometry-10 race above: complete cleanup,
+  reject an old-epoch end, reject a current-epoch stale-geometry end and a
+  current-epoch orphan change, then begin the new gesture and reject another
+  late old-epoch end. Observe exactly one cleanup, no extra reset or epoch
+  advance, and an intact new interaction; also cover a local client rejection
+  before it receives `Reset`.
+  With the gate closed, submit current-epoch/current-geometry zero-delta
+  physical `Stationary`, `Changed`, `Ended`, `Cancelled`, and momentum `Ended`
+  with physical `None`. Each must be rejected as stale, with no dispatched
+  event, cleanup, reset or gate change. Present physical `None` with present
+  momentum `None`, and a sample with both fields absent, must be admitted at
+  current epoch/geometry without opening the gate or creating a phased binding;
+  then verify that a fresh physical start still succeeds.
+- macOS native capture through SDL2 and sdl2-compat with no duplicate deltas,
+  the enum translation below the Luchs helper protocol, and zero-delta cleanup.
+  Keep a platform-independent fixture for the portable unknown-phase fallback.
+  Physical-device acceptance separately checks rubber-band release, CSS snap,
+  momentum interruption and navigation, plus #88's natural-scroll cases; the
+  CGEvent conversion spike does not prove those WebKit behaviours.
+  When the combined implementation lands, change ADR 0003's status from
+  proposed to accepted.
 
 ## Implementation sequence and verification seams
 

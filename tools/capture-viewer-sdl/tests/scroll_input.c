@@ -39,10 +39,17 @@ int main(void) {
 #endif
   viewer_input_event(&input, &event, window);
   expect_scroll(target, FT_INPUT_SCROLL_LINE, 1, 2);
-  /* Natural-scrolling inversion is applied once for either sign. */
+  /* FLIPPED reports device inversion; content-direction deltas stay unchanged. */
   event.wheel.direction = SDL_MOUSEWHEEL_FLIPPED;
   viewer_input_event(&input, &event, window);
-  expect_scroll(target, FT_INPUT_SCROLL_LINE, -1, -2);
+  expect_scroll(target, FT_INPUT_SCROLL_LINE, 1, 2);
+  /* Opposite-sign FLIPPED wheel deltas preserve content direction too. */
+  event.wheel.x = -2; event.wheel.y = 1;
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+  event.wheel.preciseX = -2; event.wheel.preciseY = 1;
+#endif
+  viewer_input_event(&input, &event, window);
+  expect_scroll(target, FT_INPUT_SCROLL_LINE, -2, -1);
 #if SDL_VERSION_ATLEAST(2, 0, 18) && !defined(__APPLE__)
   /* Portable fractional fallback scales window logical deltas to target units. */
   event.wheel.preciseX = .5; event.wheel.preciseY = -.25;
@@ -51,7 +58,7 @@ int main(void) {
   expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 1, .5);
   event.wheel.direction = SDL_MOUSEWHEEL_FLIPPED;
   viewer_input_event(&input, &event, window);
-  expect_scroll(target, FT_INPUT_SCROLL_PIXEL, -1, -.5);
+  expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 1, .5);
 #endif
   /* Cocoa's captured native pixel metadata uses this same conversion seam.
    * Precise integral deltas must remain pixels, unlike the portable heuristic. */
@@ -60,8 +67,9 @@ int main(void) {
   viewer_input_scroll(&input, window, 0, 0, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_NORMAL);
   viewer_input_scroll(&input, window, 1, 2, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_NORMAL);
   expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 2, 4);
+  /* Captured native deltas also preserve both signs when FLIPPED is set. */
   viewer_input_scroll(&input, window, -.5, .25, FT_INPUT_SCROLL_PIXEL, SDL_MOUSEWHEEL_FLIPPED);
-  expect_scroll(target, FT_INPUT_SCROLL_PIXEL, 1, -.5);
+  expect_scroll(target, FT_INPUT_SCROLL_PIXEL, -1, .5);
   /* A drag starting inside and released in a letterbox bar emits no outside
    * pointer event, but executes reset cleanup so the source button cannot latch.
    * The real socket target's next operation also proves outside motion is absent. */

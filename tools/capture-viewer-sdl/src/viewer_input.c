@@ -103,7 +103,8 @@ void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, doub
   /* Zero logical displacement is no input operation. */
   if (x == 0 && y == 0) return;
   e.x = x; e.y = y;
-  if (direction == SDL_MOUSEWHEEL_FLIPPED) { e.x = -e.x; e.y = -e.y; }
+  /* Platform deltas already include natural scrolling; direction is metadata. */
+  (void)direction;
   send_event(input, &e);
 }
 static void reset_input(viewer_input *input) {
@@ -190,6 +191,8 @@ static int wheel_filter(void *userdata, SDL_Event *event) {
   id native = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("currentEvent"));
   if (native && ((unsigned long (*)(id, SEL))objc_msgSend)(native, sel_registerName("type")) == 22 &&
       ((BOOL (*)(id, SEL))objc_msgSend)(native, sel_registerName("hasPreciseScrollingDeltas"))) {
+    /* Match SDL Cocoa's x conversion, then wire positive-down y.
+     * These are coordinate conversions, independent of device inversion. */
     precise_wheel wheel = {input->precise_wheel_type, event->wheel.timestamp, event->wheel.windowID,
       event->wheel.direction,
       -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaX")),

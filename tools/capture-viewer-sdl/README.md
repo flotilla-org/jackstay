@@ -215,8 +215,8 @@ See [bootstrap ownership and failure semantics](../../docs/design/source-bootstr
 ### Scroll units and SDL2 on macOS
 
 SDL2's [Cocoa wheel adapter](https://github.com/libsdl-org/SDL/blob/release-2.32.10/src/video/cocoa/SDL_cocoamouse.m#L509)
-passes Cocoa `deltaX/Y` to `SDL_SendMouseWheel`; `preciseX/Y` retain these float
-values. They are not AppKit's logical-pixel `scrollingDeltaX/Y`. SDL2 rounds
+passes `-deltaX` and `deltaY` to `SDL_SendMouseWheel`; `preciseX/Y` retain
+these float values. They are not AppKit's logical-pixel `scrollingDeltaX/Y`. SDL2 rounds
 non-precise wheel values away from zero and leaves precise values fractional,
 but it drops `hasPreciseScrollingDeltas`: an integral trackpad delta cannot be
 identified from `preciseX/Y` alone. This finding is from upstream source inspection,
@@ -227,10 +227,16 @@ verified.
 The C viewer captures precise wheel metadata during SDL's event filter, inside
 Cocoa dispatch. It reads the current `NSEvent` through the Objective-C C runtime: precise devices use
 `scrollingDeltaX/Y` as `Pixel`, scaled from window logical coordinates into target
-geometry. Value-only user events preserve ordering with focus and key events;
+geometry. This native path negates both AppKit axes to obtain wire right/down:
+its x conversion matches SDL's Cocoa adapter, while its y conversion matches
+the viewer's SDL positive-up to positive-down conversion. These coordinate
+conversions do not depend on the device-inversion flag. Value-only user events
+preserve ordering with focus and key events;
 notched wheels use SDL's `Line` values without a line-height multiplier.
-Positive deltas mean right/down after `SDL_MOUSEWHEEL_FLIPPED` inversion. Momentum
-arrives as further pixel events; no phases or momentum protocol is synthesized.
+Positive deltas mean right/down after coordinate conversion. Platform deltas
+already include the user's natural-scrolling setting; `SDL_MOUSEWHEEL_FLIPPED`
+is informational and never negates them. Momentum arrives as further pixel
+events; no phases or momentum protocol is synthesized.
 Outside Cocoa, SDL2 provides no portable unit/device flag: the fallback treats
 fractional wheel values as continuous `Pixel` deltas and integral values as
 `Line`. Integral precise-device deltas remain ambiguous on that fallback, and

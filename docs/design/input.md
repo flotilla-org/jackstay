@@ -53,16 +53,18 @@ Controllers choose the scroll unit from the device's reported semantics:
   devices use the line delta. For native positive-up sources (Windows
   `WM_MOUSEWHEEL` delta / 120 and macOS positive-up line deltas), negate the
   vertical delta to make it positive-down. The X11 values above are already
-  normalized. Apply natural-scrolling inversion as described below; do not
+  normalized. Preserve the platform's natural-scrolling setting; do not
   reapply an inversion already included in the platform event.
   Fractions are allowed; controllers do not round.
 - `Page` is only for explicit page-scroll gestures, never synthesized from wheels.
 
 Positive `y` scrolls content toward its end (down); positive `x` scrolls toward
-its right. The controller applies the platform's natural-scrolling inversion
-before sending. For the SDL reference, undo `SDL_MOUSEWHEEL_FLIPPED` by negating
-both SDL deltas when that flag is set, then convert SDL's positive-up `y` to
-positive-down by negating `y`; SDL's positive-right `x` keeps its sign.
+its right. Controllers preserve platform deltas as delivered in content direction,
+including the user's natural-scrolling setting. Never negate deltas because of
+`SDL_MOUSEWHEEL_FLIPPED` or another device-inversion flag. For the SDL reference,
+convert SDL's positive-up `y` to positive-down by negating `y`; SDL's
+positive-right `x` keeps its sign. This coordinate conversion is independent of
+the device-inversion flag.
 This sign handling does not determine the unit: precise/continuous device
 pixel deltas use `Pixel`, and notched-wheel deltas use `Line`.
 

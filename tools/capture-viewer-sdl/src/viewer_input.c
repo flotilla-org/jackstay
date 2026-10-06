@@ -191,6 +191,8 @@ static int wheel_filter(void *userdata, SDL_Event *event) {
   id native = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("currentEvent"));
   if (native && ((unsigned long (*)(id, SEL))objc_msgSend)(native, sel_registerName("type")) == 22 &&
       ((BOOL (*)(id, SEL))objc_msgSend)(native, sel_registerName("hasPreciseScrollingDeltas"))) {
+    /* Match SDL Cocoa's x conversion, then wire positive-down y.
+     * These are coordinate conversions, independent of device inversion. */
     precise_wheel wheel = {input->precise_wheel_type, event->wheel.timestamp, event->wheel.windowID,
       event->wheel.direction,
       -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaX")),

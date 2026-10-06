@@ -136,7 +136,7 @@ int viewer_input_capture_scroll(viewer_input *input, SDL_Window *window, double 
   native_wheel wheel = {input->native_scroll_type, SDL_GetTicks(), SDL_GetWindowID(window), unit,
     native_phase(phase, 0), native_phase(momentum, 1),
     inverted ? FT_INPUT_SCROLL_INVERSION_TRUE : FT_INPUT_SCROLL_INVERSION_FALSE,
-    x, y, (int32_t)pointer_x, (int32_t)pointer_y};
+    x, y, (int32_t)lround(pointer_x), (int32_t)lround(pointer_y)};
   SDL_Event event = {0}; memcpy(&event, &wheel, sizeof(wheel));
   if (SDL_PushEvent(&event) != 1) { input->failed = 1; return 0; }
   return 1;

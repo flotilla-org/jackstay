@@ -18,7 +18,9 @@ void *viewer_native_scroll_install(viewer_input *input, SDL_Window *window) {
     viewer_input_capture_scroll(input, window, -event.scrollingDeltaX, -event.scrollingDeltaY,
       event.hasPreciseScrollingDeltas ? FT_INPUT_SCROLL_PIXEL : FT_INPUT_SCROLL_LINE,
       event.phase, event.momentumPhase, event.isDirectionInvertedFromDevice, point.x, y);
-    return nil; /* Suppress SDL's duplicate, including non-precise native wheels. */
+    /* Suppress duplicates even while resetting/failed: falling back to SDL
+     * would strip metadata and could admit the discarded gesture tail. */
+    return nil;
   }];
   if (!monitor) input->failed = 1;
   return (__bridge_retained void *)monitor;

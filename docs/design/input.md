@@ -148,7 +148,9 @@ Stale positional scroll events, including zero-delta end events, are rejected
 under the existing geometry rule. Rejection does not execute the stale event,
 replay it with a new revision or close the viewer. The target's geometry-change
 barrier already owns cancellation. The target owns the active epoch, cleanup
-barrier and per-epoch gate for known scroll continuations. On successful
+barrier and per-epoch gate for known scroll continuations. The gate guards
+admission/reset races only; terminal events do not close it. Executors track
+and close physical and momentum activity independently. On successful
 cleanup completion it advances that epoch and closes the gate; the controller
 learns the new values from `Status::Reset`. An `Error::Stale` rejection itself
 changes neither the epoch nor the gate and never schedules cleanup, whether

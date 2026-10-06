@@ -305,12 +305,9 @@ fn local_client_preserves_metadata_and_rejects_invalid_stationary() {
         time::{Duration, Instant},
     };
 
-    use jackstay::{
-        input::transport::{Client, Server},
-        local::Stream,
-    };
+    use jackstay::input::transport::{Client, Server};
     #[cfg(unix)]
-    let (a, b) = Stream::pair().unwrap();
+    let (a, b) = jackstay::local::Stream::pair().unwrap();
     #[cfg(windows)]
     let (a, b) = jackstay::local::pipe_pair().unwrap();
     fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {

@@ -140,6 +140,19 @@ int main(void) {
    * the real SDL queue and wire. Inversion never changes either signed delta. */
   native_sample(&input, window, 1, 0, 1, -.5, .25);
   expect_metadata(target, FT_INPUT_SCROLL_PIXEL, -1, .5, FT_INPUT_SCROLL_PHASE_BEGAN, FT_INPUT_MOMENTUM_PHASE_NONE, FT_INPUT_SCROLL_INVERSION_TRUE);
+  /* AppKit sub-point positions round to the nearest SDL window coordinate;
+   * geometry scales positions independently from unchanged scroll deltas. */
+  check(viewer_input_capture_scroll(&input, window, 0, 0, FT_INPUT_SCROLL_PIXEL, 4, 0, 1, 1.75, 1.25));
+  SDL_Event rounded;
+  check(SDL_PeepEvents(&rounded, 1, SDL_GETEVENT, input.native_scroll_type, input.native_scroll_type) == 1);
+  viewer_input_event(&input, &rounded, window);
+  ft_input_work *rounded_work = NULL; uint32_t rounded_start = SDL_GetTicks();
+  while (ft_input_target_next(target, &rounded_work) == FT_STATUS_EMPTY && SDL_GetTicks() - rounded_start < 2000) SDL_Delay(1);
+  check(rounded_work != NULL);
+  ft_input_operation rounded_op; check(ft_input_work_describe(rounded_work, &rounded_op) == FT_STATUS_OK);
+  check(rounded_op.event.pointer_x == 4 && rounded_op.event.pointer_y == 2);
+  check(rounded_op.event.x == 0 && rounded_op.event.y == 0 && rounded_op.event.scroll_phase == FT_INPUT_SCROLL_PHASE_CHANGED);
+  check(ft_input_work_complete(&rounded_work, FT_INPUT_EXECUTED) == FT_STATUS_OK);
   for (int inverted = 0; inverted <= 1; ++inverted) {
     for (unsigned long phase = 0; phase <= 32; phase = phase ? phase * 2 : 1) {
       static const uint32_t mapped[] = {1, 3, 4, 5, 6, 7, 2};

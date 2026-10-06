@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-# The native present path (src/metal_present.m src/viewer_native_scroll.m) is Objective-C; enable it on
-# Apple. The CPU path (src/main.c) stays C11.
+# Native presentation and scroll capture use Objective-C on Apple.
+# The CPU path (src/main.c) stays C11.
 if(APPLE)
   project(capture_viewer_sdl C OBJC)
 else()
@@ -32,7 +32,7 @@ set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c src/vi
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
   # ft_acquisition_macos_* symbols this viewer links against are present.
-  list(APPEND VIEWER_SOURCES src/metal_present.m)
+  list(APPEND VIEWER_SOURCES src/metal_present.m src/viewer_native_scroll.m)
   # ARC: the present shim relies on __bridge_retained/__bridge_transfer to own
   # the presenter and on ARC to retain textures/event — no-ops without it.
   set_source_files_properties(src/metal_present.m src/viewer_native_scroll.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

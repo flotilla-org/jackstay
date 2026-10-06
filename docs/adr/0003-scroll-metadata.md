@@ -25,6 +25,8 @@ in-flight work before cancellation, retain its native recipient, and wait for
 cleanup completion before accepting a fresh gesture. Reject stale deltas and
 discard the old source gesture's tail; do not transplant it onto new geometry.
 Focus loss and assignment-ending cleanup also close gesture and momentum.
+The transport gate guards admission/reset races only; terminal events do not
+close it, while executors close physical and momentum activity independently.
 
 ## Alternatives considered
 

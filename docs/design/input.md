@@ -176,8 +176,12 @@ running source gesture and its momentum until a fresh physical `MayBegin` or
 It must not relabel an old `Changed` as a new `Began`. The target enforces the
 same rule at admission and after its cleanup barrier, rejecting orphan physical
 continuations and momentum starts/continuations cleanly as stale until a fresh
-physical start. Unknown/known-unphased wheel input
-can resume after reset using current geometry, with no inferred interaction.
+physical start. With the gate closed and no fresh physical `MayBegin` or
+`Began` in the same event, reject physical `Ended`/`Cancelled` and momentum
+`Ended` as stale too, including when both deltas are zero. A momentum `Ended`
+with physical `None` is an orphan terminal event, not an accepted no-op.
+These rejections never schedule cleanup or alter the gate/epoch.
+Unknown/known-unphased wheel input can resume after reset using current geometry, with no inferred interaction.
 There is at most one remote scroll interaction per controller/epoch; no device
 or gesture ID is added. A fresh physical start terminates any prior momentum
 before starting the new interaction. Executors keep physical and momentum
@@ -324,6 +328,10 @@ The follow-up implementation must verify:
   late old-epoch end. Observe exactly one cleanup, no extra reset or epoch
   advance, and an intact new interaction; also cover a local client rejection
   before it receives `Reset`.
+  With the gate closed, submit current-epoch/current-geometry zero-delta
+  physical `Ended`, physical `Cancelled`, and momentum `Ended` with physical
+  `None`. Each must be rejected as stale, with no dispatched event, cleanup,
+  reset or gate change; then verify that a fresh physical start still succeeds.
 - macOS native capture through SDL2 and sdl2-compat with no duplicate deltas,
   the enum translation below the Luchs helper protocol, and zero-delta cleanup.
   Keep a platform-independent fixture for the portable unknown-phase fallback.

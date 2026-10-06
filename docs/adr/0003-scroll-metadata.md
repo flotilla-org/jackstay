@@ -44,8 +44,10 @@ Focus loss and assignment-ending cleanup also close gesture and momentum.
 
 ## Consequences
 
-The implementation plans ABI 0.14 and input wire version 2. Rust, C, the SDL
-viewer and Luchs change together, along with exact-version consumers. This ADR
+The implementation plans ABI 0.14 and input wire version 2. If another change
+consumes 0.14 before implementation, use the next unused minor for all three
+fields together, updating this ADR and the input contract in the same change.
+Rust, C, the SDL viewer and Luchs change together, along with exact-version consumers. This ADR
 does not bump any version or add code. Implementation issues are filed after
 the design PR merges; the direction-only work in #88 has its own scope.
 

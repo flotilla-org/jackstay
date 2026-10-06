@@ -306,7 +306,7 @@ fn motion_bursts_charge_one_event_and_report_superseded_count() {
     for length in [1, 2, 6, 257, 1024] {
         let t = Target::new(Config {
             max_events: 1,
-            max_bytes: 96,
+            max_bytes: 112,
             ..Config::default()
         })
         .unwrap();
@@ -354,6 +354,9 @@ fn motions_do_not_merge_across_transitions() {
             y: 0.0,
             position: p,
             unit: ScrollUnit::Pixel,
+            phase: None,
+            momentum_phase: None,
+            inverted_from_device: None,
         },
     ] {
         let t = Target::new(Config {
@@ -450,7 +453,7 @@ fn motion_in_flight_settles_before_cleanup_and_queued_motion_is_cancelled() {
 fn in_flight_motion_still_consumes_queue_capacity() {
     let t = Target::new(Config {
         max_events: 1,
-        max_bytes: 96,
+        max_bytes: 112,
         ..Config::default()
     })
     .unwrap();
@@ -475,7 +478,7 @@ fn in_flight_motion_still_consumes_queue_capacity() {
 fn coalescing_counts_are_deltas_and_non_motion_byte_overflow_still_closes() {
     let t = Target::new(Config {
         max_events: 4,
-        max_bytes: 192,
+        max_bytes: 224,
         ..Config::default()
     })
     .unwrap();
@@ -485,7 +488,7 @@ fn coalescing_counts_are_deltas_and_non_motion_byte_overflow_still_closes() {
     assert_eq!(c.poll(), Some(Status::Coalesced { count: 1 }));
     c.submit(1, 3, motion(2.0)).unwrap();
     assert_eq!(c.poll(), Some(Status::Coalesced { count: 1 }));
-    assert_eq!(c.submit(1, 4, down(1)), Err(Error::Overflow)); // 96 + key payload exceeds 192.
+    assert_eq!(c.submit(1, 4, down(1)), Err(Error::Overflow)); // 112 + key payload exceeds 224.
     assert!(matches!(
         finish(&t).operation,
         Operation::Cleanup {

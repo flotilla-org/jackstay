@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-# The native present path (src/metal_present.m) is Objective-C; enable it on
-# Apple. The CPU path (src/main.c) stays C11.
+# Native presentation and scroll capture use Objective-C on Apple.
+# The CPU path (src/main.c) stays C11.
 if(APPLE)
   project(capture_viewer_sdl C OBJC)
 else()
@@ -32,10 +32,10 @@ set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c src/vi
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
   # ft_acquisition_macos_* symbols this viewer links against are present.
-  list(APPEND VIEWER_SOURCES src/metal_present.m)
+  list(APPEND VIEWER_SOURCES src/metal_present.m src/viewer_native_scroll.m)
   # ARC: the present shim relies on __bridge_retained/__bridge_transfer to own
   # the presenter and on ARC to retain textures/event — no-ops without it.
-  set_source_files_properties(src/metal_present.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  set_source_files_properties(src/metal_present.m src/viewer_native_scroll.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 
 add_executable(capture-viewer-sdl ${VIEWER_SOURCES})
@@ -139,6 +139,7 @@ target_link_directories(scroll-input-contract PRIVATE ${SDL2_LIBRARY_DIRS})
 target_compile_options(scroll-input-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
 target_link_libraries(scroll-input-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
 if(APPLE)
+  target_sources(scroll-input-contract PRIVATE src/viewer_native_scroll.m)
   target_link_libraries(scroll-input-contract PRIVATE "-framework AppKit" objc)
 endif()
 add_test(NAME scroll_input_contract COMMAND scroll-input-contract)

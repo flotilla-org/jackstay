@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::local::Stream;
+/// Exact input protocol version; older peers cannot carry scroll lifecycle data.
+pub const VERSION: u32 = 2;
 const MAX_FRAME: usize = 128 * 1024;
 use crate::framing::Framed;
 const STEP: Duration = Duration::from_millis(5);
@@ -76,7 +78,7 @@ fn serve(target: Target, mut wire: Framed, stop: Arc<AtomicBool>) -> io::Result<
             return Ok(());
         }
         match wire.receive()? {
-            Some(Wire::Hello { version: 1, mode }) => match target.admit(mode) {
+            Some(Wire::Hello { version: VERSION, mode }) => match target.admit(mode) {
                 Ok(c) => break c,
                 Err(e) => {
                     wire.send(Wire::Reject(e))?;
@@ -90,7 +92,7 @@ fn serve(target: Target, mut wire: Framed, stop: Arc<AtomicBool>) -> io::Result<
     };
     let config = target.config();
     wire.send(Wire::Welcome(Welcome {
-        version: 1,
+        version: VERSION,
         mode: controller.mode(),
         controller: controller.id(),
         epoch: 1,
@@ -176,12 +178,12 @@ impl Client {
     /// Performs bounded startup (five seconds). Call off an input/render thread.
     pub fn connect(stream: Stream, mode: Mode) -> Result<Self, ConnectError> {
         let mut wire = Framed::new(stream)?;
-        wire.send(Wire::Hello { version: 1, mode })?;
+        wire.send(Wire::Hello { version: VERSION, mode })?;
         let deadline = Instant::now() + Duration::from_secs(5);
         let welcome = loop {
             wire.flush()?;
             match wire.receive()? {
-                Some(Wire::Welcome(w)) if w.version == 1 && w.mode == mode => {
+                Some(Wire::Welcome(w)) if w.version == VERSION && w.mode == mode => {
                     Target::new(w.config.clone()).map_err(|_| io::Error::other("invalid input offer"))?;
                     break w;
                 }
@@ -404,7 +406,7 @@ mod tests {
         // acknowledgement is readable, but any further write gets BrokenPipe.
         let state = Arc::new(Mutex::new(ClientState {
             welcome: Welcome {
-                version: 1,
+                version: VERSION,
                 mode: Mode::Cooperative,
                 controller: 1,
                 epoch: 1,
@@ -423,5 +425,121 @@ mod tests {
         let state = state.lock().unwrap();
         assert!(!state.alive);
         assert_eq!(state.status.iter().cloned().collect::<Vec<_>>(), vec![closed]);
+    }
+    fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(STEP);
+        }
+    }
+    // A v1 Hello must never admit a controller or dispatch work on a v2 target.
+    #[test]
+    fn wire_v1_hello_is_refused_before_admission() {
+        let target = Target::new(Config::default()).unwrap();
+        let (a, b) = pair();
+        let server = Server::start(target.clone(), a).unwrap();
+        let mut peer = Framed::new(b).unwrap();
+        peer.send(Wire::Hello {
+            version: 1,
+            mode: Mode::Cooperative,
+        })
+        .unwrap();
+        peer.flush().unwrap();
+        wait(|| server.finished().then_some(()));
+        assert!(target.idle());
+        assert!(target.next().is_none());
+    }
+    // A structurally valid v1 Welcome cannot create a v2 client, even with a
+    // valid configuration; neither side silently discards lifecycle metadata.
+    #[test]
+    fn wire_v1_welcome_is_refused_before_client_creation() {
+        let (a, b) = pair();
+        let peer = thread::spawn(move || {
+            let mut wire = Framed::new(a).unwrap();
+            let hello: Wire = wait(|| wire.receive().unwrap());
+            assert!(matches!(hello, Wire::Hello { version: VERSION, .. }));
+            wire.send(Wire::Welcome(Welcome {
+                version: 1,
+                mode: Mode::Cooperative,
+                controller: 1,
+                epoch: 1,
+                config: Config::default(),
+            }))
+            .unwrap();
+            wire.flush().unwrap();
+        });
+        assert!(Client::connect(b, Mode::Cooperative).is_err());
+        peer.join().unwrap();
+    }
+    // Wire shape validation accepts Stationary, but semantic target admission
+    // rejects nonzero deltas without dispatch or cleanup and retains the gate.
+    #[test]
+    fn structurally_valid_stationary_wire_sample_is_semantically_rejected() {
+        let target = Target::new(Config::default()).unwrap();
+        let (a, b) = pair();
+        let _server = Server::start(target.clone(), a).unwrap();
+        let mut peer = Framed::new(b).unwrap();
+        peer.send(Wire::Hello {
+            version: VERSION,
+            mode: Mode::Cooperative,
+        })
+        .unwrap();
+        peer.flush().unwrap();
+        assert!(matches!(wait(|| peer.receive::<Wire>().unwrap()), Wire::Welcome(_)));
+        let event = |phase, x| Event::Scroll {
+            x,
+            y: 0.0,
+            unit: ScrollUnit::Pixel,
+            position: Position {
+                revision: 1,
+                x: 1.0,
+                y: 1.0,
+            },
+            phase: Some(phase),
+            momentum_phase: Some(MomentumPhase::None),
+            inverted_from_device: Some(false),
+        };
+        peer.send(Wire::Submit {
+            epoch: 1,
+            sequence: 1,
+            event: event(ScrollPhase::Began, 0.0),
+        })
+        .unwrap();
+        peer.flush().unwrap();
+        let work = wait(|| target.next());
+        target.complete(work.id, Outcome::Executed).unwrap();
+        assert!(matches!(
+            wait(|| peer.receive::<Wire>().unwrap()),
+            Wire::Reply(Status::Completed { sequence: 1, .. })
+        ));
+        peer.send(Wire::Submit {
+            epoch: 1,
+            sequence: 2,
+            event: event(ScrollPhase::Stationary, 1.0),
+        })
+        .unwrap();
+        peer.flush().unwrap();
+        assert!(matches!(
+            wait(|| peer.receive::<Wire>().unwrap()),
+            Wire::Reply(Status::Rejected {
+                sequence: 2,
+                error: Error::Invalid
+            })
+        ));
+        assert!(target.next().is_none());
+        peer.send(Wire::Submit {
+            epoch: 1,
+            sequence: 3,
+            event: event(ScrollPhase::Changed, 1.0),
+        })
+        .unwrap();
+        peer.flush().unwrap();
+        let work = wait(|| target.next());
+        assert_eq!(work.operation, Operation::Event(event(ScrollPhase::Changed, 1.0)));
+        target.complete(work.id, Outcome::Executed).unwrap();
     }
 }

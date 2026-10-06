@@ -4,22 +4,23 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <math.h>
-#ifdef __APPLE__
-#include <objc/message.h>
-#include <objc/runtime.h>
-#endif
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+/* Value-only native samples fit SDL's ordered queue, including zero deltas. */
+typedef struct {
+  Uint32 type, timestamp, window_id, unit, phase, momentum_phase, inversion;
+  double x, y;
+  int32_t pointer_x, pointer_y;
+} native_wheel;
+_Static_assert(offsetof(native_wheel, type) == offsetof(SDL_CommonEvent, type), "SDL event type offset");
+_Static_assert(offsetof(native_wheel, timestamp) == offsetof(SDL_CommonEvent, timestamp), "SDL event timestamp offset");
+_Static_assert(sizeof(native_wheel) <= sizeof(SDL_Event), "native wheel fits SDL event");
 #ifdef __APPLE__
-/* A value-only SDL user event preserves wheel ordering with focus and keys.
- * No heap payload or extra queue needs ownership during shutdown. */
-typedef struct { Uint32 type, timestamp, window_id, direction; double x, y; } precise_wheel;
-/* SDL identifies queued events by the first type member of SDL_Event. */
-_Static_assert(offsetof(precise_wheel, type) == offsetof(SDL_CommonEvent, type), "SDL event type offset");
-_Static_assert(sizeof(precise_wheel) <= sizeof(SDL_Event), "precise wheel fits SDL event");
+void *viewer_native_scroll_install(viewer_input *input, SDL_Window *window);
+void viewer_native_scroll_remove(void *monitor);
 #endif
 
 static int send_event(viewer_input *input, ft_input_event *event) {
@@ -89,10 +90,14 @@ static int position(viewer_input *input, SDL_Window *window, int x, int y, ft_in
   return viewer_map(r, (double)x * dw / w, (double)y * dh / h,
                     input->config.geometry.width, input->config.geometry.height, &e->x, &e->y);
 }
-void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, double y, uint32_t unit, uint32_t direction) {
+static void scroll_sample(viewer_input *input, SDL_Window *window, double x, double y,
+                          uint32_t unit, uint32_t phase, uint32_t momentum, uint32_t inversion,
+                          int pointer_x, int pointer_y) {
   if (!input || !input->client || input->failed || input->resetting) return;
+  int start = phase == FT_INPUT_SCROLL_PHASE_MAY_BEGIN || phase == FT_INPUT_SCROLL_PHASE_BEGAN;
+  int continuation = phase >= FT_INPUT_SCROLL_PHASE_STATIONARY || momentum >= FT_INPUT_MOMENTUM_PHASE_BEGAN;
+  if (!input->scroll_ready && !start && continuation) return;
   ft_input_event e = {0};
-  int pointer_x, pointer_y; SDL_GetMouseState(&pointer_x, &pointer_y);
   if (!position(input, window, pointer_x, pointer_y, &e)) return;
   e.kind = FT_INPUT_SCROLL; e.scroll_unit = unit; e.pointer_x = e.x; e.pointer_y = e.y;
   if (unit == FT_INPUT_SCROLL_PIXEL) {
@@ -100,16 +105,45 @@ void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, doub
     x *= w > 0 && r.w > 0 ? input->config.geometry.width * dw / (w * (double)r.w) : 0;
     y *= h > 0 && r.h > 0 ? input->config.geometry.height * dh / (h * (double)r.h) : 0;
   }
-  /* Zero logical displacement is no input operation. */
-  if (x == 0 && y == 0) return;
+  if (x == 0 && y == 0 && phase == 0 && momentum == 0 && inversion == 0) return;
   e.x = x; e.y = y;
-  /* Platform deltas already include natural scrolling; direction is metadata. */
+  e.scroll_phase = phase; e.scroll_momentum_phase = momentum; e.scroll_inverted_from_device = inversion;
+  if (send_event(input, &e) && start) input->scroll_ready = 1;
+}
+void viewer_input_scroll(viewer_input *input, SDL_Window *window, double x, double y, uint32_t unit, uint32_t direction) {
+  /* Plain SDL wheel samples have unknown native metadata. Direction never changes deltas. */
   (void)direction;
-  send_event(input, &e);
+  int px, py; SDL_GetMouseState(&px, &py);
+  scroll_sample(input, window, x, y, unit, 0, 0, 0, px, py);
+}
+/* NSEventPhase values are translated independently; masks/unknowns remain unknown.
+ * The native shim statically checks these values against the SDK's named constants. */
+static uint32_t native_phase(unsigned long value, int momentum) {
+  switch (value) {
+    case 0: return momentum ? FT_INPUT_MOMENTUM_PHASE_NONE : FT_INPUT_SCROLL_PHASE_NONE;
+    case 1: return momentum ? FT_INPUT_MOMENTUM_PHASE_BEGAN : FT_INPUT_SCROLL_PHASE_BEGAN;
+    case 4: return momentum ? FT_INPUT_MOMENTUM_PHASE_CHANGED : FT_INPUT_SCROLL_PHASE_CHANGED;
+    case 8: return momentum ? FT_INPUT_MOMENTUM_PHASE_ENDED : FT_INPUT_SCROLL_PHASE_ENDED;
+    case 2: return momentum ? 0 : FT_INPUT_SCROLL_PHASE_STATIONARY;
+    case 16: return momentum ? 0 : FT_INPUT_SCROLL_PHASE_CANCELLED;
+    case 32: return momentum ? 0 : FT_INPUT_SCROLL_PHASE_MAY_BEGIN;
+    default: return 0;
+  }
+}
+int viewer_input_capture_scroll(viewer_input *input, SDL_Window *window, double x, double y,
+                                uint32_t unit, unsigned long phase, unsigned long momentum,
+                                int inverted, double pointer_x, double pointer_y) {
+  native_wheel wheel = {input->native_scroll_type, SDL_GetTicks(), SDL_GetWindowID(window), unit,
+    native_phase(phase, 0), native_phase(momentum, 1),
+    inverted ? FT_INPUT_SCROLL_INVERSION_TRUE : FT_INPUT_SCROLL_INVERSION_FALSE,
+    x, y, (int32_t)lround(pointer_x), (int32_t)lround(pointer_y)};
+  SDL_Event event = {0}; memcpy(&event, &wheel, sizeof(wheel));
+  if (SDL_PushEvent(&event) != 1) { input->failed = 1; return 0; }
+  return 1;
 }
 static void reset_input(viewer_input *input) {
   if (ft_input_client_reset(input->client) != FT_STATUS_OK) input->failed = 1;
-  input->resetting = 1; input->buttons = 0; memset(input->keys, 0, sizeof(input->keys));
+  input->resetting = 1; input->scroll_ready = 0; input->buttons = 0; memset(input->keys, 0, sizeof(input->keys));
 }
 void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window *window) {
   if (!input || !input->client || input->failed) return;
@@ -118,13 +152,13 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
   }
   if (input->resetting) return;
   ft_input_event e = {0};
-#ifdef __APPLE__
-  if (event->type == input->precise_wheel_type) {
-    precise_wheel wheel; memcpy(&wheel, event, sizeof(wheel));
-    viewer_input_scroll(input, window, wheel.x, wheel.y, FT_INPUT_SCROLL_PIXEL, wheel.direction);
+  if (event->type == input->native_scroll_type) {
+    native_wheel wheel; memcpy(&wheel, event, sizeof(wheel));
+    if (wheel.window_id == SDL_GetWindowID(window))
+      scroll_sample(input, window, wheel.x, wheel.y, wheel.unit, wheel.phase,
+                    wheel.momentum_phase, wheel.inversion, (int)wheel.pointer_x, (int)wheel.pointer_y);
     return;
   }
-#endif
   switch (event->type) {
     case SDL_KEYDOWN: case SDL_KEYUP: {
       if (input->mode == FT_INPUT_MODE_SOURCE_TEXT) return;
@@ -178,42 +212,16 @@ void viewer_input_event(viewer_input *input, const SDL_Event *event, SDL_Window 
   }
   send_event(input, &e);
 }
-#ifdef __APPLE__
-static int wheel_filter(void *userdata, SDL_Event *event) {
-  viewer_input *input = userdata;
-  /* SDL_PushEvent may invoke filters on another thread. Only the Cocoa pump
-   * thread may inspect AppKit; other events remain queued for normal handling. */
-  if (SDL_ThreadID() != input->event_thread || event->type != SDL_MOUSEWHEEL) return 1;
-  /* SDL calls the filter inside the Cocoa scrollWheel: dispatch. Capture the
-   * precise-device flag and logical deltas while currentEvent is still valid.
-   * SDL2 preciseX/Y alone contain deltaX/Y and omit that flag. */
-  id app = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-  id native = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("currentEvent"));
-  if (native && ((unsigned long (*)(id, SEL))objc_msgSend)(native, sel_registerName("type")) == 22 &&
-      ((BOOL (*)(id, SEL))objc_msgSend)(native, sel_registerName("hasPreciseScrollingDeltas"))) {
-    /* Match SDL Cocoa's x conversion, then wire positive-down y.
-     * These are coordinate conversions, independent of device inversion. */
-    precise_wheel wheel = {input->precise_wheel_type, event->wheel.timestamp, event->wheel.windowID,
-      event->wheel.direction,
-      -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaX")),
-      -((double (*)(id, SEL))objc_msgSend)(native, sel_registerName("scrollingDeltaY"))};
-    memset(event, 0, sizeof(*event)); memcpy(event, &wheel, sizeof(wheel));
-  }
-  return 1;
-}
-#endif
-void viewer_input_install_wheel_filter(viewer_input *input, SDL_Window *window) {
-  (void)window;
-#ifdef __APPLE__
-  input->event_thread = SDL_ThreadID();
-  input->precise_wheel_type = SDL_RegisterEvents(1);
-  if (input->precise_wheel_type == (Uint32)-1) {
-    fprintf(stderr, "SDL precise wheel event registration failed: %s\n", SDL_GetError());
+void viewer_input_install_scroll_capture(viewer_input *input, SDL_Window *window) {
+  input->native_scroll_type = SDL_RegisterEvents(1);
+  if (input->native_scroll_type == (Uint32)-1) {
+    fprintf(stderr, "SDL native wheel event registration failed: %s\n", SDL_GetError());
     input->failed = 1; return;
   }
-  SDL_SetEventFilter(wheel_filter, input);
+#ifdef __APPLE__
+  input->scroll_monitor = viewer_native_scroll_install(input, window);
 #else
-  (void)input;
+  (void)window;
 #endif
 }
 void viewer_input_poll(viewer_input *input) {
@@ -226,7 +234,7 @@ void viewer_input_poll(viewer_input *input) {
        * retirement is needed; the surviving latest motion completes separately. */
       continue;
     }
-    if (s.kind == FT_INPUT_RESET) { input->config.geometry = s.geometry; input->resetting = 0; }
+    if (s.kind == FT_INPUT_RESET) { input->config.geometry = s.geometry; input->resetting = 0; input->scroll_ready = 0; }
     if (s.kind == FT_INPUT_REFUSED || (s.kind == FT_INPUT_COMPLETED && s.result != FT_INPUT_EXECUTED)) {
       fprintf(stderr, "input operation %llu result=%d\n", (unsigned long long)s.sequence, s.result);
     }
@@ -234,6 +242,9 @@ void viewer_input_poll(viewer_input *input) {
   }
 }
 int viewer_input_close(viewer_input *input) {
+#ifdef __APPLE__
+  if (input->scroll_monitor) { viewer_native_scroll_remove(input->scroll_monitor); input->scroll_monitor = NULL; }
+#endif
   if (!input->client) return input->failed;
   ft_input_client_close(input->client);
   uint32_t start = SDL_GetTicks(); int clean = 0;

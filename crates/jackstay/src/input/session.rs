@@ -22,6 +22,7 @@ struct Active {
     last_seen: Instant,
     keys: HashMap<u64, Key>,
     buttons: HashSet<u32>,
+    scroll_open: bool,
     mailbox: Arc<Mutex<VecDeque<Status>>>,
 }
 #[derive(Clone, Copy)]
@@ -51,7 +52,7 @@ impl Target {
             || config.capabilities & !CAP_ALL != 0
             || config.max_events == 0
             || config.max_events > 65536
-            || config.max_bytes < 96
+            || config.max_bytes < 112
             || config.max_bytes > 16 * 1024 * 1024
             || config.max_text_bytes == 0
             || config.max_text_bytes > 16384
@@ -97,6 +98,7 @@ impl Target {
             last_seen: Instant::now(),
             keys: HashMap::new(),
             buttons: HashSet::new(),
+            scroll_open: false,
             mailbox: mailbox.clone(),
         });
         Ok(Controller {
@@ -190,6 +192,7 @@ impl Target {
                 }
                 if let Some(a) = s.active.as_mut() {
                     a.buttons.clear();
+                    a.scroll_open = false;
                     if scope == Scope::All {
                         a.keys.clear();
                     }
@@ -286,6 +289,20 @@ impl Controller {
             return Err(Error::Busy);
         }
         validate(&s.config, s.active.as_ref().unwrap().mode, &event)?;
+        let a = s.active.as_ref().unwrap();
+        if let Event::Scroll { phase, momentum_phase, .. } = &event {
+            let start = matches!(phase, Some(ScrollPhase::MayBegin | ScrollPhase::Began));
+            let continuation = matches!(
+                phase,
+                Some(ScrollPhase::Stationary | ScrollPhase::Changed | ScrollPhase::Ended | ScrollPhase::Cancelled)
+            ) || matches!(
+                momentum_phase,
+                Some(MomentumPhase::Began | MomentumPhase::Changed | MomentumPhase::Ended)
+            );
+            if !a.scroll_open && !start && continuation {
+                return Err(Error::Stale);
+            }
+        }
         // Only the queued tail can be superseded; dispatched work and transitions
         // remain ordered. Validation above also prevents invalid motion replacing it.
         if matches!(event, Event::Motion(_))
@@ -303,6 +320,15 @@ impl Controller {
         if s.queue.len() + usize::from(s.flight.is_some()) >= s.config.max_events || bytes + event.bytes() > s.config.max_bytes {
             s.cancel(Scope::All, Reason::Overflow, true);
             return Err(Error::Overflow);
+        }
+        if matches!(
+            &event,
+            Event::Scroll {
+                phase: Some(ScrollPhase::MayBegin | ScrollPhase::Began),
+                ..
+            }
+        ) {
+            s.active.as_mut().unwrap().scroll_open = true;
         }
         s.next_work += 1;
         let id = s.next_work;
@@ -531,8 +557,10 @@ pub(super) fn validate(c: &Config, mode: Mode, e: &Event) -> Result<(), Error> {
             } // Release does not depend on current geometry.
             CAP_POINTER
         }
-        Event::Scroll { x, y, position: p, .. } => {
-            if !x.is_finite() || !y.is_finite() {
+        Event::Scroll {
+            x, y, phase, position: p, ..
+        } => {
+            if !x.is_finite() || !y.is_finite() || (*phase == Some(ScrollPhase::Stationary) && (*x != 0.0 || *y != 0.0)) {
                 return Err(Error::Invalid);
             }
             position(c, p)?;

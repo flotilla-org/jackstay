@@ -72,15 +72,14 @@ The executor owns the line height and page size and converts the received units
 as its platform requires. Controllers never pre-multiply line or page deltas by
 those sizes.
 
-V1 has no phase or momentum fields; OS momentum arrives as further `Pixel`
-events. The following design extends that vocabulary in one later ABI slice.
+Input wire v2 carries independent phase, momentum and inversion metadata.
+Unknown metadata preserves phaseless delta execution.
 
 ### Planned scroll metadata
 
-[Issue #90](https://github.com/flotilla-org/jackstay/issues/90) is a design slice.
-[ADR 0003](../adr/0003-scroll-metadata.md) records the decisions below. This PR
-changes no event structs, version constants or executors. Implementation in
-Jackstay and Luchs is filed after this design merges.
+[ADR 0003](../adr/0003-scroll-metadata.md) records this contract, implemented in
+Jackstay [#94](https://github.com/flotilla-org/jackstay/issues/94) with ABI 0.14
+and wire v2. Luchs native execution remains a separate follow-on.
 
 Add these independent fields to Rust `Event::Scroll`:
 
@@ -109,9 +108,7 @@ must pass through capture, admission, transport and execution even when there
 is no content movement. Metadata applies to every scroll unit, not just `Pixel`.
 
 The direction policy is the accepted design in
-[#88](https://github.com/flotilla-org/jackstay/issues/88), which supersedes the
-instruction in [Scroll units](#scroll-units) to undo
-`SDL_MOUSEWHEEL_FLIPPED` by negating both SDL deltas. Normalize platform
+[#88](https://github.com/flotilla-org/jackstay/issues/88). Normalize platform
 coordinates to Jackstay's positive-right/down content direction, retaining the
 platform's natural-scroll preference. Neither controller nor executor negates deltas because of
 `inverted_from_device`, `SDL_MOUSEWHEEL_FLIPPED` or the destination's preference.
@@ -125,14 +122,13 @@ phases. Only consecutive queued pointer motions continue to coalesce; no queue
 may sum scroll deltas, replace a scroll event or cross a scroll boundary. This
 also preserves inversion-bit changes and the last delta before an end. An
 overflow remains a visible assignment-ending failure with executor-confirmed
-cleanup, rather than dropping an end event to fit the bound. The current
-`Event::bytes` in `crates/jackstay/src/input/model.rs` charges 96 bytes per event
-plus key/text payload. Raise that fixed charge to 112: the three new C fields
+cleanup, rather than dropping an end event to fit the bound. `Event::bytes` in `crates/jackstay/src/input/model.rs` charges 112 bytes per event
+plus key/text payload: the three new C fields
 occupy 12 bytes, rounded to a 16-byte layout increase on 64-bit targets. This
 remains a queue accounting allowance, not a promise about allocator usage.
 Apply the new charge consistently to target and client queues, retaining their
-event count and wire framing bounds. Also raise `Target::new`'s minimum
-`Config::max_bytes` in `input/session.rs` from 96 to 112; smaller configurations
+event count and wire framing bounds. `Target::new`'s minimum
+`Config::max_bytes` in `input/session.rs` is 112; smaller configurations
 must fail construction, not pass construction and fail their first event.
 The C target constructor shares that Rust validation. Existing configurations
 with a byte limit of 96 through 111 need a larger limit when adopting the new
@@ -152,7 +148,9 @@ Stale positional scroll events, including zero-delta end events, are rejected
 under the existing geometry rule. Rejection does not execute the stale event,
 replay it with a new revision or close the viewer. The target's geometry-change
 barrier already owns cancellation. The target owns the active epoch, cleanup
-barrier and per-epoch gate for known scroll continuations. On successful
+barrier and per-epoch gate for known scroll continuations. The gate guards
+admission/reset races only; terminal events do not close it. Executors track
+and close physical and momentum activity independently. On successful
 cleanup completion it advances that epoch and closes the gate; the controller
 learns the new values from `Status::Reset`. An `Error::Stale` rejection itself
 changes neither the epoch nor the gate and never schedules cleanup, whether
@@ -220,9 +218,10 @@ extending `precise_wheel` in the current filter does not satisfy acceptance.
 
 The [portable SDL2 wheel struct](https://wiki.libsdl.org/SDL2/SDL_MouseWheelEvent)
 has no gesture or momentum phase. Without native capture, send both as unknown.
-Its explicit `direction` field supplies `Some(true)` for `FLIPPED` and
-`Some(false)` for `NORMAL`; do not infer phases from fractional deltas or idle
-gaps. Synthetic adapters lacking even that information send all fields absent.
+The SDL viewer leaves all native metadata unknown for plain SDL wheel events,
+as scoped in #94; the native observation path reports the inversion bit directly.
+Do not infer phases from fractional deltas or idle gaps. Synthetic adapters
+lacking native information also send all fields absent.
 
 Windows precision touchpads delivered as ordinary wheel messages also send
 unknown phases. Microsoft's
@@ -272,15 +271,12 @@ documented executor limitation does not change the transport's optional bit.
 
 #### ABI and implementation acceptance
 
-Plan one bump from the current public ABI **0.13 to 0.14** for all three fields.
-Reserve that release for the combined slice; if another change consumes 0.14
-before implementation, update this plan to the next unused minor and still
-land all three together. The design PR leaves `ft_abi_version()`, headers and
-consumer pins at their current values.
+Public ABI **0.14** carries all three fields together, replacing 0.13.
+`ft_abi_version()`, headers, layouts and consumer checks use the same version.
 
 Append three `uint32_t` fields to `ft_input_event`, in this order:
 `scroll_phase`, `scroll_momentum_phase`, `scroll_inverted_from_device`.
-Their proposed C encodings are:
+Their C encodings are:
 
 | Field | Values |
 | --- | --- |
@@ -431,15 +427,15 @@ the SDL logging above concerns source positions that cannot be encoded for sendi
 Translation tables belong to the executor, not the library or
 the C ABI.
 
-The transport uses version-1 length-prefixed JSON messages internal to the Rust
+The transport uses version-2 length-prefixed JSON messages internal to the Rust
 implementation; C/Zig callers do not implement that encoding. It bounds a frame
 to 128 KiB and queued wire bytes to 512 KiB, independently of configured event
 queues. Text commits are at most 16 KiB of valid UTF-8, including embedded NUL;
 the frame bound covers worst-case JSON escaping. Queue byte accounting charges
-96 bytes plus UTF-8 payload per event; it is not a promise about total allocator
+112 bytes plus UTF-8 payload per event; it is not a promise about total allocator
 usage. Held keys and result queues are bounded too. Only consecutive queued
 `Event::Motion` entries coalesce: the tail is replaced with the latest validated
-position and sequence, charging one event and 96 bytes. In-flight work is never
+position and sequence, charging one event and 112 bytes. In-flight work is never
 replaced, and button, key, scroll, text and cleanup boundaries are never crossed.
 The last motion before a transition is retained. Existing cancellation still
 invalidates queued motions on focus loss or geometry change; an in-flight motion

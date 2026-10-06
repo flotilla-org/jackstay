@@ -10,6 +10,9 @@ ABI release. The [input contract](../design/input.md#planned-scroll-metadata)
 defines the field shapes, C encodings, mappings and acceptance cases.
 Keep this ADR proposed while the implementation is pending; the combined
 implementation changes its status to accepted when it lands.
+After this design PR merges, file the Jackstay and Luchs implementation issues
+and add their links here. Carry the input contract's acceptance cases into those
+issues; keep the ADR proposed until both implementations have landed.
 
 Unknown differs from a known unphased event and from a known false inversion
 bit. Keep native phase numbers out of the shared contract. The

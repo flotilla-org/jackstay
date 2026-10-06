@@ -246,8 +246,12 @@ For Luchs, the [macOS spike](../scroll-metadata-spike-2026-10-06.md) confirms th
 public CoreGraphics fields preserve physical and momentum phases through
 `NSEvent(cgEvent:)`, provided the executor translates the enums. CoreGraphics
 and AppKit raw values differ. `Stationary` has no public `CGScrollPhase` value;
-Luchs completes a zero-delta stationary sample as a no-op while retaining its
-binding, rather than issuing a fake phase. Shared pre-admission validation
+Luchs treats that physical component as a no-op rather than issuing a fake
+phase. A stationary-only sample completes as `Executed` for its sequence but
+neither creates nor advances the retained native recipient or last successful
+native position used for cleanup. Any supported momentum transition in the
+same event still executes at the retained binding before completion; the
+physical no-op must not swallow a momentum end. Shared pre-admission validation
 rejects nonzero stationary samples as specified below; they never reach Luchs.
 Unknown phase fields become native `.none` without guessing.
 
@@ -310,7 +314,11 @@ The follow-up implementation must verify:
   must return invalid through Rust controller submission, local client send,
   C send and structurally valid wire submission, with no work dispatched or
   mutation of an existing scroll binding. Zero-delta stationary samples must
-  round-trip and complete the Luchs no-op while retaining that binding.
+  round-trip and complete the Luchs no-op while retaining that binding. Send
+  a stationary-only sample at a different valid position and verify that its
+  successful completion does not move the cleanup recipient or native position;
+  a stationary sample with momentum `Ended` must still dispatch that end once
+  at the retained binding.
 - Ordered zero-delta starts and ends, repeated changes with no coalescing,
   pointer-motion coalescing on either side without crossing the scroll, and
   overflow cleanup while gesture or momentum is active.

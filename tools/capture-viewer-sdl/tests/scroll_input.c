@@ -88,8 +88,45 @@ int main(void) {
   drag_start = SDL_GetTicks();
   while (input.resetting && SDL_GetTicks() - drag_start < 2000) { viewer_input_poll(&input); SDL_Delay(1); }
   check(!input.resetting && !input.failed && input.buttons == 0);
+  /* A stale positional action is dropped without ending the viewer or recording
+   * a rejected button hold. Advance target geometry while the viewer still
+   * has its old snapshot, then prove input resumes after polling the reset. */
+  input.frame_width = 0; input.frame_height = 0;
+  ft_input_geometry resized = input.config.geometry;
+  resized.revision++; resized.width *= 2; resized.height *= 2;
+  check(ft_input_target_geometry(target, &resized) == FT_STATUS_OK);
+  ft_input_work *resize_work = NULL; uint32_t resize_start = SDL_GetTicks();
+  while (ft_input_target_next(target, &resize_work) == FT_STATUS_EMPTY && SDL_GetTicks() - resize_start < 2000) SDL_Delay(1);
+  check(resize_work != NULL);
+  ft_input_operation resize_op;
+  check(ft_input_work_describe(resize_work, &resize_op) == FT_STATUS_OK);
+  check(resize_op.event.kind == FT_INPUT_CLEANUP && resize_op.scope == FT_INPUT_SCOPE_POINTER);
+  check(ft_input_work_complete(&resize_work, FT_INPUT_EXECUTED) == FT_STATUS_OK);
+  /* Wait for the transport's new geometry without consuming the viewer reset. */
+  ft_input_config current; resize_start = SDL_GetTicks();
+  do {
+    check(ft_input_client_describe(input.client, &current, &controller, &epoch) == FT_STATUS_OK);
+    if (current.geometry.revision == resized.revision) break;
+    SDL_Delay(1);
+  } while (SDL_GetTicks() - resize_start < 2000);
+  check(current.geometry.revision == resized.revision);
+  viewer_input_scroll(&input, window, 1, 2, FT_INPUT_SCROLL_LINE, SDL_MOUSEWHEEL_NORMAL);
+  check(!input.failed);
+  motion.motion.x = 50; motion.motion.y = 25;
+  viewer_input_event(&input, &motion, window);
+  check(!input.failed);
+  button.button.type = SDL_MOUSEBUTTONDOWN; button.button.x = 50;
+  viewer_input_event(&input, &button, window);
+  check(!input.failed && input.buttons == 0);
+  viewer_input_poll(&input);
+  check(input.config.geometry.revision == resized.revision && !input.failed);
+  viewer_input_scroll(&input, window, 3, 4, FT_INPUT_SCROLL_LINE, SDL_MOUSEWHEEL_NORMAL);
+  expect_scroll(target, FT_INPUT_SCROLL_LINE, 3, 4);
   /* Finish the actual executor cleanup before destroying independent handles. */
   ft_input_client_close(input.client);
+  /* A real closed-client send must still stop the viewer. */
+  viewer_input_scroll(&input, window, 1, 2, FT_INPUT_SCROLL_LINE, SDL_MOUSEWHEEL_NORMAL);
+  check(input.failed);
   ft_input_work *work = NULL; uint32_t start = SDL_GetTicks();
   while (ft_input_target_next(target, &work) == FT_STATUS_EMPTY && SDL_GetTicks() - start < 2000) SDL_Delay(1);
   check(work != NULL);

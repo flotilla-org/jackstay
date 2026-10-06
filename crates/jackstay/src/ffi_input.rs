@@ -80,6 +80,9 @@ pub struct FtInputEvent {
     pub key: [c_char; 64],
     pub text: *const u8,
     pub text_len: usize,
+    pub scroll_phase: u32,
+    pub scroll_momentum_phase: u32,
+    pub scroll_inverted_from_device: u32,
 }
 impl Default for FtInputEvent {
     fn default() -> Self {
@@ -99,6 +102,9 @@ impl Default for FtInputEvent {
             key: [0; 64],
             text: ptr::null(),
             text_len: 0,
+            scroll_phase: 0,
+            scroll_momentum_phase: 0,
+            scroll_inverted_from_device: 0,
         }
     }
 }
@@ -203,6 +209,9 @@ fn action_code(a: Action) -> u32 {
     }
 }
 unsafe fn event(e: &FtInputEvent) -> Result<Event, Error> {
+    if e.kind != 5 && (e.scroll_phase != 0 || e.scroll_momentum_phase != 0 || e.scroll_inverted_from_device != 0) {
+        return Err(Error::Invalid);
+    }
     let p = Position {
         revision: e.geometry_revision,
         x: e.x,
@@ -242,6 +251,31 @@ unsafe fn event(e: &FtInputEvent) -> Result<Event, Error> {
             position: p,
         },
         5 => Event::Scroll {
+            phase: match e.scroll_phase {
+                0 => None,
+                1 => Some(ScrollPhase::None),
+                2 => Some(ScrollPhase::MayBegin),
+                3 => Some(ScrollPhase::Began),
+                4 => Some(ScrollPhase::Stationary),
+                5 => Some(ScrollPhase::Changed),
+                6 => Some(ScrollPhase::Ended),
+                7 => Some(ScrollPhase::Cancelled),
+                _ => return Err(Error::Invalid),
+            },
+            momentum_phase: match e.scroll_momentum_phase {
+                0 => None,
+                1 => Some(MomentumPhase::None),
+                2 => Some(MomentumPhase::Began),
+                3 => Some(MomentumPhase::Changed),
+                4 => Some(MomentumPhase::Ended),
+                _ => return Err(Error::Invalid),
+            },
+            inverted_from_device: match e.scroll_inverted_from_device {
+                0 => None,
+                1 => Some(false),
+                2 => Some(true),
+                _ => return Err(Error::Invalid),
+            },
             x: e.x,
             y: e.y,
             unit: match e.scroll_unit {
@@ -303,7 +337,31 @@ fn describe(e: &Event) -> FtInputEvent {
             out.action = action_code(*action);
             Some(position)
         }
-        Event::Scroll { x, y, unit, position } => {
+        Event::Scroll {
+            x,
+            y,
+            unit,
+            position,
+            phase,
+            momentum_phase,
+            inverted_from_device,
+        } => {
+            out.scroll_phase = phase.map_or(0, |p| match p {
+                ScrollPhase::None => 1,
+                ScrollPhase::MayBegin => 2,
+                ScrollPhase::Began => 3,
+                ScrollPhase::Stationary => 4,
+                ScrollPhase::Changed => 5,
+                ScrollPhase::Ended => 6,
+                ScrollPhase::Cancelled => 7,
+            });
+            out.scroll_momentum_phase = momentum_phase.map_or(0, |p| match p {
+                MomentumPhase::None => 1,
+                MomentumPhase::Began => 2,
+                MomentumPhase::Changed => 3,
+                MomentumPhase::Ended => 4,
+            });
+            out.scroll_inverted_from_device = inverted_from_device.map_or(0, |v| if v { 2 } else { 1 });
             out.kind = 5;
             out.x = *x;
             out.y = *y;

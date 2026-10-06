@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 # Scroll metadata travels with ordered deltas and shares pointer cleanup
 
@@ -8,11 +8,9 @@ before implementation. Extend each scroll event with independent optional
 physical phase, momentum phase and device-inversion information, in one public
 ABI release. The [input contract](../design/input.md#planned-scroll-metadata)
 defines the field shapes, C encodings, mappings and acceptance cases.
-Keep this ADR proposed while the implementation is pending; the combined
-implementation changes its status to accepted when it lands.
-After this design PR merges, file the Jackstay and Luchs implementation issues
-and add their links here. Carry the input contract's acceptance cases into those
-issues; keep the ADR proposed until both implementations have landed.
+Jackstay implements the transport contract in [issue #94](https://github.com/flotilla-org/jackstay/issues/94),
+including ABI 0.14, wire v2 and native SDL capture. Luchs native execution is a
+separate follow-on; physical WebKit acceptance remains with that implementation.
 
 Unknown differs from a known unphased event and from a known false inversion
 bit. Keep native phase numbers out of the shared contract. The
@@ -47,13 +45,10 @@ Focus loss and assignment-ending cleanup also close gesture and momentum.
 
 ## Consequences
 
-The implementation plans ABI 0.14 and input wire version 2. If another change
-consumes 0.14 before implementation, use the next unused minor for all three
-fields together, updating this ADR and the input contract in the same change.
-Rust, C, the SDL viewer and Luchs change together, along with exact-version
-consumers. This ADR
-does not bump any version or add code. Implementation issues are filed after
-the design PR merges; the direction-only work in #88 has its own scope.
+The implementation uses ABI 0.14 and input wire version 2. Rust, C, the SDL
+viewer and exact-version consumers change together. Older peers and callers
+must adopt the new version; no compatibility shim is provided. Luchs applies
+the transported phases in its separate executor implementation.
 
 Capturing zero-delta terminal events requires native macOS observation before
 SDL's wheel filter discards them. End-to-end WebKit behaviour remains a separate

@@ -201,7 +201,7 @@ static int viewer_event(viewer_input *input, SDL_Window *window, viewer_affordan
   int frame_keyup = event->type == SDL_KEYUP && event->key.keysym.scancode > SDL_SCANCODE_UNKNOWN &&
     event->key.keysym.scancode < SDL_NUM_SCANCODES && input->keys[event->key.keysym.scancode];
   int consumed = frame_drag || frame_keyup ? 0 : viewer_navigation_event(&a->navigation, a->host, event);
-  if (!consumed && a->navigation.visible && (event->type == SDL_MOUSEWHEEL || event->type == input->precise_wheel_type)) {
+  if (!consumed && a->navigation.visible && (event->type == SDL_MOUSEWHEEL || event->type == input->native_scroll_type)) {
     int mx, my; SDL_GetMouseState(&mx, &my); consumed = my < VIEWER_NAV_HEIGHT;
   }
   if (!consumed && w > 0 && h > 0)
@@ -553,7 +553,7 @@ static int run_cpu(const viewer_options *options) {
   affordances.window = window; affordances.renderer = renderer;
   affordances.started = SDL_GetTicks(); affordances.dirty = 1;
   affordances.focused = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
-  if (input.client) viewer_input_install_wheel_filter(&input, window);
+  if (input.client) viewer_input_install_scroll_capture(&input, window);
   int input_test_sent = 0, window_test_sent = 0, scroll_test_stage = 0;
   failed = 0;
   while (running && (options->max_frames <= 0 || acquired < (uint64_t)options->max_frames)) {
@@ -685,9 +685,6 @@ static int run_cpu(const viewer_options *options) {
   if (options->max_frames > 0 && acquired != (uint64_t)options->max_frames) failed = 1;
   printf("acquired_frames=%" PRIu64 "\n", acquired);
 cleanup:
-#ifdef __APPLE__
-  SDL_SetEventFilter(NULL, NULL);
-#endif
   if (viewer_affordances_close(&affordances, options->log_affordances)) failed = 1;
   if (viewer_input_close(&input)) failed = 1;
   SDL_DestroyTexture(texture);

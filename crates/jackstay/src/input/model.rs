@@ -34,6 +34,25 @@ pub enum ScrollUnit {
     Line,
     Page,
 }
+/// Physical gesture phase; absence in a scroll event means unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollPhase {
+    None,
+    MayBegin,
+    Began,
+    Stationary,
+    Changed,
+    Ended,
+    Cancelled,
+}
+/// Momentum is independent of the physical gesture phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MomentumPhase {
+    None,
+    Began,
+    Changed,
+    Ended,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Position {
     pub revision: u64,
@@ -59,12 +78,15 @@ pub enum Event {
         x: f64,
         y: f64,
         unit: ScrollUnit,
+        phase: Option<ScrollPhase>,
+        momentum_phase: Option<MomentumPhase>,
+        inverted_from_device: Option<bool>,
         position: Position,
     },
 }
 impl Event {
     pub fn bytes(&self) -> usize {
-        96 + match self {
+        112 + match self {
             Self::Text(s) => s.len(),
             Self::Key {
                 key: Key::Physical(s) | Key::Logical(s),

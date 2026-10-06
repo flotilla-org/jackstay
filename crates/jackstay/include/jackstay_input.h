@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 #if defined(__unix__) || defined(__APPLE__) || defined(_WIN32)
-/* Shared input, ABI 0.7. Host supplies authorized, connected Unix streams, or
+/* Shared input, ABI 0.14. Host supplies authorized, connected Unix streams, or
  * (ABI 0.9, all platforms) Local Endpoint connections via the *_local calls.
  * Setup is blocking (bounded to five seconds on the client); run off GUI/input
  * threads. Established connections have independent network/heartbeat workers.
@@ -35,16 +35,30 @@ typedef struct ft_input_work ft_input_work;
 #define FT_INPUT_REPEAT 3
 #define FT_INPUT_PHYSICAL_KEY 1
 #define FT_INPUT_LOGICAL_KEY 2
-/* Scroll contract (all units): signs after controller-applied platform
- * natural-scrolling inversion:
- * positive y moves content toward its end (down), positive x toward the right.
- * SDL reference: negate both deltas for SDL_MOUSEWHEEL_FLIPPED, then negate y
- * to convert SDL positive-up to positive-down; x remains positive-right.
- * Executors own line height/page size and platform conversion; controllers
- * never pre-multiply. Fractions are allowed and controllers never round.
- * Phases/momentum metadata are deferred beyond v1; OS momentum is further
- * PIXEL events. See docs/design/input.md, "Scroll units".
+/* Scroll contract (ABI 0.14, input wire v2): positive x/y move content right/down.
+ * Preserve delivered natural-scroll deltas; never invert because of metadata.
+ * SDL converts positive-up y to positive-down, retaining x's sign.
+ * Scroll events never coalesce, including zero-delta lifecycle events.
+ * Executors own line height/page size; fractions remain unrounded.
  */
+/* Closed scalar values, not bit masks. Zero means unknown, distinct from NONE.
+ * Non-scroll events require all scroll metadata fields to be zero. */
+#define FT_INPUT_SCROLL_PHASE_UNKNOWN 0
+#define FT_INPUT_SCROLL_PHASE_NONE 1
+#define FT_INPUT_SCROLL_PHASE_MAY_BEGIN 2
+#define FT_INPUT_SCROLL_PHASE_BEGAN 3
+#define FT_INPUT_SCROLL_PHASE_STATIONARY 4
+#define FT_INPUT_SCROLL_PHASE_CHANGED 5
+#define FT_INPUT_SCROLL_PHASE_ENDED 6
+#define FT_INPUT_SCROLL_PHASE_CANCELLED 7
+#define FT_INPUT_MOMENTUM_PHASE_UNKNOWN 0
+#define FT_INPUT_MOMENTUM_PHASE_NONE 1
+#define FT_INPUT_MOMENTUM_PHASE_BEGAN 2
+#define FT_INPUT_MOMENTUM_PHASE_CHANGED 3
+#define FT_INPUT_MOMENTUM_PHASE_ENDED 4
+#define FT_INPUT_SCROLL_INVERSION_UNKNOWN 0
+#define FT_INPUT_SCROLL_INVERSION_FALSE 1
+#define FT_INPUT_SCROLL_INVERSION_TRUE 2
 /* Precise/continuous devices (trackpads, Magic Mouse, high-resolution wheels
  * reporting pixel deltas): target logical units, as geometry/pointer positions,
  * never device pixels. */
@@ -105,6 +119,12 @@ typedef struct {
  * x/y are target-local logical positions for motion/button and fractional deltas
  * for scroll. Scroll position is pointer_x/y, positive deltas right/down.
  * New positional events require the current revision; release does not.
+ * STATIONARY requires zero x/y. Metadata applies to every scroll unit.
+ * At admission/reset the target rejects orphan phased continuations as STALE
+ * until a fresh MAY_BEGIN/BEGAN. Unknown and known-unphased wheels remain valid.
+ * Cleanup cancels gesture/momentum at the executor's retained recipient, even
+ * without pointer buttons, and settles before publishing RESET.
+ * max_bytes must be at least 112; each payload-free event is charged 112 bytes.
  */
 typedef struct {
   uint32_t kind, action, key_kind, modifiers;
@@ -114,6 +134,7 @@ typedef struct {
   char key[64];
   const uint8_t *text;
   size_t text_len;
+  uint32_t scroll_phase, scroll_momentum_phase, scroll_inverted_from_device;
 } ft_input_event;
 typedef struct {
   uint64_t controller, epoch, sequence;
@@ -156,9 +177,12 @@ ft_status ft_input_target_resolve(ft_input_target *target);
 ft_status ft_input_target_destroy(ft_input_target **target);
 #if !defined(__cplusplus) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(ft_input_config) == 56, "input config ABI");
-_Static_assert(sizeof(ft_input_event) == 152, "input event ABI");
+_Static_assert(sizeof(ft_input_event) == 168, "input event ABI");
+_Static_assert(offsetof(ft_input_event, scroll_phase) == 152, "input scroll phase ABI");
+_Static_assert(offsetof(ft_input_event, scroll_momentum_phase) == 156, "input momentum phase ABI");
+_Static_assert(offsetof(ft_input_event, scroll_inverted_from_device) == 160, "input inversion ABI");
 _Static_assert(offsetof(ft_input_event, text) == 136, "input text pointer ABI");
-_Static_assert(sizeof(ft_input_operation) == 192, "input operation ABI");
+_Static_assert(sizeof(ft_input_operation) == 208, "input operation ABI");
 _Static_assert(sizeof(ft_input_status) == 56, "input status ABI");
 _Static_assert(offsetof(ft_input_status, sequence) == 8, "input coalesced count ABI");
 _Static_assert(FT_INPUT_COALESCED == 5, "input coalesced status ABI");

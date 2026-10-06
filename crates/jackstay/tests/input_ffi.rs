@@ -8,9 +8,9 @@ mod local;
 fn c_input_layouts_and_recoverable_handle_destruction_match_header() {
     if usize::BITS == 64 {
         assert_eq!(size_of::<FtInputConfig>(), 56);
-        assert_eq!(size_of::<FtInputEvent>(), 152);
+        assert_eq!(size_of::<FtInputEvent>(), 168);
         assert_eq!(std::mem::offset_of!(FtInputEvent, text), 136);
-        assert_eq!(size_of::<FtInputOperation>(), 192);
+        assert_eq!(size_of::<FtInputOperation>(), 208);
         assert_eq!(size_of::<FtInputStatus>(), 56);
         // Coalescing uses the existing sequence slot as a count, preserving layout.
         assert_eq!(std::mem::offset_of!(FtInputStatus, sequence), 8);

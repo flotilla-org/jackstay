@@ -25,6 +25,9 @@ _Static_assert(sizeof(precise_wheel) <= sizeof(SDL_Event), "precise wheel fits S
 static int send_event(viewer_input *input, ft_input_event *event) {
   uint64_t sequence = 0;
   ft_status s = ft_input_client_send(input->client, event, &sequence);
+  /* Geometry can advance before the viewer polls its reset notification.
+   * Drop the rejected action without recording a hold or replaying it. */
+  if (s == FT_STATUS_STALE) { fprintf(stderr, "input send: stale action dropped\n"); return 0; }
   if (s != FT_STATUS_OK) { fprintf(stderr, "input send: %d\n", s); input->failed = 1; return 0; }
   return 1;
 }

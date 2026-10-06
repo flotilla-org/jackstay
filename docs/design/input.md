@@ -181,7 +181,12 @@ physical start. With the gate closed and no fresh physical `MayBegin` or
 `Ended` as stale too, including when both deltas are zero. A momentum `Ended`
 with physical `None` is an orphan terminal event, not an accepted no-op.
 These rejections never schedule cleanup or alter the gate/epoch.
-Unknown/known-unphased wheel input can resume after reset using current geometry, with no inferred interaction.
+Unknown/known-unphased wheel input can resume after reset using current
+geometry, with no inferred interaction. In particular, present
+`Some(ScrollPhase::None)` with `Some(MomentumPhase::None)` is unphased and may
+be admitted while the gate is closed, just as a sample with both fields absent
+may be admitted. Normal epoch, geometry and input validation still apply.
+These samples neither open the gate nor create a phased native binding.
 There is at most one remote scroll interaction per controller/epoch; no device
 or gesture ID is added. A fresh physical start terminates any prior momentum
 before starting the new interaction. Executors keep physical and momentum
@@ -337,9 +342,12 @@ The follow-up implementation must verify:
   advance, and an intact new interaction; also cover a local client rejection
   before it receives `Reset`.
   With the gate closed, submit current-epoch/current-geometry zero-delta
-  physical `Ended`, physical `Cancelled`, and momentum `Ended` with physical
-  `None`. Each must be rejected as stale, with no dispatched event, cleanup,
-  reset or gate change; then verify that a fresh physical start still succeeds.
+  physical `Stationary`, `Changed`, `Ended`, `Cancelled`, and momentum `Ended`
+  with physical `None`. Each must be rejected as stale, with no dispatched
+  event, cleanup, reset or gate change. Present physical `None` with present
+  momentum `None`, and a sample with both fields absent, must be admitted at
+  current epoch/geometry without opening the gate or creating a phased binding;
+  then verify that a fresh physical start still succeeds.
 - macOS native capture through SDL2 and sdl2-compat with no duplicate deltas,
   the enum translation below the Luchs helper protocol, and zero-delta cleanup.
   Keep a platform-independent fixture for the portable unknown-phase fallback.

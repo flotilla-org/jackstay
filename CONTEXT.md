@@ -45,3 +45,8 @@ from incoming frames the producer dropped before publication.
 **Reconfiguration**:
 A transition in frame size, format, or resource allocation requirements. Existing
 leases continue to describe their original frames through the transition.
+
+**Audio track**:
+The ordered stream of audio samples a publication carries alongside its frames,
+described by its own sample format and sharing the publication's lifetime.
+_Avoid_: media, which names the playback-state affordance domain, not sample data

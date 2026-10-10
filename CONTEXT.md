@@ -64,6 +64,12 @@ consumer at attachment and updated as tracks are added, removed or changed.
 A consumer's choice of which offered tracks its incarnation uses, including any
 request to be the writer of a track that flows toward the source.
 
+**Host time**:
+The platform's monotonic clock in nanoseconds, and the one clock domain of a live
+publication. A timestamp in it is the source presentation time of a frame or of
+an audio block's first sample.
+_Avoid_: media time, unix time, capture time
+
 **Audio track**:
 A track of ordered audio samples, described by its own sample format.
 _Avoid_: media, which names the playback-state affordance domain, not sample data

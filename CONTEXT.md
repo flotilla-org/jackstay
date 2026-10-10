@@ -46,9 +46,26 @@ from incoming frames the producer dropped before publication.
 A transition in frame size, format, or resource allocation requirements. Existing
 leases continue to describe their original frames through the transition.
 
+**Publication**:
+One source's running set of tracks behind a local endpoint.
+_Avoid_: stream, when the whole set of tracks is meant
+
+**Track**:
+One stream within a publication, with a kind and a direction. Kinds are open:
+core kinds such as video, playback, recording, input and affordances, plus
+app-defined kinds whose descriptors Jackstay treats as opaque.
+_Avoid_: channel, which is reserved for audio speaker channels
+
+**Track offer**:
+The source host's description of a publication's current tracks, given to a
+consumer at attachment and updated as tracks are added, removed or changed.
+
+**Track selection**:
+A consumer's choice of which offered tracks its incarnation uses, including any
+request to be the writer of a track that flows toward the source.
+
 **Audio track**:
-An ordered stream of audio samples that a publication carries in one direction,
-described by its own sample format and sharing the publication's lifetime.
+A track of ordered audio samples, described by its own sample format.
 _Avoid_: media, which names the playback-state affordance domain, not sample data
 
 **Playback track**:

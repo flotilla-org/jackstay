@@ -47,6 +47,15 @@ A transition in frame size, format, or resource allocation requirements. Existin
 leases continue to describe their original frames through the transition.
 
 **Audio track**:
-The ordered stream of audio samples a publication carries alongside its frames,
+An ordered stream of audio samples that a publication carries in one direction,
 described by its own sample format and sharing the publication's lifetime.
 _Avoid_: media, which names the playback-state affordance domain, not sample data
+
+**Playback track**:
+An audio track the source's app plays, flowing from the source to its consumers.
+_Avoid_: output, capture, which flip meaning depending on whose side you are on
+
+**Recording track**:
+An audio track the source's app records, supplied by one admitted consumer back
+to the source.
+_Avoid_: input, which names the input channel; microphone, which names a device

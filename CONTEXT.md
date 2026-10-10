@@ -75,4 +75,4 @@ _Avoid_: output, capture, which flip meaning depending on whose side you are on
 **Recording track**:
 An audio track the source's app records, supplied by one admitted consumer back
 to the source.
-_Avoid_: input, which names the input channel; microphone, which names a device
+_Avoid_: input, which names the input track kind; microphone, which names a device

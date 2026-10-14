@@ -1,5 +1,6 @@
 pub mod acquisition;
 pub mod bootstrap;
+pub mod cbor;
 pub mod control_page;
 #[cfg(unix)]
 pub mod daemon;

@@ -187,3 +187,11 @@ Affordances are available through explicit `bootstrap::accept_v2` /
 [`jackstay_affordances.h`](crates/jackstay/include/jackstay_affordances.h) surface.
 The legacy bootstrap entry points explicitly select v1. No automatic downgrade
 or retry occurs on a partially consumed stream.
+
+## Setup encoding
+
+Setup messages are moving to deterministic CBOR under flotilla ADR 0063. The
+[setup encoding](docs/design/setup-encoding.md) note describes the profile;
+`jackstay::cbor` is the one codec that enforces it, and its
+[conformance corpus](crates/jackstay/tests/cbor_corpus/README.md) defines it.
+No setup message uses it yet (#111).

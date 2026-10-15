@@ -445,7 +445,7 @@ static int select_tracks(ft_local_connection **local, const viewer_options *opti
   ft_track_admission admissions[3];
   ft_status input_status;
   ft_status status = ft_handshake_select(&offer, selection, selected, options->input_policy ? options->typing : 0,
-      admissions, local, &input->client, &input_status, &affordances->host);
+      admissions, local, &input->client, &input_status, &affordances->host, NULL, NULL, NULL);
   if (status != FT_STATUS_OK) {
     fprintf(stderr, "handshake selection failed: status=%d%s\n", status,
             options->affordances == 2 ? "; required affordances must be admitted" : "");

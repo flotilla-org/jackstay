@@ -515,7 +515,7 @@ unsafe fn offer_tracks(connection: &mut *mut FtLocalConnection, target: *mut FtI
         descriptor: ptr::null(),
         descriptor_len: 0,
         direction,
-        reserved: 0,
+        ..Default::default()
     };
     let tracks = [track(1, c"video", FT_TRACK_FROM_SOURCE), track(2, c"input", FT_TRACK_TO_SOURCE)];
     let mut admissions = [FtTrackAdmission::default(); 2];
@@ -528,11 +528,14 @@ unsafe fn offer_tracks(connection: &mut *mut FtLocalConnection, target: *mut FtI
             FT_CLOCK_DOMAIN_HOST_TIME,
             tracks.as_ptr(),
             2,
+            ptr::null(),
+            0,
             target,
             admissions.as_mut_ptr(),
             &mut count,
             &mut server,
             &mut affordances,
+            ptr::null_mut(),
         )
     };
     assert_eq!((status, count), (FT_STATUS_OK, 2));
@@ -574,6 +577,9 @@ unsafe fn select_tracks(connection: &mut *mut FtLocalConnection) -> *mut FtInput
                 &mut input,
                 &mut input_status,
                 &mut affordances,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
             ),
             FT_STATUS_OK
         );

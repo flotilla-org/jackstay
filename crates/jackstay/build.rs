@@ -3,6 +3,9 @@ fn main() {
     // AND the target is macOS (the feature may be enabled by a dependent on
     // any platform; it must be a no-op elsewhere).
     println!("cargo:rerun-if-changed=include/jackstay_affordances.h");
+    // The playback contract test, compiled with each platform's header smoke.
+    println!("cargo:rerun-if-changed=include/jackstay_audio.h");
+    println!("cargo:rerun-if-changed=src/native/c_playback_contract.c");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let backend_macos = std::env::var_os("CARGO_FEATURE_BACKEND_MACOS").is_some();
     let backend_linux = std::env::var_os("CARGO_FEATURE_BACKEND_LINUX").is_some();
@@ -31,7 +34,10 @@ fn build_windows_smoke() {
     println!("cargo:rerun-if-changed=include/jackstay_handshake.h");
     println!("cargo:rerun-if-changed=src/native/c_abi_header_smoke.c");
     let mut build = cc::Build::new();
-    build.include("include").file("src/native/c_abi_header_smoke.c");
+    build
+        .include("include")
+        .file("src/native/c_abi_header_smoke.c")
+        .file("src/native/c_playback_contract.c");
     // The D3D11 entry points exist only in a backend-windows library.
     if std::env::var_os("CARGO_FEATURE_BACKEND_WINDOWS").is_some() {
         build.define("JACKSTAY_BACKEND_WINDOWS", None);
@@ -59,6 +65,7 @@ fn build_macos_shim() {
     cc::Build::new()
         .include("include")
         .file("src/native/c_abi_header_smoke.c")
+        .file("src/native/c_playback_contract.c")
         .compile("porthole_capture_transfer_c_abi_header_smoke");
     cc::Build::new()
         .include("include")
@@ -90,6 +97,7 @@ fn build_linux_shim() {
     build
         .include("include")
         .file("src/native/c_abi_header_smoke.c")
+        .file("src/native/c_playback_contract.c")
         .file("src/native/linux_drm_shim.c")
         .file("src/native/linux_vulkan_shim.c")
         .file("src/native/linux_pipewire_shim.c");

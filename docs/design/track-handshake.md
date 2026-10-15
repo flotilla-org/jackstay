@@ -43,7 +43,7 @@ selection position, which is its doorbell hint bit. A removed track's mapping
 stays valid until the consumer drops it; its ring just stops advancing. The
 tracks channel is always sent, one extra channel per admission. It is separate
 because CPU setup owns the media stream once video is admitted, and is
-consumer-driven. It is Rust-only for now; the C ABI follows in #116.
+consumer-driven.
 
 Kinds are open. The core kinds are `video`, `input` and `affordances`; an app
 kind is a reverse-domain name of lowercase labels, such as `org.example.cue`,
@@ -93,6 +93,12 @@ Endpoint connections: `ft_handshake_accept_local` takes the clock domain and
 submit `ft_track_selection`s. POSIX callers with a connected socket wrap it with
 `ft_local_connection_adopt`. After basic checks the connection or offer is
 consumed on failure; a required refusal returns `FT_STATUS_UNSUPPORTED`.
+Hosts pass each playback track's `ft_playback` to accept and get
+`ft_track_notices` (add, update, remove, serve); consumers get the admitted
+rings by selection position, the doorbell and `ft_tracks` (next, select).
+Playback descriptors cross as `ft_audio_descriptor` in `ft_track_offer.audio`,
+never as bytes. `jackstay_audio.h` covers writers, readers and the doorbell,
+and states the threading rules: block writes are safe on a real-time thread.
 
 Media and channel lifetimes stay independent. If CPU attach later fails and the
 host abandons the source, close and poll the input client for cleanup, then
@@ -115,4 +121,6 @@ requires it) and affordances by `--affordances none|optional|required`.
 scenarios against the Rust API and through the C ABI: admission of video, input
 and affordances, optional and required refusals, busy input, app kinds with
 4 KiB descriptors, malformed frames and a stalled peer. The viewer's ctest suite
-covers the same exchange across processes.
+covers the same exchange across processes. `tests/playback.rs` covers playback
+tracks, and `tests/playback_ffi.rs` runs the same scenarios as compiled C
+(`src/native/c_playback_contract.c`) on Linux, macOS and Windows.

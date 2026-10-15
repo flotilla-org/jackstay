@@ -7,7 +7,10 @@
 _Static_assert(sizeof(ft_cpu_grant_descriptor) == 120 && sizeof(ft_cpu_configuration_descriptor) == 88,
                "CPU descriptor layout");
 _Static_assert(sizeof(ft_track_selection) == 16 && sizeof(ft_track_admission) == 16 &&
-               sizeof(ft_track_offer) == 16 + 3 * sizeof(void *) + sizeof(size_t), "track layout");
+               sizeof(ft_track_offer) == 32 + 3 * sizeof(void *) + sizeof(size_t) &&
+               sizeof(ft_track_notice) == 8 + sizeof(ft_track_offer), "track layout");
+_Static_assert(sizeof(ft_audio_format) == 8 && sizeof(ft_audio_descriptor) == 16 &&
+               sizeof(ft_audio_block) == 48 + sizeof(void *) + sizeof(size_t), "audio layout");
 
 /* Run by acquisition_ffi.rs through this actual C translation unit. The test
  * producer wraps history and destroys its consumer between take and finish. */
@@ -63,14 +66,16 @@ int jackstay_c_local_endpoint_smoke(void) {
       ft_acquisition_cpu_connection_create_local;
   ft_status (*setup_alive_fn)(const ft_cpu_acquisition_connection *) = ft_acquisition_cpu_connection_alive;
   ft_status (*handshake_accept_fn)(ft_local_connection **, const char *, uint32_t, const ft_track_offer *, size_t,
-                                   ft_input_target *, ft_track_admission *, size_t *, ft_input_server **,
-                                   ft_affordances_producer **) = ft_handshake_accept_local;
+                                   ft_playback *const *, size_t, ft_input_target *, ft_track_admission *,
+                                   size_t *, ft_input_server **, ft_affordances_producer **,
+                                   ft_track_notices **) = ft_handshake_accept_local;
   ft_status (*handshake_connect_fn)(ft_local_connection **, ft_handshake_offer **) = ft_handshake_connect_local;
   ft_status (*handshake_describe_fn)(const ft_handshake_offer *, const char **, uint32_t *,
                                      const ft_track_offer **, size_t *) = ft_handshake_offer_describe;
   ft_status (*handshake_select_fn)(ft_handshake_offer **, const ft_track_selection *, size_t, uint32_t,
                                    ft_track_admission *, ft_local_connection **, ft_input_client **,
-                                   ft_status *, ft_affordances_host **) = ft_handshake_select;
+                                   ft_status *, ft_affordances_host **, ft_playback_ring **,
+                                   ft_playback_doorbell **, ft_tracks **) = ft_handshake_select;
   void (*handshake_destroy_fn)(ft_handshake_offer **) = ft_handshake_offer_destroy;
   ft_status (*input_serve_fn)(ft_input_target *, ft_local_connection **, ft_input_server **) =
       ft_input_target_serve_local;

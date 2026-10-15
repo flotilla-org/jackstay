@@ -3,6 +3,7 @@ module Jackstay {
     header "jackstay_ring.h"
     header "jackstay_input.h"
     header "jackstay_handshake.h"
+    header "jackstay_audio.h"
     header "jackstay_affordances.h"
     link "jackstay"
     export *

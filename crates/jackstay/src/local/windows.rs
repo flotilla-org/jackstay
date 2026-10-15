@@ -1110,8 +1110,8 @@ pub fn receive_handles(stream: &mut PipeStream, count: usize) -> io::Result<Vec<
     let mut values = vec![0; sent * 8];
     stream.read_exact(&mut values)?;
     let mut handles = Vec::with_capacity(sent);
-    for value in values.chunks_exact(8) {
-        let value = u64::from_le_bytes(value.try_into().expect("eight bytes"));
+    for value in values.as_chunks::<8>().0 {
+        let value = u64::from_le_bytes(*value);
         if value == 0
             || handles
                 .iter()

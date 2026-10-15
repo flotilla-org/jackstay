@@ -30,7 +30,8 @@ func check(_ status: ft_status, _ operation: String) {
 precondition(MemoryLayout<jackstay_ring_header>.size > 0)
 precondition(MemoryLayout<ft_input_event>.size > 0)
 precondition(MemoryLayout<ft_aff_snapshot>.size > 0)
-precondition(FT_BOOTSTRAP_INPUT_NONE == 0)
+precondition(MemoryLayout<ft_track_offer>.size > 0)
+precondition(FT_TRACK_ADMITTED == 0)
 // Clang's Swift importer cannot expose the C cast in FT_ABI_VERSION. Build the
 // same value from its imported components, without changing the public C ABI.
 let FT_ABI_VERSION = UInt32((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR)

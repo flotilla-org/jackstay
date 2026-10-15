@@ -100,12 +100,12 @@ impl Reader {
                     let pixels = self.pixels(&frame);
                     if std::env::var_os("JACKSTAY_WGC_DEBUG").is_some() {
                         let mut colors = std::collections::BTreeMap::new();
-                        for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
                             colors.entry(pixel.to_vec()).or_insert((0, index)).0 += 1;
                         }
                         eprintln!("frame {}x{}: {colors:?}", descriptor.width, descriptor.height);
                     }
-                    if (descriptor.width, descriptor.height) == size && pixels.chunks_exact(4).all(|pixel| pixel == bgra(rgb)) {
+                    if (descriptor.width, descriptor.height) == size && pixels.as_chunks::<4>().0.iter().all(|pixel| *pixel == bgra(rgb)) {
                         return frame;
                     }
                 }
@@ -156,7 +156,7 @@ fn a_captured_window_follows_resize_pause_device_loss_and_close() {
     let resized = reader.until_uniform(&producer, &mut consumer, BLUE, (200, 90));
     assert_ne!(resized.descriptor().pool_id, red.descriptor().pool_id);
     assert!(
-        reader.pixels(&red).chunks_exact(4).all(|pixel| pixel == bgra(RED)),
+        reader.pixels(&red).as_chunks::<4>().0.iter().all(|pixel| *pixel == bgra(RED)),
         "held frame changed across resize"
     );
     drop((red, resized));
@@ -276,7 +276,7 @@ fn cpu_publication_is_reported_and_carries_the_client_area() {
         if let AcquireOutcome::Frame(frame) = consumer.acquire_latest(0).unwrap() {
             let descriptor = frame.descriptor();
             assert_eq!((descriptor.width, descriptor.height, descriptor.stride), (160, 40, 160 * 4));
-            if frame.bytes().chunks_exact(4).all(|pixel| pixel == bgra(GREEN)) {
+            if frame.bytes().as_chunks::<4>().0.iter().all(|pixel| *pixel == bgra(GREEN)) {
                 break;
             }
         }

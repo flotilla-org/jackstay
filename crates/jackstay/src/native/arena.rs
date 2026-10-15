@@ -395,7 +395,6 @@ where
                 height: self.params.height,
                 pixel_format: self.params.pixel_format as u32,
                 color_space: self.params.color_space as u32,
-                clock_domain: self.params.clock_domain as u32,
                 payload_kind: self.backend.payload_kind() as u32,
                 modifier: self.params.modifier,
                 sync_kind: FrameSyncKind::NativeTimeline as u32,

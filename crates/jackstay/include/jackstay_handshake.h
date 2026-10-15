@@ -62,7 +62,8 @@ typedef struct ft_track_admission {
 
 typedef struct ft_handshake_offer ft_handshake_offer;
 
-/* Source host. Offer at most one input and one affordances track. A non-NULL
+/* Source host. clock_domain is the one FT_CLOCK_DOMAIN_* of every track's
+ * timestamps. Offer at most one input and one affordances track. A non-NULL
  * target authorizes this peer's input on it; NULL refuses input tracks. The
  * target stays live until return; its executor keeps pumping. out_admissions
  * holds track_count entries and receives *out_admission_count of them in
@@ -71,7 +72,7 @@ typedef struct ft_handshake_offer ft_handshake_offer;
  * the connection is consumed on failure. Returned servers own workers; they
  * are not proof of input admission. */
 ft_status ft_handshake_accept_local(ft_local_connection **connection, const char *source_label,
-                                    const ft_track_offer *tracks, size_t track_count,
+                                    uint32_t clock_domain, const ft_track_offer *tracks, size_t track_count,
                                     ft_input_target *authorized_input,
                                     ft_track_admission *out_admissions, size_t *out_admission_count,
                                     ft_input_server **out_input,
@@ -83,7 +84,8 @@ ft_status ft_handshake_accept_local(ft_local_connection **connection, const char
 ft_status ft_handshake_connect_local(ft_local_connection **connection, ft_handshake_offer **out_offer);
 /* Borrowed until the offer is selected or destroyed. */
 ft_status ft_handshake_offer_describe(const ft_handshake_offer *offer, const char **out_source_label,
-                                      const ft_track_offer **out_tracks, size_t *out_track_count);
+                                      uint32_t *out_clock_domain, const ft_track_offer **out_tracks,
+                                      size_t *out_track_count);
 /* input_mode is one FT_INPUT_MODE_* value, or 0 when no input track is
  * selected. out_admissions receives count entries in selection order. On
  * success the media connection is in *out_connection, ready for

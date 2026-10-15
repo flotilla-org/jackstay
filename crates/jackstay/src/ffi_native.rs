@@ -1048,7 +1048,7 @@ mod tests {
     };
     use crate::{
         ffi::{FT_STATUS_EMPTY, FT_STATUS_OK, FT_STATUS_TIMEOUT},
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat},
         native::{
             NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy,
             attach::AttachEndpoint,
@@ -1066,7 +1066,6 @@ mod tests {
             height: HEIGHT,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         };
         Arc::new(Mutex::new(
@@ -1234,7 +1233,7 @@ mod linux_tests {
         control_page::{PendingVideoRingEntry, VideoTrackControlPage},
         fdpass::recv_fds,
         ffi::{FT_STATUS_CLOSED, FT_STATUS_EMPTY, FT_STATUS_INVALID_ARGUMENT, FT_STATUS_OK, FT_STATUS_UNSUPPORTED},
-        model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
+        model::{ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
         native::{
             lease::NativeLeaseIdentity,
             linux::{
@@ -1262,7 +1261,6 @@ mod linux_tests {
             slot_id: 0,
             payload_offset: 0,
             payload_len: 0,
-            clock_domain: ClockDomain::HostTime as u32,
             color_space: ColorSpace::Srgb as u32,
             sync_kind: FrameSyncKind::NativeTimeline as u32,
             damage_kind: DamageKind::FullFrame as u32,
@@ -1458,7 +1456,6 @@ mod linux_tests {
             slot_id: 0,
             payload_offset: 0,
             payload_len: 0,
-            clock_domain: ClockDomain::HostTime as u32,
             color_space: ColorSpace::Srgb as u32,
             sync_kind: FrameSyncKind::NativeTimeline as u32,
             damage_kind: DamageKind::FullFrame as u32,

@@ -143,6 +143,7 @@ fn c_handshake_snapshot_verb_and_destroy() {
                 ft_handshake_accept_local(
                     &mut a,
                     c"source".as_ptr(),
+                    FT_CLOCK_DOMAIN_HOST_TIME,
                     &track,
                     1,
                     ptr::null_mut(),

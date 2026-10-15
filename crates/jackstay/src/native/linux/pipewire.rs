@@ -460,7 +460,6 @@ impl PipeWireNativeProducerObserver {
             height: config.height,
             pixel_format,
             color_space: crate::model::ColorSpace::Srgb,
-            clock_domain: crate::model::ClockDomain::MediaTime,
             modifier: config.modifier,
         })
     }
@@ -621,6 +620,8 @@ impl PipeWireStreamObserver for PipeWireNativeProducerObserver {
             return;
         };
         drop(state);
+        // pw_buffer.time is CLOCK_MONOTONIC (host time) since PipeWire 1.0.5;
+        // earlier versions leave it zero, which publish stamps as now.
         if let Err(error) = producer
             .lock()
             .expect("pipewire native producer poisoned")
@@ -1264,7 +1265,7 @@ mod tests {
     };
     use crate::{
         CaptureTransferError,
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat, host_time_ns},
         native::{
             NativeFrameBackend, NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy,
             lease::{NativeLeaseIdentity, NativeLeaseRelease},
@@ -1587,7 +1588,6 @@ mod tests {
                 height: 32,
                 pixel_format: PixelFormat::Bgra8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::MediaTime,
                 modifier: DRM_FORMAT_MOD_LINEAR,
             },
             1,
@@ -1672,7 +1672,8 @@ mod tests {
         };
         observer.buffer_added(0, Ok(descriptor0));
         observer.buffer_added(1, Ok(descriptor1.clone()));
-        observer.frame_ready(1, 1234, Ok(descriptor1));
+        let before = host_time_ns();
+        observer.frame_ready(1, 0, Ok(descriptor1));
 
         let producer = handle.producer().expect("observer should build producer on first frame");
         let producer = producer.lock().unwrap();
@@ -1681,7 +1682,7 @@ mod tests {
         assert_eq!(entry.slot_id, 1);
         assert_eq!(entry.width, 64);
         assert_eq!(entry.height, 32);
-        assert_eq!(entry.timestamp_ns, 1234);
+        assert!((before..=host_time_ns()).contains(&entry.timestamp_ns));
         assert!(
             handle.last_error().is_none(),
             "unexpected observer error: {:?}",

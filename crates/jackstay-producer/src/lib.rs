@@ -18,6 +18,7 @@ use jackstay::{
     handshake::{self, Direction, Kind, Offer, Track},
     input::{Config, Geometry, Outcome, Target, Work},
     local::{Endpoint, Listener, ShutdownHandle},
+    model::ClockDomain,
 };
 
 /// The offered track IDs: one video, input and affordances track each.
@@ -107,6 +108,7 @@ impl<P: Producer> Builder<P> {
         };
         let offer = Arc::new(Offer {
             source: self.endpoint.name().into(),
+            clock: ClockDomain::HostTime,
             tracks: vec![
                 track(VIDEO, Kind::Video, Direction::FromSource, "default"),
                 track(INPUT, Kind::Input, Direction::ToSource, "default"),

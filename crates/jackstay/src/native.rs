@@ -34,7 +34,7 @@ use std::os::windows::io::OwnedHandle as OwnedFd;
 use crate::{
     control_page::{PendingVideoRingEntry, VideoTrackControlPage},
     error::{CaptureTransferError, Result},
-    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
+    model::{ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat, host_time_ns},
     native::attach::{AttachGrant, AttachPool},
 };
 
@@ -47,7 +47,6 @@ pub struct NativeStreamParams {
     pub height: u32,
     pub pixel_format: PixelFormat,
     pub color_space: ColorSpace,
-    pub clock_domain: ClockDomain,
     /// Format modifier (e.g. dmabuf modifier); 0 / linear for IOSurface.
     pub modifier: u64,
 }
@@ -306,7 +305,8 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
 
     /// Stage `frame` into an eligible surface, signal the fence, and publish
     /// the descriptor. When the pool is exhausted the configured
-    /// [`PoolExhaustionPolicy`] applies.
+    /// [`PoolExhaustionPolicy`] applies. A zero `timestamp_ns` is stamped
+    /// with [`host_time_ns`].
     pub fn publish(&mut self, frame: &B::CapturedFrame, timestamp_ns: u64) -> Result<PublishOutcome> {
         let Some(slot_id) = self.claim_slot(frame)? else {
             return match self.exhaustion_policy {
@@ -341,7 +341,7 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
         self.backend.signal_fence(&mut self.fence, self.fence_value)?;
         let cursor = self.page.push(PendingVideoRingEntry {
             sequence: self.sequence,
-            timestamp_ns,
+            timestamp_ns: if timestamp_ns == 0 { host_time_ns() } else { timestamp_ns },
             width: self.params.width,
             height: self.params.height,
             // Native payloads have no in-band bytes; the surface defines its
@@ -352,7 +352,6 @@ impl<B: NativeFrameBackend> NativeTrackProducer<B> {
             slot_id,
             payload_offset: 0,
             payload_len: 0,
-            clock_domain: self.params.clock_domain as u32,
             color_space: self.params.color_space as u32,
             sync_kind: FrameSyncKind::NativeTimeline as u32,
             damage_kind: DamageKind::FullFrame as u32,
@@ -698,7 +697,7 @@ mod tests {
     use crate::{
         CaptureTransferError,
         control_page::{VideoRingReadError, VideoTrackControlPage},
-        model::{ClockDomain, ColorSpace, FrameSyncKind, PayloadKind, PixelFormat},
+        model::{ColorSpace, FrameSyncKind, PayloadKind, PixelFormat, host_time_ns},
     };
 
     fn params() -> NativeStreamParams {
@@ -707,7 +706,6 @@ mod tests {
             height: 480,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         }
     }
@@ -781,6 +779,16 @@ mod tests {
         assert_eq!(entry.slot_id, 0);
         assert_eq!(registry.surface_bytes(entry.pool_id, entry.slot_id).unwrap(), vec![7, 8, 9]);
         assert!(registry.fence_value(entry.fence_id).unwrap() >= entry.fence_value);
+    }
+
+    #[test]
+    fn unset_timestamps_are_stamped_with_host_time() {
+        let registry = FakeSurfaceRegistry::default();
+        let mut producer = producer(&registry, 4, 5, PoolExhaustionPolicy::default());
+        let before = host_time_ns();
+        let cursor = publish_cursor(&mut producer, &[1], 0);
+        let entry = map_consumer_page(&producer).read_entry_for_cursor(cursor).unwrap();
+        assert!((before..=host_time_ns()).contains(&entry.timestamp_ns));
     }
 
     #[test]

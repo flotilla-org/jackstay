@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use jackstay::{
     acquisition::arena::{AcquireOutcome, ArenaConfig},
-    model::{ClockDomain, ColorSpace, PixelFormat},
+    model::{ColorSpace, PixelFormat},
     native::{
         NativeFrameBackend, NativeStreamParams,
         arena::NativeArenaProducer,
@@ -21,7 +21,6 @@ fn producer() -> Arc<Mutex<NativeArenaProducer<MacosFrameBackend>>> {
         height: 16,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     let mut backend = MacosFrameBackend::new().unwrap();
@@ -86,7 +85,6 @@ fn c_native_frames_keep_their_generation_handles_after_replacement_and_api_teard
                 height: 19,
                 pixel_format: PixelFormat::Rgba8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             })
             .unwrap();
@@ -187,7 +185,6 @@ fn xpc_replacement_keeps_an_acquired_old_generation_and_installs_new_native_hand
             height: 19,
             pixel_format: PixelFormat::Rgba8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         })
         .unwrap();

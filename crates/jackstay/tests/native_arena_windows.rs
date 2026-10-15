@@ -14,7 +14,7 @@ use jackstay::{
         AcquireOutcome, ArenaConfig, ArenaError, Cancellation, ConfigurationInstall, PublishOutcome, ReconfigurationStatus, WaitInterest,
         WaitOutcome,
     },
-    model::{ClockDomain, ColorSpace, PayloadKind, PixelFormat},
+    model::{ColorSpace, PayloadKind, PixelFormat},
     native::{
         NativeFrameBackend, NativeStreamParams,
         arena::{ArenaNativeBackend, NativeArenaProducer},
@@ -43,7 +43,6 @@ fn params(width: u32, height: u32) -> NativeStreamParams {
         height,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     }
 }

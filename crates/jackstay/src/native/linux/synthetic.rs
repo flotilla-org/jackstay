@@ -284,7 +284,7 @@ fn surface_layout(params: &NativeStreamParams) -> Result<(u32, u64)> {
 mod tests {
     use crate::{
         CaptureTransferError,
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat},
         native::{
             NativeFrameBackend, NativeStreamParams, SlotClaim, SlotReuseCandidate,
             linux::synthetic::{SyntheticLinuxBackend, surface_layout},
@@ -297,7 +297,6 @@ mod tests {
             height: 32,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         }
     }

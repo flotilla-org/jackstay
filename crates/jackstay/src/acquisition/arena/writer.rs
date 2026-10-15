@@ -193,6 +193,7 @@ impl ArenaProducer {
         descriptor.config_generation = map.generation;
         descriptor.slot_id = index as u32;
         descriptor.payload_offset = map.layout.payload_offset(index) as u64;
+        super::stamp(&mut descriptor);
         // SAFETY: exclusive retired slot; delegate writes completed before call.
         unsafe {
             map.descriptor_ptr(index).write(descriptor);

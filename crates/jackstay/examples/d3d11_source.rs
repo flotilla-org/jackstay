@@ -53,7 +53,7 @@ mod source {
     use jackstay::{
         acquisition::arena::{ArenaConfig, ReconfigurationStatus},
         local::{Endpoint, Listener, Scope, Transport},
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat, host_time_ns},
         native::{
             NativeStreamParams,
             arena::NativeArenaProducer,
@@ -137,7 +137,6 @@ mod source {
             height: size.1,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         }
     }
@@ -268,7 +267,7 @@ mod source {
                     }
                     *frame += 1;
                     let texture = device.upload(size.0, size.1, PixelFormat::Bgra8Unorm, &pattern(size, *frame))?;
-                    producer.publish(&D3d11CapturedFrame::new(texture), elapsed.as_nanos() as u64)?;
+                    producer.publish(&D3d11CapturedFrame::new(texture), host_time_ns())?;
                     let _ = producer.poll_cleanup();
                 }
                 Self::Window { window, capture, color } => {

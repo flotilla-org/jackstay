@@ -6,15 +6,19 @@
 //! flows toward the source. The host replies with what it admitted, in
 //! selection order, and then passes one channel per admitted input or
 //! affordances track: a socketpair end with SCM_RIGHTS on Unix, or a private
-//! pipe end duplicated into the verified peer on Windows. A required refusal
-//! closes setup on both sides; optional refusals are reported.
+//! pipe end duplicated into the verified peer on Windows. When playback tracks
+//! are admitted it then passes their doorbell and read-only rings in one
+//! transfer (see [`crate::audio`]). A required refusal closes setup on both
+//! sides; optional refusals are reported.
 //!
 //! An admitted video track is carried by this same connection, which stays
 //! the CPU setup stream so `serve_cpu` sees the consumer's kernel identity.
 //! This module creates no listener, discovers no source and grants no
 //! authority: the host selects the source and supplies its input target.
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
 use std::{collections::HashSet, io, time::Duration};
 
 pub use flotilla_cbor::Bytes;
@@ -23,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     affordances,
+    audio::{self, Playback},
     input::{
         self, Mode, Target,
         transport::{Client, ConnectError, Server},
@@ -50,6 +55,8 @@ pub enum Kind {
     Video,
     Input,
     Affordances,
+    /// Playback audio, described by an [`audio::Descriptor`].
+    Playback,
     /// Any other kind. A consumer skips kinds it does not know.
     Other(String),
 }
@@ -60,6 +67,7 @@ impl From<String> for Kind {
             "video" => Self::Video,
             "input" => Self::Input,
             "affordances" => Self::Affordances,
+            "playback" => Self::Playback,
             _ => Self::Other(kind),
         }
     }
@@ -77,6 +85,7 @@ impl Kind {
             Self::Video => "video",
             Self::Input => "input",
             Self::Affordances => "affordances",
+            Self::Playback => "playback",
             Self::Other(kind) => kind,
         }
     }
@@ -108,7 +117,7 @@ pub struct Track {
     pub kind: Kind,
     pub direction: Direction,
     pub label: String,
-    /// Empty for today's core kinds.
+    /// Empty for core kinds other than playback.
     #[serde(default)]
     pub descriptor: Bytes,
 }
@@ -191,6 +200,8 @@ pub enum Error {
     Refused { id: u64, refusal: Refusal },
     #[error("input admission: {0:?}")]
     Input(input::Error),
+    #[error("playback: {0}")]
+    Audio(#[from] audio::Error),
 }
 
 pub struct Accepted {
@@ -201,20 +212,25 @@ pub struct Accepted {
     /// Retain this independently of media; dropping schedules target cleanup.
     pub input: Option<Server>,
     pub affordances: Option<affordances::Producer>,
+    /// Retain for the incarnation's lifetime when playback was admitted.
+    pub doorbell: Option<audio::Bell>,
 }
 
 /// Run the host side on a worker. Supplying a target authorizes input on that
-/// target for this peer; None refuses any input track. One offer track per
+/// target for this peer; None refuses any input track. Every offered playback
+/// track needs its ring in `playback`. One offer track per
 /// video, input and affordances kind at most: one incarnation carries one
 /// media stream. On any failure, including a required
 /// refusal, all owned channels close; keep pumping target cleanup. The whole
 /// handshake is bounded to five seconds.
-pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>) -> Result<Accepted, Error> {
+pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &[Playback]) -> Result<Accepted, Error> {
     let mut ids = HashSet::new();
     let mut single_kinds = HashSet::new();
+    let ring = |id| playback.iter().find(|p| p.id() == id);
     for track in &offer.tracks {
         let single = matches!(track.kind, Kind::Video | Kind::Input | Kind::Affordances);
-        if !ids.insert(track.id) || !track.kind.offerable() || (single && !single_kinds.insert(track.kind.clone())) {
+        let unplayable = track.kind == Kind::Playback && (track.direction != Direction::FromSource || ring(track.id).is_none());
+        if !ids.insert(track.id) || !track.kind.offerable() || unplayable || (single && !single_kinds.insert(track.kind.clone())) {
             return Err(Error::Protocol("invalid offer"));
         }
     }
@@ -270,12 +286,38 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>) -> Result<A
     for peer in peers {
         handshake.send_channel(peer)?;
     }
+    let playing = playback_tracks(offer, &admissions);
+    let mut doorbell = None;
+    if !playing.is_empty() {
+        let (bell, mut objects) = audio::Bell::new()?;
+        for (_, id) in &playing {
+            objects.push(ring(*id).expect("validated offer").read_only_fd()?);
+        }
+        handshake.send_objects(objects)?;
+        for (position, id) in &playing {
+            ring(*id).expect("validated offer").register(&bell, *position);
+        }
+        doorbell = Some(bell);
+    }
     Ok(Accepted {
         media: handshake.finish()?,
         admissions,
         input,
         affordances,
+        doorbell,
     })
+}
+
+/// Selection positions and IDs of the admitted playback tracks. Both sides
+/// derive the ring transfer order from this.
+fn playback_tracks(offer: &Offer, admissions: &[Admission]) -> Vec<(usize, u64)> {
+    let playback = |id| offer.tracks.iter().any(|t| t.id == id && t.kind == Kind::Playback);
+    admissions
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.refusal.is_none() && playback(a.id))
+        .map(|(position, a)| (position, a.id))
+        .collect()
 }
 
 /// The kinds of the admitted tracks that each carry one channel, in selection
@@ -306,6 +348,10 @@ pub struct Connected {
     /// A clean input admission rejection for an optional input track.
     pub input_error: Option<input::Error>,
     pub affordances: Option<affordances::Host>,
+    /// The admitted playback rings, in selection order.
+    pub playback: Vec<audio::PlaybackRing>,
+    /// Present when playback was admitted.
+    pub doorbell: Option<audio::Doorbell>,
 }
 
 /// Read the offer of the selected source. Call off the GUI/input thread.
@@ -364,6 +410,21 @@ impl Offered {
                 affordances = Some(affordances::Host::start(channel)?);
             }
         }
+        let playing = playback_tracks(&self.offer, &admitted.tracks);
+        let mut playback = Vec::new();
+        let mut doorbell = None;
+        if !playing.is_empty() {
+            let mut objects = self.handshake.receive_objects(playing.len() + 2)?.into_iter();
+            let (Some(page), Some(wake)) = (objects.next(), objects.next()) else {
+                return Err(Error::Protocol("missing doorbell"));
+            };
+            doorbell = Some(audio::Doorbell::map(page, wake)?);
+            for ((_, id), fd) in playing.into_iter().zip(objects) {
+                let track = self.offer.tracks.iter().find(|t| t.id == id).expect("offered");
+                let descriptor = audio::Descriptor::decode(&track.descriptor)?;
+                playback.push(audio::PlaybackRing::map(id, descriptor, fd)?);
+            }
+        }
         let media = self.handshake.finish()?;
         let (input, input_error) = match input.map(|stream| Client::connect(stream, mode)) {
             None => (None, None),
@@ -378,6 +439,8 @@ impl Offered {
             input,
             input_error,
             affordances,
+            playback,
+            doorbell,
         })
     }
 }
@@ -426,32 +489,44 @@ impl Handshake {
 #[cfg(unix)]
 impl Handshake {
     fn send_channel(&mut self, peer: Stream) -> Result<(), Error> {
+        self.send_objects(vec![peer.into()])
+    }
+    fn receive_channel(&mut self) -> Result<Stream, Error> {
+        let stream = Stream::from(self.receive_objects(1)?.remove(0));
+        if stream.peer_addr().is_err() {
+            return Err(Error::Protocol("channel descriptor is not a connected Unix socket"));
+        }
+        Ok(stream)
+    }
+    fn send_objects(&mut self, objects: Vec<OwnedFd>) -> Result<(), Error> {
         self.exchange.writable()?;
-        crate::fdpass::send_fd(self.exchange.stream(), peer.as_raw_fd())?;
-        // Retain the sending copy until the peer has installed the descriptor.
+        let fds: Vec<_> = objects.iter().map(AsRawFd::as_raw_fd).collect();
+        crate::fdpass::send_fds(self.exchange.stream(), &fds)?;
+        // Retain the sending copies until the peer has installed them.
         // Parallel macOS tests otherwise intermittently see channel EOF.
         let mut receipt = [0];
         self.exchange.read_exact(&mut receipt)?;
         if receipt != [1] {
             return Err(Error::Protocol("channel descriptor not received"));
         }
-        // This copy must not keep the channel alive after peer loss.
-        drop(peer);
+        // These copies must not keep a channel alive after peer loss.
+        drop(objects);
         Ok(())
     }
-    fn receive_channel(&mut self) -> Result<Stream, Error> {
+    fn receive_objects(&mut self, count: usize) -> Result<Vec<OwnedFd>, Error> {
         self.exchange.readable()?;
-        let fd = crate::fdpass::recv_fd(self.exchange.stream())?;
-        // SAFETY: this live received FD must not leak through exec.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error().into());
+        let fds = crate::fdpass::recv_fds(self.exchange.stream(), count)?;
+        for fd in &fds {
+            // SAFETY: this live received FD must not leak through exec.
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
         }
-        let stream = Stream::from(fd);
-        if stream.peer_addr().is_err() {
-            return Err(Error::Protocol("channel descriptor is not a connected Unix socket"));
+        if fds.len() != count {
+            return Err(Error::Protocol("missing descriptors"));
         }
         self.exchange.write_all(&[1])?;
-        Ok(stream)
+        Ok(fds)
     }
 }
 
@@ -460,16 +535,10 @@ impl Handshake {
 #[cfg(windows)]
 impl Handshake {
     fn send_channel(&mut self, peer: Stream) -> Result<(), Error> {
-        self.exchange.writable()?;
-        // Duplication closes this copy before the peer learns the value, so it
-        // cannot keep the channel alive after peer loss; the peer acknowledges
-        // adopting it within the same deadline.
-        crate::local::send_handles(self.exchange.stream_mut(), vec![(peer.into_handle()?, crate::local::Access::Same)])?;
-        Ok(())
+        self.send_objects(vec![peer.into_handle()?])
     }
     fn receive_channel(&mut self) -> Result<Stream, Error> {
-        self.exchange.readable()?;
-        let handle = crate::local::receive_handles(self.exchange.stream_mut(), 1)?.remove(0);
+        let handle = self.receive_objects(1)?.remove(0);
         // SAFETY: the host this stream connected to duplicated its private pipe
         // end into this process for this receiver alone.
         let stream = unsafe { crate::local::PipeStream::from_owned_handle(handle, false) }
@@ -478,5 +547,23 @@ impl Handshake {
             return Err(Error::Protocol("channel handle is not a connected pipe"));
         }
         Ok(stream)
+    }
+    /// Read-only rings are already restricted, so every handle keeps its access.
+    fn send_objects(&mut self, objects: Vec<OwnedHandle>) -> Result<(), Error> {
+        self.exchange.writable()?;
+        // Duplication closes these copies before the peer learns the values,
+        // so they cannot keep a channel alive after peer loss; the peer
+        // acknowledges adopting them within the same deadline.
+        let objects = objects.into_iter().map(|object| (object, crate::local::Access::Same)).collect();
+        crate::local::send_handles(self.exchange.stream_mut(), objects)?;
+        Ok(())
+    }
+    fn receive_objects(&mut self, count: usize) -> Result<Vec<OwnedHandle>, Error> {
+        self.exchange.readable()?;
+        let handles = crate::local::receive_handles(self.exchange.stream_mut(), count)?;
+        if handles.len() != count {
+            return Err(Error::Protocol("missing handles"));
+        }
+        Ok(handles)
     }
 }

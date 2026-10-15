@@ -35,10 +35,10 @@ use windows_sys::Win32::{
 use super::super::process::ProcessWatch;
 
 #[derive(Debug)]
-pub(in crate::acquisition::arena) struct Wake(OwnedHandle);
+pub(crate) struct Wake(OwnedHandle);
 
 #[derive(Debug)]
-pub(in crate::acquisition::arena) struct Receiver(OwnedHandle);
+pub(crate) struct Receiver(OwnedHandle);
 
 fn event() -> io::Result<OwnedHandle> {
     // SAFETY: null attributes give a non-inheritable handle; a null name keeps
@@ -52,7 +52,7 @@ fn event() -> io::Result<OwnedHandle> {
 }
 
 /// One direction, both ends in this process: cancellation.
-pub(super) fn channel() -> io::Result<(Arc<Wake>, Receiver)> {
+pub(crate) fn channel() -> io::Result<(Arc<Wake>, Receiver)> {
     let event = event()?;
     Ok((Arc::new(Wake(event.try_clone()?)), Receiver(event)))
 }
@@ -82,7 +82,7 @@ pub(in crate::acquisition::arena) fn import(consumer: &OwnedHandle, producer: Ow
 }
 
 impl Wake {
-    pub(in crate::acquisition::arena) fn signal(&self) -> io::Result<()> {
+    pub(crate) fn signal(&self) -> io::Result<()> {
         // SAFETY: the owned event handle is live for the call.
         if unsafe { SetEvent(self.0.as_raw_handle()) } == 0 {
             return Err(io::Error::last_os_error());
@@ -104,22 +104,22 @@ impl Receiver {
 
     /// Sleep until this receiver or `cancel` is signaled, or the deadline. The
     /// caller rechecks its predicate after every return.
-    pub(super) fn sleep_or_cancel(&self, cancel: &Receiver, deadline: Option<Instant>) -> io::Result<()> {
+    pub(crate) fn sleep_or_cancel(&self, cancel: &Receiver, deadline: Option<Instant>) -> io::Result<()> {
         wait_any(&[self.0.as_raw_handle(), cancel.0.as_raw_handle()], deadline)
             .map_err(|error| io::Error::other(format!("acquisition wait channel failed: {error}")))
     }
 
-    pub(in crate::acquisition::arena) fn from_fd(handle: OwnedHandle) -> io::Result<Self> {
+    pub(crate) fn from_fd(handle: OwnedHandle) -> io::Result<Self> {
         Ok(Self(handle))
     }
 
-    pub(in crate::acquisition::arena) fn into_fd(self) -> OwnedHandle {
+    pub(crate) fn into_fd(self) -> OwnedHandle {
         self.0
     }
 
     /// Consume a pending wake. Only this receiver resets its event, and it
     /// rechecks shared state afterwards; a later signal stays pending.
-    pub(in crate::acquisition::arena) fn drain(&mut self) -> io::Result<()> {
+    pub(crate) fn drain(&mut self) -> io::Result<()> {
         // SAFETY: the owned event handle is live for the call.
         if unsafe { ResetEvent(self.0.as_raw_handle()) } == 0 {
             return Err(io::Error::last_os_error());

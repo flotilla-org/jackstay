@@ -69,7 +69,7 @@ fn exchange(
     Result<handshake::Connected, handshake::Error>,
 ) {
     let (host, peer) = pair();
-    let worker = thread::spawn(move || handshake::accept(host, &offer, target));
+    let worker = thread::spawn(move || handshake::accept(host, &offer, target, &[]));
     let offered = handshake::connect(peer).unwrap();
     assert_eq!(offered.offer().source, "test source");
     let connected = offered.select(selection, Mode::Cooperative);
@@ -186,7 +186,7 @@ fn app_kinds_carry_opaque_descriptors_up_to_four_kibibytes() {
     with_app.tracks.push(app.clone());
     let (host, peer) = pair();
     let host_offer = with_app.clone();
-    let worker = thread::spawn(move || handshake::accept(host, &host_offer, None));
+    let worker = thread::spawn(move || handshake::accept(host, &host_offer, None, &[]));
     let offered = handshake::connect(peer).unwrap();
     assert_eq!(offered.offer(), &with_app);
     let connected = offered.select(&[select(u64::MAX, true, false)], Mode::Cooperative).unwrap();
@@ -202,7 +202,7 @@ fn app_kinds_carry_opaque_descriptors_up_to_four_kibibytes() {
             ..track(4, Kind::Other(kind.into()), Direction::FromSource)
         });
         let (host, _peer) = pair();
-        assert!(handshake::accept(host, &bad, None).is_err(), "{kind} {len}");
+        assert!(handshake::accept(host, &bad, None, &[]).is_err(), "{kind} {len}");
     }
 }
 
@@ -213,14 +213,14 @@ fn offers_carry_at_most_one_track_of_each_core_kind() {
         let mut twice = offer();
         twice.tracks.push(track(9, kind.clone(), Direction::Both));
         let (host, _peer) = pair();
-        assert!(handshake::accept(host, &twice, None).is_err(), "{kind:?}");
+        assert!(handshake::accept(host, &twice, None, &[]).is_err(), "{kind:?}");
     }
 }
 
 #[test]
 fn consumers_reject_their_own_invalid_selection_before_sending() {
     let (host, peer) = pair();
-    let worker = thread::spawn(move || handshake::accept(host, &offer(), None));
+    let worker = thread::spawn(move || handshake::accept(host, &offer(), None, &[]));
     let offered = handshake::connect(peer).unwrap();
     let result = offered.select(&[select(1, false, false), select(1, false, false)], Mode::Cooperative);
     assert!(matches!(result, Err(handshake::Error::Protocol("invalid selection"))));
@@ -230,7 +230,7 @@ fn consumers_reject_their_own_invalid_selection_before_sending() {
 #[test]
 fn malformed_frames_fail_instead_of_downgrading() {
     let (host, mut peer) = pair();
-    let worker = thread::spawn(move || handshake::accept(host, &offer(), None));
+    let worker = thread::spawn(move || handshake::accept(host, &offer(), None, &[]));
     let mut frame = [0; 12];
     peer.read_exact(&mut frame).unwrap();
     assert_eq!(&frame[..8], &handshake::MAGIC);
@@ -243,7 +243,7 @@ fn silent_peer_cannot_hold_the_handshake_indefinitely() {
     let (host, _peer) = pair();
     let started = Instant::now();
     assert!(matches!(
-        handshake::accept(host, &offer(), None),
+        handshake::accept(host, &offer(), None, &[]),
         Err(handshake::Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
     ));
     assert!(started.elapsed() < Duration::from_secs(8));

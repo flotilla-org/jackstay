@@ -6,10 +6,12 @@
 //! flows toward the source. The host replies with what it admitted, in
 //! selection order, and then passes one channel per admitted input or
 //! affordances track: a socketpair end with SCM_RIGHTS on Unix, or a private
-//! pipe end duplicated into the verified peer on Windows. When playback tracks
-//! are admitted it then passes their doorbell and read-only rings in one
-//! transfer (see [`crate::audio`]). A required refusal closes setup on both
-//! sides; optional refusals are reported.
+//! pipe end duplicated into the verified peer on Windows. When audio tracks
+//! are admitted it then passes their rings in one transfer (see
+//! [`crate::audio`]): read-only playback rings, after their doorbell, and the
+//! read-write ring of a recording track the consumer was admitted to write.
+//! A required refusal closes setup on both sides; optional refusals are
+//! reported.
 //!
 //! Every admission also passes a tracks channel for [notices](Notices).
 //!
@@ -63,6 +65,8 @@ pub enum Kind {
     Affordances,
     /// Playback audio, described by an [`audio::Descriptor`].
     Playback,
+    /// Recording audio toward the source, described likewise.
+    Recording,
     /// Any other kind. A consumer skips kinds it does not know.
     Other(String),
 }
@@ -74,6 +78,7 @@ impl From<String> for Kind {
             "input" => Self::Input,
             "affordances" => Self::Affordances,
             "playback" => Self::Playback,
+            "recording" => Self::Recording,
             _ => Self::Other(kind),
         }
     }
@@ -92,8 +97,13 @@ impl Kind {
             Self::Input => "input",
             Self::Affordances => "affordances",
             Self::Playback => "playback",
+            Self::Recording => "recording",
             Self::Other(kind) => kind,
         }
+    }
+
+    fn audio(&self) -> bool {
+        matches!(self, Self::Playback | Self::Recording)
     }
 
     /// Whether a host may offer this kind: a core kind, or a reverse-domain
@@ -123,7 +133,7 @@ pub struct Track {
     pub kind: Kind,
     pub direction: Direction,
     pub label: String,
-    /// Empty for core kinds other than playback.
+    /// Empty for core kinds other than playback and recording.
     #[serde(default)]
     pub descriptor: Bytes,
 }
@@ -144,7 +154,7 @@ impl Message for Offer {
 }
 
 /// One selected track. `write` requests writing a track that flows toward
-/// the source; selecting input always requests it.
+/// the source; selecting input or recording always requests it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selected {
     pub id: u64,
@@ -170,7 +180,8 @@ pub enum Refusal {
     /// The offer has no track with this ID.
     Unknown,
     /// The host withholds this track from this consumer, for example input
-    /// without an authorized target, or input selected without writing.
+    /// without an authorized target, input or recording selected without
+    /// writing, or recording that another consumer is writing.
     Unavailable,
     /// Writing was requested on a track that flows only from the source.
     NotWritable,
@@ -220,13 +231,14 @@ pub struct Accepted {
     /// Retain this independently of media; dropping schedules target cleanup.
     pub input: Option<Server>,
     pub affordances: Option<affordances::Producer>,
-    /// Retain for the incarnation's lifetime: it also holds the playback doorbell.
+    /// Retain for the incarnation's lifetime: it also holds the playback
+    /// doorbell and any recording writer's admission.
     pub notices: Notices,
 }
 
 /// Run the host side on a worker. Supplying a target authorizes input on that
 /// target for this peer; None refuses any input track. Every offered playback
-/// track needs its ring in `playback`. One offer track per
+/// or recording track needs its ring in `playback`. One offer track per
 /// video, input and affordances kind at most: one incarnation carries one
 /// media stream. On any failure, including a required
 /// refusal, all owned channels close; keep pumping target cleanup. The whole
@@ -235,7 +247,7 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     let mut ids = HashSet::new();
     let mut single_kinds = HashSet::new();
     let ring = |id| playback.iter().find(|p| p.id() == id);
-    if offer.tracks.iter().filter(|t| t.kind == Kind::Playback).count() > audio::MAX_TRACKS {
+    if offer.tracks.iter().filter(|t| t.kind.audio()).count() > audio::MAX_TRACKS {
         return Err(Error::Protocol("invalid offer"));
     }
     for track in &offer.tracks {
@@ -248,6 +260,7 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     handshake.write(offer)?;
     let selection: Selection = handshake.read()?;
     let mut selected = HashSet::new();
+    let mut leases = Vec::new();
     if selection.tracks.len() > offer.tracks.len() || !selection.tracks.iter().all(|s| selected.insert(s.id)) {
         return Err(Error::Protocol("invalid selection"));
     }
@@ -260,6 +273,7 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
                 None => Some(Refusal::Unknown),
                 Some(t) if s.write && t.direction == Direction::FromSource => Some(Refusal::NotWritable),
                 Some(t) if t.kind == Kind::Input && (!s.write || target.is_none()) => Some(Refusal::Unavailable),
+                Some(t) if t.kind == Kind::Recording => claim(t.id, s.write, playback, &mut leases),
                 Some(_) => None,
             },
         })
@@ -304,19 +318,12 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     for peer in peers {
         handshake.send_channel(peer)?;
     }
-    let playing = playback_tracks(offer, &admissions);
+    let rings: Vec<_> = audio_tracks(&offer.tracks, &admissions)
+        .into_iter()
+        .map(|(position, t)| (position, ring(t.id).expect("validated offer")))
+        .collect();
     let mut doorbell = None;
-    if !playing.is_empty() {
-        let (bell, mut objects) = audio::Bell::new()?;
-        // Register first, so every block after the transfer rings the bell.
-        for (position, id) in &playing {
-            let ring = ring(*id).expect("validated offer");
-            ring.register(&bell, *position);
-            objects.push(ring.read_only_fd()?);
-        }
-        handshake.send_objects(objects)?;
-        doorbell = Some(bell);
-    }
+    send_rings(&mut handshake, &mut doorbell, &rings)?;
     let admitted = admissions.iter().filter(|a| a.refusal.is_none()).map(|a| a.id).collect();
     let notices = Notices {
         stream: tracks.expect("admitted"),
@@ -326,6 +333,7 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
         admitted,
         positions: admissions.len(),
         bell: doorbell,
+        leases,
     };
     Ok(Accepted {
         media: handshake.finish()?,
@@ -336,27 +344,96 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     })
 }
 
-/// Whether a host may offer this track: an offerable kind, and for playback
-/// a track from the source whose descriptor fits its ring in `playback`.
+/// Whether a host may offer this track: an offerable kind, and for audio a
+/// track in its kind's direction whose descriptor fits its ring in `playback`.
 fn offerable(track: &Track, playback: &[Playback]) -> bool {
+    let recording = track.kind == Kind::Recording;
     let fits = || {
         let descriptor = audio::Descriptor::decode(&track.descriptor);
-        let ring = playback.iter().find(|p| p.id() == track.id);
+        let ring = playback.iter().find(|p| p.id() == track.id && p.recording() == recording);
         ring.is_some_and(|ring| descriptor.is_ok_and(|descriptor| ring.fits(&descriptor)))
     };
-    track.kind.offerable() && (track.kind != Kind::Playback || (track.direction == Direction::FromSource && fits()))
+    let direction = if recording { Direction::ToSource } else { Direction::FromSource };
+    track.kind.offerable() && (!track.kind.audio() || (track.direction == direction && fits()))
 }
 
-/// Selection positions and IDs of the admitted playback tracks. Both sides
-/// derive the ring transfer order from this.
-fn playback_tracks(offer: &Offer, admissions: &[Admission]) -> Vec<(usize, u64)> {
-    let playback = |id| offer.tracks.iter().any(|t| t.id == id && t.kind == Kind::Playback);
+/// Admit a recording track's one writer, or refuse it.
+fn claim(id: u64, write: bool, playback: &[Playback], leases: &mut Vec<audio::Lease>) -> Option<Refusal> {
+    let ring = playback.iter().find(|p| p.id() == id);
+    let Some(lease) = ring.filter(|_| write).and_then(Playback::claim) else {
+        return Some(Refusal::Unavailable);
+    };
+    leases.push(lease);
+    None
+}
+
+/// Selection positions of the admitted audio tracks. Both sides derive the
+/// ring transfer order from this.
+fn audio_tracks<'a>(tracks: &'a [Track], admissions: &[Admission]) -> Vec<(usize, &'a Track)> {
+    let audio = |id| tracks.iter().find(|t| t.id == id && t.kind.audio());
     admissions
         .iter()
         .enumerate()
-        .filter(|(_, a)| a.refusal.is_none() && playback(a.id))
-        .map(|(position, a)| (position, a.id))
+        .filter(|(_, a)| a.refusal.is_none())
+        .filter_map(|(position, a)| Some((position, audio(a.id)?)))
         .collect()
+}
+
+/// Pass admitted audio rings: a new doorbell first when there is none and
+/// playback is among them, then each ring.
+fn send_rings<S: BorrowMut<Stream>>(
+    handshake: &mut Handshake<S>,
+    bell: &mut Option<audio::Bell>,
+    rings: &[(usize, &Playback)],
+) -> Result<(), Error> {
+    if rings.is_empty() {
+        return Ok(());
+    }
+    let mut objects = Vec::new();
+    if bell.is_none() && rings.iter().any(|(_, ring)| !ring.recording()) {
+        let (new, bell_objects) = audio::Bell::new()?;
+        (*bell, objects) = (Some(new), bell_objects);
+    }
+    // Register first, so every block after the transfer rings the bell.
+    for (position, ring) in rings {
+        if let Some(bell) = bell {
+            ring.register(bell, *position);
+        }
+        objects.push(ring.fd()?);
+    }
+    handshake.send_objects(objects)
+}
+
+#[derive(Default)]
+struct Rings {
+    doorbell: Option<audio::Doorbell>,
+    playback: Vec<audio::PlaybackRing>,
+    recording: Vec<audio::RecordingWriter>,
+}
+
+/// Receive and map the rings [`send_rings`] passes for `tracks`.
+fn receive_rings<S: BorrowMut<Stream>>(handshake: &mut Handshake<S>, doorbell: bool, tracks: &[&Track]) -> Result<Rings, Error> {
+    let mut rings = Rings::default();
+    if tracks.is_empty() {
+        return Ok(rings);
+    }
+    let bell = !doorbell && tracks.iter().any(|t| t.kind == Kind::Playback);
+    let mut objects = handshake.receive_objects(tracks.len() + if bell { 2 } else { 0 })?.into_iter();
+    if bell {
+        let (Some(page), Some(wake)) = (objects.next(), objects.next()) else {
+            return Err(Error::Protocol("missing doorbell"));
+        };
+        rings.doorbell = Some(audio::Doorbell::map(page, wake)?);
+    }
+    for (track, fd) in tracks.iter().zip(objects) {
+        let descriptor = audio::Descriptor::decode(&track.descriptor)?;
+        if track.kind == Kind::Recording {
+            rings.recording.push(audio::RecordingWriter::map(track.id, descriptor, fd)?);
+        } else {
+            rings.playback.push(audio::PlaybackRing::map(track.id, descriptor, fd)?);
+        }
+    }
+    Ok(rings)
 }
 
 /// The kinds of the admitted tracks that each carry one channel, in selection
@@ -389,6 +466,8 @@ pub struct Connected {
     pub affordances: Option<affordances::Host>,
     /// The admitted playback rings, in selection order.
     pub playback: Vec<audio::PlaybackRing>,
+    /// Writers of the admitted recording tracks, in selection order.
+    pub recording: Vec<audio::RecordingWriter>,
     /// Present when playback was admitted.
     pub doorbell: Option<audio::Doorbell>,
     /// Notices and late selection.
@@ -452,21 +531,15 @@ impl Offered {
             }
         }
         let channel = self.handshake.receive_channel()?;
-        let playing = playback_tracks(&self.offer, &admitted.tracks);
-        let mut playback = Vec::new();
-        let mut doorbell = None;
-        if !playing.is_empty() {
-            let mut objects = self.handshake.receive_objects(playing.len() + 2)?.into_iter();
-            let (Some(page), Some(wake)) = (objects.next(), objects.next()) else {
-                return Err(Error::Protocol("missing doorbell"));
-            };
-            doorbell = Some(audio::Doorbell::map(page, wake)?);
-            for ((_, id), fd) in playing.into_iter().zip(objects) {
-                let track = self.offer.tracks.iter().find(|t| t.id == id).expect("offered");
-                let descriptor = audio::Descriptor::decode(&track.descriptor)?;
-                playback.push(audio::PlaybackRing::map(id, descriptor, fd)?);
-            }
-        }
+        let audio: Vec<_> = audio_tracks(&self.offer.tracks, &admitted.tracks)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        let Rings {
+            doorbell,
+            playback,
+            recording,
+        } = receive_rings(&mut self.handshake, false, &audio)?;
         let media = self.handshake.finish()?;
         let (input, input_error) = match input.map(|stream| Client::connect(stream, mode)) {
             None => (None, None),
@@ -489,6 +562,7 @@ impl Offered {
             input_error,
             affordances,
             playback,
+            recording,
             doorbell,
             tracks,
         })

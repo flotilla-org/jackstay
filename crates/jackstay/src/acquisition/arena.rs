@@ -353,7 +353,7 @@ impl ClaimMap {
     }
 
     fn word(&self, offset: usize) -> &AtomicU64 {
-        assert!(offset % align_of::<AtomicU64>() == 0 && offset + 8 <= self.storage.len());
+        assert!(offset.is_multiple_of(align_of::<AtomicU64>()) && offset + 8 <= self.storage.len());
         // SAFETY: all callers name initialized atomic words in the claim map.
         unsafe { &*self.storage.as_ptr().add(offset).cast::<AtomicU64>() }
     }
@@ -417,22 +417,24 @@ impl RemoteConsumerGrant {
 /// resources, claims, consumer notification endpoint, producer notification
 /// endpoint, payload, in that order. Never resend a consumed grant. The Windows setup
 /// channel grants each position its own access (`acquisition::socket`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The C ABI's `ft_cpu_grant_descriptor` has this layout.
+#[repr(C)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GrantDescriptor {
     pub version: u64,
     pub generation: u64,
-    pub drain_timeout: Duration,
-    pub mapping_slot: u32,
+    pub drain_timeout_ns: u64,
     pub incarnation: u64,
-    pub resources: u32,
-    pub history: u32,
     pub payload_capacity: u64,
     pub resource_map_len: u64,
     pub control_map_len: u64,
+    pub claim_map_len: u64,
     pub arena_scope: [u8; 16],
     pub claim_scope: [u8; 16],
+    pub mapping_slot: u32,
+    pub resources: u32,
+    pub history: u32,
     pub holding: u32,
-    pub claim_map_len: u64,
     /// Zero for an unbound grant; otherwise the admitted recipient process.
     pub recipient_pid: u32,
 }
@@ -449,7 +451,7 @@ impl ConsumerGrant {
         let descriptor = GrantDescriptor {
             version: VERSION,
             generation: self.generation,
-            drain_timeout: self.drain_timeout,
+            drain_timeout_ns: u64::try_from(self.drain_timeout.as_nanos()).unwrap_or(u64::MAX),
             mapping_slot: self.mapping_slot as u32,
             incarnation: self.claims.incarnation.0,
             resources: self.layout.resources as u32,
@@ -488,7 +490,8 @@ impl ConsumerGrant {
     /// another process follows a shared-memory lifetime protocol.
     pub unsafe fn from_parts(descriptor: GrantDescriptor, fds: [OwnedFd; 6]) -> Result<Self, ArenaError> {
         let [control_fd, resource_fd, claim_fd, reader_fd, writer_fd, payload_fd] = fds;
-        if descriptor.drain_timeout.is_zero() || std::time::Instant::now().checked_add(descriptor.drain_timeout).is_none() {
+        let drain_timeout = Duration::from_nanos(descriptor.drain_timeout_ns);
+        if drain_timeout.is_zero() || std::time::Instant::now().checked_add(drain_timeout).is_none() {
             return Err(ArenaError::Mapping("invalid consumer drain interval"));
         }
         if descriptor.recipient_pid != std::process::id() {
@@ -540,7 +543,7 @@ impl ConsumerGrant {
             reader_fd: Some(reader_fd),
             layout,
             generation: descriptor.generation,
-            drain_timeout: descriptor.drain_timeout,
+            drain_timeout,
             mapping_slot: descriptor.mapping_slot as usize,
             claims,
             consumed: false,

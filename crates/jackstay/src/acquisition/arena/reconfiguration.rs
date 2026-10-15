@@ -49,19 +49,21 @@ pub struct ConfigurationGrant {
 
 /// Setup metadata accompanying replacement resource/payload FDs. Control, claim,
 /// and notification mappings remain those of the existing incarnation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The C ABI's `ft_cpu_configuration_descriptor` has this layout.
+#[repr(C)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConfigurationDescriptor {
     pub version: u64,
     pub generation: u64,
     pub incarnation: u64,
+    pub payload_capacity: u64,
+    pub resource_map_len: u64,
     pub arena_scope: [u8; 16],
     pub claim_scope: [u8; 16],
     pub recipient_pid: u32,
     pub mapping_slot: u32,
     pub resources: u32,
     pub history: u32,
-    pub payload_capacity: u64,
-    pub resource_map_len: u64,
 }
 
 impl ConfigurationGrant {

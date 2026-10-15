@@ -120,7 +120,8 @@ uses synthetic native sources; authorized live capture acceptance is separate.
 
 ## Cooperative input reference
 
-ABI 0.12 supports bootstrap v2 over named Local Endpoints. Start the toolkit
+The viewer selects tracks through the [track handshake](../../docs/design/track-handshake.md)
+(ABI 0.15) over named Local Endpoints or Unix socket paths. Start the toolkit
 example and connect to its user endpoint:
 
 ```sh
@@ -129,19 +130,20 @@ cargo run -p jackstay-producer --example minimal &
 ./build/viewer/capture-viewer-sdl --source-endpoint minimal-producer --log-affordances
 ```
 
-`--source-endpoint NAME` uses `ft_local_connect` and bootstrap v2; add
-`--session-scope` when the producer uses a session endpoint. `--affordances
-none|optional|required` defaults to `optional` and applies only to this path.
-Required absence fails setup; optional absence preserves media. `--observe`
+`--source-endpoint NAME` uses `ft_local_connect`; add `--session-scope` when the
+producer uses a session endpoint. The viewer always requires the video track.
+`--affordances none|optional|required` defaults to `optional`. A required track
+the source does not offer, or refuses, fails setup; optional absence or refusal
+preserves media. `--observe`
 requests no input while still allowing affordances. `--log-affordances` prints
 each producer snapshot's domain and summary to stderr. The viewer publishes an
 initial `presentation` snapshot with visible=true, window focus, scale=1 and no
 preferred size. Media, input and affordances are independently owned and closed;
 affordances closure does not confirm input cleanup. Affordances are not rendered.
 
-`--source-socket PATH` retains bootstrap v1 for arbitrary POSIX paths; it cannot
-connect to a v2-only toolkit producer. Start the legacy interactive source in
-a private directory:
+`--source-socket PATH` runs the same handshake on an arbitrary POSIX path,
+adopted with `ft_local_connection_adopt`. Start the interactive source in a
+private directory:
 
 ```sh
 demo_dir=$(mktemp -d /tmp/jackstay-input.XXXXXX)
@@ -164,9 +166,7 @@ This is a cooperative target, not native desktop injection.
 
 The source also listens on a [Local Endpoint](../../docs/design/local-endpoints.md)
 with `--endpoint NAME` (add `--session-scope` for a session endpoint), the only
-form on Windows. This legacy source still uses bootstrap v1, including on named
-endpoints; the new viewer `--source-endpoint` path requires a v2 producer. It
-needs no SDL, so build it there directly, for example from a
+form on Windows. It offers a video and an input track. It needs no SDL, so build it there directly, for example from a
 Visual Studio developer prompt:
 
 ```bat
@@ -187,7 +187,7 @@ refusal is reported while observation continues. The source can withhold input
 with `--observe-only`. The low-level `--cpu-socket` plus `--input-socket` pair
 remains available for independent adapter tests. Without `--input-socket`, that
 low-level CPU connection is observation-only. The reference sender
-uses `--typing cooperative|text|physical` on either bootstrap path (default
+uses `--typing cooperative|text|physical` on either source path (default
 `cooperative`). With `--observe`, typing has no effect because no input channel
 is requested. Text mode sends committed text and suppresses every key, including
 modifiers, Enter, Backspace and arrows; those keys do not become remote controls
@@ -200,8 +200,8 @@ loss clears held state but retains the controller; reconnecting starts empty.
 The input connection has its own heartbeat worker, independent of rendering.
 
 `ctest --test-dir build/viewer --output-on-failure` includes separate-process
-cooperative input, all typing modes, viewer-process-death cleanup, v2 channel
-negotiation/presentation/teardown, and the actual toolkit minimal example. The
+cooperative input, all typing modes, viewer-process-death cleanup, track
+selection/presentation/teardown, and the actual toolkit minimal example. The
 latter uses Cargo in offline mode and an isolated runtime directory; cached or
 vendored crates are required, and its first run may build the example. `--input-self-test` is a
 fixture for that test, not ordinary interactive behavior. The text fixture feeds
@@ -210,7 +210,7 @@ pushed SDL2 text-input events. Native desktop input and live desktop capture are
 separate acceptance work. See [the contract](../../docs/design/input.md) and
 [the C interface](../../crates/jackstay/include/jackstay_input.h).
 
-See [bootstrap ownership and failure semantics](../../docs/design/source-bootstrap.md).
+See [track handshake ownership and failure semantics](../../docs/design/track-handshake.md).
 
 ### Scroll units and SDL2 on macOS
 
@@ -246,9 +246,8 @@ remain separate from the dummy-video tests.
 ### Window and presentation affordances (CPU)
 
 Use `--source-endpoint minimal-producer` or
-`--source-socket /path/to/minimal-producer.sock --affordances optional` for v2
-window/presentation affordances. Raw source sockets without affordance flags
-retain v1 bootstrap. `--log-affordances` also selects v2 on raw source sockets.
+`--source-socket /path/to/minimal-producer.sock` for window/presentation
+affordances.
 The CPU window is resizable and HiDPI capable, initially hidden. A published
 window domain supplies its requested logical size until the user resizes; ready
 shows the window, with a two-second deadline. With no window domain observed at
@@ -283,7 +282,7 @@ cursor boundary fake; it does not establish native macOS cursor appearance.
 
 ### Overlay scrollbars
 
-Bootstrap v2 sources can publish the `scroll` domain. The viewer draws thin
+Sources offering an affordances track can publish the `scroll` domain. The viewer draws thin
 horizontal and vertical overlays inside the fitted frame, using the producer's
 content length, viewport length, and position. They appear while the frame is
 hovered or for one second after a position update. Withdrawal and channel closure

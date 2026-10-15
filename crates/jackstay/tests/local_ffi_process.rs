@@ -14,7 +14,7 @@ use jackstay::{
     acquisition::arena::FrameDescriptor,
     ffi::*,
     ffi_acquisition::{producer::*, session::*, setup_server::*, *},
-    ffi_bootstrap::*,
+    ffi_handshake::*,
     ffi_input::*,
     ffi_local::*,
 };
@@ -300,11 +300,7 @@ fn a_killed_consumer_process_is_cleaned_up_after_resize_input_and_cancellation()
             "the client must verify this server"
         );
 
-        let mut input_server = ptr::null_mut();
-        assert_eq!(
-            ft_source_bootstrap_accept_local(&mut connection, target, &mut input_server),
-            FT_STATUS_OK
-        );
+        let mut input_server = offer_tracks(&mut connection, target);
         assert!(!input_server.is_null());
         let mut setup = ptr::null_mut();
         assert_eq!(ft_cpu_producer_serve_local(producer, &mut connection, &mut setup), FT_STATUS_OK);
@@ -384,18 +380,7 @@ fn local_ffi_consumer_child() {
             pid: server.pid,
             user: user(&server),
         });
-        let (mut input, mut input_status) = (ptr::null_mut(), FT_STATUS_ERROR);
-        assert_eq!(
-            ft_source_bootstrap_connect_local(
-                &mut connection,
-                FT_BOOTSTRAP_INPUT_REQUIRED,
-                COOPERATIVE,
-                &mut input,
-                &mut input_status
-            ),
-            FT_STATUS_OK
-        );
-        assert_eq!(input_status, FT_STATUS_OK);
+        let input = select_tracks(&mut connection);
         let mut setup = ptr::null_mut();
         assert_eq!(
             ft_acquisition_cpu_connection_create_local(&mut connection, &mut setup),
@@ -456,17 +441,7 @@ fn a_killed_producer_process_is_observed_through_setup_liveness_and_input() {
         assert_eq!(ft_local_connection_peer(connection, &mut server), FT_STATUS_OK);
         assert_eq!(server.pid, child.id(), "connect must verify the actual server process");
         assert_eq!(ft_local_connection_alive(connection), FT_STATUS_OK);
-        let (mut input, mut input_status) = (ptr::null_mut(), FT_STATUS_ERROR);
-        assert_eq!(
-            ft_source_bootstrap_connect_local(
-                &mut connection,
-                FT_BOOTSTRAP_INPUT_REQUIRED,
-                COOPERATIVE,
-                &mut input,
-                &mut input_status
-            ),
-            FT_STATUS_OK
-        );
+        let mut input = select_tracks(&mut connection);
         let mut setup = ptr::null_mut();
         assert_eq!(
             ft_acquisition_cpu_connection_create_local(&mut connection, &mut setup),
@@ -516,11 +491,7 @@ fn local_ffi_producer_child() {
         link.send(&Report::Listening);
         let mut connection = ptr::null_mut();
         assert_eq!(ft_local_listener_accept(listener, &mut connection), FT_STATUS_OK);
-        let mut input_server = ptr::null_mut();
-        assert_eq!(
-            ft_source_bootstrap_accept_local(&mut connection, target, &mut input_server),
-            FT_STATUS_OK
-        );
+        let _input_server = offer_tracks(&mut connection, target);
         let mut setup = ptr::null_mut();
         assert_eq!(ft_cpu_producer_serve_local(producer, &mut connection, &mut setup), FT_STATUS_OK);
         publish(producer, b"produced");
@@ -530,6 +501,84 @@ fn local_ffi_producer_child() {
             thread::sleep(Duration::from_millis(2));
         }
     }
+}
+
+/// Offer video 1 and input 2; the returned input server is non-null.
+///
+/// # Safety
+/// A live, exclusively owned connection and input target.
+unsafe fn offer_tracks(connection: &mut *mut FtLocalConnection, target: *mut FtInputTarget) -> *mut FtInputServer {
+    let track = |id, kind: &std::ffi::CStr, direction| FtTrackOffer {
+        id,
+        kind: kind.as_ptr(),
+        label: c"default".as_ptr(),
+        descriptor: ptr::null(),
+        descriptor_len: 0,
+        direction,
+        reserved: 0,
+    };
+    let tracks = [track(1, c"video", FT_TRACK_FROM_SOURCE), track(2, c"input", FT_TRACK_TO_SOURCE)];
+    let mut admissions = [FtTrackAdmission::default(); 2];
+    let (mut count, mut server, mut affordances) = (0, ptr::null_mut(), ptr::null_mut());
+    // SAFETY: caller's live handles; arrays and outputs are disjoint locals.
+    let status = unsafe {
+        ft_handshake_accept_local(
+            connection,
+            c"source".as_ptr(),
+            tracks.as_ptr(),
+            2,
+            target,
+            admissions.as_mut_ptr(),
+            &mut count,
+            &mut server,
+            &mut affordances,
+        )
+    };
+    assert_eq!((status, count), (FT_STATUS_OK, 2));
+    assert!(!server.is_null());
+    server
+}
+
+/// Select video and cooperative input, both required; `connection` comes back
+/// for CPU setup.
+///
+/// # Safety
+/// A live, exclusively owned connection from `ft_local_connect`.
+unsafe fn select_tracks(connection: &mut *mut FtLocalConnection) -> *mut FtInputClient {
+    let selection = [
+        FtTrackSelection {
+            id: 1,
+            required: 1,
+            write: 0,
+        },
+        FtTrackSelection {
+            id: 2,
+            required: 1,
+            write: 1,
+        },
+    ];
+    let mut admissions = [FtTrackAdmission::default(); 2];
+    let (mut offer, mut input, mut input_status, mut affordances) = (ptr::null_mut(), ptr::null_mut(), FT_STATUS_ERROR, ptr::null_mut());
+    // SAFETY: caller's live handle; outputs are disjoint locals.
+    unsafe {
+        assert_eq!(ft_handshake_connect_local(connection, &mut offer), FT_STATUS_OK);
+        assert_eq!(
+            ft_handshake_select(
+                &mut offer,
+                selection.as_ptr(),
+                2,
+                COOPERATIVE,
+                admissions.as_mut_ptr(),
+                connection,
+                &mut input,
+                &mut input_status,
+                &mut affordances,
+            ),
+            FT_STATUS_OK
+        );
+    }
+    assert_eq!(input_status, FT_STATUS_OK);
+    input
 }
 
 /// # Safety

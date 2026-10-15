@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 14
+#define FT_ABI_VERSION_MINOR 15
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -114,7 +114,7 @@ typedef int32_t ft_os_object;
  * selects the source. A client connects and the library verifies the server
  * runs as the current user (and session, for SESSION scope) before returning.
  * A connection is then consumed by exactly one *_local setup call: CPU setup,
- * source bootstrap (which hands it back for CPU setup) or input. These are the
+ * the track handshake (which hands it back for CPU setup) or input. These are the
  * Windows setup entry points; the fd-taking calls remain for POSIX callers.
  * Setup is blocking: run it off GUI/input threads. */
 #define FT_ENDPOINT_SCOPE_USER 1u
@@ -154,6 +154,12 @@ void ft_local_listener_destroy(ft_local_listener **listener);
  * seconds for a busy endpoint (TIMEOUT). *out starts NULL. */
 ft_status ft_local_connect(const ft_local_endpoint *endpoint, ft_local_connection **out);
 ft_status ft_local_connection_peer(const ft_local_connection *connection, ft_peer_identity *out);
+#if defined(__unix__) || defined(__APPLE__)
+/* Adopt a connected Unix stream socket whose peer the caller has verified, for
+ * the calls that take a connection. After basic checks *fd is consumed and set
+ * to -1 on every outcome. *out starts NULL. */
+ft_status ft_local_connection_adopt(int32_t *fd, ft_local_connection **out);
+#endif
 /* OK while the peer holds its end, CLOSED after; never consumes bytes. */
 ft_status ft_local_connection_alive(const ft_local_connection *connection);
 /* ABI 0.11: a host's own exchange on an unconsumed connection before the setup
@@ -236,27 +242,62 @@ typedef struct ft_acquisition_events {
   uint32_t reserved;
 } ft_acquisition_events;
 
-/* Import GrantDescriptor JSON and its six owned setup objects (FDs; on Windows
+/* A CPU grant's setup metadata, as CPU setup received it. */
+typedef struct ft_cpu_grant_descriptor {
+  uint64_t version;
+  uint64_t generation;
+  uint64_t drain_timeout_ns;
+  uint64_t incarnation;
+  uint64_t payload_capacity;
+  uint64_t resource_map_len;
+  uint64_t control_map_len;
+  uint64_t claim_map_len;
+  uint8_t arena_scope[16];
+  uint8_t claim_scope[16];
+  uint32_t mapping_slot;
+  uint32_t resources;
+  uint32_t history;
+  uint32_t holding;
+  uint32_t recipient_pid;
+} ft_cpu_grant_descriptor;
+
+/* A CPU replacement offer's setup metadata. */
+typedef struct ft_cpu_configuration_descriptor {
+  uint64_t version;
+  uint64_t generation;
+  uint64_t incarnation;
+  uint64_t payload_capacity;
+  uint64_t resource_map_len;
+  uint8_t arena_scope[16];
+  uint8_t claim_scope[16];
+  uint32_t recipient_pid;
+  uint32_t mapping_slot;
+  uint32_t resources;
+  uint32_t history;
+} ft_cpu_configuration_descriptor;
+
+/* Import a CPU grant descriptor and its six owned setup objects (FDs; on Windows
  * HANDLEs owned by this process). The trusted producer must follow Jackstay's
  * shared-memory protocol and bind the grant to this PID. Grants are single-use:
- * no replay, forwarding, fork or retained transport copies. JSON length must be
- * 1..1048576; *out must start NULL. Invalid pointers, lengths, occupied outputs
- * or invalid/duplicate objects reject without transfer. Once these argument
- * checks pass, all six are consumed and set to FT_OS_OBJECT_NONE, including on
- * malformed JSON or failed mapping. Import CPU grants only; native resources
- * require the backend setup that retains their handles with leases. */
-ft_status ft_acquisition_import_cpu(const uint8_t *json, size_t len, ft_os_object fds[6],
+ * no replay, forwarding, fork or retained transport copies. *out must start
+ * NULL. Invalid pointers, occupied outputs or invalid/duplicate objects reject
+ * without transfer. Once these argument checks pass, all six are consumed and
+ * set to FT_OS_OBJECT_NONE, including on an inconsistent descriptor or failed
+ * mapping. Import CPU grants only; native resources require the backend setup
+ * that retains their handles with leases. */
+ft_status ft_acquisition_import_cpu(const ft_cpu_grant_descriptor *descriptor, ft_os_object fds[6],
                                    ft_acquisition_consumer **out);
-/* Install ConfigurationDescriptor JSON plus its two owned resource/payload objects on
+/* Install a configuration descriptor plus its two owned resource/payload objects on
  * this already admitted consumer. The same single-use, no-fork and no-extra-copy
- * rules apply. Invalid pointers, lengths or invalid/duplicate objects reject without
+ * rules apply. Invalid pointers or invalid/duplicate objects reject without
  * transfer. After basic validation both objects are consumed and set to
  * FT_OS_OBJECT_NONE on every outcome. OK installs it; STALE disposes a valid
  * superseded offer so the host can offer the current generation. Contradictory
  * mappings remain ERROR. Existing frame handles keep their original storage and
  * holding credit. */
 ft_status ft_acquisition_install_cpu_configuration(ft_acquisition_consumer *,
-                                                  const uint8_t *json, size_t len, ft_os_object fds[2]);
+                                                  const ft_cpu_configuration_descriptor *descriptor,
+                                                  ft_os_object fds[2]);
 /* Drop the consumer's unleased current mapping, e.g. during a capacity pause.
  * Frame handles and deferred uses retain their own mappings; admission and
  * notification state survive. The host retries allocation once budget permits. */
@@ -302,7 +343,7 @@ void ft_acquisition_consumer_destroy(ft_acquisition_consumer **);
 #if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
 typedef struct ft_cpu_acquisition_connection ft_cpu_acquisition_connection;
 /* Generic setup on a connection from ft_local_connect (after an optional
- * ft_source_bootstrap_connect_local), whose server was verified. Same rules as
+ * ft_handshake_select), whose server was verified. Same rules as
  * ft_acquisition_cpu_connection_create below: the peer must be the conforming
  * sole producer, no forwarding/replay of grants/maps, and no admission I/O until
  * attach. After basic checks *connection is consumed and set to NULL on every
@@ -384,7 +425,7 @@ void ft_acquisition_macos_connection_destroy(ft_macos_acquisition_connection **)
 #if defined(_WIN32)
 /* ABI 0.10 D3D11 frames. Requires a library built with backend-windows. Setup
  * runs on a connection from ft_local_connect (after an optional
- * ft_source_bootstrap_connect_local) whose server was verified; the peer must
+ * ft_handshake_select) whose server was verified; the peer must
  * be the conforming sole producer, and grants and handles are never forwarded
  * or replayed. Handles move once per consumer incarnation and pool generation;
  * per-frame data is the descriptor (slot, pool, fence id and value). Serialize

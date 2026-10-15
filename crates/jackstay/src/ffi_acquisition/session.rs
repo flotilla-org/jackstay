@@ -84,7 +84,7 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connection_create(fd: *mut i32, out:
     }
 }
 
-/// Own a connection from `ft_local_connect` (optionally after source bootstrap)
+/// Own a connection from `ft_local_connect` (optionally after the track handshake)
 /// for CPU setup. Its server was verified when connecting. No admission I/O
 /// happens until attach, so cancellation can be installed first.
 ///

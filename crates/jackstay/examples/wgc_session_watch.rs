@@ -120,9 +120,13 @@ mod watch {
                         .device
                         .read_pixels(&texture, &[(&ready, descriptor.fence_value)], Duration::from_secs(2))
                         .ok()?;
-                    let uniform = COLORS
-                        .iter()
-                        .any(|rgb| pixels.chunks_exact(4).all(|pixel| pixel == [rgb[2], rgb[1], rgb[0], 255]));
+                    let uniform = COLORS.iter().any(|rgb| {
+                        pixels
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .all(|pixel| *pixel == [rgb[2], rgb[1], rgb[0], 255])
+                    });
                     Some(format!(
                         "frame {}x{} gen {} {}",
                         descriptor.width,

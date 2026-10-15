@@ -1,4 +1,4 @@
-"""Actual toolkit producer and SDL viewer, separated by the bootstrap socket."""
+"""Actual toolkit producer and SDL viewer, separated by the handshake socket."""
 import os
 import pathlib
 import re

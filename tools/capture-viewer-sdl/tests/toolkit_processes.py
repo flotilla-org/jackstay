@@ -1,4 +1,4 @@
-"""The presentation-aware toolkit minimal example is the real v2 producer collaborator."""
+"""The presentation-aware toolkit minimal example is the real handshake producer collaborator."""
 import os
 import pathlib
 import subprocess

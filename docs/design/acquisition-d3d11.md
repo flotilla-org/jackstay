@@ -56,8 +56,8 @@ to add to these.
 
 `serve_d3d11` runs on a Local Endpoint named pipe (Wheelhouse ADR 0011; see
 [local endpoints](local-endpoints.md)). The host has already routed and
-authorized the connection. Requests are length-prefixed JSON behind the magic
-`JSD3D001`:
+authorized the connection. Requests are CBOR maps (flotilla ADR 0063) framed
+like the [track handshake](track-handshake.md), behind the magic `JSD3D002`:
 
 | Request | Reply and objects |
 | --- | --- |

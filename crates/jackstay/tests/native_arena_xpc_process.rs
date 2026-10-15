@@ -149,10 +149,10 @@ impl Drop for Service {
         if !self.stopped {
             let _ = Command::new("launchctl").args(["bootout", &self.target]).output();
         }
-        if std::thread::panicking() {
-            if let Some(directory) = self.directory.take() {
-                eprintln!("XPC test diagnostics: {}", directory.keep().display());
-            }
+        if std::thread::panicking()
+            && let Some(directory) = self.directory.take()
+        {
+            eprintln!("XPC test diagnostics: {}", directory.keep().display());
         }
     }
 }

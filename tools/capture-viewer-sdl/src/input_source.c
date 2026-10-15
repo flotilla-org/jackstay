@@ -5,7 +5,7 @@
 #if !defined(_WIN32)
 #define _POSIX_C_SOURCE 200809L
 #endif
-#include "jackstay_bootstrap.h"
+#include "jackstay_handshake.h"
 #include "synthetic.h"
 #include <assert.h>
 #include <errno.h>
@@ -37,6 +37,13 @@ static int listener(const char *path) {
  * a different aspect ratio so the change is visible in any viewer. */
 enum { LARGE_WIDTH = WIDTH * 3 / 2, LARGE_HEIGHT = HEIGHT * 2 };
 static void checked(ft_status status) { if (status != FT_STATUS_OK) { fprintf(stderr, "reference source status=%d\n", status); exit(1); } }
+/* Offer video 1 and input 2. A NULL target withholds input authority. */
+static void offer_tracks(ft_local_connection **connection, ft_input_target *target, ft_input_server **input) {
+  ft_track_offer tracks[2] = {{1, FT_TRACK_KIND_VIDEO, "default", NULL, 0, FT_TRACK_FROM_SOURCE, 0},
+                              {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0}};
+  ft_track_admission admissions[2]; size_t count = 0; ft_affordances_producer *affordances = NULL;
+  checked(ft_handshake_accept_local(connection, "reference input source", tracks, 2, target, admissions, &count, input, &affordances));
+}
 static const char *action_name(uint32_t action) {
   return action == FT_INPUT_DOWN ? "down" : action == FT_INPUT_UP ? "up" : action == FT_INPUT_REPEAT ? "repeat" : "?";
 }
@@ -114,7 +121,7 @@ int main(int argc, char **argv) {
     if (local_listener) {
       ft_local_connection *connection = NULL;
       checked(ft_local_listener_accept(local_listener, &connection));
-      checked(ft_source_bootstrap_accept_local(&connection, observe_only ? NULL : target, &input_server));
+      offer_tracks(&connection, observe_only ? NULL : target, &input_server);
       checked(ft_cpu_producer_serve_local(producer, &connection, &media_server));
       /* Release the name so a restarted source can bind it. */
       if (!repeat) ft_local_listener_destroy(&local_listener);
@@ -122,8 +129,10 @@ int main(int argc, char **argv) {
 #if !defined(_WIN32)
     else {
       int32_t media_fd = accept(media_listener, NULL, NULL); if (media_fd < 0) return 1;
-      checked(ft_source_bootstrap_accept(&media_fd, observe_only ? NULL : target, &input_server));
-      checked(ft_cpu_producer_serve(producer, &media_fd, &media_server));
+      ft_local_connection *connection = NULL;
+      checked(ft_local_connection_adopt(&media_fd, &connection));
+      offer_tracks(&connection, observe_only ? NULL : target, &input_server);
+      checked(ft_cpu_producer_serve_local(producer, &connection, &media_server));
       if (!repeat) { close(media_listener); unlink(path); }
     }
 #endif

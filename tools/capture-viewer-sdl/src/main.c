@@ -22,7 +22,7 @@
 #include "viewer_input.h"
 #include "viewer_affordances.h"
 #include "viewer_fit.h"
-#include "jackstay_bootstrap.h"
+#include "jackstay_handshake.h"
 
 #include "synthetic.h"
 #include "scroll_self_test.h"
@@ -62,7 +62,7 @@ typedef struct viewer_options {
   int log_affordances;
   uint32_t typing;
   int typing_set;
-  uint32_t bootstrap_input;
+  uint32_t input_policy; /* 0 none, 1 optional, 2 required */
   int input_policy_set;
   const char *input_socket;
   int input_self_test;
@@ -78,7 +78,7 @@ typedef struct viewer_options {
 } viewer_options;
 
 static viewer_options parse_options(int argc, char **argv) {
-  viewer_options options = {.bootstrap_input = FT_BOOTSTRAP_INPUT_OPTIONAL, .affordances = 1, .typing = FT_INPUT_MODE_COOPERATIVE};
+  viewer_options options = {.input_policy = 1, .affordances = 1, .typing = FT_INPUT_MODE_COOPERATIVE};
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--scroll-self-test") == 0) {
       options.scroll_self_test = 1;
@@ -113,9 +113,9 @@ static viewer_options parse_options(int argc, char **argv) {
       if (++i >= argc || !argv[i][0]) { options.invalid = 1; return options; }
       options.source_socket = argv[i];
     } else if (strcmp(argv[i], "--observe") == 0) {
-      options.bootstrap_input = FT_BOOTSTRAP_INPUT_NONE; options.input_policy_set = 1;
+      options.input_policy = 0; options.input_policy_set = 1;
     } else if (strcmp(argv[i], "--require-input") == 0) {
-      options.bootstrap_input = FT_BOOTSTRAP_INPUT_REQUIRED; options.input_policy_set = 1;
+      options.input_policy = 2; options.input_policy_set = 1;
     } else if (strcmp(argv[i], "--input-socket") == 0) {
       if (++i >= argc || !argv[i][0]) { options.invalid = 1; return options; }
       options.input_socket = argv[i];
@@ -177,18 +177,18 @@ static viewer_options parse_options(int argc, char **argv) {
       ((options.affordances_policy_set || options.log_affordances) && !options.source_endpoint && !options.source_socket) ||
       (options.session_scope && !options.source_endpoint) ||
       (options.typing_set && !options.source_endpoint && !options.source_socket)) {
-    fprintf(stderr, "--source-endpoint selects one source; affordances require a bootstrap source; session scope requires an endpoint\n"); options.invalid = 1;
+    fprintf(stderr, "--source-endpoint selects one source; affordances require a handshake source; session scope requires an endpoint\n"); options.invalid = 1;
   }
   if ((options.source_socket && (options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
       (options.input_policy_set && !options.source_socket && !options.source_endpoint)) {
-    fprintf(stderr, "bootstrap input policy requires --source-socket or --source-endpoint\n"); options.invalid = 1;
+    fprintf(stderr, "input policy requires --source-socket or --source-endpoint\n"); options.invalid = 1;
   }
   if ((options.input_socket && (options.native || !options.cpu_socket)) ||
-      (options.input_self_test && !options.input_socket && ((!options.source_socket && !options.source_endpoint) || options.bootstrap_input == FT_BOOTSTRAP_INPUT_NONE))) {
+      (options.input_self_test && !options.input_socket && ((!options.source_socket && !options.source_endpoint) || !options.input_policy))) {
     fprintf(stderr, "input requires a generic CPU socket source; self-test requires input\n"); options.invalid = 1;
   }
   /* The input self-test cannot succeed with observation-only fallback. */
-  if (options.input_self_test && (options.source_socket || options.source_endpoint)) options.bootstrap_input = FT_BOOTSTRAP_INPUT_REQUIRED;
+  if (options.input_self_test && (options.source_socket || options.source_endpoint)) options.input_policy = 2;
   return options;
 }
 
@@ -415,6 +415,51 @@ static int run_native(const viewer_options *options) {
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
+/* Handshake v3: select the offered video track (required) plus input and
+ * affordances by policy (0 none, 1 optional, 2 required). On success *local is
+ * the media connection, ready for CPU setup. */
+static int select_tracks(ft_local_connection **local, const viewer_options *options, viewer_input *input,
+                         viewer_affordances *affordances) {
+  ft_handshake_offer *offer = NULL;
+  const char *source = NULL;
+  const ft_track_offer *tracks = NULL;
+  size_t count = 0;
+  if (require_ok(ft_handshake_connect_local(local, &offer), "handshake offer") ||
+      require_ok(ft_handshake_offer_describe(offer, &source, &tracks, &count), "handshake describe")) return 1;
+  ft_track_selection selection[3];
+  size_t selected = 0;
+  int have_input = 0, have_affordances = 0;
+  for (size_t i = 0; i < count && selected < 3; i++) {
+    uint32_t policy = !strcmp(tracks[i].kind, FT_TRACK_KIND_VIDEO) ? 2
+        : !strcmp(tracks[i].kind, FT_TRACK_KIND_INPUT) && !have_input++ ? options->input_policy
+        : !strcmp(tracks[i].kind, FT_TRACK_KIND_AFFORDANCES) && !have_affordances++ ? options->affordances : 0;
+    if (policy) selection[selected++] = (ft_track_selection){tracks[i].id, policy == 2, !strcmp(tracks[i].kind, FT_TRACK_KIND_INPUT)};
+  }
+  const char *missing = options->input_policy == 2 && !have_input ? "input"
+      : options->affordances == 2 && !have_affordances ? "affordances" : NULL;
+  if (missing) {
+    fprintf(stderr, "required %s not offered by source %s\n", missing, source);
+    ft_handshake_offer_destroy(&offer); return 1;
+  }
+  ft_track_admission admissions[3];
+  ft_status input_status;
+  ft_status status = ft_handshake_select(&offer, selection, selected, options->input_policy ? options->typing : 0,
+      admissions, local, &input->client, &input_status, &affordances->host);
+  if (status != FT_STATUS_OK) {
+    fprintf(stderr, "handshake selection failed: status=%d%s\n", status,
+            options->affordances == 2 ? "; required affordances must be admitted" : "");
+    return 1;
+  }
+  for (size_t i = 0; i < selected; i++)
+    if (admissions[i].result != FT_TRACK_ADMITTED) fprintf(stderr, "track %" PRIu64 " refused: %u; continuing\n", admissions[i].id, admissions[i].result);
+  if (input->client) {
+    uint64_t controller, epoch;
+    if (require_ok(ft_input_client_describe(input->client, &input->config, &controller, &epoch), "input describe")) return 1;
+  } else if (options->input_policy) fprintf(stderr, "source input unavailable: %d; continuing observation\n", input_status);
+  if (options->affordances && !affordances->host) fprintf(stderr, "source affordances unavailable; continuing media\n");
+  return 0;
+}
+
 /* Generic CPU setup belongs to the connecting process. Selection and desktop
  * authorization, when needed, remain with the host that supplies this path. */
 static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **connection,
@@ -452,22 +497,13 @@ static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **
 #endif
   if (uid != geteuid()) { fprintf(stderr, "CPU socket peer is not the current user\n"); goto cleanup; }
   if (options->source_socket) {
-    ft_status input_status;
-    uint32_t mode = options->bootstrap_input == FT_BOOTSTRAP_INPUT_NONE ? 0 : options->typing;
-    if (options->affordances_policy_set || options->log_affordances) {
-      ft_status aff_status;
-      if (require_ok(ft_source_bootstrap_connect_v2(&fd, options->bootstrap_input, mode,
-          options->affordances, &input->client, &input_status, &affordances->host, &aff_status), "source bootstrap v2")) goto cleanup;
-    } else if (require_ok(ft_source_bootstrap_connect(&fd, options->bootstrap_input, mode,
-                 &input->client, &input_status), "ft_source_bootstrap_connect")) goto cleanup;
-    if (input->client) {
-      uint64_t controller, epoch;
-      if (require_ok(ft_input_client_describe(input->client, &input->config, &controller, &epoch), "ft_input_client_describe")) goto cleanup;
-    } else if (input_status != FT_STATUS_EMPTY) {
-      fprintf(stderr, "source input unavailable: %d; continuing observation\n", input_status);
-    }
-  }
-  if (require_ok(ft_acquisition_cpu_connection_create(&fd, connection), "ft_acquisition_cpu_connection_create") ||
+    ft_local_connection *local = NULL;
+    int selected = require_ok(ft_local_connection_adopt(&fd, &local), "adopt source socket") ||
+        select_tracks(&local, options, input, affordances) ||
+        require_ok(ft_acquisition_cpu_connection_create_local(&local, connection), "CPU local setup");
+    ft_local_connection_destroy(&local);
+    if (selected || require_ok(ft_acquisition_cpu_attach(*connection, 1, consumer), "ft_acquisition_cpu_attach")) goto cleanup;
+  } else if (require_ok(ft_acquisition_cpu_connection_create(&fd, connection), "ft_acquisition_cpu_connection_create") ||
       require_ok(ft_acquisition_cpu_attach(*connection, 1, consumer), "ft_acquisition_cpu_attach")) goto cleanup;
   failed = 0;
 cleanup:
@@ -500,23 +536,10 @@ static int run_cpu(const viewer_options *options) {
     ft_local_connection *local = NULL;
     ft_local_endpoint endpoint = {options->session_scope ? FT_ENDPOINT_SCOPE_SESSION : FT_ENDPOINT_SCOPE_USER,
                                   FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, options->source_endpoint};
-    ft_status input_status, affordances_status;
     ft_status setup = ft_local_connect(&endpoint, &local);
-    if (setup == FT_STATUS_OK) setup = ft_source_bootstrap_connect_v2_local(&local, options->bootstrap_input,
-        options->bootstrap_input == FT_BOOTSTRAP_INPUT_NONE ? 0 : options->typing,
-        options->affordances, &input.client, &input_status, &affordances.host, &affordances_status);
-    if (setup != FT_STATUS_OK) {
-      fprintf(stderr, "source endpoint bootstrap v2 failed: status=%d%s\n", setup,
-              options->affordances == 2 ? "; required affordances must be offered by a v2 source" : "");
+    if (require_ok(setup, "source endpoint connect") || select_tracks(&local, options, &input, &affordances)) {
       ft_local_connection_destroy(&local); goto cleanup;
     }
-    if (input.client) {
-      uint64_t controller, epoch;
-      if (require_ok(ft_input_client_describe(input.client, &input.config, &controller, &epoch), "input describe")) {
-        ft_local_connection_destroy(&local); goto cleanup;
-      }
-    } else if (input_status != FT_STATUS_EMPTY) fprintf(stderr, "source input unavailable: %d; continuing observation\n", input_status);
-    if (affordances_status == FT_STATUS_UNSUPPORTED) fprintf(stderr, "source affordances unavailable; continuing media\n");
     setup = ft_acquisition_cpu_connection_create_local(&local, &connection);
     ft_local_connection_destroy(&local);
     if (require_ok(setup, "CPU local setup") || require_ok(ft_acquisition_cpu_attach(connection, 1, &consumer), "CPU attach")) goto cleanup;

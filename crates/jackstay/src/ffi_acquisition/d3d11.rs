@@ -120,7 +120,7 @@ impl FtD3d11AcquisitionConnection {
     }
 }
 
-/// Own a connection from `ft_local_connect` (optionally after source bootstrap)
+/// Own a connection from `ft_local_connect` (optionally after the track handshake)
 /// for D3D11 setup. Its server was verified when connecting. No setup I/O
 /// happens until describe or attach, so cancellation can be installed first.
 ///

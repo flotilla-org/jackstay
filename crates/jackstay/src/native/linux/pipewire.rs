@@ -625,10 +625,9 @@ impl PipeWireStreamObserver for PipeWireNativeProducerObserver {
             .lock()
             .expect("pipewire native producer poisoned")
             .publish(&PipeWireNativeFrame { slot_id: native_slot_id }, stream_time_ns)
+            && let Ok(mut state) = self.inner.lock()
         {
-            if let Ok(mut state) = self.inner.lock() {
-                Self::record_error(&mut state, error);
-            }
+            Self::record_error(&mut state, error);
         }
     }
 }

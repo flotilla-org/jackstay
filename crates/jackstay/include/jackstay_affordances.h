@@ -177,26 +177,6 @@ void ft_affordances_host_destroy(ft_affordances_host **);
 ft_status ft_affordances_host_send(ft_affordances_host *, const ft_aff_verb *);
 ft_status ft_affordances_event_view(const ft_affordances_event *, ft_aff_event_view *);
 void ft_affordances_event_destroy(ft_affordances_event **);
-/* Explicit v2 Local Endpoint bootstrap; legacy entry points select v1.
- * affordances_request: NONE=0 OPTIONAL=1 REQUIRED=2. accept enable: 0/1.
- * Same consumption rules as jackstay_bootstrap.h. On success media remains
- * in *connection; independent handles transfer to caller. Optional refusal
- * returns NULL plus UNSUPPORTED; unrequested returns NULL plus EMPTY.
- */
-ft_status ft_source_bootstrap_accept_v2_local(ft_local_connection **,
-    ft_input_target *, uint32_t, ft_input_server **, ft_affordances_producer **);
-/* POSIX descriptor variant: sole ownership, same output rules as the local
- * variant. After validation *fd becomes -1, then receives media on success.
- * The caller must verify the selected source peer before calling. */
-#if defined(__unix__) || defined(__APPLE__)
-ft_status ft_source_bootstrap_connect_v2(int32_t *fd,
-    uint32_t input_request, uint32_t input_mode, uint32_t affordances_request,
-    ft_input_client **, ft_status *input_status,
-    ft_affordances_host **, ft_status *affordances_status);
-#endif
-ft_status ft_source_bootstrap_connect_v2_local(ft_local_connection **,
-    uint32_t, uint32_t, uint32_t, ft_input_client **, ft_status *,
-    ft_affordances_host **, ft_status *);
 #ifdef __cplusplus
 }
 #endif

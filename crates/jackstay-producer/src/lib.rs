@@ -15,10 +15,15 @@ use jackstay::{
         socket::serve_cpu,
     },
     affordances::{Event, Snapshot},
-    bootstrap,
+    handshake::{self, Direction, Kind, Offer, Track},
     input::{Config, Geometry, Outcome, Target, Work},
     local::{Endpoint, Listener, ShutdownHandle},
 };
+
+/// The offered track IDs: one video, input and affordances track each.
+pub const VIDEO: u64 = 1;
+pub const INPUT: u64 = 2;
+pub const AFFORDANCES: u64 = 3;
 
 /// One owned CPU frame. The callback may return None while content is unchanged.
 pub struct Frame {
@@ -72,7 +77,7 @@ impl<P: Producer> Builder<P> {
             max_connections: 8,
         }
     }
-    /// Bounds simultaneous bootstrap/media workers, including stalled peers.
+    /// Bounds simultaneous handshake/media workers, including stalled peers.
     pub fn max_connections(mut self, n: usize) -> Self {
         self.max_connections = n;
         self
@@ -93,6 +98,21 @@ impl<P: Producer> Builder<P> {
         let a = arena.clone();
         let t = target.clone();
         let limit = self.max_connections;
+        let track = |id, kind, direction, label: &str| Track {
+            id,
+            kind,
+            direction,
+            label: label.into(),
+            descriptor: Default::default(),
+        };
+        let offer = Arc::new(Offer {
+            source: self.endpoint.name().into(),
+            tracks: vec![
+                track(VIDEO, Kind::Video, Direction::FromSource, "default"),
+                track(INPUT, Kind::Input, Direction::ToSource, "default"),
+                track(AFFORDANCES, Kind::Affordances, Direction::Both, "default"),
+            ],
+        });
         let accept = thread::Builder::new().name("jackstay-source-accept".into()).spawn(move || {
             while !flag.load(Ordering::Acquire) {
                 let c = match accept_listener.accept() {
@@ -121,16 +141,20 @@ impl<P: Producer> Builder<P> {
                 };
                 let a = a.clone();
                 let t = t.clone();
+                let offer = offer.clone();
                 let channels = Arc::new(Mutex::new(None));
                 let shared = channels.clone();
                 if let Ok(worker) = thread::Builder::new().name("jackstay-source-peer".into()).spawn(move || {
-                    if let Ok(accepted) = bootstrap::accept_v2(stream, Some(t), true) {
+                    if let Ok(accepted) = handshake::accept(stream, &offer, Some(t)) {
+                        let video = accepted.admissions.iter().any(|x| x.id == VIDEO && x.refusal.is_none());
                         *shared.lock().unwrap() = Some(Channels {
                             input: accepted.input,
                             affordances: accepted.affordances,
                             sent: std::collections::BTreeMap::new(),
                         });
-                        let _ = serve_cpu(accepted.media, a);
+                        if video {
+                            let _ = serve_cpu(accepted.media, a);
+                        }
                     }
                 }) {
                     peers.push(Peer {
@@ -280,11 +304,11 @@ fn pump<P: Producer>(
                 break;
             }
         };
-        if let Some((width, height)) = reported_geometry {
-            if let Err(e) = apply_logical(&target, &mut geometry, width, height) {
-                error = Some(e);
-                break;
-            }
+        if let Some((width, height)) = reported_geometry
+            && let Err(e) = apply_logical(&target, &mut geometry, width, height)
+        {
+            error = Some(e);
+            break;
         }
         target.tick();
         while let Some(work) = target.next() {
@@ -316,16 +340,16 @@ fn pump<P: Producer>(
             let peers = peers.lock().unwrap();
             for peer in peers.iter() {
                 let mut channels = peer.channels.lock().unwrap();
-                if let Some(c) = channels.as_mut() {
-                    if let Some(a) = c.affordances.as_ref() {
-                        for (domain, snapshot) in &snapshots {
-                            if c.sent.get(domain) != Some(snapshot) && a.publish(snapshot.clone()).is_ok() {
-                                c.sent.insert(*domain, snapshot.clone());
-                            }
+                if let Some(c) = channels.as_mut()
+                    && let Some(a) = c.affordances.as_ref()
+                {
+                    for (domain, snapshot) in &snapshots {
+                        if c.sent.get(domain) != Some(snapshot) && a.publish(snapshot.clone()).is_ok() {
+                            c.sent.insert(*domain, snapshot.clone());
                         }
-                        while let Some(e) = a.poll() {
-                            events.push(e)
-                        }
+                    }
+                    while let Some(e) = a.poll() {
+                        events.push(e)
                     }
                 }
             }

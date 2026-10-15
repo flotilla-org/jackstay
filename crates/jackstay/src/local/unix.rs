@@ -103,7 +103,7 @@ pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<(u32, u32)> {
     Ok((pid, uid))
 }
 
-fn identity(stream: &UnixStream) -> io::Result<PeerIdentity> {
+pub(crate) fn identity(stream: &UnixStream) -> io::Result<PeerIdentity> {
     let (pid, uid) = peer_credentials(stream)?;
     Ok(PeerIdentity {
         pid,

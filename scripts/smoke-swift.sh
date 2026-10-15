@@ -51,8 +51,8 @@ echo "Swift dylib mutation: missing library rejected with a dyld diagnostic"
 # from the successful import above. Mutate only a disposable header copy.
 cp -R crates/jackstay/include "$swift_smoke_dir/broken-include"
 sed 's/"jackstay_input.h"/"jackstay_missing_header.h"/' \
-  crates/jackstay/include/jackstay_bootstrap.h \
-  > "$swift_smoke_dir/broken-include/jackstay_bootstrap.h"
+  crates/jackstay/include/jackstay_handshake.h \
+  > "$swift_smoke_dir/broken-include/jackstay_handshake.h"
 if swiftc -typecheck scripts/swift/writer.swift \
   -I "$swift_smoke_dir/broken-include" \
   -module-cache-path "$swift_smoke_dir/module-cache" \

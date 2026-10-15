@@ -26,6 +26,10 @@ pub const FT_WAIT_ALL: u32 = 3;
 
 pub struct FtAcquisitionConsumer(ArenaConsumer);
 
+/// `ft_cpu_grant_descriptor` and `ft_cpu_configuration_descriptor`.
+pub type FtCpuGrantDescriptor = GrantDescriptor;
+pub type FtCpuConfigurationDescriptor = ConfigurationDescriptor;
+
 pub mod producer;
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -128,7 +132,7 @@ fn status(error: ArenaError) -> FtStatus {
     }
 }
 
-/// Import a single-use CPU grant serialized as GrantDescriptor JSON, with its
+/// Import a single-use CPU grant described by `descriptor`, with its
 /// six owned setup objects (FDs, or Windows handles with the access listed in
 /// docs/design/acquisition-process-cleanup.md). After argument validation they
 /// are consumed on success OR failure, and their entries become
@@ -137,17 +141,20 @@ fn status(error: ArenaError) -> FtStatus {
 /// # Safety
 /// The producer must obey ConsumerGrant::from_parts' shared-memory protocol.
 /// This process must be the sole intended recipient; never replay, forward or
-/// fork its grant/mappings. `json` must reference `len` readable bytes. `fds`
+/// fork its grant/mappings. `descriptor` must be live and readable. `fds`
 /// must reference six distinct, exclusively owned live objects; `out` must
 /// point to null. All arguments must be non-aliasing and valid throughout.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_import_cpu(
-    json: *const u8,
-    len: usize,
+    descriptor: *const FtCpuGrantDescriptor,
     fds: *mut FtOsObject,
     out: *mut *mut FtAcquisitionConsumer,
 ) -> FtStatus {
-    if json.is_null() || fds.is_null() || len == 0 || len > 1024 * 1024 {
+    // SAFETY: caller supplies a live descriptor when non-null.
+    let Some(descriptor) = (unsafe { descriptor.as_ref() }).cloned() else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if fds.is_null() {
         return FT_STATUS_INVALID_ARGUMENT;
     }
     // SAFETY: caller supplies a valid output and a writable array of six FDs.
@@ -170,12 +177,6 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
         // SAFETY: each live object is distinct and its sole ownership moves.
         unsafe { own_object(fd) }
     });
-    // SAFETY: readable range is guaranteed by the caller and length is bounded.
-    let bytes = unsafe { std::slice::from_raw_parts(json, len) };
-    let descriptor: GrantDescriptor = match serde_json::from_slice(bytes) {
-        Ok(descriptor) => descriptor,
-        Err(_) => return FT_STATUS_INVALID_ARGUMENT,
-    };
     let is_cpu = descriptor.payload_capacity != 0;
     // SAFETY: these are the intended process's single-use mappings from the
     // conforming producer required by this function's caller contract.
@@ -200,20 +201,20 @@ pub unsafe extern "C" fn ft_acquisition_import_cpu(
 /// # Safety
 /// The producer, recipient and mapping lifetime must obey
 /// ConfigurationGrant::from_parts. No replay, forwarding, fork or other FD
-/// copies are allowed. `consumer` must be live and exclusively accessed; `json`
-/// must reference `len` readable bytes and `fd` must point to two distinct exclusively
+/// copies are allowed. `consumer` must be live and exclusively accessed;
+/// `descriptor` must be live and `fd` must point to two distinct exclusively
 /// owned live object. All arguments must be non-aliasing. After basic validation
 /// it is consumed on every outcome and its slot becomes [`FT_OS_OBJECT_NONE`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_install_cpu_configuration(
     consumer: *mut FtAcquisitionConsumer,
-    json: *const u8,
-    len: usize,
+    descriptor: *const FtCpuConfigurationDescriptor,
     fd: *mut FtOsObject,
 ) -> FtStatus {
-    if json.is_null() || fd.is_null() || len == 0 || len > 1024 * 1024 {
+    // SAFETY: caller supplies a live descriptor when non-null.
+    let Some(descriptor) = (unsafe { descriptor.as_ref() }).cloned() else {
         return FT_STATUS_INVALID_ARGUMENT;
-    }
+    };
     // SAFETY: validity, exclusivity and non-aliasing are caller obligations.
     let (Some(consumer), Some(fd)) = (unsafe { consumer.as_mut() }, unsafe { fd.cast::<[FtOsObject; 2]>().as_mut() }) else {
         return FT_STATUS_INVALID_ARGUMENT;
@@ -223,12 +224,6 @@ pub unsafe extern "C" fn ft_acquisition_install_cpu_configuration(
     }
     // SAFETY: sole ownership of this live object is transferred exactly once.
     let owned = std::mem::replace(fd, [FT_OS_OBJECT_NONE; 2]).map(|object| unsafe { own_object(object) });
-    // SAFETY: caller guarantees the readable byte range; length is bounded above.
-    let bytes = unsafe { std::slice::from_raw_parts(json, len) };
-    let descriptor: ConfigurationDescriptor = match serde_json::from_slice(bytes) {
-        Ok(descriptor) => descriptor,
-        Err(_) => return FT_STATUS_INVALID_ARGUMENT,
-    };
     let is_cpu = descriptor.payload_capacity != 0;
     // SAFETY: this consumer is the intended recipient of the conforming
     // producer's single-use replacement as required by the caller contract.

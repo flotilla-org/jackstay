@@ -1,5 +1,5 @@
 //! Run `cargo run -p jackstay-producer --example scroll` then attach using
-//! bootstrap::connect_v2. Source selection and authorization remain host policy.
+//! handshake::connect. Source selection and authorization remain host policy.
 use std::time::Duration;
 
 use jackstay::{
@@ -96,28 +96,28 @@ impl Producer for Content {
         snapshots
     }
     fn affordance(&mut self, event: Event) {
-        if let Event::Verb(ref verb) = event {
-            if verb.domain == Domain::Scroll {
-                let position = if verb.body["axis"] == "x" { &mut self.x } else { &mut self.y };
-                match verb.name.as_str() {
-                    "set_position" => *position = verb.body["position"].as_f64().unwrap().clamp(0., 800.),
-                    "scroll_by_step" => {
-                        let step = if verb.body["step"] == "large" { 200. } else { 20. };
-                        let direction = if verb.body["direction"] == "increment" { 1. } else { -1. };
-                        *position = (*position + step * direction).clamp(0., 800.);
-                    }
-                    _ => return,
+        if let Event::Verb(ref verb) = event
+            && verb.domain == Domain::Scroll
+        {
+            let position = if verb.body["axis"] == "x" { &mut self.x } else { &mut self.y };
+            match verb.name.as_str() {
+                "set_position" => *position = verb.body["position"].as_f64().unwrap().clamp(0., 800.),
+                "scroll_by_step" => {
+                    let step = if verb.body["step"] == "large" { 200. } else { 20. };
+                    let direction = if verb.body["direction"] == "increment" { 1. } else { -1. };
+                    *position = (*position + step * direction).clamp(0., 800.);
                 }
-                self.dirty = true;
-                eprintln!("verb={} axis={} position={}", verb.name, verb.body["axis"], position);
+                _ => return,
             }
+            self.dirty = true;
+            eprintln!("verb={} axis={} position={}", verb.name, verb.body["axis"], position);
         }
-        if let Event::Snapshot(Snapshot::Presentation(p)) = event {
-            if let Some(size) = p.preferred_size {
-                self.width = (size.width * p.scale).round().clamp(1., 2048.) as u32;
-                self.height = (size.height * p.scale).round().clamp(1., 2048.) as u32;
-                eprintln!("presentation frame={}x{} scale={}", self.width, self.height, p.scale);
-            }
+        if let Event::Snapshot(Snapshot::Presentation(p)) = event
+            && let Some(size) = p.preferred_size
+        {
+            self.width = (size.width * p.scale).round().clamp(1., 2048.) as u32;
+            self.height = (size.height * p.scale).round().clamp(1., 2048.) as u32;
+            eprintln!("presentation frame={}x{} scale={}", self.width, self.height, p.scale);
         }
     }
 }

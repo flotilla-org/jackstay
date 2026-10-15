@@ -54,7 +54,7 @@ impl Check {
     fn matches(self, width: u32, height: u32, pixels: &[u8]) -> bool {
         match self {
             Self::Pattern(seed) => pixels == pattern(width, height, seed),
-            Self::Uniform(bgra) => pixels.chunks_exact(4).all(|pixel| pixel == bgra),
+            Self::Uniform(bgra) => pixels.as_chunks::<4>().0.iter().all(|pixel| *pixel == bgra),
         }
     }
 }

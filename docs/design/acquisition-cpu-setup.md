@@ -37,8 +37,9 @@ alone does not establish that trust. The supplied stream must use blocking I/O.
 
 ## Wire and mapping ownership
 
-Each message has the `JSCPU001` version marker, a little-endian 32-bit JSON length
-and at most 16 KiB of JSON. Exact reads leave the ancillary byte for `recvmsg`.
+Each message is one CBOR map framed as on the [track handshake](track-handshake.md):
+the `JSSETUP3` magic, a big-endian 32-bit length and at most 64 KiB. Exact reads
+leave the ancillary byte for `recvmsg`.
 Initial admission transfers the common grant descriptor and six FDs;
 replacement transfers a configuration descriptor and resource and payload FDs. Received
 FDs are made close-on-exec before import.

@@ -28,7 +28,7 @@ fn main() {
 fn build_windows_smoke() {
     println!("cargo:rerun-if-changed=include/capture_transfer.h");
     println!("cargo:rerun-if-changed=include/jackstay_input.h");
-    println!("cargo:rerun-if-changed=include/jackstay_bootstrap.h");
+    println!("cargo:rerun-if-changed=include/jackstay_handshake.h");
     println!("cargo:rerun-if-changed=src/native/c_abi_header_smoke.c");
     let mut build = cc::Build::new();
     build.include("include").file("src/native/c_abi_header_smoke.c");

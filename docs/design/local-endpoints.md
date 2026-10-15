@@ -1,6 +1,6 @@
 # Local Endpoints and the Windows setup channel
 
-CPU acquisition setup, source bootstrap and input now run over named pipes on
+CPU acquisition setup, the track handshake and input now run over named pipes on
 Windows as well as Unix sockets. Wheelhouse
 [ADR 0011](https://github.com/flotilla-org/wheelhouse/blob/84d3a46ee8419d38e8daefc8e5348eb973d5cd96/docs/adr/0011-windows-local-ipc-uses-named-pipes-with-logical-endpoints.md)
 is the contract; this records how Jackstay meets it
@@ -27,7 +27,7 @@ enforce, so `Session` equals `User` there, as the ADR allows.
 carrying the kernel-reported `PeerIdentity` (PID, user, and the Windows
 session), and `local::connect` connects and verifies the server. A connection's
 stream then feeds exactly one of `serve_cpu`/`CpuSetupClient`,
-`bootstrap::accept`/`connect` or the input `Server`/`Client`, unchanged from
+`handshake::accept`/`connect` or the input `Server`/`Client`, unchanged from
 Unix. The host still authorizes the accepted peer and selects the source;
 binding an endpoint grants nothing by itself.
 
@@ -100,9 +100,9 @@ page, `SYNCHRONIZE | EVENT_MODIFY_STATE` for the consumer event and
 one read-only section. The consumer adopts handles only from a server that
 `connect` verified, under `CpuSetupClient::from_stream`'s existing contract.
 
-Bootstrap's optional input channel is one end of a `pipe_pair`, duplicated into
-the verified peer the same way, within the bootstrap's five-second deadline.
-The receiver checks it is a connected pipe. D3D11 pool textures and fences use
+The handshake's input and affordances channels are each one end of a
+`pipe_pair`, duplicated into the verified peer the same way, within the
+handshake's five-second deadline. The receiver checks each is a connected pipe. D3D11 pool textures and fences use
 the same transfer once per consumer incarnation and pool generation
 ([D3D11 backend](acquisition-d3d11.md)).
 
@@ -121,7 +121,7 @@ caller's handle after basic argument checks, as the FD calls set -1:
 
 | Host | Client |
 | --- | --- |
-| `ft_source_bootstrap_accept_local` (hands the connection back) | `ft_source_bootstrap_connect_local` (hands it back) |
+| `ft_handshake_accept_local` (hands the connection back) | `ft_handshake_connect_local`, then `ft_handshake_select` (hands it back) |
 | `ft_cpu_producer_serve_local` | `ft_acquisition_cpu_connection_create_local`, then the existing attach, cancel and configuration calls |
 | `ft_input_target_serve_local` | `ft_input_client_connect_local` |
 | a Rust `serve_d3d11` host | `ft_acquisition_d3d11_connection_create_local` (ABI 0.10, [D3D11](acquisition-d3d11.md#c-abi-010)) |
@@ -131,9 +131,9 @@ its end of setup (OK, CLOSED, or CANCELLED after cancellation) without consuming
 setup bytes, so a consumer no longer peeks at a borrowed descriptor to notice a
 vanished producer. It answers OK while another setup call owns the connection.
 
-The acquisition, producer, bootstrap and input APIs are now declared and built on
+The acquisition, producer, handshake and input APIs are now declared and built on
 Windows. The FD-taking setup calls (`ft_cpu_producer_serve`,
-`ft_acquisition_cpu_connection_create`, `ft_source_bootstrap_accept`/`connect`,
+`ft_acquisition_cpu_connection_create`, `ft_local_connection_adopt`,
 `ft_input_target_serve`, `ft_input_client_connect`) and the Porthole daemon's
 `ft_acquisition_cpu_connect_session` remain POSIX-only. Raw grant import takes
 `ft_os_object`: an `int32_t` FD on POSIX (unchanged) or a `HANDLE` on Windows,
@@ -161,7 +161,7 @@ stream position is unknown and the caller destroys the connection. The calls
 are transport-neutral: the host protocol, not Jackstay, decides what the bytes
 mean, so no host's authority model enters the transport core.
 
-They share one helper with the bootstrap preface, `local::Bounded`: a stream
+They share one helper with the track handshake, `local::Bounded`: a stream
 whose operations are all bounded by one absolute deadline. On Unix it makes
 the socket non-blocking and `poll`s for the time left before each operation,
 touching no socket option, and puts the socket back to blocking at the end.
@@ -186,10 +186,10 @@ from another Windows session is tested with an injected identity: creating a
 second logon session is outside what the test can do. A `Session` endpoint
 accepting its own session is tested live.
 
-`acquisition_socket`, `bootstrap` and `input_transport` now run on Windows,
+`acquisition_socket`, `handshake` and `input_transport` now run on Windows,
 including a child process admitted through a pipe listener and killed while it
 holds a claim. So do `acquisition_ffi`, `acquisition_producer_ffi`,
-`acquisition_cpu_server_ffi`, `bootstrap_ffi` and `input_ffi`, with `_local`
+`acquisition_cpu_server_ffi`, `handshake_ffi` and `input_ffi`, with `_local`
 counterparts of the FD tests (argument rejection versus consumption, blocked
 attach cancellation, partial-request server cancellation, EOF versus protocol
 failure, liveness). `acquisition_session` stays POSIX-only: it drives the Porthole
@@ -197,7 +197,7 @@ daemon's Unix session protocol, which has no Windows implementation.
 
 `local_ffi_process` runs a producer and a consumer in separate processes using
 only the C entry points. The consumer child connects by endpoint, verifies the
-server's PID and user, bootstraps required input and attaches; the host checks
+server's PID and user, selects video and required input, and attaches; the host checks
 the accepted peer is that child. They exchange a frame and text input; the host
 resizes the allocation and the consumer installs the replacement while holding
 the old frame; the host cancels setup and the consumer observes closure through

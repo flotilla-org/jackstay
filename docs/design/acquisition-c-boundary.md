@@ -8,13 +8,13 @@ in `capture_transfer.h` under ABI 0.6. It uses `ArenaConsumer`, `FrameLease`,
 
 A Rust host can transfer an admitted consumer with
 `FtAcquisitionConsumer::into_raw`. A C process can import an authorized CPU grant
-using `ft_acquisition_import_cpu`: versioned `GrantDescriptor` JSON and the six
+using `ft_acquisition_import_cpu`: a typed `ft_cpu_grant_descriptor` and the six
 owned setup FDs from `RemoteConsumerGrant::into_parts`. The producer must obey
 the shared-memory protocol and bind the grant to the recipient process. This
 does not introduce a Porthole authorization requirement.
 
 The C import consumes all six FDs after basic argument validation, including
-when parsing or mapping fails, and writes -1 into the caller's array. A caller
+when validation or mapping fails, and writes -1 into the caller's array. A caller
 must not retain other transport copies, replay a grant or fork its mappings.
 Native setup must install its resource handles with the grant; it cannot use
 the CPU import to omit them.
@@ -54,7 +54,7 @@ serialization; cancellation handles must outlive all concurrent callers.
 ## Configuration replacement
 
 `ft_acquisition_install_cpu_configuration` consumes resource and payload FDs and its
-`ConfigurationDescriptor` JSON for the existing incarnation. Installed and stale
+`ft_cpu_configuration_descriptor` for the existing incarnation. Installed and stale
 offers have distinct results. A stale offer is disposed before another offer can
 be accepted; contradictory metadata or mappings remain errors. Existing frame
 handles keep their original descriptor and storage, and installing a new

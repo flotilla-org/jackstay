@@ -1,4 +1,4 @@
-"""Real toolkit producer and viewer communicate across a bootstrap socket."""
+"""Real toolkit producer and viewer communicate across a handshake socket."""
 import os
 import pathlib
 import re

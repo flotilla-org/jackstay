@@ -17,7 +17,7 @@
 //! time consumes nothing past what it needs.
 //!
 //! SIGPIPE: Local Endpoint connections are created with it suppressed
-//! (`local::unix` connect and accept), and bootstrap suppresses it on the
+//! (`local::unix` connect and accept), and the handshake suppresses it on the
 //! host-supplied streams it takes, so writes here report `BrokenPipe` in a C
 //! host that keeps the default disposition. Setting the option here instead
 //! would fail on macOS once the peer has closed.

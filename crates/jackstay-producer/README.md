@@ -1,7 +1,7 @@
 # jackstay-producer
 
 This crate owns the repetitive lifecycle of a native CPU producer. It uses
-Jackstay's Local Endpoint, bootstrap, input executor and CPU arena APIs. It adds
+Jackstay's Local Endpoint, track handshake, input executor and CPU arena APIs. It adds
 no transport, renderer, source discovery, host chrome or desktop authority.
 
 Construct `Builder` with a Local Endpoint, `ArenaConfig`, input `Config`, and a
@@ -22,14 +22,16 @@ private named pipe. Endpoint access is scoped to the current user/session;
 the host still selects and authorizes the source. The builder input config
 specifies supported typing modes and capabilities; semantic callbacks confer
 no input authority. Connections are bounded to eight by default; use
-`max_connections` to change the limit. A silent bootstrap cannot hold shutdown.
+`max_connections` to change the limit. A silent handshake cannot hold shutdown.
 At the limit, newly accepted connections are closed without negotiation. A peer
 continues to count after media EOF while input or affordances remains alive.
 Finished peer records and threads are reaped on the next accept or shutdown;
 the connection limit bounds this retained bookkeeping.
-Each accepted connection runs the explicit v2 bootstrap on a worker bounded
-by the existing five-second handshake deadline. Successful media streams keep
-their original peer identity and go to the CPU setup server.
+Each accepted connection runs the track handshake on a worker bounded by its
+five-second deadline. The source offers one video, input and affordances track
+(IDs `VIDEO`, `INPUT` and `AFFORDANCES`, labelled `default`, source label the
+endpoint name). When video is admitted, the media stream keeps its original
+peer identity and goes to the CPU setup server.
 
 Callbacks run serially on the source pump, roughly every five milliseconds.
 Each channel worker also polls at five milliseconds, so callback delivery can take about ten milliseconds or longer

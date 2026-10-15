@@ -1,5 +1,5 @@
 //! Run `cargo run -p jackstay-producer --example navigation` then attach using
-//! bootstrap::connect_v2. Source selection and authorization remain host policy.
+//! handshake::connect. Source selection and authorization remain host policy.
 use std::time::Duration;
 
 use jackstay::{
@@ -77,29 +77,29 @@ impl Producer for Content {
         snapshots
     }
     fn affordance(&mut self, event: Event) {
-        if let Event::Verb(ref verb) = event {
-            if verb.domain == Domain::Navigation {
-                match verb.name.as_str() {
-                    "back" => self.index = 0,
-                    "forward" => self.index = 1,
-                    "reload" => self.loading = true,
-                    "stop" => self.loading = false,
-                    "load" => {
-                        let Some(url) = verb.body["url"].as_str() else { return };
-                        self.url = url.into();
-                    }
-                    _ => return,
+        if let Event::Verb(ref verb) = event
+            && verb.domain == Domain::Navigation
+        {
+            match verb.name.as_str() {
+                "back" => self.index = 0,
+                "forward" => self.index = 1,
+                "reload" => self.loading = true,
+                "stop" => self.loading = false,
+                "load" => {
+                    let Some(url) = verb.body["url"].as_str() else { return };
+                    self.url = url.into();
                 }
-                self.dirty = true;
-                eprintln!("navigation verb={} url={}", verb.name, self.url);
+                _ => return,
             }
+            self.dirty = true;
+            eprintln!("navigation verb={} url={}", verb.name, self.url);
         }
-        if let Event::Snapshot(Snapshot::Presentation(p)) = event {
-            if let Some(size) = p.preferred_size {
-                self.width = (size.width * p.scale).round().clamp(1., 2048.) as u32;
-                self.height = (size.height * p.scale).round().clamp(1., 2048.) as u32;
-                eprintln!("presentation frame={}x{} scale={}", self.width, self.height, p.scale);
-            }
+        if let Event::Snapshot(Snapshot::Presentation(p)) = event
+            && let Some(size) = p.preferred_size
+        {
+            self.width = (size.width * p.scale).round().clamp(1., 2048.) as u32;
+            self.height = (size.height * p.scale).round().clamp(1., 2048.) as u32;
+            eprintln!("presentation frame={}x{} scale={}", self.width, self.height, p.scale);
         }
     }
 }

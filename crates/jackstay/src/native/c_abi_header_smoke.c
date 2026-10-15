@@ -1,7 +1,13 @@
 #include "jackstay_affordances.h"
 #include "capture_transfer.h"
-#include "jackstay_bootstrap.h"
+#include "jackstay_handshake.h"
 #include <string.h>
+
+/* Layouts pinned to the same sizes as the Rust definitions (handshake_ffi.rs). */
+_Static_assert(sizeof(ft_cpu_grant_descriptor) == 120 && sizeof(ft_cpu_configuration_descriptor) == 88,
+               "CPU descriptor layout");
+_Static_assert(sizeof(ft_track_selection) == 16 && sizeof(ft_track_admission) == 16 &&
+               sizeof(ft_track_offer) == 16 + 3 * sizeof(void *) + sizeof(size_t), "track layout");
 
 /* Run by acquisition_ffi.rs through this actual C translation unit. The test
  * producer wraps history and destroys its consumer between take and finish. */
@@ -56,24 +62,33 @@ int jackstay_c_local_endpoint_smoke(void) {
   ft_status (*create_fn)(ft_local_connection **, ft_cpu_acquisition_connection **) =
       ft_acquisition_cpu_connection_create_local;
   ft_status (*setup_alive_fn)(const ft_cpu_acquisition_connection *) = ft_acquisition_cpu_connection_alive;
-  ft_status (*bootstrap_accept_fn)(ft_local_connection **, ft_input_target *, ft_input_server **) =
-      ft_source_bootstrap_accept_local;
-  ft_status (*bootstrap_connect_fn)(ft_local_connection **, uint32_t, uint32_t, ft_input_client **,
-                                    ft_status *) = ft_source_bootstrap_connect_local;
+  ft_status (*handshake_accept_fn)(ft_local_connection **, const char *, const ft_track_offer *, size_t,
+                                   ft_input_target *, ft_track_admission *, size_t *, ft_input_server **,
+                                   ft_affordances_producer **) = ft_handshake_accept_local;
+  ft_status (*handshake_connect_fn)(ft_local_connection **, ft_handshake_offer **) = ft_handshake_connect_local;
+  ft_status (*handshake_describe_fn)(const ft_handshake_offer *, const char **, const ft_track_offer **,
+                                     size_t *) = ft_handshake_offer_describe;
+  ft_status (*handshake_select_fn)(ft_handshake_offer **, const ft_track_selection *, size_t, uint32_t,
+                                   ft_track_admission *, ft_local_connection **, ft_input_client **,
+                                   ft_status *, ft_affordances_host **) = ft_handshake_select;
+  void (*handshake_destroy_fn)(ft_handshake_offer **) = ft_handshake_offer_destroy;
   ft_status (*input_serve_fn)(ft_input_target *, ft_local_connection **, ft_input_server **) =
       ft_input_target_serve_local;
   ft_status (*input_connect_fn)(ft_local_connection **, uint32_t, ft_input_client **) =
       ft_input_client_connect_local;
-  ft_status (*import_fn)(const uint8_t *, size_t, ft_os_object[6], ft_acquisition_consumer **) =
+  ft_status (*import_fn)(const ft_cpu_grant_descriptor *, ft_os_object[6], ft_acquisition_consumer **) =
       ft_acquisition_import_cpu;
+  ft_status (*install_fn)(ft_acquisition_consumer *, const ft_cpu_configuration_descriptor *, ft_os_object[2]) =
+      ft_acquisition_install_cpu_configuration;
   char rendered[512];
   if (ft_local_endpoint_render(&endpoint, rendered, sizeof rendered) != FT_STATUS_OK) return -1;
   return (int)(sizeof peer + (none == FT_OS_OBJECT_NONE) + (listen_fn != NULL) + (accept_fn != NULL) +
                (connect_fn != NULL) + (peer_fn != NULL) + (alive_fn != NULL) + (write_fn != NULL) +
                (read_until_fn != NULL) + (serve_fn != NULL) +
-               (create_fn != NULL) + (setup_alive_fn != NULL) + (bootstrap_accept_fn != NULL) +
-               (bootstrap_connect_fn != NULL) + (input_serve_fn != NULL) + (input_connect_fn != NULL) +
-               (import_fn != NULL) + FT_STATUS_ADDRESS_IN_USE + FT_STATUS_UNTRUSTED_PEER);
+               (create_fn != NULL) + (setup_alive_fn != NULL) + (handshake_accept_fn != NULL) +
+               (handshake_connect_fn != NULL) + (handshake_describe_fn != NULL) + (handshake_select_fn != NULL) +
+               (handshake_destroy_fn != NULL) + (input_serve_fn != NULL) + (input_connect_fn != NULL) +
+               (import_fn != NULL) + (install_fn != NULL) + FT_STATUS_ADDRESS_IN_USE + FT_STATUS_UNTRUSTED_PEER);
 }
 
 #if defined(_WIN32)

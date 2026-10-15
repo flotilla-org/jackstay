@@ -94,11 +94,11 @@ fn malformed_cpu_grant_consumes_all_transferred_fds_without_returning_a_consumer
     let mut fds: [FtOsObject; 6] = std::array::from_fn(|_| into_raw(sender.try_clone().unwrap()));
     drop(sender);
     let mut consumer = ptr::null_mut();
-    // SAFETY: the malformed JSON is rejected before maps are accessed. All five
-    // FDs are valid, distinct, exclusively owned and transferred exactly once.
-    assert_eq!(
-        unsafe { ft_acquisition_import_cpu(b"!".as_ptr(), 1, fds.as_mut_ptr(), &mut consumer) },
-        FT_STATUS_INVALID_ARGUMENT
+    // SAFETY: the inconsistent descriptor is rejected before maps are accessed.
+    // All six objects are valid, distinct, exclusively owned and transferred once.
+    assert_ne!(
+        unsafe { ft_acquisition_import_cpu(&FtCpuGrantDescriptor::default(), fds.as_mut_ptr(), &mut consumer) },
+        FT_STATUS_OK
     );
     assert_eq!(fds, [FT_OS_OBJECT_NONE; 6]);
     assert!(consumer.is_null());
@@ -122,13 +122,12 @@ fn imported_consumer(producer: &mut ArenaProducer, holding: u32) -> (jackstay::a
     let grant = producer.attach_process(holding, std::process::id()).unwrap();
     let incarnation = grant.incarnation();
     let (descriptor, fds) = grant.into_parts().unwrap();
-    let json = serde_json::to_vec(&descriptor).unwrap();
     let mut fds = fds.map(into_raw);
     let mut consumer = ptr::null_mut();
     // SAFETY: conforming producer; sole intended recipient of this single-use
     // grant. No other FD copies remain and this test does not fork mappings.
     assert_eq!(
-        unsafe { ft_acquisition_import_cpu(json.as_ptr(), json.len(), fds.as_mut_ptr(), &mut consumer) },
+        unsafe { ft_acquisition_import_cpu(&descriptor, fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_OK
     );
     assert_eq!(fds, [FT_OS_OBJECT_NONE; 6]);
@@ -161,10 +160,9 @@ fn c_replacement_distinguishes_stale_offers_and_preserves_old_frames_and_credit(
         producer.reconfigure_cpu(8).unwrap();
         let (stale, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
         producer.reconfigure_cpu(12).unwrap();
-        let json = serde_json::to_vec(&stale).unwrap();
         let mut fd = fd.map(into_raw);
         assert_eq!(
-            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), fd.as_mut_ptr()),
+            ft_acquisition_install_cpu_configuration(consumer, &stale, fd.as_mut_ptr()),
             FT_STATUS_STALE
         );
         assert_eq!(fd, [FT_OS_OBJECT_NONE; 2]);
@@ -173,10 +171,9 @@ fn c_replacement_distinguishes_stale_offers_and_preserves_old_frames_and_credit(
             FT_STATUS_RECONFIGURATION
         );
         let (current, fd) = producer.configuration_offer(incarnation).unwrap().unwrap().into_parts().unwrap();
-        let json = serde_json::to_vec(&current).unwrap();
         let mut fd = fd.map(into_raw);
         assert_eq!(
-            ft_acquisition_install_cpu_configuration(consumer, json.as_ptr(), json.len(), fd.as_mut_ptr()),
+            ft_acquisition_install_cpu_configuration(consumer, &current, fd.as_mut_ptr()),
             FT_STATUS_OK
         );
         assert_eq!(fd, [FT_OS_OBJECT_NONE; 2]);
@@ -319,13 +316,12 @@ fn c_frames_keep_independent_credit_and_survive_consumer_destruction() {
 fn c_selection_preserves_misses_gaps_and_empty_results() {
     let mut producer = producer();
     let (grant, fds) = producer.attach_process(1, std::process::id()).unwrap().into_parts().unwrap();
-    let json = serde_json::to_vec(&grant).unwrap();
     let mut fds = fds.map(into_raw);
     let mut consumer = ptr::null_mut();
     // SAFETY: conforming producer, intended recipient, six uniquely owned FDs,
     // one import, and no fork or other copies of the transferred mappings.
     assert_eq!(
-        unsafe { ft_acquisition_import_cpu(json.as_ptr(), json.len(), fds.as_mut_ptr(), &mut consumer) },
+        unsafe { ft_acquisition_import_cpu(&grant, fds.as_mut_ptr(), &mut consumer) },
         FT_STATUS_OK
     );
     assert_eq!(fds, [FT_OS_OBJECT_NONE; 6]);

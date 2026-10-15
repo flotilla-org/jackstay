@@ -352,6 +352,9 @@ fn malformed_ignored_verbs_never_reach_callbacks() {
     let fd = jackstay::fdpass::recv_fd(&media).unwrap();
     let mut controls = local::Stream::from(fd);
     media.write_all(&[1]).unwrap();
+    // Then the tracks channel.
+    let _tracks = jackstay::fdpass::recv_fd(&media).unwrap();
+    media.write_all(&[1]).unwrap();
     controls.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     assert!(receive(&mut controls).contains("seek_absolute"));
     for withdrawn in [false, true] {

@@ -32,6 +32,19 @@ SCM_RIGHTS on Unix, or a private pipe end duplicated into the verified peer on
 Windows, each acknowledged before the sender drops its copy. Input and
 affordances keep their existing protocols on those channels.
 
+After the channels the host passes one more: the incarnation's tracks
+channel, on which it announces **added** (`track`), **removed** (`id`) and
+**updated** (`track`) notices with the same framing. An update keeps the ID
+and the selection; a device reopen is one. The consumer may select an offered
+playback or app-kind track late with a one-track **selection**; the host
+answers **admitted** and, for playback, passes the read-only ring, preceded by
+the doorbell if the incarnation had none. A late selection takes the next
+selection position, which is its doorbell hint bit. A removed track's mapping
+stays valid until the consumer drops it; its ring just stops advancing. The
+tracks channel is always sent, one extra channel per admission. It is separate
+because CPU setup owns the media stream once video is admitted, and is
+consumer-driven. It is Rust-only for now; the C ABI follows in #116.
+
 Kinds are open. The core kinds are `video`, `input` and `affordances`; an app
 kind is a reverse-domain name of lowercase labels, such as `org.example.cue`,
 whose descriptor Jackstay treats as opaque. A host offers at most one video, one
@@ -63,13 +76,15 @@ correction, and video-only consumers may ignore timestamps. See
 
 Hosts call `handshake::accept(stream, &offer, target)` on a worker. `Accepted`
 holds the media stream, the admissions, and the input `Server` and affordances
-`Producer` for admitted tracks. Serve CPU setup on the media stream when a
-video track was admitted.
+`Producer` for admitted tracks, and the `Notices` handle: `add`, `update` and
+`remove` send notices, and `serve` answers one late selection (a zero timeout
+polls). Serve CPU setup on the media stream when a video track was admitted.
 
 Consumers call `handshake::connect(stream)`, inspect `Offered::offer()`, then
 `select(&selection, mode)`. `Connected` holds the media stream, the admissions,
 an input `Client` or an optional input's clean admission rejection, and the
-affordances `Host`.
+affordances `Host`, and `Tracks`: `next` returns notices and `select` makes a
+late selection.
 
 `jackstay_handshake.h` exposes the same exchange as typed structs on Local
 Endpoint connections: `ft_handshake_accept_local` takes the clock domain and

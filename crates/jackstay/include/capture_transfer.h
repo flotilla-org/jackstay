@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 15
+#define FT_ABI_VERSION_MINOR 16
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -60,9 +60,10 @@ uint32_t ft_abi_version(void);
 #define FT_PIXEL_FORMAT_BGRA8_UNORM 1
 #define FT_PIXEL_FORMAT_RGBA8_UNORM 2
 
+/* A publication's clock domain, declared once in its offer. Host time is the
+ * platform monotonic clock in ns: Linux CLOCK_MONOTONIC, macOS
+ * CLOCK_UPTIME_RAW (mach_absolute_time), Windows QPC. */
 #define FT_CLOCK_DOMAIN_UNKNOWN 0
-#define FT_CLOCK_DOMAIN_UNIX_TIME 1
-#define FT_CLOCK_DOMAIN_MEDIA_TIME 2
 #define FT_CLOCK_DOMAIN_HOST_TIME 3
 
 #define FT_COLOR_SPACE_UNKNOWN 0
@@ -205,7 +206,7 @@ typedef struct ft_acquisition_release_timeline ft_acquisition_release_timeline;
 typedef struct ft_acquired_frame_descriptor {
   uint64_t cursor;
   uint64_t sequence;
-  uint64_t timestamp_ns;
+  uint64_t timestamp_ns; /* host time; producers stamp 0 at publish */
   uint64_t config_generation;
   uint64_t pool_id;
   uint64_t payload_offset;
@@ -220,13 +221,13 @@ typedef struct ft_acquired_frame_descriptor {
   uint32_t stride;
   uint32_t pixel_format;
   uint32_t slot_id;
-  uint32_t clock_domain;
   uint32_t color_space;
   uint32_t sync_kind;
   uint32_t payload_kind;
   uint32_t damage_kind;
   uint32_t dropped_before_publish;
   uint32_t flags;
+  uint32_t reserved;
 } ft_acquired_frame_descriptor;
 
 typedef struct ft_acquisition_range {
@@ -596,7 +597,7 @@ ft_status ft_cpu_producer_serve(ft_cpu_producer *, int32_t *fd, ft_cpu_setup_ser
 _Static_assert(sizeof(ft_acquired_frame_descriptor) == 144, "acquired descriptor size");
 _Static_assert(offsetof(ft_acquired_frame_descriptor, fence_value) == 72, "acquired readiness packing");
 _Static_assert(offsetof(ft_acquired_frame_descriptor, width) == 96, "acquired dimensions packing");
-_Static_assert(offsetof(ft_acquired_frame_descriptor, flags) == 140, "acquired flags packing");
+_Static_assert(offsetof(ft_acquired_frame_descriptor, flags) == 136, "acquired flags packing");
 _Static_assert(sizeof(ft_acquisition_range) == 16, "acquisition range size");
 _Static_assert(sizeof(ft_acquisition_events) == 32, "acquisition events size");
 _Static_assert(sizeof(ft_cpu_producer_config) == 40, "CPU producer config size");

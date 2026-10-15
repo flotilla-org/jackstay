@@ -30,7 +30,7 @@ use jackstay::{
         ft_acquired_frame_defer_release, ft_acquired_frame_describe, ft_acquired_frame_release, ft_acquisition_acquire,
         ft_acquisition_consumer_destroy, ft_acquisition_release_timeline_destroy, ft_acquisition_relinquish_configuration,
     },
-    model::{ClockDomain, ColorSpace, PixelFormat},
+    model::{ColorSpace, PixelFormat},
     native::{
         NativeStreamParams,
         arena::NativeArenaProducer,
@@ -60,7 +60,6 @@ fn params(width: u32, height: u32) -> NativeStreamParams {
         height,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     }
 }

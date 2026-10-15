@@ -159,13 +159,43 @@ pub enum ColorSpace {
     Srgb = 1,
 }
 
+/// A publication's one clock domain, declared in its offer (#99).
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ClockDomain {
     Unknown = 0,
-    UnixTime = 1,
-    MediaTime = 2,
+    /// See [`host_time_ns`].
     HostTime = 3,
+}
+
+/// Now in host time: the platform monotonic clock in nanoseconds (Linux
+/// `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW`, the nanosecond form of
+/// `mach_absolute_time`, Windows QPC).
+#[must_use]
+pub fn host_time_ns() -> u64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+        let (mut ticks, mut frequency) = (0, 1);
+        // SAFETY: both are valid out pointers; neither call fails on XP or later.
+        unsafe {
+            QueryPerformanceCounter(&mut ticks);
+            QueryPerformanceFrequency(&mut frequency);
+        }
+        (i128::from(ticks) * 1_000_000_000 / i128::from(frequency)) as u64
+    }
+    #[cfg(unix)]
+    {
+        #[cfg(target_vendor = "apple")]
+        let clock = libc::CLOCK_UPTIME_RAW;
+        #[cfg(not(target_vendor = "apple"))]
+        let clock = libc::CLOCK_MONOTONIC;
+        let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `time` is a valid out pointer; the clock always exists.
+        unsafe { libc::clock_gettime(clock, &mut time) };
+        time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+    }
 }
 
 #[repr(u32)]
@@ -197,8 +227,7 @@ mod tests {
         assert_eq!(PixelFormat::Bgra8Unorm as u32, 1);
         assert_eq!(PixelFormat::Rgba8Unorm as u32, 2);
         assert_eq!(ClockDomain::Unknown as u32, 0);
-        assert_eq!(ClockDomain::UnixTime as u32, 1);
-        assert_eq!(ClockDomain::MediaTime as u32, 2);
+        assert_eq!(ClockDomain::HostTime as u32, 3);
         assert_eq!(FrameSyncKind::CpuCopyComplete as u32, 1);
         assert_eq!(DamageKind::FullFrame as u32, 1);
         assert_eq!(ColorSpace::Unknown as u32, 0);

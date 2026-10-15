@@ -27,8 +27,9 @@ int main(int argc, char **argv) {
                               {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0},
                               {3, FT_TRACK_KIND_AFFORDANCES, "default", NULL, 0, FT_TRACK_BOTH, 0}};
   ft_track_admission admissions[3]; size_t count = 0;
-  ft_status handshake = ft_handshake_accept_local(&local, "C fixture", tracks, strcmp(argv[2], "offered") ? 2 : 3,
-                                                  NULL, admissions, &count, &input, &affordances);
+  ft_status handshake = ft_handshake_accept_local(&local, "C fixture", FT_CLOCK_DOMAIN_HOST_TIME, tracks,
+                                                  strcmp(argv[2], "offered") ? 2 : 3, NULL, admissions, &count,
+                                                  &input, &affordances);
   ft_local_listener_destroy(&listener);
   /* A viewer requiring absent affordances abandons the offer, ending here. */
   if (handshake != FT_STATUS_OK || (argc == 4 && !strcmp(argv[3], "refusal"))) {
@@ -65,7 +66,7 @@ int main(int argc, char **argv) {
       pause_ms(); continue;
     }
     fill_frame(pixels, sequence);
-    ft_acquired_frame_descriptor desc = {.sequence = sequence, .timestamp_ns = sequence * 16000000,
+    ft_acquired_frame_descriptor desc = {.sequence = sequence,
       .width = WIDTH, .height = HEIGHT, .stride = STRIDE, .pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM};
     uint64_t cursor; ft_status s = ft_cpu_producer_publish(producer, &desc, pixels, sizeof(pixels), &cursor);
     if (s != FT_STATUS_OK && s != FT_STATUS_DROPPED) check(s);

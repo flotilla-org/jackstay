@@ -525,6 +525,7 @@ unsafe fn offer_tracks(connection: &mut *mut FtLocalConnection, target: *mut FtI
         ft_handshake_accept_local(
             connection,
             c"source".as_ptr(),
+            FT_CLOCK_DOMAIN_HOST_TIME,
             tracks.as_ptr(),
             2,
             target,

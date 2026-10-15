@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{AdmissionBook, AdmissionError, AdmissionLimits, AllocationId, HoldingRequest, IncarnationId};
-use crate::{CaptureTransferError, shm::SharedMemorySegment};
+use crate::{CaptureTransferError, model::host_time_ns, shm::SharedMemorySegment};
 
 mod writer;
 pub use writer::{CpuReservation, DelegatedWriter, WriterDescriptor, WriterExport, WriterSlot};
@@ -90,6 +90,8 @@ pub struct ArenaConfig {
 pub struct FrameDescriptor {
     pub cursor: u64,
     pub sequence: u64,
+    /// Source presentation time in host time. Publishing stamps a zero
+    /// timestamp with [`host_time_ns`].
     pub timestamp_ns: u64,
     /// Installed allocation generation, stamped by the arena at publication.
     pub config_generation: u64,
@@ -106,13 +108,19 @@ pub struct FrameDescriptor {
     pub stride: u32,
     pub pixel_format: u32,
     pub slot_id: u32,
-    pub clock_domain: u32,
     pub color_space: u32,
     pub sync_kind: u32,
     pub payload_kind: u32,
     pub damage_kind: u32,
     pub dropped_before_publish: u32,
     pub flags: u32,
+    pub reserved: u32,
+}
+
+fn stamp(descriptor: &mut FrameDescriptor) {
+    if descriptor.timestamp_ns == 0 {
+        descriptor.timestamp_ns = host_time_ns();
+    }
 }
 
 #[repr(C, align(128))]
@@ -817,6 +825,7 @@ impl ArenaProducer {
             descriptor.config_generation = resources.generation;
             descriptor.payload_offset = payload_offset as u64;
             descriptor.payload_len = bytes.len() as u64;
+            stamp(&mut descriptor);
             // SAFETY: resource is outside history, retired, and unclaimed.
             // SC retirement/scan excludes successful concurrent acquisition.
             // This producer owns the only write API; descriptors are copied

@@ -34,8 +34,10 @@ use crate::{
     shm::SharedMemorySegment,
 };
 
-/// The most playback tracks one offer may carry: one doorbell hint bit each,
-/// which also keeps the single ring transfer far below `SCM_MAX_FD`.
+/// The most playback tracks one offer may carry, which keeps the single ring
+/// transfer far below `SCM_MAX_FD`. Hint bits are selection positions mod 64,
+/// so tracks can share a bit when the selection is longer; that only costs a
+/// spurious wake.
 pub const MAX_TRACKS: usize = 64;
 
 /// The shortest ring a producer may configure.

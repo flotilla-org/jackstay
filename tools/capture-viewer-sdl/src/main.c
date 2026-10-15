@@ -422,10 +422,11 @@ static int select_tracks(ft_local_connection **local, const viewer_options *opti
                          viewer_affordances *affordances) {
   ft_handshake_offer *offer = NULL;
   const char *source = NULL;
+  uint32_t clock = 0;
   const ft_track_offer *tracks = NULL;
   size_t count = 0;
   if (require_ok(ft_handshake_connect_local(local, &offer), "handshake offer") ||
-      require_ok(ft_handshake_offer_describe(offer, &source, &tracks, &count), "handshake describe")) return 1;
+      require_ok(ft_handshake_offer_describe(offer, &source, &clock, &tracks, &count), "handshake describe")) return 1;
   ft_track_selection selection[3];
   size_t selected = 0;
   int have_input = 0, have_affordances = 0;
@@ -599,7 +600,7 @@ static int run_cpu(const viewer_options *options) {
     if (producer != NULL) {
       fill_frame(pixels, acquired + 1);
       ft_acquired_frame_descriptor descriptor = {
-        .sequence = acquired + 1, .timestamp_ns = (acquired + 1) * UINT64_C(16666667),
+        .sequence = acquired + 1,
         .width = WIDTH, .height = HEIGHT, .stride = STRIDE, .pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM,
       };
       ft_status publication = ft_cpu_producer_publish(producer, &descriptor, pixels, (size_t)STRIDE * HEIGHT, &published_cursor);

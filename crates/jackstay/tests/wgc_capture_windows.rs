@@ -399,7 +399,7 @@ fn a_minimized_window_starts_and_publishes_once_restored() {
 #[ignore = "needs an interactive desktop; creates and captures its own window"]
 fn a_replacement_paused_for_capacity_publishes_a_static_window_once_capacity_frees() {
     use jackstay::{
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat},
         native::{NativeStreamParams, arena::ArenaNativeBackend, windows::D3d11FrameBackend},
     };
     let window = TestWindow::open(160, 120, RED);
@@ -412,7 +412,6 @@ fn a_replacement_paused_for_capacity_publishes_a_static_window_once_capacity_fre
                 height: 120,
                 pixel_format: PixelFormat::Bgra8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             },
             6,

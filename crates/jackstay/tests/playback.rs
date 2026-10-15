@@ -9,6 +9,7 @@ use jackstay::{
     handshake::{self, Accepted, Connected, Kind, Offer, Refusal, Selected},
     input::Mode,
     local::Stream,
+    model::ClockDomain,
 };
 
 #[cfg(unix)]
@@ -51,6 +52,7 @@ fn write(writer: &mut PlaybackWriter, n: u8) -> u64 {
 fn connect(writers: &[&PlaybackWriter], selection: &[Selected]) -> (Accepted, Connected) {
     let offer = Offer {
         source: "test source".into(),
+        clock: ClockDomain::HostTime,
         tracks: writers.iter().map(|w| w.track("default")).collect(),
     };
     let rings: Vec<_> = writers.iter().map(|w| w.playback()).collect();
@@ -74,6 +76,7 @@ fn offer_carries_the_descriptor_and_settings_floor_the_depth() {
     let (host, peer) = pair();
     let offer = Offer {
         source: "test source".into(),
+        clock: ClockDomain::HostTime,
         tracks: vec![writer.track("default")],
     };
     let rings = [writer.playback()];
@@ -116,6 +119,7 @@ fn offer_carries_the_descriptor_and_settings_floor_the_depth() {
     let (host, _peer) = pair();
     let offer = Offer {
         source: "test source".into(),
+        clock: ClockDomain::HostTime,
         tracks: vec![writer.track("default")],
     };
     assert!(handshake::accept(host, &offer, None, &[]).is_err());
@@ -127,6 +131,7 @@ fn offer_carries_the_descriptor_and_settings_floor_the_depth() {
     let (host, _peer) = pair();
     let offer = Offer {
         source: "test source".into(),
+        clock: ClockDomain::HostTime,
         tracks: vec![track],
     };
     let result = handshake::accept(host, &offer, None, &[writer.playback()]);

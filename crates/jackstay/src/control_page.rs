@@ -20,7 +20,7 @@ use crate::{
 
 pub const CONTROL_PAGE_ALIGNMENT: usize = 128;
 pub const VIDEO_TRACK_CONTROL_MAGIC: u64 = u64::from_le_bytes(*b"JSFRING1");
-pub const VIDEO_TRACK_CONTROL_VERSION: u32 = 3;
+pub const VIDEO_TRACK_CONTROL_VERSION: u32 = 4;
 pub const CONFIG_RING_CAPACITY: usize = 4;
 // config_index_mask derives the ring mask as CONFIG_RING_CAPACITY - 1, which is
 // only a valid index mask when the capacity is a power of two.
@@ -107,9 +107,8 @@ pub struct StreamConfig {
     pub stride: u32,
     pub pixel_format: u32,
     pub color_space: u32,
-    pub clock_domain: u32,
     pub sync_kind: u32,
-    pub reserved0: u32,
+    pub reserved0: u64,
     pub modifier: u64,
     /// The stream's timeline fence, as registered via the setup channel.
     pub fence_id: u64,
@@ -125,7 +124,6 @@ impl Default for StreamConfig {
             stride: 0,
             pixel_format: 0,
             color_space: 0,
-            clock_domain: 0,
             sync_kind: 0,
             reserved0: 0,
             modifier: 0,
@@ -210,8 +208,7 @@ const _: () = {
     assert!(std::mem::offset_of!(StreamConfig, stride) == 16);
     assert!(std::mem::offset_of!(StreamConfig, pixel_format) == 20);
     assert!(std::mem::offset_of!(StreamConfig, color_space) == 24);
-    assert!(std::mem::offset_of!(StreamConfig, clock_domain) == 28);
-    assert!(std::mem::offset_of!(StreamConfig, sync_kind) == 32);
+    assert!(std::mem::offset_of!(StreamConfig, sync_kind) == 28);
     assert!(std::mem::offset_of!(StreamConfig, modifier) == 40);
     assert!(std::mem::offset_of!(StreamConfig, fence_id) == 48);
     assert!(std::mem::offset_of!(StreamConfig, reserved1) == 56);
@@ -240,7 +237,6 @@ pub struct PendingVideoRingEntry {
     pub slot_id: u32,
     pub payload_offset: u64,
     pub payload_len: u64,
-    pub clock_domain: u32,
     pub color_space: u32,
     pub sync_kind: u32,
     pub damage_kind: u32,
@@ -269,7 +265,6 @@ pub struct VideoRingEntry {
     pub slot_id: u32,
     pub payload_offset: u64,
     pub payload_len: u64,
-    pub clock_domain: u32,
     pub color_space: u32,
     pub sync_kind: u32,
     pub damage_kind: u32,
@@ -298,7 +293,6 @@ impl VideoRingEntry {
             slot_id: slot.slot_id,
             payload_offset: slot.payload_offset,
             payload_len: slot.payload_len,
-            clock_domain: config.clock_domain,
             color_space: config.color_space,
             sync_kind: config.sync_kind,
             damage_kind: slot.damage_kind,
@@ -590,7 +584,6 @@ impl VideoTrackControlPage {
             stride: entry.stride,
             pixel_format: entry.pixel_format,
             color_space: entry.color_space,
-            clock_domain: entry.clock_domain,
             sync_kind: entry.sync_kind,
             reserved0: 0,
             modifier: entry.modifier,
@@ -1111,7 +1104,7 @@ mod tests {
     use super::{
         CONFIG_RING_CAPACITY, CONTROL_PAGE_ALIGNMENT, FrameSlot, PendingVideoRingEntry, VideoRingReadError, VideoTrackControlPage,
     };
-    use crate::model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat};
+    use crate::model::{ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat};
 
     fn pending(sequence: u64) -> PendingVideoRingEntry {
         PendingVideoRingEntry {
@@ -1125,7 +1118,6 @@ mod tests {
             slot_id: sequence as u32,
             payload_offset: sequence * 64,
             payload_len: 4,
-            clock_domain: 0,
             color_space: 0,
             sync_kind: 0,
             damage_kind: 0,
@@ -1152,7 +1144,6 @@ mod tests {
             slot_id: sequence as u32,
             payload_offset: sequence * 64,
             payload_len: 4,
-            clock_domain: ClockDomain::MediaTime as u32,
             color_space: ColorSpace::Srgb as u32,
             sync_kind: FrameSyncKind::CpuCopyComplete as u32,
             damage_kind: DamageKind::InlineRects as u32,
@@ -1369,7 +1360,6 @@ mod tests {
         assert_eq!(entry.slot_id, pending.slot_id);
         assert_eq!(entry.payload_offset, pending.payload_offset);
         assert_eq!(entry.payload_len, pending.payload_len);
-        assert_eq!(entry.clock_domain, pending.clock_domain);
         assert_eq!(entry.color_space, pending.color_space);
         assert_eq!(entry.sync_kind, pending.sync_kind);
         assert_eq!(entry.damage_kind, pending.damage_kind);

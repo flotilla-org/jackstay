@@ -433,7 +433,7 @@ mod tests {
     use super::{XpcAttachClient, XpcAttachServer};
     use crate::{
         control_page::VideoTrackControlPage,
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat},
         native::{
             NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy,
             attach::{AttachEndpoint, AttachError},
@@ -451,7 +451,6 @@ mod tests {
             height: HEIGHT,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         };
         Arc::new(Mutex::new(

@@ -74,7 +74,7 @@ use super::{AdapterInfo, AdapterSelection, D3d11CapturedFrame, D3d11Device, D3d1
 use crate::{
     acquisition::arena::{ArenaConfig, ArenaError, ArenaProducer, FrameDescriptor, PublishOutcome, ReconfigurationStatus},
     error::Result,
-    model::{ClockDomain, ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
+    model::{ColorSpace, DamageKind, FrameSyncKind, PayloadKind, PixelFormat},
     native::{NativeStreamParams, arena::NativeArenaProducer},
 };
 
@@ -326,7 +326,6 @@ fn stream_params(size: (u32, u32)) -> NativeStreamParams {
         height: size.1,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     }
 }
@@ -586,7 +585,6 @@ impl Cpu {
                 stride: width * 4,
                 pixel_format: PixelFormat::Bgra8Unorm as u32,
                 color_space: ColorSpace::Srgb as u32,
-                clock_domain: ClockDomain::HostTime as u32,
                 payload_kind: PayloadKind::CpuShm as u32,
                 sync_kind: FrameSyncKind::CpuCopyComplete as u32,
                 damage_kind: DamageKind::FullFrame as u32,

@@ -1,8 +1,11 @@
 use std::{process::Command, time::Duration};
 
-use jackstay::acquisition::arena::{
-    AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, Cancellation, ConsumerGrant, FrameDescriptor, PublishOutcome, WaitInterest,
-    WaitOutcome,
+use jackstay::{
+    acquisition::arena::{
+        AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, Cancellation, ConsumerGrant, FrameDescriptor, PublishOutcome,
+        WaitInterest, WaitOutcome,
+    },
+    model::host_time_ns,
 };
 
 #[path = "support/child.rs"]
@@ -54,6 +57,27 @@ fn a_mapped_cpu_lease_keeps_its_descriptor_and_bytes_after_many_ring_wraps() {
     };
     assert_eq!(latest.bytes(), b"wxyz");
     assert_eq!(latest.descriptor().sequence, 107);
+}
+
+#[test]
+fn publishing_stamps_unset_timestamps_with_host_time() {
+    let mut producer = ArenaProducer::new(config()).unwrap();
+    let consumer = ArenaConsumer::from_grant(producer.attach(2).unwrap()).unwrap();
+    let before = host_time_ns();
+    producer.publish(FrameDescriptor::default(), b"abcd").unwrap();
+    let AcquireOutcome::Frame(stamped) = consumer.acquire_latest(0).unwrap() else {
+        panic!("stamped frame missing")
+    };
+    assert!((before..=host_time_ns()).contains(&stamped.descriptor().timestamp_ns));
+    let given = FrameDescriptor {
+        timestamp_ns: 5,
+        ..FrameDescriptor::default()
+    };
+    producer.publish(given, b"wxyz").unwrap();
+    let AcquireOutcome::Frame(kept) = consumer.acquire_latest(stamped.cursor()).unwrap() else {
+        panic!("timestamped frame missing")
+    };
+    assert_eq!(kept.descriptor().timestamp_ns, 5);
 }
 
 #[test]

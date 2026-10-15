@@ -196,7 +196,7 @@ mod tests {
     use super::{AttachEndpoint, AttachError, AttachGrant, AttachRequest, AttachResponse, AttachSession};
     use crate::{
         control_page::VideoTrackControlPage,
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat},
         native::{
             NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy,
             fake::{FakeCapturedFrame, FakeNativeBackend, FakeSurfaceRegistry},
@@ -209,7 +209,6 @@ mod tests {
             height: 480,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         }
     }

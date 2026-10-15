@@ -42,7 +42,8 @@ static void offer_tracks(ft_local_connection **connection, ft_input_target *targ
   ft_track_offer tracks[2] = {{1, FT_TRACK_KIND_VIDEO, "default", NULL, 0, FT_TRACK_FROM_SOURCE, 0},
                               {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0}};
   ft_track_admission admissions[2]; size_t count = 0; ft_affordances_producer *affordances = NULL;
-  checked(ft_handshake_accept_local(connection, "reference input source", tracks, 2, target, admissions, &count, input, &affordances));
+  checked(ft_handshake_accept_local(connection, "reference input source", FT_CLOCK_DOMAIN_HOST_TIME, tracks, 2,
+                                    target, admissions, &count, input, &affordances));
 }
 static const char *action_name(uint32_t action) {
   return action == FT_INPUT_DOWN ? "down" : action == FT_INPUT_UP ? "up" : action == FT_INPUT_REPEAT ? "repeat" : "?";
@@ -217,7 +218,7 @@ int main(int argc, char **argv) {
           p[0] = buttons ? 0 : 255; p[1] = buttons ? 0 : 255; p[2] = 255;
         }
       }
-      ft_acquired_frame_descriptor desc = {.sequence = sequence, .timestamp_ns = sequence * 16000000,
+      ft_acquired_frame_descriptor desc = {.sequence = sequence,
         .width = width, .height = height, .stride = stride, .pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM};
       uint64_t cursor; ft_status s = ft_cpu_producer_publish(producer, &desc, pixels, (size_t)stride * height, &cursor);
       if (s != FT_STATUS_OK && s != FT_STATUS_DROPPED) checked(s);

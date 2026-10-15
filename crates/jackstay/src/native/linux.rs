@@ -798,7 +798,7 @@ mod tests {
 
     use crate::{
         error::{CaptureTransferError, Result},
-        model::{ClockDomain, ColorSpace, PayloadKind, PixelFormat},
+        model::{ColorSpace, PayloadKind, PixelFormat},
         native::{
             NativeFrameBackend, NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy, SlotClaim, SlotReuseCandidate,
             attach::AttachEndpoint,
@@ -924,7 +924,6 @@ mod tests {
                 height: 32,
                 pixel_format: PixelFormat::Bgra8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             },
             2,
@@ -1040,7 +1039,6 @@ mod tests {
                 height: 32,
                 pixel_format: PixelFormat::Bgra8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             },
             2,
@@ -1072,7 +1070,6 @@ mod tests {
                 height: 32,
                 pixel_format: PixelFormat::Bgra8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             },
             2,
@@ -1145,7 +1142,6 @@ mod tests {
                     height: 32,
                     pixel_format: PixelFormat::Bgra8Unorm,
                     color_space: ColorSpace::Srgb,
-                    clock_domain: ClockDomain::HostTime,
                     modifier: 0,
                 },
                 2,
@@ -1198,7 +1194,6 @@ mod tests {
                 height: 32,
                 pixel_format: PixelFormat::Bgra8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             },
             2,

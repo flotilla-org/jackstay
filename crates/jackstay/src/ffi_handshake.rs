@@ -13,6 +13,7 @@ use crate::{
     handshake::{self, Admission, Bytes, Direction, Kind, Offer, Offered, Refusal, Selected, Track},
     input::Mode,
     local::PeerIdentity,
+    model::ClockDomain,
 };
 
 pub const FT_TRACK_FROM_SOURCE: u32 = 0;
@@ -136,6 +137,7 @@ unsafe fn track(track: &FtTrackOffer) -> Option<Track> {
 pub unsafe extern "C" fn ft_handshake_accept_local(
     connection: *mut *mut FtLocalConnection,
     source_label: *const c_char,
+    clock_domain: u32,
     tracks: *const FtTrackOffer,
     track_count: usize,
     authorized_input: *mut FtInputTarget,
@@ -149,6 +151,11 @@ pub unsafe extern "C" fn ft_handshake_accept_local(
         out_affordances.as_mut()
     }) else {
         return FT_STATUS_INVALID_ARGUMENT;
+    };
+    let clock = match clock_domain {
+        FT_CLOCK_DOMAIN_UNKNOWN => ClockDomain::Unknown,
+        FT_CLOCK_DOMAIN_HOST_TIME => ClockDomain::HostTime,
+        _ => return FT_STATUS_INVALID_ARGUMENT,
     };
     if !input.is_null() || !affordances.is_null() || (track_count > 0 && (tracks.is_null() || out_admissions.is_null())) {
         return FT_STATUS_INVALID_ARGUMENT;
@@ -169,7 +176,7 @@ pub unsafe extern "C" fn ft_handshake_accept_local(
         return FT_STATUS_INVALID_ARGUMENT;
     };
     let FtLocalConnection { stream, peer } = *taken;
-    match handshake::accept(stream, &Offer { source, tracks }, target, &[]) {
+    match handshake::accept(stream, &Offer { source, clock, tracks }, target, &[]) {
         Ok(accepted) => {
             for (index, admission) in accepted.admissions.iter().enumerate() {
                 // SAFETY: the host refuses selections longer than its offer.
@@ -261,7 +268,7 @@ pub unsafe extern "C" fn ft_handshake_connect_local(
 }
 
 /// Borrow the offer's source label and tracks, valid until the offer is
-/// selected or destroyed.
+/// selected or destroyed, and copy its FT_CLOCK_DOMAIN_* value.
 ///
 /// # Safety
 /// `offer` is live; outputs are writable and disjoint.
@@ -269,19 +276,22 @@ pub unsafe extern "C" fn ft_handshake_connect_local(
 pub unsafe extern "C" fn ft_handshake_offer_describe(
     offer: *const FtHandshakeOffer,
     out_source_label: *mut *const c_char,
+    out_clock_domain: *mut u32,
     out_tracks: *mut *const FtTrackOffer,
     out_track_count: *mut usize,
 ) -> FtStatus {
     // SAFETY: caller supplies live, disjoint pointers.
-    let (Some(offer), Some(source), Some(tracks), Some(count)) = (
+    let (Some(offer), Some(source), Some(clock), Some(tracks), Some(count)) = (
         unsafe { offer.as_ref() },
         unsafe { out_source_label.as_mut() },
+        unsafe { out_clock_domain.as_mut() },
         unsafe { out_tracks.as_mut() },
         unsafe { out_track_count.as_mut() },
     ) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
     *source = offer.source.as_ptr();
+    *clock = offer.offered.offer().clock as u32;
     *tracks = offer.tracks.as_ptr();
     *count = offer.tracks.len();
     FT_STATUS_OK

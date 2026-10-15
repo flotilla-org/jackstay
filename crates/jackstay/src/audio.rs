@@ -1,10 +1,14 @@
-//! Playback audio tracks. Each track is one single-writer seqlock broadcast
+//! Audio tracks. Each track is one single-writer seqlock broadcast
 //! ring of fixed-size sample blocks, following `jackstay_ring.h`: the writer
 //! zeroes a block's sequence word, writes it, then publishes the sequence and
 //! the ring cursor; a reader copies a block out and keeps it only if the
 //! sequence named its cursor before and after the copy. Reader cursors are
 //! private, so a slow reader is lapped without affecting anyone else, and the
-//! writer never waits. Consumers map rings read-only.
+//! writer never waits. Consumers map playback rings read-only.
+//!
+//! A recording track uses the same ring with the roles swapped: the one
+//! admitted consumer maps it read-write and writes, and the source reads it
+//! through a [`RecordingReader`], which yields silence while nobody writes.
 //!
 //! Each consumer incarnation that selects playback tracks gets one doorbell:
 //! a shared changed-track hint (bit = selection position mod 64) and the
@@ -148,7 +152,7 @@ pub struct Settings {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("invalid playback track: {0}")]
+    #[error("invalid audio track: {0}")]
     Invalid(&'static str),
     #[error(transparent)]
     Storage(#[from] CaptureTransferError),
@@ -197,13 +201,20 @@ struct Ring {
 }
 
 impl Ring {
-    fn create(blocks: u64, payload_len: usize) -> Result<(Self, OwnedFd), Error> {
+    /// The ring and the consumers' descriptor: read-only unless `writable`.
+    fn create(blocks: u64, payload_len: usize, writable: bool) -> Result<(Self, OwnedFd), Error> {
         let block_len = (size_of::<BlockHeader>() + payload_len).next_multiple_of(BLOCK_ALIGN);
         let map_len = usize::try_from(blocks)
             .ok()
             .and_then(|blocks| blocks.checked_mul(block_len)?.checked_add(HEADER_LEN))
             .ok_or(Error::Invalid("ring too large"))?;
-        let (segment, read_only) = SharedMemorySegment::with_read_only_fd(map_len)?;
+        let (segment, fd) = if writable {
+            let segment = SharedMemorySegment::new(map_len)?;
+            let fd = segment.try_clone_fd()?;
+            (segment, fd)
+        } else {
+            SharedMemorySegment::with_read_only_fd(map_len)?
+        };
         let header = RingHeader {
             magic: MAGIC,
             version: VERSION,
@@ -220,11 +231,11 @@ impl Ring {
             block_len,
             payload_len,
         };
-        Ok((ring, read_only))
+        Ok((ring, fd))
     }
 
-    /// Map a received ring read-only, validating its geometry once.
-    fn map(fd: OwnedFd) -> Result<Self, Error> {
+    /// Map a received ring, validating its geometry once.
+    fn map(fd: OwnedFd, writable: bool) -> Result<Self, Error> {
         let probe = SharedMemorySegment::map_read_only(fd.try_clone()?, HEADER_LEN)?;
         // SAFETY: line 0 is plain integers, immutable once shared.
         let header = unsafe { probe.as_ptr().cast::<RingHeader>().read() };
@@ -248,7 +259,11 @@ impl Ring {
         {
             return Err(Error::Invalid("ring geometry"));
         }
-        let segment = SharedMemorySegment::map_read_only(fd, map_len)?;
+        let segment = if writable {
+            SharedMemorySegment::map_read_write(fd, map_len)?
+        } else {
+            SharedMemorySegment::map_read_only(fd, map_len)?
+        };
         // SAFETY: as above, on the full mapping.
         if unsafe { segment.as_ptr().cast::<RingHeader>().read() } != header {
             return Err(Error::Invalid("ring geometry"));
@@ -338,25 +353,17 @@ impl Ring {
 #[derive(Debug)]
 struct Shared {
     id: u64,
-    ring: Ring,
-    read_only: OwnedFd,
+    ring: Arc<Ring>,
+    /// What consumers map: read-only for playback, read-write for recording.
+    fd: OwnedFd,
+    recording: bool,
+    /// Recording: the first cursor of the admitted writer, or 0 with none.
+    writer: AtomicU64,
     bells: Mutex<Vec<(Weak<BellInner>, u64)>>,
 }
 
-/// The producer side of one playback track. Writing never blocks or
-/// allocates, and continues with no readers.
-#[derive(Debug)]
-pub struct PlaybackWriter {
-    shared: Arc<Shared>,
-    format: Format,
-    generation: u32,
-    position: u64,
-    cursor: u64,
-    flags: u32,
-}
-
-impl PlaybackWriter {
-    pub fn new(id: u64, settings: Settings) -> Result<Self, Error> {
+impl Shared {
+    fn new(id: u64, settings: Settings, recording: bool) -> Result<Arc<Self>, Error> {
         let Settings {
             format,
             block_frames,
@@ -374,15 +381,58 @@ impl PlaybackWriter {
         let payload_len = (block_frames as usize)
             .checked_mul(format.frame_bytes())
             .ok_or(Error::Invalid("block too large"))?;
-        let (ring, read_only) = Ring::create(u64::from(blocks), payload_len)?;
-        Ok(Self {
-            shared: Arc::new(Shared {
-                id,
-                ring,
-                read_only,
-                bells: Mutex::default(),
-            }),
+        let (ring, fd) = Ring::create(u64::from(blocks), payload_len, recording)?;
+        Ok(Arc::new(Self {
+            id,
+            ring: Arc::new(ring),
+            fd,
+            recording,
+            writer: AtomicU64::new(0),
+            bells: Mutex::default(),
+        }))
+    }
+
+    fn descriptor(&self, format: Format) -> Descriptor {
+        Descriptor {
             format,
+            block_frames: (self.ring.payload_len / format.frame_bytes()) as u32,
+            blocks: self.ring.blocks as u32,
+        }
+    }
+
+    fn track(&self, format: Format, label: String) -> Track {
+        let (kind, direction) = if self.recording {
+            (Kind::Recording, Direction::ToSource)
+        } else {
+            (Kind::Playback, Direction::FromSource)
+        };
+        Track {
+            id: self.id,
+            kind,
+            direction,
+            label,
+            descriptor: Bytes(flotilla_cbor::to_vec(&self.descriptor(format), &LIMITS).expect("a descriptor encodes")),
+        }
+    }
+}
+
+/// The producer side of one playback track. Writing never blocks or
+/// allocates, and continues with no readers.
+#[derive(Debug)]
+pub struct PlaybackWriter {
+    shared: Arc<Shared>,
+    format: Format,
+    generation: u32,
+    position: u64,
+    cursor: u64,
+    flags: u32,
+}
+
+impl PlaybackWriter {
+    pub fn new(id: u64, settings: Settings) -> Result<Self, Error> {
+        Ok(Self {
+            shared: Shared::new(id, settings, false)?,
+            format: settings.format,
             generation: 1,
             position: 0,
             cursor: 0,
@@ -392,23 +442,12 @@ impl PlaybackWriter {
 
     #[must_use]
     pub fn descriptor(&self) -> Descriptor {
-        let ring = &self.shared.ring;
-        Descriptor {
-            format: self.format,
-            block_frames: (ring.payload_len / self.format.frame_bytes()) as u32,
-            blocks: ring.blocks as u32,
-        }
+        self.shared.descriptor(self.format)
     }
 
     /// The offered track, carrying the current descriptor.
     pub fn track(&self, label: impl Into<String>) -> Track {
-        Track {
-            id: self.shared.id,
-            kind: Kind::Playback,
-            direction: Direction::FromSource,
-            label: label.into(),
-            descriptor: Bytes(flotilla_cbor::to_vec(&self.descriptor(), &LIMITS).expect("a descriptor encodes")),
-        }
+        self.shared.track(self.format, label.into())
     }
 
     /// The handle a source host passes to `handshake::accept`.
@@ -466,7 +505,8 @@ impl PlaybackWriter {
     }
 }
 
-/// A source host's handle to one playback track's ring.
+/// A source host's handle to one audio track's ring: playback from a
+/// [`PlaybackWriter`] or recording from a [`RecordingReader`].
 #[derive(Clone, Debug)]
 pub struct Playback(Arc<Shared>);
 
@@ -476,8 +516,20 @@ impl Playback {
         self.0.id
     }
 
-    pub(crate) fn read_only_fd(&self) -> io::Result<OwnedFd> {
-        self.0.read_only.try_clone()
+    pub(crate) fn recording(&self) -> bool {
+        self.0.recording
+    }
+
+    /// The descriptor an admitted consumer maps.
+    pub(crate) fn fd(&self) -> io::Result<OwnedFd> {
+        self.0.fd.try_clone()
+    }
+
+    /// Admit the one writer of a recording ring; None while another holds it.
+    pub(crate) fn claim(&self) -> Option<Lease> {
+        let start = self.0.ring.latest() + 1;
+        let claimed = self.0.recording && self.0.writer.compare_exchange(0, start, AcqRel, Acquire).is_ok();
+        claimed.then(|| Lease(self.0.clone()))
     }
 
     /// Whether an offered descriptor matches this ring's geometry.
@@ -488,6 +540,23 @@ impl Playback {
     pub(crate) fn register(&self, bell: &Bell, position: usize) {
         let mut bells = self.0.bells.lock().unwrap_or_else(PoisonError::into_inner);
         bells.push((Arc::downgrade(&bell.0), 1 << (position % 64)));
+    }
+}
+
+/// A recording ring's admitted writer. Dropping it, when the writer's
+/// incarnation ends, lets the source read silence and admit another writer.
+#[derive(Debug)]
+pub(crate) struct Lease(Arc<Shared>);
+
+impl Lease {
+    pub(crate) fn id(&self) -> u64 {
+        self.0.id
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.0.writer.store(0, Release);
     }
 }
 
@@ -576,7 +645,11 @@ pub struct PlaybackRing {
 
 impl PlaybackRing {
     pub(crate) fn map(id: u64, descriptor: Descriptor, fd: OwnedFd) -> Result<Self, Error> {
-        let ring = Ring::map(fd)?;
+        Self::map_ring(id, descriptor, fd, false)
+    }
+
+    fn map_ring(id: u64, descriptor: Descriptor, fd: OwnedFd, writable: bool) -> Result<Self, Error> {
+        let ring = Ring::map(fd, writable)?;
         if !ring.fits(&descriptor) {
             return Err(Error::Invalid("ring disagrees with its descriptor"));
         }
@@ -628,6 +701,8 @@ pub struct PlaybackReader {
     ring: PlaybackRing,
     latency: u64,
     next: u64,
+    /// The earliest cursor this reader starts at.
+    floor: u64,
     gap: bool,
     gaps: u64,
     underruns: u64,
@@ -651,6 +726,7 @@ impl PlaybackReader {
             payload: vec![0; ring.ring.payload_len],
             ring,
             next: 0,
+            floor: 1,
             gap: false,
             gaps: 0,
             underruns: 0,
@@ -658,7 +734,7 @@ impl PlaybackReader {
     }
 
     fn start(&self, latest: u64) -> u64 {
-        latest.saturating_add(1).saturating_sub(self.latency).max(1)
+        latest.saturating_add(1).saturating_sub(self.latency).max(self.floor)
     }
 
     /// Blocks ready to read: the cursor check that needs no doorbell.
@@ -723,5 +799,117 @@ impl PlaybackReader {
         }
         self.underruns += 1;
         None
+    }
+}
+
+/// The admitted consumer's writer for one recording track, over its
+/// read-write mapping. Its first block marks the writer change as a
+/// discontinuity, and its sample positions start at 0.
+#[derive(Debug)]
+pub struct RecordingWriter(PlaybackWriter);
+
+impl RecordingWriter {
+    pub(crate) fn map(id: u64, descriptor: Descriptor, fd: OwnedFd) -> Result<Self, Error> {
+        let PlaybackRing { ring, .. } = PlaybackRing::map_ring(id, descriptor, fd, true)?;
+        let fd = ring.segment.try_clone_fd()?;
+        Ok(Self(PlaybackWriter {
+            cursor: ring.latest(),
+            shared: Arc::new(Shared {
+                id,
+                ring,
+                fd,
+                recording: true,
+                writer: AtomicU64::new(0),
+                bells: Mutex::default(),
+            }),
+            format: descriptor.format,
+            generation: 1,
+            position: 0,
+            flags: DISCONTINUITY,
+        }))
+    }
+
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.0.shared.id
+    }
+
+    /// See [`PlaybackWriter::discontinuity`].
+    pub fn discontinuity(&mut self) {
+        self.0.discontinuity();
+    }
+
+    /// Write one block in the offered format; see [`PlaybackWriter::write`].
+    pub fn write(&mut self, samples: &[u8], host_time_ns: u64) -> Result<u64, Error> {
+        self.0.write(samples, host_time_ns)
+    }
+}
+
+/// The source side of one recording track: its ring and a private cursor
+/// over it. With no writer admitted it reads silence.
+#[derive(Debug)]
+pub struct RecordingReader {
+    shared: Arc<Shared>,
+    reader: PlaybackReader,
+    writer: u64,
+    silence: Vec<u8>,
+}
+
+impl RecordingReader {
+    /// A ring in `settings`' format, which the writer must keep, read
+    /// `latency` behind the writer as for [`PlaybackReader::new`].
+    pub fn new(id: u64, settings: Settings, latency: Duration) -> Result<Self, Error> {
+        let shared = Shared::new(id, settings, true)?;
+        let format = settings.format;
+        let ring = PlaybackRing {
+            id,
+            descriptor: shared.descriptor(format),
+            ring: shared.ring.clone(),
+        };
+        let silence = if format.sample == Sample::U8 { 0x80 } else { 0 };
+        Ok(Self {
+            silence: vec![silence; shared.ring.payload_len],
+            reader: PlaybackReader::new(ring, latency),
+            shared,
+            writer: 0,
+        })
+    }
+
+    /// The offered track.
+    pub fn track(&self, label: impl Into<String>) -> Track {
+        self.shared.track(self.reader.ring.descriptor.format, label.into())
+    }
+
+    /// The handle a source host passes to `handshake::accept`.
+    #[must_use]
+    pub fn ring(&self) -> Playback {
+        Playback(self.shared.clone())
+    }
+
+    /// The next block in order, or None in underrun. With no writer admitted
+    /// it is a block of silence with cursor 0. After a writer change, reading
+    /// restarts at the latency target but never before the new writer's
+    /// first block.
+    pub fn read(&mut self) -> Option<Block<'_>> {
+        match self.shared.writer.load(Acquire) {
+            0 => Some(Block {
+                cursor: 0,
+                sample_position: 0,
+                host_time_ns: 0,
+                frames: self.reader.ring.descriptor.block_frames,
+                format: self.reader.ring.descriptor.format,
+                generation: 0,
+                discontinuity: false,
+                reconfiguration: false,
+                gap: false,
+                samples: &self.silence,
+            }),
+            writer => {
+                if writer != self.writer {
+                    (self.writer, self.reader.next, self.reader.floor) = (writer, 0, writer);
+                }
+                self.reader.read()
+            }
+        }
     }
 }

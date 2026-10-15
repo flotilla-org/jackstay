@@ -1,12 +1,12 @@
 //! Playback track contract, in-process over a local connection: offer,
-//! selection, ring transfer, reading and the doorbell.
+//! selection, ring transfer, reading, the doorbell and notices while attached.
 
 use std::{thread, time::Duration};
 
 use jackstay::{
     acquisition::arena::Cancellation,
     audio::{Descriptor, Format, Layout, PlaybackReader, PlaybackWriter, Sample, Settings},
-    handshake::{self, Accepted, Connected, Kind, Offer, Refusal, Selected},
+    handshake::{self, Accepted, Connected, Kind, Notice, Notices, Offer, Refusal, Selected},
     input::Mode,
     local::Stream,
     model::ClockDomain,
@@ -328,4 +328,128 @@ fn the_doorbell_hints_changed_tracks_and_cursors_remain_authoritative() {
     let mut reader = PlaybackReader::new(connected.playback[0].clone(), Duration::from_millis(30));
     assert_eq!(reader.available(), 3);
     assert_eq!(reader.read().unwrap().samples[0], 1);
+}
+
+/// Answer one late selection on a host worker.
+fn serve(mut notices: Notices) -> thread::JoinHandle<Notices> {
+    thread::spawn(move || {
+        assert!(notices.serve(Duration::from_secs(5)).unwrap());
+        notices
+    })
+}
+
+#[test]
+fn a_track_added_after_attach_is_selected_late_without_disturbing_others() {
+    let (mut a, mut b) = (writer(1), writer(2));
+    let (accepted, mut connected) = connect(&[], &[]);
+    let (mut notices, tracks) = (accepted.notices, &mut connected.tracks);
+    assert!(tracks.next(Duration::ZERO).unwrap().is_none());
+    notices.add(a.track("default"), Some(a.playback())).unwrap();
+    assert_eq!(
+        tracks.next(Duration::from_secs(5)).unwrap(),
+        Some(Notice::Added { track: a.track("default") })
+    );
+    let server = serve(notices);
+    let late = tracks.select(select(1)).unwrap();
+    let mut notices = server.join().unwrap();
+    assert_eq!((late.admission.refusal, late.position), (None, 0));
+    // The incarnation's first playback track brings the doorbell.
+    let (mut doorbell, ring) = (late.doorbell.unwrap(), late.playback.unwrap());
+    let mut reader_a = PlaybackReader::new(ring, Duration::from_millis(250));
+    write(&mut a, 1);
+
+    // Selecting before reading the notice queues it; a's reader is undisturbed.
+    notices.add(b.track("cue"), Some(b.playback())).unwrap();
+    let server = serve(notices);
+    let late = tracks.select(select(2)).unwrap();
+    let _notices = server.join().unwrap();
+    assert!(late.doorbell.is_none() && late.position == 1);
+    assert!(matches!(tracks.next(Duration::ZERO).unwrap(), Some(Notice::Added { track }) if track.id == 2));
+    let mut reader_b = PlaybackReader::new(late.playback.unwrap(), Duration::from_millis(250));
+    write(&mut a, 2);
+    write(&mut b, 1);
+    let cancel = Cancellation::new().unwrap();
+    assert_eq!(doorbell.wait(&cancel, None).unwrap(), 0b11);
+    assert_eq!((reader_a.read().unwrap().cursor, reader_a.read().unwrap().cursor), (1, 2));
+    assert_eq!(reader_b.read().unwrap().samples[0], 1);
+}
+
+#[test]
+fn a_reopen_updates_the_track_and_keeps_the_selection() {
+    let mut writer = writer(1);
+    let (accepted, mut connected) = connect(&[&writer], &[select(1)]);
+    let mut notices = accepted.notices;
+    let mut reader = PlaybackReader::new(connected.playback[0].clone(), Duration::from_millis(250));
+    write(&mut writer, 1);
+    let mono = Format {
+        rate: 44_100,
+        channels: 1,
+        layout: Layout::Mono,
+        sample: Sample::F32,
+    };
+    writer.reconfigure(mono).unwrap();
+    notices.update(writer.track("default")).unwrap();
+    let Some(Notice::Updated { track }) = connected.tracks.next(Duration::from_secs(5)).unwrap() else {
+        panic!("expected an update");
+    };
+    assert_eq!(Descriptor::decode(&track.descriptor).unwrap().format, mono);
+    assert_eq!(connected.tracks.tracks(), [track]);
+    write(&mut writer, 2);
+    assert!(!reader.read().unwrap().reconfiguration);
+    let block = reader.read().unwrap();
+    assert!(block.reconfiguration && block.format == mono);
+    // Still selected: selecting it again is refused.
+    let server = serve(notices);
+    let again = connected.tracks.select(select(1)).unwrap();
+    assert_eq!(again.admission.refusal, Some(Refusal::Unavailable));
+    let mut notices = server.join().unwrap();
+    // A descriptor the ring cannot hold is not an update.
+    let mut track = writer.track("default");
+    let mut descriptor = Descriptor::decode(&track.descriptor).unwrap();
+    descriptor.blocks += 1;
+    track.descriptor = handshake::Bytes(flotilla_cbor::to_vec(&descriptor, &handshake::LIMITS).unwrap());
+    assert!(notices.update(track).is_err());
+}
+
+#[test]
+fn removal_ends_the_read_state_cleanly() {
+    let mut writer = writer(1);
+    let (accepted, mut connected) = connect(&[&writer], &[select(1)]);
+    let mut notices = accepted.notices;
+    let mut reader = PlaybackReader::new(connected.playback.remove(0), Duration::from_millis(250));
+    write(&mut writer, 1);
+    write(&mut writer, 2);
+    let track = writer.track("default");
+    notices.remove(1).unwrap();
+    drop(writer);
+    assert_eq!(
+        connected.tracks.next(Duration::from_secs(5)).unwrap(),
+        Some(Notice::Removed { id: 1 })
+    );
+    assert!(connected.tracks.tracks().is_empty());
+    // Blocks already written stay readable, then the ring is quiet.
+    assert_eq!(reader.read().unwrap().samples[0], 1);
+    assert_eq!(reader.read().unwrap().samples[0], 2);
+    assert!(reader.read().is_none());
+    drop(reader);
+    let server = serve(notices);
+    assert_eq!(
+        connected.tracks.select(select(1)).unwrap().admission.refusal,
+        Some(Refusal::Unknown)
+    );
+    let mut notices = server.join().unwrap();
+    // IDs are never reused.
+    let reused = PlaybackWriter::new(
+        1,
+        Settings {
+            format: STEREO,
+            block_frames: FRAMES,
+            depth: Duration::from_millis(250),
+        },
+    )
+    .unwrap();
+    assert!(notices.add(track, Some(reused.playback())).is_err());
+    // The consumer's going ends the host's channel.
+    drop(connected);
+    assert!(notices.serve(Duration::from_secs(5)).is_err());
 }

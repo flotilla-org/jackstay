@@ -11,6 +11,8 @@
 //! transfer (see [`crate::audio`]). A required refusal closes setup on both
 //! sides; optional refusals are reported.
 //!
+//! Every admission also passes a tracks channel for [notices](Notices).
+//!
 //! An admitted video track is carried by this same connection, which stays
 //! the CPU setup stream so `serve_cpu` sees the consumer's kernel identity.
 //! This module creates no listener, discovers no source and grants no
@@ -19,7 +21,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::OwnedHandle;
-use std::{collections::HashSet, io, time::Duration};
+use std::{borrow::BorrowMut, collections::HashSet, io, time::Duration};
 
 pub use flotilla_cbor::Bytes;
 use flotilla_cbor::{Framing, HEADER_LEN, Limits, Message};
@@ -35,6 +37,9 @@ use crate::{
     local::{Bounded, Stream},
     model::ClockDomain,
 };
+
+mod notices;
+pub use notices::{Late, Notice, Notices, Tracks};
 
 /// The frame magic of every setup message on a source connection: this
 /// handshake, then CPU setup.
@@ -215,8 +220,8 @@ pub struct Accepted {
     /// Retain this independently of media; dropping schedules target cleanup.
     pub input: Option<Server>,
     pub affordances: Option<affordances::Producer>,
-    /// Retain for the incarnation's lifetime when playback was admitted.
-    pub doorbell: Option<audio::Bell>,
+    /// Retain for the incarnation's lifetime: it also holds the playback doorbell.
+    pub notices: Notices,
 }
 
 /// Run the host side on a worker. Supplying a target authorizes input on that
@@ -235,12 +240,7 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     }
     for track in &offer.tracks {
         let single = matches!(track.kind, Kind::Video | Kind::Input | Kind::Affordances);
-        let fits = || {
-            let descriptor = audio::Descriptor::decode(&track.descriptor);
-            ring(track.id).is_some_and(|ring| descriptor.is_ok_and(|descriptor| ring.fits(&descriptor)))
-        };
-        let unplayable = track.kind == Kind::Playback && (track.direction != Direction::FromSource || !fits());
-        if !ids.insert(track.id) || !track.kind.offerable() || unplayable || (single && !single_kinds.insert(track.kind.clone())) {
+        if !ids.insert(track.id) || !offerable(track, playback) || (single && !single_kinds.insert(track.kind.clone())) {
             return Err(Error::Protocol("invalid offer"));
         }
     }
@@ -272,6 +272,7 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     let mut input = None;
     let mut affordances = None;
     let mut peers = Vec::new();
+    let mut tracks = None;
     if refused.is_none() {
         for kind in channel_kinds(offer, &admissions) {
             let (host, peer) = channel_pair()?;
@@ -283,6 +284,13 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
             }
             peers.push(peer);
         }
+        #[cfg_attr(unix, allow(unused_mut))]
+        let (mut host, peer) = channel_pair()?;
+        // Handles sent on the host's pipe end go to the media stream's peer.
+        #[cfg(windows)]
+        host.set_peer_process(handshake.exchange.stream().peer_process()?);
+        tracks = Some(host);
+        peers.push(peer);
     }
     handshake.write(&Admitted {
         tracks: admissions.clone(),
@@ -309,13 +317,34 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
         handshake.send_objects(objects)?;
         doorbell = Some(bell);
     }
+    let admitted = admissions.iter().filter(|a| a.refusal.is_none()).map(|a| a.id).collect();
+    let notices = Notices {
+        stream: tracks.expect("admitted"),
+        tracks: offer.tracks.clone(),
+        playback: playback.to_vec(),
+        offered: ids,
+        admitted,
+        positions: admissions.len(),
+        bell: doorbell,
+    };
     Ok(Accepted {
         media: handshake.finish()?,
         admissions,
         input,
         affordances,
-        doorbell,
+        notices,
     })
+}
+
+/// Whether a host may offer this track: an offerable kind, and for playback
+/// a track from the source whose descriptor fits its ring in `playback`.
+fn offerable(track: &Track, playback: &[Playback]) -> bool {
+    let fits = || {
+        let descriptor = audio::Descriptor::decode(&track.descriptor);
+        let ring = playback.iter().find(|p| p.id() == track.id);
+        ring.is_some_and(|ring| descriptor.is_ok_and(|descriptor| ring.fits(&descriptor)))
+    };
+    track.kind.offerable() && (track.kind != Kind::Playback || (track.direction == Direction::FromSource && fits()))
 }
 
 /// Selection positions and IDs of the admitted playback tracks. Both sides
@@ -362,6 +391,8 @@ pub struct Connected {
     pub playback: Vec<audio::PlaybackRing>,
     /// Present when playback was admitted.
     pub doorbell: Option<audio::Doorbell>,
+    /// Notices and late selection.
+    pub tracks: Tracks,
 }
 
 /// Read the offer of the selected source. Call off the GUI/input thread.
@@ -420,6 +451,7 @@ impl Offered {
                 affordances = Some(affordances::Host::start(channel)?);
             }
         }
+        let channel = self.handshake.receive_channel()?;
         let playing = playback_tracks(&self.offer, &admitted.tracks);
         let mut playback = Vec::new();
         let mut doorbell = None;
@@ -443,6 +475,13 @@ impl Offered {
             Some(Err(ConnectError::Admission(error))) => (None, Some(error)),
             Some(Err(ConnectError::Transport(error))) => return Err(error.into()),
         };
+        let tracks = Tracks {
+            stream: channel,
+            tracks: self.offer.tracks,
+            positions: selection.len(),
+            doorbell: doorbell.is_some(),
+            pending: Default::default(),
+        };
         Ok(Connected {
             media,
             admissions: admitted.tracks,
@@ -451,6 +490,7 @@ impl Offered {
             affordances,
             playback,
             doorbell,
+            tracks,
         })
     }
 }
@@ -468,36 +508,41 @@ fn channel_pair() -> io::Result<(Stream, Stream)> {
 // Exact reads under an absolute deadline (crate::local::Bounded), not a
 // per-byte timeout a trickling peer can extend. No buffered reader may eat
 // media bytes or the ancillary-data byte belonging to a channel.
-struct Handshake {
-    exchange: Bounded<Stream>,
+struct Handshake<S: BorrowMut<Stream> = Stream> {
+    exchange: Bounded<S>,
 }
 
-impl Handshake {
-    fn new(stream: Stream) -> io::Result<Self> {
+impl<S: BorrowMut<Stream>> Handshake<S> {
+    fn new(stream: S) -> io::Result<Self> {
         #[cfg(unix)]
-        crate::socket_options::suppress_sigpipe(&stream)?;
+        crate::socket_options::suppress_sigpipe(stream.borrow())?;
         Ok(Self {
             exchange: Bounded::new(stream, TIMEOUT)?,
         })
     }
     fn read<M: Message>(&mut self) -> Result<M, Error> {
+        Ok(flotilla_cbor::decode_message(&self.read_body(&[])?, &LIMITS)?)
+    }
+    /// The body of a frame whose header begins with `start`, already read.
+    fn read_body(&mut self, start: &[u8]) -> Result<Vec<u8>, Error> {
         let mut header = [0; HEADER_LEN];
-        self.exchange.read_exact(&mut header)?;
+        header[..start.len()].copy_from_slice(start);
+        self.exchange.read_exact(&mut header[start.len()..])?;
         let mut body = vec![0; FRAMING.body_len(&header)?];
         self.exchange.read_exact(&mut body)?;
-        Ok(flotilla_cbor::decode_message(&body, &LIMITS)?)
+        Ok(body)
     }
     fn write<M: Message>(&mut self, message: &M) -> Result<(), Error> {
         Ok(self.exchange.write_all(&FRAMING.encode(message)?)?)
     }
     /// The media stream, blocking again with its previous timeouts.
-    fn finish(self) -> io::Result<Stream> {
+    fn finish(self) -> io::Result<S> {
         self.exchange.finish()
     }
 }
 
 #[cfg(unix)]
-impl Handshake {
+impl<S: BorrowMut<Stream>> Handshake<S> {
     fn send_channel(&mut self, peer: Stream) -> Result<(), Error> {
         self.send_objects(vec![peer.into()])
     }
@@ -543,7 +588,7 @@ impl Handshake {
 // Handle transfer is one write and one acknowledgement, both bounded by the
 // time left: ready() sets the pipe's timeouts to it.
 #[cfg(windows)]
-impl Handshake {
+impl<S: BorrowMut<Stream>> Handshake<S> {
     fn send_channel(&mut self, peer: Stream) -> Result<(), Error> {
         self.send_objects(vec![peer.into_handle()?])
     }

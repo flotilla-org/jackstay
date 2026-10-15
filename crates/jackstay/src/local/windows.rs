@@ -794,6 +794,11 @@ impl PipeStream {
         Ok(Arc::new(process))
     }
 
+    /// Send handles on this end to `process`: the owner of a pipe pair's other end.
+    pub(crate) fn set_peer_process(&mut self, process: Arc<OwnedHandle>) {
+        self.peer_process = Some(process);
+    }
+
     /// Start one overlapped transfer and wait for it, the shutdown event, or the
     /// timeout. Every path settles the operation before its buffer goes away.
     fn transfer(&self, write: bool, data: *mut u8, len: u32, timeout: Option<Duration>) -> io::Result<usize> {

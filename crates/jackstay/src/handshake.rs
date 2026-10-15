@@ -205,15 +205,16 @@ pub struct Accepted {
 
 /// Run the host side on a worker. Supplying a target authorizes input on that
 /// target for this peer; None refuses any input track. One offer track per
-/// input and affordances kind at most. On any failure, including a required
+/// video, input and affordances kind at most: one incarnation carries one
+/// media stream. On any failure, including a required
 /// refusal, all owned channels close; keep pumping target cleanup. The whole
 /// handshake is bounded to five seconds.
 pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>) -> Result<Accepted, Error> {
     let mut ids = HashSet::new();
-    let mut channels = HashSet::new();
+    let mut single_kinds = HashSet::new();
     for track in &offer.tracks {
-        let channel = matches!(track.kind, Kind::Input | Kind::Affordances);
-        if !ids.insert(track.id) || !track.kind.offerable() || (channel && !channels.insert(track.kind.clone())) {
+        let single = matches!(track.kind, Kind::Video | Kind::Input | Kind::Affordances);
+        if !ids.insert(track.id) || !track.kind.offerable() || (single && !single_kinds.insert(track.kind.clone())) {
             return Err(Error::Protocol("invalid offer"));
         }
     }
@@ -249,7 +250,8 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>) -> Result<A
         for kind in channel_kinds(offer, &admissions) {
             let (host, peer) = channel_pair()?;
             if kind == Kind::Input {
-                input = Some(Server::start(target.clone().expect("admitted input has a target"), host)?);
+                let target = target.clone().ok_or(Error::Protocol("input admitted without a target"))?;
+                input = Some(Server::start(target, host)?);
             } else {
                 affordances = Some(affordances::Producer::start(host)?);
             }
@@ -327,6 +329,10 @@ impl Offered {
     /// for optional input, are reported in the result; required ones fail the
     /// whole setup. Input admission adds its own five-second bound.
     pub fn select(mut self, selection: &[Selected], mode: Mode) -> Result<Connected, Error> {
+        let mut ids = HashSet::new();
+        if selection.len() > self.offer.tracks.len() || !selection.iter().all(|s| ids.insert(s.id)) {
+            return Err(Error::Protocol("invalid selection"));
+        }
         self.handshake.write(&Selection {
             tracks: selection.to_vec(),
         })?;

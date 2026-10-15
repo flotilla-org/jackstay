@@ -33,8 +33,10 @@ affordances keep their existing protocols on those channels.
 
 Kinds are open. The core kinds are `video`, `input` and `affordances`; an app
 kind is a reverse-domain name of lowercase labels, such as `org.example.cue`,
-whose descriptor Jackstay treats as opaque. A host offers at most one input and
-one affordances track. Consumers skip kinds they do not know. Today's core
+whose descriptor Jackstay treats as opaque. A host offers at most one video, one
+input and one affordances track. Admitting an app-kind track only records the
+agreement: Jackstay opens no channel for it, so its transport is the host's and
+consumer's own. Consumers skip kinds they do not know. Today's core
 kinds have empty descriptors.
 
 One incarnation carries the selected tracks. An admitted video track continues

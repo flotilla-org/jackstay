@@ -36,9 +36,9 @@ After the channels the host passes one more: the incarnation's tracks
 channel, on which it announces **added** (`track`), **removed** (`id`) and
 **updated** (`track`) notices with the same framing. An update keeps the ID
 and the selection; a device reopen is one. The consumer may select an offered
-playback or app-kind track late with a one-track **selection**; the host
-answers **admitted** and, for playback, passes the read-only ring, preceded by
-the doorbell if the incarnation had none. A late selection takes the next
+audio or app-kind track late with a one-track **selection**; the host
+answers **admitted** and, for audio, passes the ring, preceded by the doorbell
+if this is the incarnation's first playback track. A late selection takes the next
 selection position, which is its doorbell hint bit. A removed track's mapping
 stays valid until the consumer drops it; its ring just stops advancing. The
 tracks channel is always sent, one extra channel per admission. It is separate
@@ -47,7 +47,15 @@ consumer-driven.
 
 Kinds are open. The core kinds are `video`, `input` and `affordances`; an app
 kind is a reverse-domain name of lowercase labels, such as `org.example.cue`,
-whose descriptor Jackstay treats as opaque. A host offers at most one video, one
+whose descriptor Jackstay treats as opaque.
+
+A `recording` track flows toward the source in the playback ring layout with
+the roles swapped. Selecting it requests writing, and one consumer at a time is
+admitted: it alone receives the ring, read-write, and any other request is
+refused `unavailable`. The admission lasts until that incarnation's `Notices`
+is dropped or the track is removed. Each writer's first block is a
+discontinuity, and the source's `RecordingReader` starts at the new writer's
+blocks. With no writer it reads silence. A host offers at most one video, one
 input and one affordances track. Admitting an app-kind track only records the
 agreement: Jackstay opens no channel for it, so its transport is the host's and
 consumer's own. Consumers skip kinds they do not know. Today's core

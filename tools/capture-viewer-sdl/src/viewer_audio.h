@@ -21,7 +21,7 @@ typedef struct viewer_audio {
   void *context;
   uint32_t rate, channels; /* the output device's */
   uint64_t latency_ns;
-  int muted;
+  atomic_int muted;
   /* Source host time heard at host time t is t + clock_offset_ns, INT64_MIN
    * while nothing plays. Any thread may load it. */
   _Atomic int64_t clock_offset_ns;
@@ -57,10 +57,11 @@ typedef struct viewer_playback {
 
 /* Logs offered audio tracks; 1 when this one is the track to select. */
 int viewer_playback_offered(viewer_playback *playback, const ft_track_offer *offer);
-/* Opens the device for an admitted ring (SDL audio initialized). */
-int viewer_playback_start(viewer_playback *playback);
+/* Opens the device for an admitted ring (SDL audio initialized). The track is
+ * optional: a failure is logged and leaves video playing without it. */
+void viewer_playback_start(viewer_playback *playback);
 /* Follows track notices, selecting the labelled track when it is added late. */
-int viewer_playback_poll(viewer_playback *playback);
+void viewer_playback_poll(viewer_playback *playback);
 /* The playout clock offset (see viewer_audio), INT64_MIN without audio. */
 int64_t viewer_playback_clock(viewer_playback *playback);
 void viewer_playback_close(viewer_playback *playback);

@@ -349,9 +349,11 @@ domain is host time.
 
 `audio_contract` checks conversion, concealment, mute and ten simulated minutes
 of drift correction against producer clocks skewed by ±0.5%, in a few seconds.
-`audio_processes` plays `audio-source-fixture`'s tone, offered at attach and
-added late, using SDL's dummy drivers. The dummy and disk audio drivers do not
-keep real time, so their drift figures mean nothing.
+`audio_processes` plays `audio-source-fixture`'s tone, offered at attach,
+added late, and removed then re-added, using SDL's dummy drivers. Audio is
+optional: a selection or device failure is logged and video carries on. The
+dummy and disk audio drivers do not keep real time, so their drift figures mean
+nothing.
 
 Real-time drift check (manual, on a real output device): run
 `build/viewer/audio-source-fixture tone-check --skew-ppm 500`, then

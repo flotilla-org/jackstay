@@ -445,7 +445,10 @@ static int select_tracks(ft_local_connection **local, const viewer_options *opti
   if (require_ok(ft_handshake_connect_local(local, &offer), "handshake offer") ||
       require_ok(ft_handshake_offer_describe(offer, &source, &clock, &tracks, &count), "handshake describe")) return 1;
   /* Audio playout and video sync need host-time stamps. */
-  if (clock != FT_CLOCK_DOMAIN_HOST_TIME) playback->label = NULL;
+  if (playback->label && clock != FT_CLOCK_DOMAIN_HOST_TIME) {
+    fprintf(stderr, "source clock domain %u is not host time; continuing without audio\n", clock);
+    playback->label = NULL;
+  }
   ft_track_selection selection[4];
   size_t selected = 0, audio = SIZE_MAX;
   int have_input = 0, have_affordances = 0;
@@ -601,7 +604,7 @@ static int run_cpu(const viewer_options *options) {
     if (renderer == NULL) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
   }
   if (renderer == NULL) { fprintf(stderr, "SDL setup: %s\n", SDL_GetError()); goto cleanup; }
-  if (playback.ring && viewer_playback_start(&playback)) goto cleanup;
+  if (playback.ring) viewer_playback_start(&playback);
   if (options->input_socket && viewer_input_open(&input, options->input_socket) != 0) { fprintf(stderr, "input connection failed\n"); goto cleanup; }
   if (input.client && input.mode != FT_INPUT_MODE_PHYSICAL) SDL_StartTextInput();
   input.renderer = renderer;
@@ -617,7 +620,8 @@ static int run_cpu(const viewer_options *options) {
     while (SDL_PollEvent(&event)) { if (event.type == SDL_QUIT) running = 0; if (viewer_event(&input, window, &affordances, &event)) { failed = 1; running = 0; } }
     viewer_input_poll(&input);
     if (viewer_affordances_poll(&affordances, options->log_affordances)) { failed = 1; break; }
-    if (viewer_affordances_tick(&affordances) || input.failed || viewer_playback_poll(&playback)) { failed = 1; break; }
+    if (viewer_affordances_tick(&affordances) || input.failed) { failed = 1; break; }
+    viewer_playback_poll(&playback);
     if (options->input_self_test && !input_test_sent && acquired >= 2 && !input.resetting) {
       viewer_input_self_test(&input, window); input_test_sent = 1;
     }

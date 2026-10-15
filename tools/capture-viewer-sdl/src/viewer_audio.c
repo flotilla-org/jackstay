@@ -93,7 +93,8 @@ void viewer_audio_render(viewer_audio *a, float *out, uint32_t frames, uint64_t 
     double due = (double)now_ns + frames * 1e9 / a->rate - (double)a->latency_ns;
     double error = due - (a->a_time + a->phase * a->period_ns);
     if (!a->aligned || fabs(error) > RESYNC_NS) {
-      /* Behind: drop source frames. Ahead: play silence until due. */
+      /* Behind: drop source frames. Ahead: play silence until due. Reads
+       * cannot lag past the ring's depth, which bounds the frames dropped. */
       while (a->primed && error > a->period_ns / 2) {
         if (advance(a)) error = due - (a->a_time + a->phase * a->period_ns);
         else a->primed = 0;
@@ -112,6 +113,7 @@ void viewer_audio_render(viewer_audio *a, float *out, uint32_t frames, uint64_t 
     step = a->period_ns > 0 ? 1e9 / a->period_ns / a->rate * (1 + a->correction) : 0;
     atomic_store(&a->clock_offset_ns, -(int64_t)a->latency_ns - (int64_t)error);
   }
+  int muted = atomic_load_explicit(&a->muted, memory_order_relaxed);
   for (uint32_t k = 0; k < frames; k++) {
     if (fade && (k == 0 || k == wait)) conceal(a);
     int playing = a->primed && k >= wait;
@@ -120,7 +122,7 @@ void viewer_audio_render(viewer_audio *a, float *out, uint32_t frames, uint64_t 
     for (uint32_t c = 0; c < a->channels; c++) {
       float x = playing ? a->a[c] + (a->b[c] - a->a[c]) * (float)a->phase : 0;
       a->last[c] = x + (a->held[c] - x) * g;
-      o[c] = a->muted ? 0 : a->last[c];
+      o[c] = muted ? 0 : a->last[c];
     }
     if (!playing) continue;
     for (a->phase += step; a->phase >= 1; a->phase -= 1) {
@@ -149,7 +151,7 @@ int viewer_playback_offered(viewer_playback *p, const ft_track_offer *offer) {
   return p->label && !p->ring && !strcmp(offer->label, p->label);
 }
 
-int viewer_playback_start(viewer_playback *p) {
+void viewer_playback_start(viewer_playback *p) {
   const ft_audio_format *f = &p->descriptor.format;
   /* 10 ms periods. */
   SDL_AudioSpec want = {.freq = (int)f->rate, .format = AUDIO_F32SYS,
@@ -158,20 +160,25 @@ int viewer_playback_start(viewer_playback *p) {
   SDL_AudioSpec have;
   if ((!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) ||
       !(p->device = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_CHANNELS_CHANGE))) {
-    fprintf(stderr, "audio device: %s\n", SDL_GetError());
-    return 1;
+    fprintf(stderr, "audio device: %s; continuing without audio\n", SDL_GetError());
+    p->device = 0;
+    ft_playback_ring_destroy(&p->ring);
+    return;
   }
   if (have.channels > VIEWER_AUDIO_CHANNELS ||
       ft_playback_reader_create(p->ring, p->latency_ns, &p->reader) != FT_STATUS_OK) {
-    fprintf(stderr, "audio playout setup failed\n");
-    return 1;
+    fprintf(stderr, "audio playout setup failed; continuing without audio\n");
+    SDL_CloseAudioDevice(p->device);
+    p->device = 0;
+    ft_playback_reader_destroy(&p->reader);
+    ft_playback_ring_destroy(&p->ring);
+    return;
   }
   viewer_audio_init(&p->audio, (uint32_t)have.freq, have.channels, p->latency_ns);
   p->audio.read = read_ring;
   p->audio.context = p->reader;
-  p->audio.muted = p->muted;
+  atomic_store(&p->audio.muted, p->muted);
   SDL_PauseAudioDevice(p->device, 0);
-  return 0;
 }
 
 static void viewer_playback_stop(viewer_playback *p) {
@@ -187,7 +194,7 @@ static void viewer_playback_stop(viewer_playback *p) {
   ft_playback_ring_destroy(&p->ring);
 }
 
-int viewer_playback_poll(viewer_playback *p) {
+void viewer_playback_poll(viewer_playback *p) {
   ft_track_notice notice;
   ft_status status = FT_STATUS_EMPTY;
   while (p->tracks && (status = ft_tracks_next(p->tracks, 0, &notice)) == FT_STATUS_OK) {
@@ -201,20 +208,25 @@ int viewer_playback_poll(viewer_playback *p) {
     ft_track_admission admission;
     ft_playback_doorbell *doorbell = NULL;
     uint32_t position;
-    if (ft_tracks_select(p->tracks, &selection, &admission, &position, &p->ring, &doorbell) != FT_STATUS_OK ||
-        admission.result != FT_TRACK_ADMITTED || !p->ring) {
-      fprintf(stderr, "late audio selection failed\n");
-      return 1;
+    status = ft_tracks_select(p->tracks, &selection, &admission, &position, &p->ring, &doorbell);
+    if (status != FT_STATUS_OK) break; /* ends the channel */
+    if (admission.result != FT_TRACK_ADMITTED || !p->ring) {
+      fprintf(stderr, "audio track id=%" PRIu64 " refused: %u; continuing without audio\n", notice.track.id,
+              admission.result);
+      ft_playback_ring_destroy(&p->ring);
+      continue;
     }
     /* The viewer reads its ring when the device asks; it needs no doorbell. */
     ft_playback_doorbell_destroy(&doorbell);
     p->track = notice.track.id;
     p->descriptor = notice.track.audio;
-    if (viewer_playback_start(p)) return 1;
+    viewer_playback_start(p);
   }
-  /* The channel ends with the source. */
-  if (p->tracks && status != FT_STATUS_EMPTY) ft_tracks_destroy(&p->tracks);
-  return 0;
+  /* The channel ends with the source, or on a failure. */
+  if (p->tracks && status != FT_STATUS_EMPTY) {
+    if (status != FT_STATUS_CLOSED) fprintf(stderr, "audio track channel failed: %d; continuing without new tracks\n", status);
+    ft_tracks_destroy(&p->tracks);
+  }
 }
 
 int64_t viewer_playback_clock(viewer_playback *p) {

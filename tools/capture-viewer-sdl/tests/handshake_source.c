@@ -23,13 +23,13 @@ int main(int argc, char **argv) {
   puts("ready"); fflush(stdout);
   check(ft_local_listener_accept(listener, &local));
   /* Video 1, input 2 (refused: no target), and affordances 3 when offered. */
-  ft_track_offer tracks[3] = {{1, FT_TRACK_KIND_VIDEO, "default", NULL, 0, FT_TRACK_FROM_SOURCE, 0},
-                              {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0},
-                              {3, FT_TRACK_KIND_AFFORDANCES, "default", NULL, 0, FT_TRACK_BOTH, 0}};
+  ft_track_offer tracks[3] = {{1, FT_TRACK_KIND_VIDEO, "default", NULL, 0, FT_TRACK_FROM_SOURCE, 0, {{0}, 0, 0}},
+                              {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0, {{0}, 0, 0}},
+                              {3, FT_TRACK_KIND_AFFORDANCES, "default", NULL, 0, FT_TRACK_BOTH, 0, {{0}, 0, 0}}};
   ft_track_admission admissions[3]; size_t count = 0;
   ft_status handshake = ft_handshake_accept_local(&local, "C fixture", FT_CLOCK_DOMAIN_HOST_TIME, tracks,
-                                                  strcmp(argv[2], "offered") ? 2 : 3, NULL, admissions, &count,
-                                                  &input, &affordances);
+                                                  strcmp(argv[2], "offered") ? 2 : 3, NULL, 0, NULL, admissions,
+                                                  &count, &input, &affordances, NULL);
   ft_local_listener_destroy(&listener);
   /* A viewer requiring absent affordances abandons the offer, ending here. */
   if (handshake != FT_STATUS_OK || (argc == 4 && !strcmp(argv[3], "refusal"))) {

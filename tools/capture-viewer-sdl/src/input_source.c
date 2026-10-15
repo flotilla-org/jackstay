@@ -39,11 +39,11 @@ enum { LARGE_WIDTH = WIDTH * 3 / 2, LARGE_HEIGHT = HEIGHT * 2 };
 static void checked(ft_status status) { if (status != FT_STATUS_OK) { fprintf(stderr, "reference source status=%d\n", status); exit(1); } }
 /* Offer video 1 and input 2. A NULL target withholds input authority. */
 static void offer_tracks(ft_local_connection **connection, ft_input_target *target, ft_input_server **input) {
-  ft_track_offer tracks[2] = {{1, FT_TRACK_KIND_VIDEO, "default", NULL, 0, FT_TRACK_FROM_SOURCE, 0},
-                              {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0}};
+  ft_track_offer tracks[2] = {{1, FT_TRACK_KIND_VIDEO, "default", NULL, 0, FT_TRACK_FROM_SOURCE, 0, {{0}, 0, 0}},
+                              {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0, {{0}, 0, 0}}};
   ft_track_admission admissions[2]; size_t count = 0; ft_affordances_producer *affordances = NULL;
-  checked(ft_handshake_accept_local(connection, "reference input source", FT_CLOCK_DOMAIN_HOST_TIME, tracks, 2,
-                                    target, admissions, &count, input, &affordances));
+  checked(ft_handshake_accept_local(connection, "reference input source", FT_CLOCK_DOMAIN_HOST_TIME, tracks, 2, NULL, 0,
+                                    target, admissions, &count, input, &affordances, NULL));
 }
 static const char *action_name(uint32_t action) {
   return action == FT_INPUT_DOWN ? "down" : action == FT_INPUT_UP ? "up" : action == FT_INPUT_REPEAT ? "repeat" : "?";

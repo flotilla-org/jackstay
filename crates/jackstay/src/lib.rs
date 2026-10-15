@@ -87,6 +87,7 @@ pub mod error;
 pub mod fdpass;
 pub mod ffi;
 pub mod ffi_acquisition;
+pub mod ffi_audio;
 pub mod ffi_handshake;
 pub mod ffi_input;
 pub mod ffi_local;

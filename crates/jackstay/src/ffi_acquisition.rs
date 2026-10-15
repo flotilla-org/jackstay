@@ -85,7 +85,7 @@ impl FtAcquisitionConsumer {
 }
 
 pub struct FtAcquiredFrame(Option<FrameLease>);
-pub struct FtAcquisitionCancellation(Cancellation);
+pub struct FtAcquisitionCancellation(pub(crate) Cancellation);
 pub struct FtAcquisitionReleaseTimeline(ConsumerReleaseTimeline);
 
 impl FtAcquisitionReleaseTimeline {

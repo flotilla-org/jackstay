@@ -135,7 +135,7 @@ fn c_handshake_snapshot_verb_and_destroy() {
                 descriptor: ptr::null(),
                 descriptor_len: 0,
                 direction: FT_TRACK_BOTH,
-                reserved: 0,
+                ..Default::default()
             };
             let mut admission = FtTrackAdmission::default();
             let (mut count, mut input, mut aff) = (0, ptr::null_mut(), ptr::null_mut());
@@ -146,11 +146,14 @@ fn c_handshake_snapshot_verb_and_destroy() {
                     FT_CLOCK_DOMAIN_HOST_TIME,
                     &track,
                     1,
+                    ptr::null(),
+                    0,
                     ptr::null_mut(),
                     &mut admission,
                     &mut count,
                     &mut input,
-                    &mut aff
+                    &mut aff,
+                    ptr::null_mut(),
                 ),
                 FT_STATUS_OK
             );
@@ -178,7 +181,10 @@ fn c_handshake_snapshot_verb_and_destroy() {
                 &mut b,
                 &mut input,
                 &mut input_status,
-                &mut host
+                &mut host,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
             ),
             FT_STATUS_OK
         );

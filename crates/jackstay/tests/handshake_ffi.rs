@@ -32,7 +32,7 @@ fn offer(id: u64, kind: &'static CStr, direction: u32, descriptor: &'static [u8]
         descriptor: descriptor.as_ptr(),
         descriptor_len: descriptor.len(),
         direction,
-        reserved: 0,
+        ..Default::default()
     }
 }
 
@@ -64,11 +64,14 @@ fn host(
                 FT_CLOCK_DOMAIN_HOST_TIME,
                 tracks.as_ptr(),
                 tracks.len(),
+                ptr::null(),
+                0,
                 target.0,
                 admissions.as_mut_ptr(),
                 &mut count,
                 &mut server,
                 &mut affordances,
+                ptr::null_mut(),
             )
         };
         assert!(affordances.is_null());
@@ -133,6 +136,9 @@ fn consume(connection: *mut FtLocalConnection, selection: &[FtTrackSelection]) -
             &mut selected.input,
             &mut selected.input_status,
             &mut affordances,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
         );
         assert!(handle.is_null() && affordances.is_null());
         selected.admissions = admissions;
@@ -150,7 +156,7 @@ fn layouts_match_the_sizes_the_c_header_pins() {
         (120, 88)
     );
     assert_eq!((size_of::<FtTrackSelection>(), size_of::<FtTrackAdmission>()), (16, 16));
-    assert_eq!(size_of::<FtTrackOffer>(), 16 + 3 * size_of::<*const u8>() + size_of::<usize>());
+    assert_eq!(size_of::<FtTrackOffer>(), 32 + 3 * size_of::<*const u8>() + size_of::<usize>());
 }
 
 #[test]

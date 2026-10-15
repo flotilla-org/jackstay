@@ -54,7 +54,7 @@ Build just the Rust library with `cargo build --workspace --locked`. For macOS
 native capture consumers, add `--features backend-macos`; for Linux native
 transport add `--features backend-linux`. On Windows the library, shared memory,
 the acquisition arena, the named-pipe setup channel and the acquisition,
-bootstrap and input C ABI ([Local Endpoints](docs/design/local-endpoints.md),
+handshake and input C ABI ([Local Endpoints](docs/design/local-endpoints.md),
 ABI 0.9) build and are tested. `--features backend-windows` adds the D3D11 arena
 backend and Windows.Graphics.Capture sessions
 ([D3D11 backend](docs/design/acquisition-d3d11.md)), and ABI 0.10's D3D11
@@ -143,7 +143,7 @@ written bytes after the child exits. Keep the export and reservation alive until
 delegate writes finish; never reuse a slot while the delegate is writing it.
 The check also verifies the dylib install name and executable rpath, requires
 loading to fail when the packaged dylib is removed, and requires Swift to reject
-a disposable header copy with a broken bootstrap include. On macOS, `cargo test`
+a disposable header copy with a broken handshake include. On macOS, `cargo test`
 runs this script through the `swift_bindings` integration test with an isolated
 Cargo target directory. Each invocation builds the CPU library and exporter
 again in that fresh directory, adding a debug build to both the CPU-only and
@@ -167,11 +167,14 @@ interface; neither is implied by the reference demo.
 
 ## One source endpoint
 
-ABI 0.8 adds [shared source bootstrap](docs/design/source-bootstrap.md). Hosts can
-expose one authorized endpoint for CPU media and optional shared input, while
-retaining independent channel ownership and processing. Rust uses `bootstrap`;
-C/Zig clients use `jackstay_bootstrap.h`. The SDL reference source and viewer
-exercise it with `--source-socket`; KS's connector adoption is a separate change.
+ABI 0.15 replaces source bootstrap with the [track handshake](docs/design/track-handshake.md).
+Hosts expose one authorized endpoint and offer its tracks (video, input,
+affordances and app kinds); consumers select some as optional or required, and
+the host admits them. Channel ownership and processing stay independent. Rust
+uses `handshake`; C/Zig clients use `jackstay_handshake.h`, with typed offers,
+selections and admissions. Setup messages are CBOR (flotilla ADR 0063) from the
+pinned `flotilla-cbor` git dependency. The SDL reference source and viewer
+exercise it with `--source-socket` and `--source-endpoint`.
 
 Native Rust producers can use the **`jackstay-producer`** workspace crate. It is
 convenience scaffolding over Jackstay, with no rendering dependency or desktop
@@ -182,8 +185,5 @@ and affordance callbacks. See
 [the minimal example](crates/jackstay-producer/examples/minimal.rs) and
 [the toolkit contract](crates/jackstay-producer/README.md).
 
-Affordances are available through explicit `bootstrap::accept_v2` /
-`connect_v2` negotiation and the ABI 0.12 typed
+Affordances are an offered track kind and the ABI 0.12 typed
 [`jackstay_affordances.h`](crates/jackstay/include/jackstay_affordances.h) surface.
-The legacy bootstrap entry points explicitly select v1. No automatic downgrade
-or retry occurs on a partially consumed stream.

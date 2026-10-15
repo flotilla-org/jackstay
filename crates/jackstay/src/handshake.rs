@@ -227,9 +227,16 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     let mut ids = HashSet::new();
     let mut single_kinds = HashSet::new();
     let ring = |id| playback.iter().find(|p| p.id() == id);
+    if offer.tracks.iter().filter(|t| t.kind == Kind::Playback).count() > audio::MAX_TRACKS {
+        return Err(Error::Protocol("invalid offer"));
+    }
     for track in &offer.tracks {
         let single = matches!(track.kind, Kind::Video | Kind::Input | Kind::Affordances);
-        let unplayable = track.kind == Kind::Playback && (track.direction != Direction::FromSource || ring(track.id).is_none());
+        let fits = || {
+            let descriptor = audio::Descriptor::decode(&track.descriptor);
+            ring(track.id).is_some_and(|ring| descriptor.is_ok_and(|descriptor| ring.fits(&descriptor)))
+        };
+        let unplayable = track.kind == Kind::Playback && (track.direction != Direction::FromSource || !fits());
         if !ids.insert(track.id) || !track.kind.offerable() || unplayable || (single && !single_kinds.insert(track.kind.clone())) {
             return Err(Error::Protocol("invalid offer"));
         }
@@ -290,13 +297,13 @@ pub fn accept(stream: Stream, offer: &Offer, target: Option<Target>, playback: &
     let mut doorbell = None;
     if !playing.is_empty() {
         let (bell, mut objects) = audio::Bell::new()?;
-        for (_, id) in &playing {
-            objects.push(ring(*id).expect("validated offer").read_only_fd()?);
+        // Register first, so every block after the transfer rings the bell.
+        for (position, id) in &playing {
+            let ring = ring(*id).expect("validated offer");
+            ring.register(&bell, *position);
+            objects.push(ring.read_only_fd()?);
         }
         handshake.send_objects(objects)?;
-        for (position, id) in &playing {
-            ring(*id).expect("validated offer").register(&bell, *position);
-        }
         doorbell = Some(bell);
     }
     Ok(Accepted {

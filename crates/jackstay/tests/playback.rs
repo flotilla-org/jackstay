@@ -119,6 +119,18 @@ fn offer_carries_the_descriptor_and_settings_floor_the_depth() {
         tracks: vec![writer.track("default")],
     };
     assert!(handshake::accept(host, &offer, None, &[]).is_err());
+    // An offered descriptor that disagrees with its ring is an invalid offer.
+    let mut track = writer.track("default");
+    let mut descriptor = Descriptor::decode(&track.descriptor).unwrap();
+    descriptor.block_frames += 1;
+    track.descriptor = handshake::Bytes(flotilla_cbor::to_vec(&descriptor, &handshake::LIMITS).unwrap());
+    let (host, _peer) = pair();
+    let offer = Offer {
+        source: "test source".into(),
+        tracks: vec![track],
+    };
+    let result = handshake::accept(host, &offer, None, &[writer.playback()]);
+    assert!(matches!(result, Err(handshake::Error::Protocol("invalid offer"))));
 }
 
 #[test]

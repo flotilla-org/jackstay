@@ -34,6 +34,10 @@ use crate::{
     shm::SharedMemorySegment,
 };
 
+/// The most playback tracks one offer may carry: one doorbell hint bit each,
+/// which also keeps the single ring transfer far below `SCM_MAX_FD`.
+pub const MAX_TRACKS: usize = 64;
+
 /// The shortest ring a producer may configure.
 pub const MIN_DEPTH: Duration = Duration::from_millis(250);
 
@@ -255,6 +259,15 @@ impl Ring {
         })
     }
 
+    /// Whether a descriptor names this ring's depth and, in its own format,
+    /// exactly the frames one block holds.
+    fn fits(&self, descriptor: &Descriptor) -> bool {
+        descriptor.format.valid()
+            && descriptor.block_frames != 0
+            && self.blocks == u64::from(descriptor.blocks)
+            && usize::try_from(descriptor.block_frames).is_ok_and(|frames| frames == self.payload_len / descriptor.format.frame_bytes())
+    }
+
     fn word(&self, offset: usize) -> &AtomicU64 {
         assert!(offset.is_multiple_of(8) && offset + 8 <= self.segment.len());
         // SAFETY: an aligned, in-bounds word of the live mapping that is only
@@ -278,6 +291,9 @@ impl Ring {
         fence(Release);
         // SAFETY: the writable mapping holds this whole block; samples fit the
         // payload. Field 0 (the sequence word) is not copied as plain bytes.
+        // Readers may copy these bytes concurrently: formally a data race under
+        // the Rust memory model, the standard seqlock trade-off. Readers
+        // discard any copy the sequence word does not validate.
         unsafe {
             let block = self.segment.as_ptr().cast_mut().add(offset);
             std::ptr::copy_nonoverlapping(
@@ -298,7 +314,10 @@ impl Ring {
         let first = sequence.load(Acquire);
         let mut header = BlockHeader::default();
         // SAFETY: in-bounds reads of the mapped block into local storage of
-        // the same lengths, skipping the atomic sequence word.
+        // the same lengths, skipping the atomic sequence word. The writer may
+        // be storing these bytes concurrently: formally a data race under the
+        // Rust memory model (the standard seqlock trade-off), so the copy is
+        // plain bytes and is used only if the sequence re-read validates it.
         unsafe {
             let block = self.segment.as_ptr().add(offset);
             std::ptr::copy_nonoverlapping(
@@ -348,11 +367,12 @@ impl PlaybackWriter {
             return Err(Error::Invalid("ring depth below 250 ms"));
         }
         let blocks = (depth.as_nanos() * u128::from(format.rate)).div_ceil(u128::from(block_frames) * 1_000_000_000);
-        let blocks = u64::try_from(blocks).map_err(|_| Error::Invalid("ring too large"))?.max(2);
+        // Descriptors carry u32 geometry.
+        let blocks = u32::try_from(blocks).map_err(|_| Error::Invalid("ring too large"))?.max(2);
         let payload_len = (block_frames as usize)
             .checked_mul(format.frame_bytes())
             .ok_or(Error::Invalid("block too large"))?;
-        let (ring, read_only) = Ring::create(blocks, payload_len)?;
+        let (ring, read_only) = Ring::create(u64::from(blocks), payload_len)?;
         Ok(Self {
             shared: Arc::new(Shared {
                 id,
@@ -403,11 +423,12 @@ impl PlaybackWriter {
     /// Switch format at the next block, which carries the reconfiguration
     /// marker and a new generation. Block size in bytes stays fixed.
     pub fn reconfigure(&mut self, format: Format) -> Result<(), Error> {
-        if !format.valid() || format.frame_bytes() > self.shared.ring.payload_len {
+        let payload_len = self.shared.ring.payload_len;
+        if !format.valid() || format.frame_bytes() > payload_len || u32::try_from(payload_len / format.frame_bytes()).is_err() {
             return Err(Error::Invalid("format"));
         }
         self.format = format;
-        self.generation += 1;
+        self.generation = self.generation.wrapping_add(1);
         self.flags |= RECONFIGURATION;
         Ok(())
     }
@@ -455,6 +476,11 @@ impl Playback {
 
     pub(crate) fn read_only_fd(&self) -> io::Result<OwnedFd> {
         self.0.read_only.try_clone()
+    }
+
+    /// Whether an offered descriptor matches this ring's geometry.
+    pub(crate) fn fits(&self, descriptor: &Descriptor) -> bool {
+        self.0.ring.fits(descriptor)
     }
 
     pub(crate) fn register(&self, bell: &Bell, position: usize) {
@@ -521,7 +547,9 @@ impl Doorbell {
     }
 
     /// Sleep until the hint is non-zero, then take it. Returns 0 on
-    /// cancellation or timeout.
+    /// cancellation or timeout. The host registers its bell before passing
+    /// the rings, so no block written after connecting goes unannounced; blocks
+    /// written earlier are found by [`PlaybackReader::available`].
     pub fn wait(&mut self, cancel: &Cancellation, timeout: Option<Duration>) -> io::Result<u64> {
         let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         loop {
@@ -547,7 +575,7 @@ pub struct PlaybackRing {
 impl PlaybackRing {
     pub(crate) fn map(id: u64, descriptor: Descriptor, fd: OwnedFd) -> Result<Self, Error> {
         let ring = Ring::map(fd)?;
-        if ring.blocks != u64::from(descriptor.blocks) || descriptor.block_frames == 0 || !descriptor.format.valid() {
+        if !ring.fits(&descriptor) {
             return Err(Error::Invalid("ring disagrees with its descriptor"));
         }
         Ok(Self {

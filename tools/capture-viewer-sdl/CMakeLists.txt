@@ -115,19 +115,19 @@ add_test(NAME cooperative_input_processes COMMAND ${Python3_EXECUTABLE}
   $<TARGET_FILE:capture-input-source> $<TARGET_FILE:capture-viewer-sdl>)
 set_tests_properties(cooperative_input_processes PROPERTIES TIMEOUT 20)
 
-add_executable(v2-source-fixture tests/v2_source.c)
-target_include_directories(v2-source-fixture PRIVATE "${JACKSTAY_INCLUDE_DIR}" src)
-target_compile_options(v2-source-fixture PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(v2-source-fixture PRIVATE ${JACKSTAY_LIB})
-add_test(NAME v2_affordances_processes COMMAND ${Python3_EXECUTABLE}
-  ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_processes.py
-  $<TARGET_FILE:v2-source-fixture> $<TARGET_FILE:capture-viewer-sdl>)
-set_tests_properties(v2_affordances_processes PROPERTIES TIMEOUT 30)
+add_executable(handshake-source-fixture tests/handshake_source.c)
+target_include_directories(handshake-source-fixture PRIVATE "${JACKSTAY_INCLUDE_DIR}" src)
+target_compile_options(handshake-source-fixture PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(handshake-source-fixture PRIVATE ${JACKSTAY_LIB})
+add_test(NAME handshake_affordances_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/handshake_processes.py
+  $<TARGET_FILE:handshake-source-fixture> $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(handshake_affordances_processes PROPERTIES TIMEOUT 30)
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
-add_test(NAME v2_toolkit_processes COMMAND ${Python3_EXECUTABLE}
-  ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_toolkit.py
+add_test(NAME toolkit_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/toolkit_processes.py
   ${CARGO_EXECUTABLE} ${JACKSTAY_ROOT} $<TARGET_FILE:capture-viewer-sdl>)
-set_tests_properties(v2_toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+set_tests_properties(toolkit_processes PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 add_test(NAME typing_input_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/typing_processes.py
   $<TARGET_FILE:capture-input-source> $<TARGET_FILE:capture-viewer-sdl>)

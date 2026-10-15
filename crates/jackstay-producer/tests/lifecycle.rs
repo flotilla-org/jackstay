@@ -9,11 +9,35 @@ use jackstay::{
         arena::{AcquireOutcome, ArenaConfig, FrameDescriptor},
         socket::CpuSetupClient,
     },
-    bootstrap::{self, ChannelRequest, InputRequest},
+    handshake::{self, Connected, Selected},
     input::{Config, Event, Mode, Operation, Outcome, Work},
     local::{self, Endpoint, Scope, Transport},
 };
-use jackstay_producer::{Builder, Frame, Producer};
+use jackstay_producer::{AFFORDANCES, Builder, Frame, INPUT, Producer, VIDEO};
+
+/// Select video and cooperative input, and affordances when asked, all required.
+fn connect(stream: local::Stream, affordances: bool) -> Result<Connected, handshake::Error> {
+    let mut selection = vec![
+        Selected {
+            id: VIDEO,
+            required: true,
+            write: false,
+        },
+        Selected {
+            id: INPUT,
+            required: true,
+            write: true,
+        },
+    ];
+    if affordances {
+        selection.push(Selected {
+            id: AFFORDANCES,
+            required: true,
+            write: false,
+        });
+    }
+    handshake::connect(stream)?.select(&selection, Mode::Cooperative)
+}
 struct TestProducer(Arc<Mutex<Vec<Operation>>>);
 impl Producer for TestProducer {
     fn frame(&mut self) -> Option<Frame> {
@@ -67,12 +91,7 @@ fn consumer_input_disconnect_and_clean_stop() {
     let source = Builder::new(ep.clone(), config(), Config::default(), TestProducer(events.clone()))
         .start()
         .unwrap();
-    let c = bootstrap::connect_v2(
-        local::connect(&ep).unwrap().into_stream(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::Required,
-    )
-    .unwrap();
+    let c = connect(local::connect(&ep).unwrap().into_stream(), true).unwrap();
     let input = c.input.unwrap();
     let mut setup = unsafe { CpuSetupClient::from_stream(c.media) };
     let consumer = setup.attach(1).unwrap();
@@ -127,12 +146,7 @@ fn consumer_death_and_stop() {
 fn consumer_child() {
     let name = std::env::var("JACKSTAY_TOOLKIT_CHILD_ENDPOINT").unwrap();
     let ep = Endpoint::new(Scope::User, &name, Transport::LocalStream).unwrap();
-    let c = bootstrap::connect_v2(
-        local::connect(&ep).unwrap().into_stream(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::None,
-    )
-    .unwrap();
+    let c = connect(local::connect(&ep).unwrap().into_stream(), false).unwrap();
     let mut setup = unsafe { CpuSetupClient::from_stream(c.media) };
     let _consumer = setup.attach(1).unwrap();
     c.input.as_ref().unwrap().send(Event::Text("child".into())).unwrap();
@@ -140,9 +154,9 @@ fn consumer_child() {
         thread::sleep(Duration::from_secs(1));
     }
 }
-// Worker bounds include silent bootstrap peers; stop interrupts their reads.
+// Worker bounds include silent handshake peers; stop interrupts their reads.
 #[test]
-fn silent_bootstrap_peer_does_not_block_stop() {
+fn silent_handshake_peer_does_not_block_stop() {
     let ep = endpoint("silent");
     let source = Builder::new(ep.clone(), config(), Config::default(), TestProducer(Arc::default()))
         .max_connections(1)
@@ -162,12 +176,7 @@ fn media_disconnect_keeps_other_channels() {
     let source = Builder::new(ep.clone(), config(), Config::default(), TestProducer(events.clone()))
         .start()
         .unwrap();
-    let c = bootstrap::connect_v2(
-        local::connect(&ep).unwrap().into_stream(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::Required,
-    )
-    .unwrap();
+    let c = connect(local::connect(&ep).unwrap().into_stream(), true).unwrap();
     drop(c.media);
     thread::sleep(Duration::from_millis(20));
     let _second = local::connect(&ep).unwrap();
@@ -193,12 +202,7 @@ fn stop_cleans_up_an_active_controller() {
     let source = Builder::new(ep.clone(), config(), Config::default(), TestProducer(events.clone()))
         .start()
         .unwrap();
-    let c = bootstrap::connect_v2(
-        local::connect(&ep).unwrap().into_stream(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::None,
-    )
-    .unwrap();
+    let c = connect(local::connect(&ep).unwrap().into_stream(), false).unwrap();
     c.input.as_ref().unwrap().send(Event::Text("active".into())).unwrap();
     wait(|| events.lock().unwrap().iter().any(|o| matches!(o, Operation::Event(_))));
     source.stop().unwrap();
@@ -236,12 +240,7 @@ fn frame_resize_reconfigures_existing_consumer() {
     let source = Builder::new(ep.clone(), config(), Config::default(), Resizing(width.clone()))
         .start()
         .unwrap();
-    let c = bootstrap::connect_v2(
-        local::connect(&ep).unwrap().into_stream(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::None,
-    )
-    .unwrap();
+    let c = connect(local::connect(&ep).unwrap().into_stream(), false).unwrap();
     let mut setup = unsafe { CpuSetupClient::from_stream(c.media) };
     let mut consumer = setup.attach(1).unwrap();
     width.store(1, Ordering::Release);
@@ -335,13 +334,21 @@ fn malformed_ignored_verbs_never_reach_callbacks() {
     .unwrap();
     let mut media = local::connect(&ep).unwrap().into_stream();
     media.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let mut request = [0; 24];
-    request[..8].copy_from_slice(b"JSBOOT02");
-    request[15] = 1;
-    request[19] = 1;
-    media.write_all(&request).unwrap();
-    let mut reply = [0; 48];
-    media.read_exact(&mut reply).unwrap();
+    // A raw v3 handshake selecting only affordances track 3, to reach its
+    // channel's bytes: skip the offer frame, select, skip the admitted frame.
+    let skip_frame = |media: &mut local::Stream| {
+        let mut header = [0; 12];
+        media.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..8], &handshake::MAGIC);
+        let mut body = vec![0; u32::from_be_bytes(header[8..].try_into().unwrap()) as usize];
+        media.read_exact(&mut body).unwrap();
+    };
+    skip_frame(&mut media);
+    let selection = b"\xa2\x64type\x69selection\x66tracks\x81\xa2\x62id\x03\x68required\xf5";
+    media.write_all(&handshake::MAGIC).unwrap();
+    media.write_all(&(selection.len() as u32).to_be_bytes()).unwrap();
+    media.write_all(selection).unwrap();
+    skip_frame(&mut media);
     let fd = jackstay::fdpass::recv_fd(&media).unwrap();
     let mut controls = local::Stream::from(fd);
     media.write_all(&[1]).unwrap();
@@ -453,12 +460,7 @@ fn callback_panics_still_run_ordered_shutdown() {
         )
         .start()
         .unwrap();
-        let c = bootstrap::connect_v2(
-            local::connect(&ep).unwrap().into_stream(),
-            InputRequest::Required(Mode::Cooperative),
-            ChannelRequest::Required,
-        )
-        .unwrap();
+        let c = connect(local::connect(&ep).unwrap().into_stream(), true).unwrap();
         trigger.store(true, Ordering::Release);
         if stage == 0 {
             c.input.as_ref().unwrap().send(Event::Text("panic".into())).unwrap();
@@ -478,7 +480,7 @@ fn callback_panics_still_run_ordered_shutdown() {
 // visibly rejected (connect error or disconnect), and stop interrupts the
 // admitted peer's stalled read.
 #[test]
-fn connection_limit_rejects_peers_while_bootstrap_stalls() {
+fn connection_limit_rejects_peers_while_handshake_stalls() {
     let ep = endpoint("limit");
     let source = Builder::new(ep.clone(), config(), Config::default(), TestProducer(Arc::default()))
         .max_connections(1)
@@ -567,12 +569,7 @@ fn scaled_recycling(logical_width: f64) {
     )
     .start()
     .unwrap();
-    let connected = bootstrap::connect_v2(
-        local::connect(&ep).unwrap().into_stream(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::None,
-    )
-    .unwrap();
+    let connected = connect(local::connect(&ep).unwrap().into_stream(), false).unwrap();
     let input = connected.input.unwrap();
     let mut setup = unsafe { CpuSetupClient::from_stream(connected.media) };
     let mut consumer = setup.attach(1).unwrap();
@@ -632,12 +629,7 @@ fn direct_arena_geometry_updates_without_copied_frames() {
     )
     .start()
     .unwrap();
-    let c = bootstrap::connect_v2(
-        local::connect(&ep).unwrap().into_stream(),
-        InputRequest::Required(Mode::Cooperative),
-        ChannelRequest::None,
-    )
-    .unwrap();
+    let c = connect(local::connect(&ep).unwrap().into_stream(), false).unwrap();
     let input = c.input.as_ref().unwrap();
     input
         .send(Event::Button {

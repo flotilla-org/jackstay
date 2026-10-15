@@ -1,13 +1,13 @@
 /* Real process boundary fixture using only public C ABI channels. */
 #define _POSIX_C_SOURCE 200809L
-#include "jackstay_bootstrap.h"
+#include "jackstay_handshake.h"
 #include "synthetic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 static void checked(ft_status s, const char *operation) {
-  if (s != FT_STATUS_OK) { fprintf(stderr, "v2 fixture %s: status=%d\n", operation, s); exit(1); }
+  if (s != FT_STATUS_OK) { fprintf(stderr, "handshake fixture %s: status=%d\n", operation, s); exit(1); }
 }
 #define check(status) checked((status), #status)
 static void pause_ms(void) { struct timespec t = {0, 16000000}; nanosleep(&t, NULL); }
@@ -22,17 +22,22 @@ int main(int argc, char **argv) {
   check(ft_local_listener_create(&endpoint, &listener));
   puts("ready"); fflush(stdout);
   check(ft_local_listener_accept(listener, &local));
-  ft_status bootstrap = ft_source_bootstrap_accept_v2_local(&local, NULL, !strcmp(argv[2], "offered"), &input, &affordances);
+  /* Video 1, input 2 (refused: no target), and affordances 3 when offered. */
+  ft_track_offer tracks[3] = {{1, FT_TRACK_KIND_VIDEO, "default", NULL, 0, FT_TRACK_FROM_SOURCE, 0},
+                              {2, FT_TRACK_KIND_INPUT, "default", NULL, 0, FT_TRACK_TO_SOURCE, 0},
+                              {3, FT_TRACK_KIND_AFFORDANCES, "default", NULL, 0, FT_TRACK_BOTH, 0}};
+  ft_track_admission admissions[3]; size_t count = 0;
+  ft_status handshake = ft_handshake_accept_local(&local, "C fixture", tracks, strcmp(argv[2], "offered") ? 2 : 3,
+                                                  NULL, admissions, &count, &input, &affordances);
   ft_local_listener_destroy(&listener);
-  /* A required-refusal scenario ends at bootstrap. Starting CPU setup after
-   * the viewer rejects and closes can fail peer identification on macOS. */
-  if (bootstrap != FT_STATUS_OK || (argc == 4 && !strcmp(argv[3], "refusal"))) {
+  /* A viewer requiring absent affordances abandons the offer, ending here. */
+  if (handshake != FT_STATUS_OK || (argc == 4 && !strcmp(argv[3], "refusal"))) {
     ft_local_connection_destroy(&local); check(ft_cpu_producer_destroy(&producer));
-    puts("bootstrap refused"); return 0;
+    puts("handshake refused"); return 0;
   }
   check(ft_cpu_producer_serve_local(producer, &local, &server));
   if (affordances) {
-    const char *title = "C v2 fixture";
+    const char *title = "C handshake fixture";
     ft_aff_snapshot snapshot = {.domain = FT_AFF_DOMAIN_WINDOW,
       .window = {.ready = 1, .title = {.present = 1, .value = {(const uint8_t *)title, strlen(title)}}}};
     check(ft_affordances_producer_publish(affordances, &snapshot));

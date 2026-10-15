@@ -1,8 +1,8 @@
 pub mod acquisition;
-pub mod bootstrap;
 pub mod control_page;
 #[cfg(unix)]
 pub mod daemon;
+pub mod handshake;
 #[cfg(windows)]
 pub mod daemon {
     use crate::{
@@ -86,7 +86,7 @@ pub mod error;
 pub mod fdpass;
 pub mod ffi;
 pub mod ffi_acquisition;
-pub mod ffi_bootstrap;
+pub mod ffi_handshake;
 pub mod ffi_input;
 pub mod ffi_local;
 #[cfg(any(

@@ -1,5 +1,5 @@
 //! Run `cargo run -p jackstay-producer --example scroll` then attach using
-//! bootstrap::connect_v2. Source selection and authorization remain host policy.
+//! handshake::connect. Source selection and authorization remain host policy.
 use std::time::Duration;
 
 use jackstay::{

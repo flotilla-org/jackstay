@@ -3,16 +3,17 @@
 //! The host owns routing and authority. This protocol only admits one process
 //! incarnation and transfers its initial/replacement maps; frames never use it.
 
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, OwnedHandle as OwnedFd};
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::{
     io::{Read, Write},
-    sync::{Arc, Mutex},
+    os::fd::{AsRawFd, OwnedFd},
 };
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use flotilla_cbor::{Framing, Message};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
@@ -22,10 +23,8 @@ use super::{
         GrantDescriptor,
     },
 };
-use crate::local::Stream;
+use crate::{handshake::FRAMING, local::Stream};
 
-const MAGIC: &[u8; 8] = b"JSCPU001";
-const MAX_MESSAGE: usize = 16 * 1024;
 #[cfg(unix)]
 const TRANSFER_FINISHED: u8 = 1;
 
@@ -33,8 +32,8 @@ const TRANSFER_FINISHED: u8 = 1;
 pub enum SocketError {
     #[error("CPU setup I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("CPU setup JSON: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("CPU setup message: {0}")]
+    Message(#[from] flotilla_cbor::Error),
     #[error(transparent)]
     Arena(#[from] ArenaError),
     #[error(transparent)]
@@ -46,14 +45,18 @@ pub enum SocketError {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
     Attach { holding: u32 },
     Configuration,
 }
 
+impl Message for Request {
+    const TYPES: &'static [&'static str] = &["attach", "configuration"];
+}
+
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
     Attached { descriptor: GrantDescriptor },
     Configuration { descriptor: ConfigurationDescriptor },
@@ -61,53 +64,36 @@ enum Response {
     Rejected { message: String },
 }
 
-fn read_message<T: DeserializeOwned>(stream: &mut Stream) -> Result<Option<T>, SocketError> {
-    read_framed(stream, MAGIC)
+impl Message for Response {
+    const TYPES: &'static [&'static str] = &["attached", "configuration", "empty", "rejected"];
 }
 
-/// One length-prefixed JSON message behind an 8-byte protocol magic. Shared
-/// with the native setup channels, which differ only in magic and messages.
-pub(crate) fn read_framed<T: DeserializeOwned>(stream: &mut Stream, magic: &[u8; 8]) -> Result<Option<T>, SocketError> {
-    let mut header = [0; 12];
-    loop {
-        match stream.read(&mut header[..1]) {
-            Ok(0) => return Ok(None),
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    stream.read_exact(&mut header[1..])?;
-    if &header[..8] != magic {
-        return Err(SocketError::Protocol("unsupported version"));
-    }
-    let len = u32::from_le_bytes(header[8..].try_into().expect("four bytes")) as usize;
-    if len == 0 || len > MAX_MESSAGE {
-        return Err(SocketError::Protocol("message size exceeds limit"));
-    }
-    let mut bytes = vec![0; len];
-    // Exact reads cannot consume the following ancillary byte before recvmsg.
-    stream.read_exact(&mut bytes)?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+fn read_message<M: Message>(stream: &mut Stream) -> Result<Option<M>, SocketError> {
+    read_framed(stream, &FRAMING)
 }
 
-fn write_message<T: Serialize>(stream: &mut Stream, value: &T) -> Result<(), SocketError> {
-    write_framed(stream, MAGIC, value)
+/// One framed setup message (flotilla ADR 0063 CBOR), or None at a clean EOF
+/// between messages. Shared with the native setup channels, which differ only
+/// in magic and messages. Exact reads cannot consume the ancillary byte that
+/// follows a reply before recvmsg.
+pub(crate) fn read_framed<M: Message>(stream: &mut Stream, framing: &Framing) -> Result<Option<M>, SocketError> {
+    match framing.read(stream) {
+        Ok(message) => Ok(Some(message)),
+        Err(flotilla_cbor::Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
-pub(crate) fn write_framed<T: Serialize>(stream: &mut Stream, magic: &[u8; 8], value: &T) -> Result<(), SocketError> {
+fn write_message<M: Message>(stream: &mut Stream, message: &M) -> Result<(), SocketError> {
+    write_framed(stream, &FRAMING, message)
+}
+
+pub(crate) fn write_framed<M: Message>(stream: &mut Stream, framing: &Framing, message: &M) -> Result<(), SocketError> {
     // Setup accepts host-owned streams; apply this at the fallible write boundary
     // rather than making the infallible CpuSetupClient constructor fallible.
     #[cfg(unix)]
     crate::socket_options::suppress_sigpipe(stream)?;
-    let bytes = serde_json::to_vec(value)?;
-    if bytes.is_empty() || bytes.len() > MAX_MESSAGE {
-        return Err(SocketError::Protocol("message size exceeds limit"));
-    }
-    stream.write_all(magic)?;
-    stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    stream.write_all(&bytes)?;
-    Ok(())
+    Ok(framing.write(stream, message)?)
 }
 
 /// Obtain the peer's kernel identity, never a PID supplied in request metadata.
@@ -473,7 +459,7 @@ impl Drop for CpuSetupClient {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{io::Write, time::Duration};
 
     use super::*;
     use crate::acquisition::arena::ArenaConfig;
@@ -575,11 +561,11 @@ mod tests {
     fn setup_rejects_oversized_messages_before_reading_the_body() {
         let (mut sender, mut receiver) = pair();
         receiver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        sender.write_all(MAGIC).unwrap();
-        sender.write_all(&((MAX_MESSAGE + 1) as u32).to_le_bytes()).unwrap();
+        sender.write_all(&FRAMING.magic).unwrap();
+        sender.write_all(&((FRAMING.limits.max_message + 1) as u32).to_be_bytes()).unwrap();
         assert!(matches!(
             read_message::<Request>(&mut receiver),
-            Err(SocketError::Protocol("message size exceeds limit"))
+            Err(SocketError::Message(error)) if error.kind() == flotilla_cbor::ErrorKind::MessageLimit
         ));
     }
 }

@@ -2,7 +2,7 @@ module Jackstay {
     header "capture_transfer.h"
     header "jackstay_ring.h"
     header "jackstay_input.h"
-    header "jackstay_bootstrap.h"
+    header "jackstay_handshake.h"
     header "jackstay_affordances.h"
     link "jackstay"
     export *

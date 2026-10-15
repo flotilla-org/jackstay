@@ -3,7 +3,7 @@
 //! A host binds a listener and accepts connections carrying the verified peer
 //! identity; a client connects by logical address and the library verifies the
 //! server. Either side then hands the connection to exactly one setup call
-//! (CPU setup, source bootstrap or input), which consumes it. These are the
+//! (CPU setup, the track handshake or input), which consumes it. These are the
 //! Windows setup entry points; the FD-taking calls remain for POSIX callers.
 
 use std::{
@@ -122,7 +122,7 @@ pub(crate) unsafe fn take_connection(connection: *mut *mut FtLocalConnection) ->
     Some(unsafe { Box::from_raw(std::mem::replace(slot, ptr::null_mut())) })
 }
 
-/// Hand a connection back to the caller in `slot`, e.g. after bootstrap.
+/// Hand a connection back to the caller in `slot`, e.g. after the handshake.
 ///
 /// # Safety
 /// `slot` is writable and currently null.
@@ -254,6 +254,36 @@ pub unsafe extern "C" fn ft_local_connect(endpoint_ptr: *const FtLocalEndpoint, 
     }
 }
 
+/// Adopt a connected Unix stream socket the caller has already verified, for
+/// the handshake and setup calls that take a connection. After basic checks
+/// `*fd` is consumed and set to -1 on every outcome.
+///
+/// # Safety
+/// `fd` is writable and solely owns a live descriptor; `out` is writable,
+/// disjoint and starts null.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ft_local_connection_adopt(fd: *mut i32, out: *mut *mut FtLocalConnection) -> FtStatus {
+    // SAFETY: caller supplies writable, disjoint pointers.
+    let (Some(fd), Some(out)) = (unsafe { fd.as_mut() }, unsafe { out.as_mut() }) else {
+        return FT_STATUS_INVALID_ARGUMENT;
+    };
+    if *fd < 0 || !out.is_null() {
+        return FT_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: caller transfers sole ownership of this live descriptor.
+    let Ok(stream) = (unsafe { crate::ffi_acquisition::setup_server::take_stream(fd) }) else {
+        return FT_STATUS_ERROR;
+    };
+    match local::peer_identity(&stream) {
+        Ok(peer) => {
+            *out = Box::into_raw(Box::new(FtLocalConnection { stream, peer }));
+            FT_STATUS_OK
+        }
+        Err(_) => FT_STATUS_ERROR,
+    }
+}
+
 /// Copy the connection's verified peer identity.
 ///
 /// # Safety
@@ -297,7 +327,7 @@ pub unsafe extern "C" fn ft_local_connection_alive(connection: *const FtLocalCon
 }
 
 /// Run a host exchange on `stream` within `timeout_ms` (nonzero) of now,
-/// through the same deadline-bounded stream as the bootstrap preface, then
+/// through the same deadline-bounded stream as the track handshake, then
 /// hand the stream back in its setup mode.
 fn with_deadline(
     stream: &mut Stream,

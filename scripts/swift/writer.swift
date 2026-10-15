@@ -26,7 +26,7 @@ func check(_ status: ft_status, _ operation: String) {
 }
 
 // All public headers are part of the module; these types also check the ring,
-// input, bootstrap and affordance declarations beyond the CPU writer surface.
+// input, handshake and affordance declarations beyond the CPU writer surface.
 precondition(MemoryLayout<jackstay_ring_header>.size > 0)
 precondition(MemoryLayout<ft_input_event>.size > 0)
 precondition(MemoryLayout<ft_aff_snapshot>.size > 0)

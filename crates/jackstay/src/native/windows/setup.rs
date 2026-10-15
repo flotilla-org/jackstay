@@ -21,6 +21,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use flotilla_cbor::{Framing, Message};
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::{
     Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE},
@@ -41,7 +42,8 @@ use crate::{
     native::arena::{NativeArenaGrant, NativeArenaProducer},
 };
 
-const MAGIC: &[u8; 8] = b"JSD3D001";
+/// D3D11 setup frames: CBOR (flotilla ADR 0063) under the setup limits.
+const FRAMING: Framing = Framing::new(*b"JSD3D002", crate::handshake::LIMITS);
 
 /// A shared D3D11 producer, as the setup server and the capture session share it.
 pub type D3d11Producer = Arc<Mutex<NativeArenaProducer<D3d11FrameBackend>>>;
@@ -110,7 +112,7 @@ struct NativeSetup {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
     Describe,
     Attach { holding: u32, adapter: AdapterLuid },
@@ -118,8 +120,12 @@ enum Request {
     RegisterRelease { handle: u64 },
 }
 
+impl Message for Request {
+    const TYPES: &'static [&'static str] = &["describe", "attach", "configuration", "register_release"];
+}
+
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
     Described {
         producer: ProducerDescription,
@@ -142,6 +148,18 @@ enum Response {
     Rejected {
         message: String,
     },
+}
+
+impl Message for Response {
+    const TYPES: &'static [&'static str] = &[
+        "described",
+        "attached",
+        "configuration",
+        "empty",
+        "registered",
+        "refused",
+        "rejected",
+    ];
 }
 
 /// Least access for each native object in the consumer: it reads textures
@@ -315,19 +333,19 @@ pub fn serve_d3d11(mut stream: Stream, producer: D3d11Producer) -> Result<(), Se
         producer,
         incarnation: None,
     };
-    while let Some(request) = read_framed(&mut stream, MAGIC)? {
+    while let Some(request) = read_framed(&mut stream, &FRAMING)? {
         match session.reply(request, &stream) {
-            Ok(Reply::Plain(response)) => write_framed(&mut stream, MAGIC, &response)?,
+            Ok(Reply::Plain(response)) => write_framed(&mut stream, &FRAMING, &response)?,
             Ok(Reply::Grant(response, arena, native)) => {
                 // No I/O holds the producer lock. Arena objects go first; the
                 // consumer adopts both batches before building its grant.
-                write_framed(&mut stream, MAGIC, &response)?;
+                write_framed(&mut stream, &FRAMING, &response)?;
                 send_objects(&mut stream, arena)?;
                 send_native(&mut stream, native)?;
             }
             Err(error) => write_framed(
                 &mut stream,
-                MAGIC,
+                &FRAMING,
                 &Response::Rejected {
                     message: error.to_string(),
                 },
@@ -384,8 +402,8 @@ impl D3d11SetupClient {
             return Err(SocketError::Protocol("connection failed").into());
         }
         let result = (|| {
-            write_framed(&mut self.stream, MAGIC, request)?;
-            read_framed(&mut self.stream, MAGIC)?.ok_or(SocketError::Protocol("missing reply"))
+            write_framed(&mut self.stream, &FRAMING, request)?;
+            read_framed(&mut self.stream, &FRAMING)?.ok_or(SocketError::Protocol("missing reply"))
         })();
         match result {
             Ok(Response::Rejected { message }) => Err(SocketError::Rejected(message).into()),

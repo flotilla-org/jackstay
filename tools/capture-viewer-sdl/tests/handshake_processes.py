@@ -1,4 +1,4 @@
-"""V2 optional/required channel negotiation and independent teardown over real processes."""
+"""Handshake v3 optional/required track selection and independent teardown over real processes."""
 import os
 import subprocess
 import sys
@@ -9,7 +9,7 @@ env = {**os.environ, "SDL_VIDEODRIVER": "dummy"}
 for offered, policy, session in (("offered", "required", False), ("offered", "none", False),
                                  ("absent", "optional", False), ("absent", "required", False),
                                  ("offered", "default", True)):
-    name = "v2-test-" + uuid.uuid4().hex[:12]
+    name = "handshake-test-" + uuid.uuid4().hex[:12]
     refusal = policy == "required" and offered == "absent"
     source_flags = ["refusal"] if refusal else ["session"] if session else []
     source = subprocess.Popen([sys.argv[1], name, offered, *source_flags], stdout=subprocess.PIPE,
@@ -21,11 +21,11 @@ for offered, policy, session in (("offered", "required", False), ("offered", "no
                                  *flags, "--log-affordances", "--frames", "10"],
                                 env=env, capture_output=True, text=True, timeout=12)
         out, err = source.communicate(timeout=5)
-        # A required unavailable channel fails bootstrap clearly before media admission.
+        # A required track the source does not offer fails setup clearly before media admission.
         if refusal:
             assert viewer.returncode != 0 and "required affordances" in viewer.stderr, viewer
             assert "acquired_frames=" not in viewer.stdout, viewer.stdout
-            assert "bootstrap refused" in out, (out, err)
+            assert "handshake refused" in out, (out, err)
         else:
             # Media remains available when affordances are optional or unrequested.
             assert viewer.returncode == 0 and "acquired_frames=10" in viewer.stdout, (viewer.stdout, viewer.stderr)

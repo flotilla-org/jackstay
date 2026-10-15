@@ -108,7 +108,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use jackstay::{ffi_bootstrap::*, ffi_local::ft_local_connection_destroy};
+use jackstay::{ffi_handshake::*, ffi_local::ft_local_connection_destroy};
 fn poll(mut f: impl FnMut(*mut *mut FtAffordancesEvent) -> FtStatus) -> *mut FtAffordancesEvent {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut event = ptr::null_mut();
@@ -122,30 +122,66 @@ fn poll(mut f: impl FnMut(*mut *mut FtAffordancesEvent) -> FtStatus) -> *mut FtA
 // The public C API negotiates independently owned channels, copies borrowed
 // snapshot/string input, exposes typed event views, and nulls destroyed owners.
 #[test]
-fn c_bootstrap_snapshot_verb_and_destroy() {
+fn c_handshake_snapshot_verb_and_destroy() {
     unsafe {
         let (a, mut b) = local::c_pair();
         let a = a as usize;
         let worker = thread::spawn(move || {
             let mut a = a as *mut jackstay::ffi_local::FtLocalConnection;
-            let mut input = ptr::null_mut();
-            let mut aff = ptr::null_mut();
+            let track = FtTrackOffer {
+                id: 3,
+                kind: c"affordances".as_ptr(),
+                label: c"default".as_ptr(),
+                descriptor: ptr::null(),
+                descriptor_len: 0,
+                direction: FT_TRACK_BOTH,
+                reserved: 0,
+            };
+            let mut admission = FtTrackAdmission::default();
+            let (mut count, mut input, mut aff) = (0, ptr::null_mut(), ptr::null_mut());
             assert_eq!(
-                ft_source_bootstrap_accept_v2_local(&mut a, ptr::null_mut(), 1, &mut input, &mut aff),
+                ft_handshake_accept_local(
+                    &mut a,
+                    c"source".as_ptr(),
+                    &track,
+                    1,
+                    ptr::null_mut(),
+                    &mut admission,
+                    &mut count,
+                    &mut input,
+                    &mut aff
+                ),
                 FT_STATUS_OK
             );
             assert!(input.is_null());
             (a as usize, aff as usize)
         });
+        let mut offer = ptr::null_mut();
+        assert_eq!(ft_handshake_connect_local(&mut b, &mut offer), FT_STATUS_OK);
+        let selection = FtTrackSelection {
+            id: 3,
+            required: 1,
+            write: 0,
+        };
+        let mut admission = FtTrackAdmission::default();
         let mut input = ptr::null_mut();
         let mut input_status = 0;
         let mut host = ptr::null_mut();
-        let mut aff_status = 0;
         assert_eq!(
-            ft_source_bootstrap_connect_v2_local(&mut b, 0, 0, 2, &mut input, &mut input_status, &mut host, &mut aff_status),
+            ft_handshake_select(
+                &mut offer,
+                &selection,
+                1,
+                0,
+                &mut admission,
+                &mut b,
+                &mut input,
+                &mut input_status,
+                &mut host
+            ),
             FT_STATUS_OK
         );
-        assert_eq!(aff_status, FT_STATUS_OK);
+        assert_eq!(admission.result, FT_TRACK_ADMITTED);
         let (a, p) = worker.join().unwrap();
         let mut a = a as *mut jackstay::ffi_local::FtLocalConnection;
         let mut producer = p as *mut FtAffordancesProducer;

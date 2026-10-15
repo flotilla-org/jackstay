@@ -8,7 +8,7 @@
 //! process, user and (on Windows) session.
 //!
 //! This module only establishes connections. The host still authorizes each
-//! accepted peer and selects the source; Jackstay's setup, bootstrap and input
+//! accepted peer and selects the source; Jackstay's setup, track handshake and input
 //! protocols then run over the returned [`Stream`] exactly as they do over a
 //! host-supplied Unix socket.
 //!
@@ -25,6 +25,8 @@ mod windows;
 pub(crate) use deadline::Bounded;
 #[cfg(unix)]
 pub use unix::ShutdownHandle;
+#[cfg(unix)]
+pub(crate) use unix::identity as peer_identity;
 #[cfg(windows)]
 pub use windows::{Access, PipeShutdown as ShutdownHandle, PipeStream, pipe_pair, receive_handles, send_handles};
 
@@ -164,7 +166,7 @@ impl Connection {
         &self.peer
     }
 
-    /// Hand the stream to one setup protocol (CPU setup, bootstrap or input).
+    /// Hand the stream to one setup protocol (CPU setup, the track handshake or input).
     #[must_use]
     pub fn into_stream(self) -> Stream {
         self.stream

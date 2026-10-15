@@ -6,7 +6,7 @@ use std::{thread, time::Duration};
 use jackstay::{
     acquisition::arena::Cancellation,
     audio::{Descriptor, Format, Layout, PlaybackReader, PlaybackWriter, Sample, Settings},
-    handshake::{self, Accepted, Connected, Kind, Notice, Notices, Offer, Refusal, Selected},
+    handshake::{self, Accepted, Connected, Direction, Kind, Notice, Notices, Offer, Refusal, Selected, Track},
     input::Mode,
     local::Stream,
     model::ClockDomain,
@@ -330,10 +330,13 @@ fn the_doorbell_hints_changed_tracks_and_cursors_remain_authoritative() {
     assert_eq!(reader.read().unwrap().samples[0], 1);
 }
 
-/// Answer one late selection on a host worker.
+/// Answer one late selection on a host worker that polls with a zero timeout.
 fn serve(mut notices: Notices) -> thread::JoinHandle<Notices> {
     thread::spawn(move || {
-        assert!(notices.serve(Duration::from_secs(5)).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !notices.serve(Duration::ZERO).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+        }
         notices
     })
 }
@@ -344,9 +347,20 @@ fn a_track_added_after_attach_is_selected_late_without_disturbing_others() {
     let (accepted, mut connected) = connect(&[], &[]);
     let (mut notices, tracks) = (accepted.notices, &mut connected.tracks);
     assert!(tracks.next(Duration::ZERO).unwrap().is_none());
+    // A ring belongs only with a playback track, and playback needs one.
+    assert!(notices.add(a.track("default"), None).is_err());
+    let app = Track {
+        id: 3,
+        kind: Kind::Other("org.example.cue".into()),
+        direction: Direction::FromSource,
+        label: "cue".into(),
+        descriptor: handshake::Bytes(vec![1]),
+    };
+    assert!(notices.add(app.clone(), Some(a.playback())).is_err());
     notices.add(a.track("default"), Some(a.playback())).unwrap();
+    // A zero timeout polls: the notice already sent is returned.
     assert_eq!(
-        tracks.next(Duration::from_secs(5)).unwrap(),
+        tracks.next(Duration::ZERO).unwrap(),
         Some(Notice::Added { track: a.track("default") })
     );
     let server = serve(notices);
@@ -362,9 +376,24 @@ fn a_track_added_after_attach_is_selected_late_without_disturbing_others() {
     notices.add(b.track("cue"), Some(b.playback())).unwrap();
     let server = serve(notices);
     let late = tracks.select(select(2)).unwrap();
-    let _notices = server.join().unwrap();
+    let mut notices = server.join().unwrap();
     assert!(late.doorbell.is_none() && late.position == 1);
     assert!(matches!(tracks.next(Duration::ZERO).unwrap(), Some(Notice::Added { track }) if track.id == 2));
+    // An app-kind track is selected late without a ring; writing a
+    // source-bound track is refused.
+    notices.add(app, None).unwrap();
+    let server = serve(notices);
+    let writing = Selected {
+        id: 3,
+        required: false,
+        write: true,
+    };
+    assert_eq!(tracks.select(writing).unwrap().admission.refusal, Some(Refusal::NotWritable));
+    let server = serve(server.join().unwrap());
+    let cue = tracks.select(select(3)).unwrap();
+    // Notices holds the doorbell: keep it.
+    let _notices = server.join().unwrap();
+    assert!(cue.admission.refusal.is_none() && cue.playback.is_none() && cue.doorbell.is_none());
     let mut reader_b = PlaybackReader::new(late.playback.unwrap(), Duration::from_millis(250));
     write(&mut a, 2);
     write(&mut b, 1);

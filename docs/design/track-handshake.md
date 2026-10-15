@@ -41,8 +41,9 @@ answers **admitted** and, for playback, passes the read-only ring, preceded by
 the doorbell if the incarnation had none. A late selection takes the next
 selection position, which is its doorbell hint bit. A removed track's mapping
 stays valid until the consumer drops it; its ring just stops advancing. The
-tracks channel is separate because CPU setup owns the media stream once video
-is admitted, and is consumer-driven.
+tracks channel is always sent, one extra channel per admission. It is separate
+because CPU setup owns the media stream once video is admitted, and is
+consumer-driven. It is Rust-only for now; the C ABI follows in #116.
 
 Kinds are open. The core kinds are `video`, `input` and `affordances`; an app
 kind is a reverse-domain name of lowercase labels, such as `org.example.cue`,
@@ -76,8 +77,8 @@ correction, and video-only consumers may ignore timestamps. See
 Hosts call `handshake::accept(stream, &offer, target)` on a worker. `Accepted`
 holds the media stream, the admissions, and the input `Server` and affordances
 `Producer` for admitted tracks, and the `Notices` handle: `add`, `update` and
-`remove` send notices, and `serve` answers one late selection. Serve CPU setup on the media stream when a
-video track was admitted.
+`remove` send notices, and `serve` answers one late selection (a zero timeout
+polls). Serve CPU setup on the media stream when a video track was admitted.
 
 Consumers call `handshake::connect(stream)`, inspect `Offered::offer()`, then
 `select(&selection, mode)`. `Connected` holds the media stream, the admissions,

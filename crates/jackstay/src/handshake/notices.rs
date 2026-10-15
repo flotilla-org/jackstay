@@ -52,6 +52,9 @@ fn late(kind: &Kind) -> bool {
 /// A started message gets the setup bound.
 fn receive(stream: &mut Stream, timeout: Duration) -> Result<Option<Vec<u8>>, Error> {
     let mut first = [0];
+    // Bounded treats no time left as timed out before reading, so a zero
+    // timeout becomes the shortest poll.
+    let timeout = timeout.max(Duration::from_millis(1));
     let started = Bounded::new(&mut *stream, timeout)?.read_exact(&mut first);
     match started {
         Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(None),
@@ -90,7 +93,8 @@ impl Notices {
     /// Offer a playback or app-kind track with a new ID. Playback needs its ring.
     pub fn add(&mut self, track: Track, ring: Option<Playback>) -> Result<(), Error> {
         let ring = Vec::from_iter(ring);
-        if !late(&track.kind) || !offerable(&track, &ring) || !self.offered.insert(track.id) {
+        let playback = track.kind == Kind::Playback;
+        if !late(&track.kind) || playback == ring.is_empty() || !offerable(&track, &ring) || !self.offered.insert(track.id) {
             return Err(Error::Protocol("invalid track"));
         }
         self.playback.extend(ring);
@@ -133,6 +137,8 @@ impl Notices {
             Some(t) if !late(&t.kind) || self.admitted.contains(&id) => Some(Refusal::Unavailable),
             Some(_) => None,
         };
+        // Any failure from here leaves the sides' positions apart; it ends
+        // the incarnation, as every channel error does.
         let position = self.positions;
         self.positions += 1;
         let mut handshake = Handshake::new(&mut self.stream)?;
@@ -250,5 +256,35 @@ impl Tracks {
             late.playback = Some(audio::PlaybackRing::map(selected.id, descriptor, ring)?);
         }
         Ok(late)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notices_that_do_not_match_the_offer_fail_closed() {
+        #[cfg(unix)]
+        let (stream, _host) = Stream::pair().unwrap();
+        #[cfg(windows)]
+        let (stream, _host) = crate::local::pipe_pair().unwrap();
+        let track = Track {
+            id: 1,
+            kind: Kind::Other("org.example.cue".into()),
+            direction: Direction::FromSource,
+            label: "cue".into(),
+            descriptor: Default::default(),
+        };
+        let mut tracks = Tracks {
+            stream,
+            tracks: vec![track.clone()],
+            positions: 0,
+            doorbell: false,
+            pending: VecDeque::new(),
+        };
+        assert!(tracks.apply(Notice::Added { track }).is_err());
+        assert!(tracks.apply(Notice::Removed { id: 2 }).is_err());
+        assert!(tracks.pending.is_empty() && tracks.tracks.len() == 1);
     }
 }

@@ -157,7 +157,8 @@ pub unsafe extern "C" fn ft_playback_writer_descriptor(writer: *const FtPlayback
     FT_STATUS_OK
 }
 
-/// Never waits or allocates.
+/// Never waits or allocates. Every failure maps to INVALID_ARGUMENT, since
+/// `PlaybackWriter::write` only fails on a bad block length.
 ///
 /// # Safety
 /// `writer` is live and used by one thread at a time; `samples` holds `len`
@@ -238,6 +239,9 @@ pub unsafe extern "C" fn ft_playback_reader_create(
     FT_STATUS_OK
 }
 
+/// `out.samples` borrows the reader's buffer: valid until its next read or
+/// destruction.
+///
 /// # Safety
 /// `reader` is live and used by one thread at a time; `out` is writable.
 #[unsafe(no_mangle)]
@@ -299,7 +303,9 @@ pub unsafe extern "C" fn ft_playback_doorbell_take(doorbell: *const FtPlaybackDo
     unsafe { doorbell.as_ref() }.map_or(0, |doorbell| doorbell.0.take())
 }
 
-/// `u64::MAX` waits indefinitely; zero checks once.
+/// `u64::MAX` waits indefinitely; zero checks once. Exclusive (`*mut`)
+/// because a wait drains the wake receiver: concurrent waiters could
+/// consume each other's wakes.
 ///
 /// # Safety
 /// Pointers are live and disjoint; one waiter per doorbell; cancellation may

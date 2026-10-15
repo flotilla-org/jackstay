@@ -102,7 +102,7 @@ one read-only section. The consumer adopts handles only from a server that
 
 The handshake's input and affordances channels are each one end of a
 `pipe_pair`, duplicated into the verified peer the same way, within the
-handshake's five-second deadline. The receiver checks each is a connected pipe. D3D11 pool textures and fences use
+handshake's five-second deadline. The receiver checks each is a pipe; like a Unix socket, one the host has already closed fails on first use. D3D11 pool textures and fences use
 the same transfer once per consumer incarnation and pool generation
 ([D3D11 backend](acquisition-d3d11.md)).
 

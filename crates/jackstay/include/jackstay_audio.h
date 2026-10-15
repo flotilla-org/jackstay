@@ -55,8 +55,9 @@ typedef struct ft_audio_descriptor {
   uint32_t blocks;       /* ring depth */
 } ft_audio_descriptor;
 
-/* One block copied out of a ring. samples are borrowed until the reader's
- * next read or destruction. */
+/* One block copied out of a ring. samples point into the reader's buffer: the
+ * next read on that reader overwrites them, and destruction frees them.
+ * Ignore reserved. */
 typedef struct ft_audio_block {
   uint64_t cursor;
   uint64_t sample_position;
@@ -86,7 +87,8 @@ ft_status ft_playback_writer_create(uint64_t track_id, const ft_audio_format *fo
 /* The writer's current descriptor, for ft_track_offer.audio. */
 ft_status ft_playback_writer_descriptor(const ft_playback_writer *writer, ft_audio_descriptor *out);
 /* Publish one block of whole interleaved frames, at most block_frames, stamped
- * with the host time of its first sample, and ring the doorbells. */
+ * with the host time of its first sample, and ring the doorbells. Every
+ * failure is INVALID_ARGUMENT: the only one is a bad length or pointer. */
 ft_status ft_playback_writer_write(ft_playback_writer *writer, const void *samples, size_t len,
                                    uint64_t host_time_ns, uint64_t *out_cursor);
 /* Flag the next block as a discontinuity. */
@@ -117,7 +119,9 @@ void ft_playback_ring_destroy(ft_playback_ring **ring);
  * optional: readers may always check their counters. Take clears it. */
 uint64_t ft_playback_doorbell_take(const ft_playback_doorbell *doorbell);
 /* Sleep until the hint is non-zero, then take it: OK, TIMEOUT or CANCELLED.
- * timeout_ns=0 checks once, UINT64_MAX waits indefinitely. */
+ * timeout_ns=0 checks once, UINT64_MAX waits indefinitely. One waiter per
+ * doorbell: a wait drains the shared wake, so a second waiter could consume
+ * the first one's wake and leave it asleep. take needs no such care. */
 ft_status ft_playback_doorbell_wait(ft_playback_doorbell *doorbell, const ft_acquisition_cancellation *cancel,
                                     uint64_t timeout_ns, uint64_t *out_hint);
 void ft_playback_doorbell_destroy(ft_playback_doorbell **doorbell);

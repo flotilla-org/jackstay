@@ -596,12 +596,10 @@ impl<S: BorrowMut<Stream>> Handshake<S> {
         let handle = self.receive_objects(1)?.remove(0);
         // SAFETY: the host this stream connected to duplicated its private pipe
         // end into this process for this receiver alone.
-        let stream = unsafe { crate::local::PipeStream::from_owned_handle(handle, false) }
-            .map_err(|_| Error::Protocol("channel handle is not a connected pipe"))?;
-        if !stream.is_alive() {
-            return Err(Error::Protocol("channel handle is not a connected pipe"));
-        }
-        Ok(stream)
+        // No liveness check: as with a Unix socket, a host may already have
+        // closed its end (a C host declining notices drops the tracks channel
+        // as soon as accept returns), and that shows on first use.
+        unsafe { crate::local::PipeStream::from_owned_handle(handle, false) }.map_err(|_| Error::Protocol("channel handle is not a pipe"))
     }
     /// Read-only rings are already restricted, so every handle keeps its access.
     fn send_objects(&mut self, objects: Vec<OwnedHandle>) -> Result<(), Error> {

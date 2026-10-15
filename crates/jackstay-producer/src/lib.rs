@@ -147,7 +147,7 @@ impl<P: Producer> Builder<P> {
                 let channels = Arc::new(Mutex::new(None));
                 let shared = channels.clone();
                 if let Ok(worker) = thread::Builder::new().name("jackstay-source-peer".into()).spawn(move || {
-                    if let Ok(accepted) = handshake::accept(stream, &offer, Some(t)) {
+                    if let Ok(accepted) = handshake::accept(stream, &offer, Some(t), &[]) {
                         let video = accepted.admissions.iter().any(|x| x.id == VIDEO && x.refusal.is_none());
                         *shared.lock().unwrap() = Some(Channels {
                             input: accepted.input,

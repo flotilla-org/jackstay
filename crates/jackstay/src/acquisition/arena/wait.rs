@@ -17,7 +17,8 @@ mod unix;
 use unix as sys;
 #[cfg(windows)]
 mod windows;
-pub(super) use sys::{Receiver, Wake, import, incarnation, producer_endpoint, producer_receiver};
+pub(crate) use sys::{Receiver, Wake, channel};
+pub(super) use sys::{import, incarnation, producer_endpoint, producer_receiver};
 #[cfg(windows)]
 use windows as sys;
 
@@ -93,6 +94,10 @@ impl Cancellation {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(SeqCst)
+    }
+
+    pub(crate) fn receiver(&self) -> &Receiver {
+        &self.0.reader
     }
 }
 

@@ -176,7 +176,7 @@ pub unsafe extern "C" fn ft_handshake_accept_local(
         return FT_STATUS_INVALID_ARGUMENT;
     };
     let FtLocalConnection { stream, peer } = *taken;
-    match handshake::accept(stream, &Offer { source, clock, tracks }, target) {
+    match handshake::accept(stream, &Offer { source, clock, tracks }, target, &[]) {
         Ok(accepted) => {
             for (index, admission) in accepted.admissions.iter().enumerate() {
                 // SAFETY: the host refuses selections longer than its offer.

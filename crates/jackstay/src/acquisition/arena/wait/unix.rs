@@ -16,13 +16,13 @@ use std::{
 use super::super::process::ProcessWatch;
 
 #[derive(Debug)]
-pub(in crate::acquisition::arena) struct Wake(UnixStream);
+pub(crate) struct Wake(UnixStream);
 
 #[derive(Debug)]
-pub(in crate::acquisition::arena) struct Receiver(UnixStream);
+pub(crate) struct Receiver(UnixStream);
 
 /// One direction, both ends in this process: cancellation.
-pub(super) fn channel() -> io::Result<(Arc<Wake>, Receiver)> {
+pub(crate) fn channel() -> io::Result<(Arc<Wake>, Receiver)> {
     let (writer, reader) = UnixStream::pair()?;
     crate::socket_options::suppress_sigpipe(&writer)?;
     writer.set_nonblocking(true)?;
@@ -66,7 +66,7 @@ impl Wake {
         self.0.try_clone().map(OwnedFd::from)
     }
 
-    pub(in crate::acquisition::arena) fn signal(&self) -> io::Result<()> {
+    pub(crate) fn signal(&self) -> io::Result<()> {
         // The writer is configured at creation/import so a closed receiver is
         // an I/O error even when the embedding host has default SIGPIPE handling.
         loop {
@@ -126,7 +126,7 @@ impl Receiver {
 
     /// Sleep until this receiver or `cancel` is readable, or the deadline. An
     /// interrupted sleep returns early; the caller rechecks its predicate.
-    pub(super) fn sleep_or_cancel(&self, cancel: &Receiver, deadline: Option<Instant>) -> io::Result<()> {
+    pub(crate) fn sleep_or_cancel(&self, cancel: &Receiver, deadline: Option<Instant>) -> io::Result<()> {
         let mut descriptors = [
             libc::pollfd {
                 fd: self.0.as_raw_fd(),
@@ -153,17 +153,17 @@ impl Receiver {
         Ok(())
     }
 
-    pub(in crate::acquisition::arena) fn from_fd(fd: OwnedFd) -> io::Result<Self> {
+    pub(crate) fn from_fd(fd: OwnedFd) -> io::Result<Self> {
         let stream = UnixStream::from(fd);
         stream.set_nonblocking(true)?;
         Ok(Self(stream))
     }
 
-    pub(in crate::acquisition::arena) fn into_fd(self) -> OwnedFd {
+    pub(crate) fn into_fd(self) -> OwnedFd {
         self.0.into()
     }
 
-    pub(in crate::acquisition::arena) fn drain(&mut self) -> io::Result<()> {
+    pub(crate) fn drain(&mut self) -> io::Result<()> {
         // Bounded drain: a notification flood must not starve cancellation or
         // the predicate recheck. Residual bytes keep the next poll readable.
         let mut bytes = [0; 4096];

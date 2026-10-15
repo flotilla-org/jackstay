@@ -1,4 +1,5 @@
 pub mod acquisition;
+pub mod audio;
 pub mod control_page;
 #[cfg(unix)]
 pub mod daemon;

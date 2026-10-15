@@ -42,6 +42,7 @@ use mapping::{ControlMap, ResourceLayout, ResourceMap};
 
 mod wait;
 pub use wait::{Cancellation, WaitEvents, WaitInterest, WaitOutcome};
+pub(crate) use wait::{Receiver, Wake, channel};
 mod retirement;
 pub use retirement::ConsumerReleaseTimeline;
 mod cleanup;

@@ -107,11 +107,22 @@ impl SharedMemorySegment {
 #[cfg(unix)]
 impl SharedMemorySegment {
     pub fn new(len: usize) -> Result<Self> {
+        Self::create(len, false).map(|(segment, _)| segment)
+    }
+
+    /// A new segment plus a descriptor that maps it only read-only and can
+    /// neither write nor resize it: for a ring no reader may corrupt.
+    pub fn with_read_only_fd(len: usize) -> Result<(Self, OwnedFd)> {
+        let (segment, read_only) = Self::create(len, true)?;
+        Ok((segment, read_only.expect("read-only descriptor requested").into()))
+    }
+
+    fn create(len: usize, read_only: bool) -> Result<(Self, Option<File>)> {
         if len == 0 {
             return Err(CaptureTransferError::InvalidSharedMemoryLength);
         }
 
-        let file = create_anonymous_backing(len)?;
+        let (file, read_only) = create_anonymous_backing(len, read_only)?;
 
         // SAFETY: mmap is called with a valid file descriptor, non-zero length,
         // and read/write shared permissions. The mapping is released in Drop.
@@ -133,12 +144,19 @@ impl SharedMemorySegment {
             });
         }
 
-        Ok(Self {
+        // Linux: this seal only stops later writable mappings and writes, so
+        // it follows the producer's own mapping.
+        #[cfg(target_os = "linux")]
+        if read_only.is_some() {
+            seal(&file, libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL)?;
+        }
+        let segment = Self {
             ptr: NonNull::new(raw.cast::<u8>()).expect("mmap returned null without MAP_FAILED"),
             len,
             writable: true,
             _file: file,
-        })
+        };
+        Ok((segment, read_only))
     }
 
     pub fn map_read_only(fd: OwnedFd, len: usize) -> Result<Self> {
@@ -277,6 +295,41 @@ impl SharedMemorySegment {
         // SAFETY: raw is a fresh section handle owned by nothing else.
         let mapping = unsafe { OwnedFd::from_raw_handle(raw) };
         Self::map_view(mapping, len, true, "map-view")
+    }
+
+    /// A new segment plus a section handle with only `FILE_MAP_READ`: for a
+    /// ring no reader may corrupt.
+    pub fn with_read_only_fd(len: usize) -> Result<(Self, OwnedFd)> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+        use windows_sys::Win32::{
+            Foundation::DuplicateHandle,
+            System::{Memory::FILE_MAP_READ, Threading::GetCurrentProcess},
+        };
+
+        let segment = Self::new(len)?;
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: the source is this segment's live section handle; the
+        // duplicate is a new, non-inheritable handle in this process.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                segment.mapping.as_raw_handle(),
+                GetCurrentProcess(),
+                &mut handle,
+                FILE_MAP_READ,
+                0,
+                0,
+            )
+        };
+        if duplicated == 0 {
+            return Err(CaptureTransferError::SharedMemory {
+                operation: "duplicate-read-only",
+                message: std::io::Error::last_os_error().to_string(),
+            });
+        }
+        // SAFETY: DuplicateHandle succeeded, so handle is owned by nothing else.
+        Ok((segment, unsafe { OwnedFd::from_raw_handle(handle) }))
     }
 
     /// Maps `len` bytes of the section read-only. Like the macOS guard (whose
@@ -420,7 +473,7 @@ impl Drop for SharedMemorySegment {
 /// process leaks nothing, and pages are swap-backed rather than written back
 /// to disk by the pager.
 #[cfg(target_os = "macos")]
-fn create_anonymous_backing(len: usize) -> Result<File> {
+fn create_anonymous_backing(len: usize, read_only: bool) -> Result<(File, Option<File>)> {
     use std::{
         ffi::CString,
         os::fd::FromRawFd,
@@ -449,6 +502,18 @@ fn create_anonymous_backing(len: usize) -> Result<File> {
         }
         // SAFETY: fd was just returned by shm_open and is owned by nothing else.
         let file = unsafe { File::from_raw_fd(fd) };
+        // A read-only open while the name exists is the only route to a
+        // descriptor that can never map the object writable.
+        let read_only = read_only
+            .then(|| {
+                // SAFETY: name is the valid NUL-terminated string opened above.
+                let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY) };
+                // SAFETY: a non-negative fd was just returned and is owned by nothing else.
+                (fd >= 0)
+                    .then(|| unsafe { File::from_raw_fd(fd) })
+                    .ok_or_else(std::io::Error::last_os_error)
+            })
+            .transpose();
         // Drop the name immediately: the kernel refcounts the object (xnu holds
         // a usecount reference per fd and mapping), so only handles keep it
         // alive from here on.
@@ -460,7 +525,11 @@ fn create_anonymous_backing(len: usize) -> Result<File> {
             operation: "resize",
             message: error.to_string(),
         })?;
-        return Ok(file);
+        let read_only = read_only.map_err(|error| CaptureTransferError::SharedMemory {
+            operation: "shm-open-read-only",
+            message: error.to_string(),
+        })?;
+        return Ok((file, read_only));
     }
     Err(CaptureTransferError::SharedMemory {
         operation: "shm-open",
@@ -469,13 +538,13 @@ fn create_anonymous_backing(len: usize) -> Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn create_anonymous_backing(len: usize) -> Result<File> {
+fn create_anonymous_backing(len: usize, read_only: bool) -> Result<(File, Option<File>)> {
     use std::os::fd::FromRawFd;
 
     // The name is purely diagnostic (/proc/self/fd); memfds are anonymous.
     let name = c"jackstay-segment";
     // SAFETY: name is a valid NUL-terminated string.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(CaptureTransferError::SharedMemory {
             operation: "memfd-create",
@@ -488,11 +557,33 @@ fn create_anonymous_backing(len: usize) -> Result<File> {
         operation: "resize",
         message: error.to_string(),
     })?;
-    Ok(file)
+    // Segments are sized once; no peer holding the fd may truncate it under a
+    // mapping (SIGBUS) or grow it.
+    seal(&file, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW)?;
+    let read_only = read_only
+        .then(|| file.try_clone())
+        .transpose()
+        .map_err(|error| CaptureTransferError::SharedMemory {
+            operation: "clone-fd",
+            message: error.to_string(),
+        })?;
+    Ok((file, read_only))
+}
+
+#[cfg(target_os = "linux")]
+fn seal(file: &File, seals: libc::c_int) -> Result<()> {
+    // SAFETY: fcntl with F_ADD_SEALS takes an integer argument and a live fd.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(CaptureTransferError::SharedMemory {
+            operation: "seal",
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn create_anonymous_backing(_len: usize) -> Result<File> {
+fn create_anonymous_backing(_len: usize, _read_only: bool) -> Result<(File, Option<File>)> {
     Err(CaptureTransferError::SharedMemory {
         operation: "create",
         message: "anonymous shm backing is only implemented for macOS and Linux".to_string(),

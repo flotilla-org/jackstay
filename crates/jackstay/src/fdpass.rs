@@ -130,7 +130,7 @@ pub fn recv_fds(stream: &UnixStream, max_fds: usize) -> Result<Vec<OwnedFd>> {
         let fd_count = fd_bytes / size_of::<RawFd>();
         let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
         let raw_fds = std::slice::from_raw_parts(data, fd_count).to_vec();
-        if fd_bytes % size_of::<RawFd>() != 0 {
+        if !fd_bytes.is_multiple_of(size_of::<RawFd>()) {
             close_raw_fds(&raw_fds);
             return Err(CaptureTransferError::MissingPassedFd);
         }

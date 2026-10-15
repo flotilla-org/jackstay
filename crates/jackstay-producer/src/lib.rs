@@ -280,11 +280,11 @@ fn pump<P: Producer>(
                 break;
             }
         };
-        if let Some((width, height)) = reported_geometry {
-            if let Err(e) = apply_logical(&target, &mut geometry, width, height) {
-                error = Some(e);
-                break;
-            }
+        if let Some((width, height)) = reported_geometry
+            && let Err(e) = apply_logical(&target, &mut geometry, width, height)
+        {
+            error = Some(e);
+            break;
         }
         target.tick();
         while let Some(work) = target.next() {
@@ -316,16 +316,16 @@ fn pump<P: Producer>(
             let peers = peers.lock().unwrap();
             for peer in peers.iter() {
                 let mut channels = peer.channels.lock().unwrap();
-                if let Some(c) = channels.as_mut() {
-                    if let Some(a) = c.affordances.as_ref() {
-                        for (domain, snapshot) in &snapshots {
-                            if c.sent.get(domain) != Some(snapshot) && a.publish(snapshot.clone()).is_ok() {
-                                c.sent.insert(*domain, snapshot.clone());
-                            }
+                if let Some(c) = channels.as_mut()
+                    && let Some(a) = c.affordances.as_ref()
+                {
+                    for (domain, snapshot) in &snapshots {
+                        if c.sent.get(domain) != Some(snapshot) && a.publish(snapshot.clone()).is_ok() {
+                            c.sent.insert(*domain, snapshot.clone());
                         }
-                        while let Some(e) = a.poll() {
-                            events.push(e)
-                        }
+                    }
+                    while let Some(e) = a.poll() {
+                        events.push(e)
                     }
                 }
             }

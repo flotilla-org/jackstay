@@ -400,10 +400,10 @@ impl Channel {
         if (v.domain() == Domain::Presentation) == self.producer {
             return Err(invalid());
         }
-        if let Snapshot::Media(m) = &v {
-            if m.position.is_some_and(|n| !n.is_finite()) || m.duration.is_some_and(|n| !n.is_finite()) {
-                return Err(invalid());
-            }
+        if let Snapshot::Media(m) = &v
+            && (m.position.is_some_and(|n| !n.is_finite()) || m.duration.is_some_and(|n| !n.is_finite()))
+        {
+            return Err(invalid());
         }
         let v = parse_snapshot(v.domain(), v.body())?;
         let mut s = self.state.lock().unwrap();
@@ -484,10 +484,10 @@ fn decode(v: Value, s: &State, producer: bool) -> io::Result<Option<Event>> {
             if !validate_verb(&verb)? {
                 return Ok(None);
             }
-            if let Snapshot::Scroll(scroll) = snapshot {
-                if (verb.body["axis"] == "x" && !scroll.x.scrollable) || (verb.body["axis"] == "y" && !scroll.y.scrollable) {
-                    return Ok(None);
-                }
+            if let Snapshot::Scroll(scroll) = snapshot
+                && ((verb.body["axis"] == "x" && !scroll.x.scrollable) || (verb.body["axis"] == "y" && !scroll.y.scrollable))
+            {
+                return Ok(None);
             }
             Ok(Some(Event::Verb(verb)))
         }

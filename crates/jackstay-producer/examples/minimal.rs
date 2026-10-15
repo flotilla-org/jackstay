@@ -81,12 +81,12 @@ impl Producer for Content {
         snapshots
     }
     fn affordance(&mut self, event: Event) {
-        if let Event::Snapshot(Snapshot::Presentation(p)) = event {
-            if let Some(size) = p.preferred_size {
-                self.width = (size.width * p.scale).round().clamp(1., 2048.) as u32;
-                self.height = (size.height * p.scale).round().clamp(1., 2048.) as u32;
-                eprintln!("presentation frame={}x{} scale={}", self.width, self.height, p.scale);
-            }
+        if let Event::Snapshot(Snapshot::Presentation(p)) = event
+            && let Some(size) = p.preferred_size
+        {
+            self.width = (size.width * p.scale).round().clamp(1., 2048.) as u32;
+            self.height = (size.height * p.scale).round().clamp(1., 2048.) as u32;
+            eprintln!("presentation frame={}x{} scale={}", self.width, self.height, p.scale);
         }
     }
 }

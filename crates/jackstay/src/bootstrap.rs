@@ -135,10 +135,10 @@ pub fn connect(stream: Stream, request: InputRequest) -> Result<Connected, Error
         }
         _ => return Err(Error::Protocol("unexpected input offer")),
     }
-    if let Some(error) = input_error {
-        if matches!(request, InputRequest::Required(_)) {
-            return Err(Error::Input(error));
-        }
+    if let Some(error) = input_error
+        && matches!(request, InputRequest::Required(_))
+    {
+        return Err(Error::Input(error));
     }
     Ok(Connected {
         media: handshake.finish()?,
@@ -381,10 +381,10 @@ pub fn connect_v2(stream: Stream, input_request: InputRequest, request: ChannelR
             input_error = Some(input::Error::Unsupported)
         }
     }
-    if matches!(input_request, InputRequest::Required(_)) {
-        if let Some(e) = input_error {
-            return Err(Error::Input(e));
-        }
+    if matches!(input_request, InputRequest::Required(_))
+        && let Some(e) = input_error
+    {
+        return Err(Error::Input(e));
     }
     let affordances_refused = request != ChannelRequest::None && affordances.is_none();
     if affordances_refused && request == ChannelRequest::Required {

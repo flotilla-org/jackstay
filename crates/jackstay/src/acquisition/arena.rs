@@ -353,7 +353,7 @@ impl ClaimMap {
     }
 
     fn word(&self, offset: usize) -> &AtomicU64 {
-        assert!(offset % align_of::<AtomicU64>() == 0 && offset + 8 <= self.storage.len());
+        assert!(offset.is_multiple_of(align_of::<AtomicU64>()) && offset + 8 <= self.storage.len());
         // SAFETY: all callers name initialized atomic words in the claim map.
         unsafe { &*self.storage.as_ptr().add(offset).cast::<AtomicU64>() }
     }

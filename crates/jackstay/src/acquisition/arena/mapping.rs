@@ -177,7 +177,7 @@ impl ResourceMap {
     }
 
     fn word(&self, offset: usize) -> &AtomicU64 {
-        assert!(offset % align_of::<AtomicU64>() == 0 && offset + 8 <= self.layout.len);
+        assert!(offset.is_multiple_of(align_of::<AtomicU64>()) && offset + 8 <= self.layout.len);
         // SAFETY: every call names a initialized atomic word, never plain
         // descriptor storage. No reference spans other mutable map contents.
         unsafe { &*self.storage.as_ptr().add(offset).cast::<AtomicU64>() }
@@ -281,7 +281,7 @@ impl ControlMap {
     }
 
     pub(super) fn word(&self, offset: usize) -> &AtomicU64 {
-        assert!(offset % align_of::<AtomicU64>() == 0 && offset + 8 <= self.storage.len());
+        assert!(offset.is_multiple_of(align_of::<AtomicU64>()) && offset + 8 <= self.storage.len());
         // SAFETY: callers name initialized atomic words, never header bytes.
         unsafe { &*self.storage.as_ptr().add(offset).cast::<AtomicU64>() }
     }

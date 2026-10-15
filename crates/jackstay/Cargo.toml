@@ -33,6 +33,7 @@ cc = "1"
 libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+flotilla-cbor = { git = "https://github.com/flotilla-org/flotilla", rev = "cc203c23b51d67af897b988254a809c5b63c99a6" }
 thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -570,10 +570,10 @@ pub unsafe extern "C" fn ft_input_target_destroy(target: *mut *mut FtInputTarget
 /// Slot is writable and exclusively owns a server handle, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_input_server_destroy(server: *mut *mut FtInputServer) {
-    if let Some(slot) = unsafe { server.as_mut() } {
-        if !slot.is_null() {
-            drop(unsafe { Box::from_raw(std::mem::replace(slot, ptr::null_mut())) });
-        }
+    if let Some(slot) = unsafe { server.as_mut() }
+        && !slot.is_null()
+    {
+        drop(unsafe { Box::from_raw(std::mem::replace(slot, ptr::null_mut())) });
     }
 }
 /// # Safety
@@ -726,10 +726,10 @@ pub unsafe extern "C" fn ft_input_client_close(client: *mut FtInputClient) {
 /// Slot is writable and exclusively owns its client handle, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_input_client_destroy(client: *mut *mut FtInputClient) {
-    if let Some(slot) = unsafe { client.as_mut() } {
-        if !slot.is_null() {
-            drop(unsafe { Box::from_raw(std::mem::replace(slot, ptr::null_mut())) });
-        }
+    if let Some(slot) = unsafe { client.as_mut() }
+        && !slot.is_null()
+    {
+        drop(unsafe { Box::from_raw(std::mem::replace(slot, ptr::null_mut())) });
     }
 }
 

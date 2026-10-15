@@ -412,11 +412,11 @@ owners!(
 /// strings have their stated byte lengths. Event views last until destruction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_affordances_event_destroy(p: *mut *mut FtAffordancesEvent) {
-    if let Some(p) = unsafe { p.as_mut() } {
-        if !p.is_null() {
-            drop(unsafe { Box::from_raw(*p) });
-            *p = ptr::null_mut();
-        }
+    if let Some(p) = unsafe { p.as_mut() }
+        && !p.is_null()
+    {
+        drop(unsafe { Box::from_raw(*p) });
+        *p = ptr::null_mut();
     }
 }
 fn view_string(s: &str) -> FtAffString {

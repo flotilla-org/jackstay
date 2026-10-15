@@ -62,12 +62,12 @@ int jackstay_c_local_endpoint_smoke(void) {
   ft_status (*create_fn)(ft_local_connection **, ft_cpu_acquisition_connection **) =
       ft_acquisition_cpu_connection_create_local;
   ft_status (*setup_alive_fn)(const ft_cpu_acquisition_connection *) = ft_acquisition_cpu_connection_alive;
-  ft_status (*handshake_accept_fn)(ft_local_connection **, const char *, const ft_track_offer *, size_t,
+  ft_status (*handshake_accept_fn)(ft_local_connection **, const char *, uint32_t, const ft_track_offer *, size_t,
                                    ft_input_target *, ft_track_admission *, size_t *, ft_input_server **,
                                    ft_affordances_producer **) = ft_handshake_accept_local;
   ft_status (*handshake_connect_fn)(ft_local_connection **, ft_handshake_offer **) = ft_handshake_connect_local;
-  ft_status (*handshake_describe_fn)(const ft_handshake_offer *, const char **, const ft_track_offer **,
-                                     size_t *) = ft_handshake_offer_describe;
+  ft_status (*handshake_describe_fn)(const ft_handshake_offer *, const char **, uint32_t *,
+                                     const ft_track_offer **, size_t *) = ft_handshake_offer_describe;
   ft_status (*handshake_select_fn)(ft_handshake_offer **, const ft_track_selection *, size_t, uint32_t,
                                    ft_track_admission *, ft_local_connection **, ft_input_client **,
                                    ft_status *, ft_affordances_host **) = ft_handshake_select;

@@ -28,6 +28,7 @@ use crate::{
         transport::{Client, ConnectError, Server},
     },
     local::{Bounded, Stream},
+    model::ClockDomain,
 };
 
 /// The frame magic of every setup message on a source connection: this
@@ -119,6 +120,8 @@ pub struct Track {
 pub struct Offer {
     /// The source label: the program's identity.
     pub source: String,
+    /// Every track's timestamps are in this one domain.
+    pub clock: ClockDomain,
     pub tracks: Vec<Track>,
 }
 

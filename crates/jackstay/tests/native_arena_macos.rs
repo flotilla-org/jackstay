@@ -5,7 +5,7 @@ mod child;
 use child::KillOnDrop;
 use jackstay::{
     acquisition::arena::{AcquireOutcome, ArenaConfig, ArenaConsumer, Cancellation, WaitInterest, WaitOutcome},
-    model::{ClockDomain, ColorSpace, PixelFormat},
+    model::{ColorSpace, PixelFormat},
     native::{
         NativeFrameBackend, NativeStreamParams,
         arena::{ArenaNativeBackend, NativeArenaProducer},
@@ -23,7 +23,6 @@ fn native_pool_preflight_bounds_actual_storage_and_preserves_odd_sized_pixels() 
                 height,
                 pixel_format: format,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             };
             let bound = backend.pool_allocation_upper_bound(&params, slots).unwrap();
@@ -50,7 +49,6 @@ fn native_pool_preflight_rejects_empty_unsupported_and_overflowing_layouts() {
         height: 1,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     assert!(backend.pool_allocation_upper_bound(&params, 0).is_err());
@@ -80,7 +78,6 @@ fn native_creation_rejects_the_total_byte_charge_before_allocating_a_fence() {
         height: 16,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     // Enough for all native surfaces, but not the separately charged arena
@@ -111,7 +108,6 @@ fn stopped_native_producer_waits_for_gpu_writes_and_consumer_mappings() {
         height: 16,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     let backend = MacosFrameBackend::new().unwrap();
@@ -173,7 +169,6 @@ fn native_reconfiguration_retains_old_pixels_and_shares_holding_credit_with_the_
         height: 19,
         pixel_format: PixelFormat::Rgba8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     let ReconfigurationStatus::Ready { generation } = producer.reconfigure(params).unwrap() else {
@@ -214,7 +209,6 @@ fn pending_producer_gpu_writes_keep_a_retired_pool_charged_without_any_consumer_
         height: 16,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     let mut backend = MacosFrameBackend::new().unwrap();
@@ -288,7 +282,6 @@ fn native_replacement_waits_for_old_storage_and_reclaims_repeated_pool_generatio
         height: 16,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     let mut backend = MacosFrameBackend::new().unwrap();
@@ -369,7 +362,6 @@ fn producer(max_incarnations: u32) -> NativeArenaProducer<MacosFrameBackend> {
         height: 16,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     let mut backend = MacosFrameBackend::new().unwrap();
@@ -514,7 +506,6 @@ fn submitted_gpu_work_keeps_a_deferred_iosurface_lease_through_pool_replacement(
                     height: 16,
                     pixel_format: PixelFormat::Bgra8Unorm,
                     color_space: ColorSpace::Srgb,
-                    clock_domain: ClockDomain::HostTime,
                     modifier: 0,
                 })
                 .unwrap(),
@@ -640,7 +631,6 @@ fn a_crashed_native_consumer_without_completion_evidence_keeps_its_iosurface_qua
                 height: 19,
                 pixel_format: PixelFormat::Rgba8Unorm,
                 color_space: ColorSpace::Srgb,
-                clock_domain: ClockDomain::HostTime,
                 modifier: 0,
             })
             .unwrap(),

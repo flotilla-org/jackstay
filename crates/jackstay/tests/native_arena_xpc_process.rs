@@ -13,7 +13,7 @@ use std::{
 
 use jackstay::{
     acquisition::arena::{AcquireOutcome, ArenaConfig, Cancellation, ConfigurationInstall, WaitInterest, WaitOutcome},
-    model::{ClockDomain, ColorSpace, PixelFormat},
+    model::{ColorSpace, PixelFormat},
     native::{
         NativeFrameBackend, NativeStreamParams,
         arena::NativeArenaProducer,
@@ -222,7 +222,6 @@ fn launchd_multiple_publications_child() {
             height: 16,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         };
         let mut producer = NativeArenaProducer::new(
@@ -543,7 +542,6 @@ fn launchd_producer_child() {
         height: 16,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     };
     let mut backend = MacosFrameBackend::new().unwrap();

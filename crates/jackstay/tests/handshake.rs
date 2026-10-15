@@ -10,6 +10,7 @@ use jackstay::{
     handshake::{self, Admission, Bytes, Direction, Kind, Offer, Refusal, Selected, Track},
     input::{self, Config, Event, Mode, Operation, Outcome, Status, Target},
     local::Stream,
+    model::ClockDomain,
 };
 
 #[cfg(unix)]
@@ -36,6 +37,7 @@ fn track(id: u64, kind: Kind, direction: Direction) -> Track {
 fn offer() -> Offer {
     Offer {
         source: "test source".into(),
+        clock: ClockDomain::HostTime,
         tracks: vec![
             track(1, Kind::Video, Direction::FromSource),
             track(2, Kind::Input, Direction::ToSource),
@@ -72,6 +74,7 @@ fn exchange(
     let worker = thread::spawn(move || handshake::accept(host, &offer, target));
     let offered = handshake::connect(peer).unwrap();
     assert_eq!(offered.offer().source, "test source");
+    assert_eq!(offered.offer().clock, ClockDomain::HostTime);
     let connected = offered.select(selection, Mode::Cooperative);
     (worker.join().unwrap(), connected)
 }

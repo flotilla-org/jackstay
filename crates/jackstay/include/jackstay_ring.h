@@ -1,4 +1,4 @@
-/* jackstay frame ring — canonical shared-memory layout (layout_version 3)
+/* jackstay frame ring — canonical shared-memory layout (layout_version 4)
  *
  * This header is the wire-format contract for the jackstay video track
  * control page. The Rust implementation in src/control_page.rs mirrors these
@@ -69,7 +69,7 @@
 /* "JSFRING1" read as a little-endian uint64_t. */
 #define JACKSTAY_RING_MAGIC 0x31474E495246534AULL
 
-#define JACKSTAY_RING_LAYOUT_VERSION 3
+#define JACKSTAY_RING_LAYOUT_VERSION 4
 
 /* jackstay_frame_slot.payload_kind */
 #define JACKSTAY_PAYLOAD_CPU_SHM             0u
@@ -116,7 +116,7 @@ typedef struct jackstay_frame_slot {
     uint64_t sequence;               /*   8: producer frame count; unlike the
                                       *      cursor it advances on dropped
                                       *      frames, so gaps are visible      */
-    uint64_t timestamp_ns;           /*  16: in the config's clock_domain     */
+    uint64_t timestamp_ns;           /*  16: publication clock (host time)    */
     uint64_t pool_id;                /*  24: unique forever, never reused —
                                       *      stale pools need no generation   */
     uint64_t payload_offset;         /*  32: bytes into the pool mapping      */
@@ -149,9 +149,8 @@ typedef struct jackstay_stream_config {
     uint32_t stride;            /*  16: bytes per row (cpu-shm payloads)     */
     uint32_t pixel_format;      /*  20 */
     uint32_t color_space;       /*  24 */
-    uint32_t clock_domain;      /*  28 */
-    uint32_t sync_kind;         /*  32 */
-    uint32_t reserved0;         /*  36 */
+    uint32_t sync_kind;         /*  28 */
+    uint64_t reserved0;         /*  32 */
     uint64_t modifier;          /*  40: dmabuf format modifier               */
     uint64_t fence_id;          /*  48: the stream's timeline fence, as
                                  *      registered via the setup channel     */

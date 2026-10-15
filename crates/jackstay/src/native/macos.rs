@@ -780,7 +780,7 @@ impl Drop for ConsumerFence {
 mod tests {
     use super::{ConsumerFence, IoSurface, MacosCapturedFrame, MacosFrameBackend, MetalContext};
     use crate::{
-        model::{ClockDomain, ColorSpace, PixelFormat},
+        model::{ColorSpace, PixelFormat},
         native::{NativeStreamParams, NativeTrackProducer, PoolExhaustionPolicy},
     };
 
@@ -793,7 +793,6 @@ mod tests {
             height: HEIGHT,
             pixel_format: PixelFormat::Bgra8Unorm,
             color_space: ColorSpace::Srgb,
-            clock_domain: ClockDomain::HostTime,
             modifier: 0,
         }
     }

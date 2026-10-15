@@ -26,7 +26,7 @@ use child::KillOnDrop;
 use jackstay::{
     acquisition::arena::{AcquireOutcome, ArenaConfig, ArenaConsumer, FrameLease},
     local::{Endpoint, Scope, Transport},
-    model::{ClockDomain, ColorSpace, PixelFormat},
+    model::{ColorSpace, PixelFormat},
     native::{
         NativeStreamParams,
         arena::NativeArenaProducer,
@@ -122,7 +122,6 @@ fn params(size: (u32, u32)) -> NativeStreamParams {
         height: size.1,
         pixel_format: PixelFormat::Bgra8Unorm,
         color_space: ColorSpace::Srgb,
-        clock_domain: ClockDomain::HostTime,
         modifier: 0,
     }
 }

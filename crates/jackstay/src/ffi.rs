@@ -12,7 +12,7 @@ pub type FtStatus = i32;
 /// pre-stabilization: layouts may still change freely, with a minor bump as
 /// the only signal; 1.0 waits until an external consumer needs the promise.
 pub const FT_ABI_VERSION_MAJOR: u32 = 0;
-pub const FT_ABI_VERSION_MINOR: u32 = 15;
+pub const FT_ABI_VERSION_MINOR: u32 = 16;
 pub const FT_ABI_VERSION: u32 = (FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR;
 
 /// Report the linked library's ABI version.
@@ -60,8 +60,6 @@ pub const FT_PIXEL_FORMAT_BGRA8_UNORM: u32 = 1;
 pub const FT_PIXEL_FORMAT_RGBA8_UNORM: u32 = 2;
 
 pub const FT_CLOCK_DOMAIN_UNKNOWN: u32 = 0;
-pub const FT_CLOCK_DOMAIN_UNIX_TIME: u32 = 1;
-pub const FT_CLOCK_DOMAIN_MEDIA_TIME: u32 = 2;
 pub const FT_CLOCK_DOMAIN_HOST_TIME: u32 = 3;
 
 pub const FT_COLOR_SPACE_UNKNOWN: u32 = 0;
@@ -160,6 +158,6 @@ mod tests {
         assert_eq!(define("FT_ABI_VERSION_MAJOR"), super::FT_ABI_VERSION_MAJOR);
         assert_eq!(define("FT_ABI_VERSION_MINOR"), super::FT_ABI_VERSION_MINOR);
         assert_eq!(super::ft_abi_version(), super::FT_ABI_VERSION);
-        assert_eq!(super::FT_ABI_VERSION, 0x0000_000F);
+        assert_eq!(super::FT_ABI_VERSION, 0x0000_0010);
     }
 }

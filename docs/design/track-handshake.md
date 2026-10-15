@@ -14,7 +14,8 @@ keys ignored, unknown `type`s rejected), each framed as the 8-byte magic
 `JSSETUP3`, a big-endian u32 length and one map. A message is at most 64 KiB and
 any byte string, such as a descriptor, at most 4 KiB.
 
-1. **offer** (host): `source`, and `tracks`, each with a stable u64 `id` (never
+1. **offer** (host): `source`, `clock` (`host-time` or `unknown`, see
+   [Clock](#clock)), and `tracks`, each with a stable u64 `id` (never
    reused within the publication), `kind`, `direction` (`from-source`,
    `to-source` or `both`), `label` and an opaque `descriptor` byte string.
 2. **selection** (consumer): `tracks`, each an offered `id`, `required` and
@@ -46,6 +47,18 @@ whole exchange, from the offer to the last channel receipt, has a five-second
 absolute deadline (`local::Bounded`); input admission then has its own
 five-second bound.
 
+## Clock
+
+A publication declares one clock domain in its offer, and every track's
+timestamps use it; frame descriptors carry none. Live publications use host
+time, the platform monotonic clock in nanoseconds (`model::host_time_ns`):
+`CLOCK_MONOTONIC` on Linux, `CLOCK_UPTIME_RAW` (`mach_absolute_time` in ns) on
+macOS and QPC on Windows. `unknown` is for producers that cannot say. A
+timestamp is the source presentation time; the CPU and native producers stamp a
+zero timestamp with host time at publish. Consumers own drift and A/V
+correction, and video-only consumers may ignore timestamps. See
+[#99](https://github.com/flotilla-org/jackstay/issues/99).
+
 ## Rust and C
 
 Hosts call `handshake::accept(stream, &offer, target)` on a worker. `Accepted`
@@ -59,8 +72,8 @@ an input `Client` or an optional input's clean admission rejection, and the
 affordances `Host`.
 
 `jackstay_handshake.h` exposes the same exchange as typed structs on Local
-Endpoint connections: `ft_handshake_accept_local` takes `ft_track_offer`s and
-writes `ft_track_admission`s; `ft_handshake_connect_local`,
+Endpoint connections: `ft_handshake_accept_local` takes the clock domain and
+`ft_track_offer`s and writes `ft_track_admission`s; `ft_handshake_connect_local`,
 `ft_handshake_offer_describe` and `ft_handshake_select` read the offer and
 submit `ft_track_selection`s. POSIX callers with a connected socket wrap it with
 `ft_local_connection_adopt`. After basic checks the connection or offer is

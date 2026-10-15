@@ -61,6 +61,7 @@ fn host(
             ft_handshake_accept_local(
                 &mut connection.0,
                 c"C source".as_ptr(),
+                FT_CLOCK_DOMAIN_HOST_TIME,
                 tracks.as_ptr(),
                 tracks.len(),
                 target.0,
@@ -94,12 +95,14 @@ fn consume(connection: *mut FtLocalConnection, selection: &[FtTrackSelection]) -
     unsafe {
         assert_eq!(ft_handshake_connect_local(&mut connection, &mut handle), FT_STATUS_OK);
         assert!(connection.is_null());
-        let (mut source, mut tracks, mut count): (*const c_char, *const FtTrackOffer, usize) = (ptr::null(), ptr::null(), 0);
+        let (mut source, mut clock, mut tracks, mut count): (*const c_char, u32, *const FtTrackOffer, usize) =
+            (ptr::null(), 0, ptr::null(), 0);
         assert_eq!(
-            ft_handshake_offer_describe(handle, &mut source, &mut tracks, &mut count),
+            ft_handshake_offer_describe(handle, &mut source, &mut clock, &mut tracks, &mut count),
             FT_STATUS_OK
         );
         assert_eq!(CStr::from_ptr(source), c"C source");
+        assert_eq!(clock, FT_CLOCK_DOMAIN_HOST_TIME);
         let tracks = slice::from_raw_parts(tracks, count);
         let kinds: Vec<_> = tracks.iter().map(|t| (t.id, CStr::from_ptr(t.kind), t.direction)).collect();
         assert_eq!(

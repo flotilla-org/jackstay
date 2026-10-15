@@ -150,10 +150,10 @@ extern "C" fn request(context: *mut c_void, identity: u64, pid: u32, raw: *mut c
 }
 extern "C" fn close(context: *mut c_void, identity: u64) {
     let routes = unsafe { &*context.cast::<Context>() };
-    if let Some((_, target)) = routes.lock().expect("named acquisition routes").connections.remove(&identity) {
-        if let Some(target) = target.upgrade() {
-            target.close(identity);
-        }
+    if let Some((_, target)) = routes.lock().expect("named acquisition routes").connections.remove(&identity)
+        && let Some(target) = target.upgrade()
+    {
+        target.close(identity);
     }
 }
 extern "C" fn destroy(context: *mut c_void) {

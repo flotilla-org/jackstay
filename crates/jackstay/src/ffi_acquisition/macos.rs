@@ -200,10 +200,10 @@ pub unsafe extern "C" fn ft_acquired_frame_macos_resources(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ft_acquisition_macos_connection_destroy(connection: *mut *mut FtMacosAcquisitionConnection) {
     // SAFETY: exclusive ownership and pointer validity are caller obligations.
-    if let Some(connection) = unsafe { connection.as_mut() } {
-        if !connection.is_null() {
-            // SAFETY: this box was returned by connect/attach and is consumed once.
-            drop(unsafe { Box::from_raw(std::mem::replace(connection, ptr::null_mut())) });
-        }
+    if let Some(connection) = unsafe { connection.as_mut() }
+        && !connection.is_null()
+    {
+        // SAFETY: this box was returned by connect/attach and is consumed once.
+        drop(unsafe { Box::from_raw(std::mem::replace(connection, ptr::null_mut())) });
     }
 }

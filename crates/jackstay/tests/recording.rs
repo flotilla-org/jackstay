@@ -125,7 +125,7 @@ fn serve(mut notices: Notices) -> Notices {
 }
 
 #[test]
-fn a_writer_change_starts_at_the_new_writers_blocks_with_a_discontinuity() {
+fn a_writer_change_cuts_off_the_previous_writer_and_starts_with_a_discontinuity() {
     let mut source = reader();
     let (first, mut a) = connect(&source, true);
     let (second, mut b) = connect(&source, true);
@@ -134,8 +134,11 @@ fn a_writer_change_starts_at_the_new_writers_blocks_with_a_discontinuity() {
         a.recording[0].write(&[n; FRAMES], 0).unwrap();
     }
     assert_eq!(source.read().unwrap().cursor, 2);
-    // A's incarnation ends with blocks unread; B selects late.
-    drop((first, a));
+    // A's incarnation ends with blocks unread, but A keeps its mapping and
+    // keeps writing; B selects late.
+    drop(first);
+    let mut stale = a.recording.remove(0);
+    stale.write(&[9; FRAMES], 0).unwrap();
     silent(&mut source);
     let server = thread::spawn(move || serve(second.notices));
     let late = b.tracks.select(Selected {
@@ -149,13 +152,20 @@ fn a_writer_change_starts_at_the_new_writers_blocks_with_a_discontinuity() {
     assert!(late.playback.is_none() && late.doorbell.is_none());
     let mut writer = late.recording.unwrap();
     assert!(source.read().is_none());
+    stale.write(&[9; FRAMES], 0).unwrap();
     writer.write(&[4; FRAMES], 0).unwrap();
+    stale.write(&[9; FRAMES], 0).unwrap();
     writer.write(&[5; FRAMES], 0).unwrap();
     let block = source.read().unwrap();
     assert!(block.discontinuity);
-    assert_eq!((block.cursor, block.sample_position, block.samples[0]), (4, 0, 4));
+    assert_eq!((block.cursor, block.sample_position, block.samples[0]), (1, 0, 4));
     let block = source.read().unwrap();
     assert!(!block.discontinuity && block.samples[0] == 5);
+    // The stale writer can fill its whole orphaned ring; none of it arrives.
+    for _ in 0..100 {
+        stale.write(&[9; FRAMES], 0).unwrap();
+    }
+    assert!(source.read().is_none());
 }
 
 #[test]

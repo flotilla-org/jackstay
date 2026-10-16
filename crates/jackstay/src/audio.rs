@@ -9,6 +9,8 @@
 //! A recording track uses the same ring with the roles swapped: the one
 //! admitted consumer maps it read-write and writes, and the source reads it
 //! through a [`RecordingReader`], which yields silence while nobody writes.
+//! Each admitted writer gets a fresh ring, so a previous writer's mapping
+//! reaches nothing the source reads.
 //!
 //! Each consumer incarnation that selects playback tracks gets one doorbell:
 //! a shared changed-track hint (bit = selection position mod 64) and the
@@ -23,7 +25,7 @@ use std::{
     io,
     mem::size_of,
     sync::{
-        Arc, Mutex, PoisonError, Weak,
+        Arc, Mutex, MutexGuard, PoisonError, Weak,
         atomic::{AtomicU64, Ordering::*, fence},
     },
     time::{Duration, Instant},
@@ -357,9 +359,28 @@ struct Shared {
     /// What consumers map: read-only for playback, read-write for recording.
     fd: OwnedFd,
     recording: bool,
-    /// Recording: the first cursor of the admitted writer, or 0 with none.
+    /// Recording: the admitted writer's epoch, or 0 with none.
     writer: AtomicU64,
+    writers: Mutex<Writers>,
     bells: Mutex<Vec<(Weak<BellInner>, u64)>>,
+}
+
+/// A recording track's writer rings, changed only on host threads.
+#[derive(Debug, Default)]
+struct Writers {
+    epoch: u64,
+    /// The admitted writer's ring and the descriptor it maps.
+    current: Option<(Arc<Ring>, OwnedFd)>,
+    /// Previous writers' rings, kept until the source's reader lets go so it
+    /// never unmaps one on the audio thread.
+    retired: Vec<Arc<Ring>>,
+}
+
+impl Writers {
+    fn retire(&mut self) {
+        self.retired.extend(self.current.take().map(|(ring, _)| ring));
+        self.retired.retain(|ring| Arc::strong_count(ring) > 1);
+    }
 }
 
 impl Shared {
@@ -388,8 +409,13 @@ impl Shared {
             fd,
             recording,
             writer: AtomicU64::new(0),
+            writers: Mutex::default(),
             bells: Mutex::default(),
         }))
+    }
+
+    fn writers(&self) -> MutexGuard<'_, Writers> {
+        self.writers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn descriptor(&self, format: Format) -> Descriptor {
@@ -520,16 +546,30 @@ impl Playback {
         self.0.recording
     }
 
-    /// The descriptor an admitted consumer maps.
+    /// The descriptor an admitted consumer maps: for recording, the
+    /// admitted writer's ring.
     pub(crate) fn fd(&self) -> io::Result<OwnedFd> {
-        self.0.fd.try_clone()
+        if !self.0.recording {
+            return self.0.fd.try_clone();
+        }
+        let writers = self.0.writers();
+        writers.current.as_ref().ok_or(io::ErrorKind::NotFound)?.1.try_clone()
     }
 
-    /// Admit the one writer of a recording ring; None while another holds it.
+    /// Admit the one writer of a recording track with a fresh ring; None
+    /// while another holds it or if the ring cannot be created.
     pub(crate) fn claim(&self) -> Option<Lease> {
-        let start = self.0.ring.latest() + 1;
-        let claimed = self.0.recording && self.0.writer.compare_exchange(0, start, AcqRel, Acquire).is_ok();
-        claimed.then(|| Lease(self.0.clone()))
+        let mut writers = self.0.writers();
+        if !self.0.recording || self.0.writer.load(Acquire) != 0 {
+            return None;
+        }
+        let ring = &self.0.ring;
+        let (fresh, fd) = Ring::create(ring.blocks, ring.payload_len, true).ok()?;
+        writers.retire();
+        writers.epoch += 1;
+        writers.current = Some((Arc::new(fresh), fd));
+        self.0.writer.store(writers.epoch, Release);
+        Some(Lease(self.0.clone()))
     }
 
     /// Whether an offered descriptor matches this ring's geometry.
@@ -543,8 +583,9 @@ impl Playback {
     }
 }
 
-/// A recording ring's admitted writer. Dropping it, when the writer's
-/// incarnation ends, lets the source read silence and admit another writer.
+/// A recording track's admitted writer. Dropping it, when the writer's
+/// incarnation ends, lets the source read silence and admit another writer,
+/// and orphans the writer's ring.
 #[derive(Debug)]
 pub(crate) struct Lease(Arc<Shared>);
 
@@ -556,7 +597,9 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
+        let mut writers = self.0.writers();
         self.0.writer.store(0, Release);
+        writers.retire();
     }
 }
 
@@ -701,8 +744,6 @@ pub struct PlaybackReader {
     ring: PlaybackRing,
     latency: u64,
     next: u64,
-    /// The earliest cursor this reader starts at.
-    floor: u64,
     gap: bool,
     gaps: u64,
     underruns: u64,
@@ -726,7 +767,6 @@ impl PlaybackReader {
             payload: vec![0; ring.ring.payload_len],
             ring,
             next: 0,
-            floor: 1,
             gap: false,
             gaps: 0,
             underruns: 0,
@@ -734,7 +774,7 @@ impl PlaybackReader {
     }
 
     fn start(&self, latest: u64) -> u64 {
-        latest.saturating_add(1).saturating_sub(self.latency).max(self.floor)
+        latest.saturating_add(1).saturating_sub(self.latency).max(1)
     }
 
     /// Blocks ready to read: the cursor check that needs no doorbell.
@@ -820,6 +860,7 @@ impl RecordingWriter {
                 fd,
                 recording: true,
                 writer: AtomicU64::new(0),
+                writers: Mutex::default(),
                 bells: Mutex::default(),
             }),
             format: descriptor.format,
@@ -888,11 +929,26 @@ impl RecordingReader {
 
     /// The next block in order, or None in underrun. With no writer admitted
     /// it is a block of silence with cursor 0. After a writer change, reading
-    /// restarts at the latency target but never before the new writer's
-    /// first block.
+    /// switches to the new writer's ring at its latency target. Never blocks
+    /// or allocates: while the host is admitting a writer it reads silence.
     pub fn read(&mut self) -> Option<Block<'_>> {
-        match self.shared.writer.load(Acquire) {
-            0 => Some(Block {
+        let writer = self.shared.writer.load(Acquire);
+        if writer != 0 && writer != self.writer {
+            let writers = self.shared.writers.try_lock();
+            if let Ok(Writers {
+                epoch,
+                current: Some((ring, _)),
+                ..
+            }) = writers.as_deref()
+                && *epoch == writer
+            {
+                // The host still holds the old ring, so this never unmaps.
+                self.reader.ring.ring = ring.clone();
+                (self.writer, self.reader.next) = (writer, 0);
+            }
+        }
+        match writer {
+            writer if writer == 0 || writer != self.writer => Some(Block {
                 cursor: 0,
                 sample_position: 0,
                 host_time_ns: 0,
@@ -904,12 +960,7 @@ impl RecordingReader {
                 gap: false,
                 samples: &self.silence,
             }),
-            writer => {
-                if writer != self.writer {
-                    (self.writer, self.reader.next, self.reader.floor) = (writer, 0, writer);
-                }
-                self.reader.read()
-            }
+            _ => self.reader.read(),
         }
     }
 }

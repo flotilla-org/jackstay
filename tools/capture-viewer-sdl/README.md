@@ -325,3 +325,39 @@ publishes synthetic history/loading state and prints each received verb; it does
 not access the network. `navigation_toolkit_processes` drives all five verbs
 through ordinary viewer routing in separate producer/viewer processes using
 SDL's dummy video driver. Live luchs evidence belongs to luchs#3.
+
+## Audio playback
+
+`--audio LABEL` lists each offered playback track on stderr and plays the one
+with that label through the viewer's own SDL output device, selecting it at
+attach or, through track notices and a late selection, when the source adds it
+later. A removed track stops; a later one with the label starts again. Audio
+needs a handshake source (`--source-endpoint` or `--source-socket`) whose clock
+domain is host time.
+
+- **Playout:** each block is converted from the track's format to float. A
+  linear-interpolation resampler, its ratio steered by a PI controller, plays
+  every sample `--audio-latency-ms` (default 80) after its source host time, so
+  it follows the producer's rate as estimated from block positions and host
+  times. Errors beyond 20 ms realign at once.
+- **Concealment:** gaps, discontinuities and reconfigurations crossfade over
+  128 frames; an underrun fades to silence and realigns when data returns.
+- **Video:** with audio playing, frames are presented in order when due on the
+  audio playout clock. That needs the producer to retain the latency target's
+  worth of frames; after a gap, the oldest retained frame shows at once.
+- **Mute:** `--mute` silences this viewer only; its playout clock keeps running.
+
+`audio_contract` checks conversion, concealment, mute and ten simulated minutes
+of drift correction against producer clocks skewed by ±0.5%, in a few seconds.
+`audio_processes` plays `audio-source-fixture`'s tone, offered at attach,
+added late, and removed then re-added, using SDL's dummy drivers. Audio is
+optional: a selection or device failure is logged and video carries on. The
+dummy and disk audio drivers do not keep real time, so their drift figures mean
+nothing.
+
+Real-time drift check (manual, on a real output device): run
+`build/viewer/audio-source-fixture tone-check --skew-ppm 500`, then
+`build/viewer/capture-viewer-sdl --source-endpoint tone-check --observe --affordances none --audio tone --frames 36000`
+for ten minutes of a steady 440 Hz tone. The exit line should report no
+underruns or resyncs, a drift near 500 ppm (plus the device's own) and an error
+under a millisecond.

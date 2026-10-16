@@ -28,7 +28,7 @@ if(NOT EXISTS "${JACKSTAY_LIB}")
   message(FATAL_ERROR "Build Jackstay first (backend-macos on macOS), or set JACKSTAY_LIB to the built shared library")
 endif()
 
-set(VIEWER_SOURCES src/main.c src/viewer_input.c src/viewer_affordances.c src/viewer_scroll.c src/viewer_navigation.c)
+set(VIEWER_SOURCES src/main.c src/viewer_audio.c src/viewer_input.c src/viewer_affordances.c src/viewer_scroll.c src/viewer_navigation.c)
 if(APPLE)
   # Build libjackstay with --features backend-macos so the
   # ft_acquisition_macos_* symbols this viewer links against are present.
@@ -123,6 +123,23 @@ add_test(NAME handshake_affordances_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/handshake_processes.py
   $<TARGET_FILE:handshake-source-fixture> $<TARGET_FILE:capture-viewer-sdl>)
 set_tests_properties(handshake_affordances_processes PROPERTIES TIMEOUT 30)
+
+add_executable(audio-contract tests/audio.c src/viewer_audio.c)
+target_include_directories(audio-contract PRIVATE "${JACKSTAY_INCLUDE_DIR}" src ${SDL2_INCLUDE_DIRS})
+target_link_directories(audio-contract PRIVATE ${SDL2_LIBRARY_DIRS})
+target_compile_options(audio-contract PRIVATE -Wall -Wextra -Werror ${SDL2_CFLAGS_OTHER})
+target_link_libraries(audio-contract PRIVATE ${JACKSTAY_LIB} ${SDL2_LIBRARIES} m)
+add_test(NAME audio_contract COMMAND audio-contract)
+set_tests_properties(audio_contract PROPERTIES TIMEOUT 30)
+add_executable(audio-source-fixture tests/audio_source.c)
+target_include_directories(audio-source-fixture PRIVATE "${JACKSTAY_INCLUDE_DIR}" src)
+target_compile_definitions(audio-source-fixture PRIVATE _DARWIN_C_SOURCE)
+target_compile_options(audio-source-fixture PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(audio-source-fixture PRIVATE ${JACKSTAY_LIB} m)
+add_test(NAME audio_processes COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/audio_processes.py
+  $<TARGET_FILE:audio-source-fixture> $<TARGET_FILE:capture-viewer-sdl>)
+set_tests_properties(audio_processes PROPERTIES TIMEOUT 30)
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 add_test(NAME toolkit_processes COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/toolkit_processes.py

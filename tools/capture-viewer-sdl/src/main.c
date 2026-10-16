@@ -23,6 +23,8 @@
 #include "viewer_affordances.h"
 #include "viewer_fit.h"
 #include "jackstay_handshake.h"
+#include "viewer_audio.h"
+#include "host_time.h"
 
 #include "synthetic.h"
 #include "scroll_self_test.h"
@@ -75,10 +77,13 @@ typedef struct viewer_options {
   uint32_t transport_kind;
   const char *endpoint;
   const char *token;
+  const char *audio; /* the playback track label to play */
+  uint32_t audio_latency_ms;
+  int mute;
 } viewer_options;
 
 static viewer_options parse_options(int argc, char **argv) {
-  viewer_options options = {.input_policy = 1, .affordances = 1, .typing = FT_INPUT_MODE_COOPERATIVE};
+  viewer_options options = {.input_policy = 1, .affordances = 1, .typing = FT_INPUT_MODE_COOPERATIVE, .audio_latency_ms = 80};
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--scroll-self-test") == 0) {
       options.scroll_self_test = 1;
@@ -89,6 +94,16 @@ static viewer_options parse_options(int argc, char **argv) {
     } else if (strcmp(argv[i], "--source-endpoint") == 0) {
       if (++i >= argc || !argv[i][0]) { fprintf(stderr, "--source-endpoint requires a name\n"); options.invalid = 1; return options; }
       options.source_endpoint = argv[i];
+    } else if (strcmp(argv[i], "--audio") == 0) {
+      if (++i >= argc || !argv[i][0]) { fprintf(stderr, "--audio requires a track label\n"); options.invalid = 1; return options; }
+      options.audio = argv[i];
+    } else if (strcmp(argv[i], "--audio-latency-ms") == 0) {
+      char *end = NULL;
+      unsigned long value = ++i < argc ? strtoul(argv[i], &end, 10) : 0;
+      if (!end || end == argv[i] || *end || value == 0 || value > 10000) { fprintf(stderr, "--audio-latency-ms requires 1..10000\n"); options.invalid = 1; return options; }
+      options.audio_latency_ms = (uint32_t)value;
+    } else if (strcmp(argv[i], "--mute") == 0) {
+      options.mute = 1;
     } else if (strcmp(argv[i], "--session-scope") == 0) {
       options.session_scope = 1;
     } else if (strcmp(argv[i], "--navigation-self-test") == 0) {
@@ -176,8 +191,9 @@ static viewer_options parse_options(int argc, char **argv) {
   if ((options.source_endpoint && (options.source_socket || options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
       ((options.affordances_policy_set || options.log_affordances) && !options.source_endpoint && !options.source_socket) ||
       (options.session_scope && !options.source_endpoint) ||
-      (options.typing_set && !options.source_endpoint && !options.source_socket)) {
-    fprintf(stderr, "--source-endpoint selects one source; affordances require a handshake source; session scope requires an endpoint\n"); options.invalid = 1;
+      (options.typing_set && !options.source_endpoint && !options.source_socket) ||
+      (options.audio && !options.source_endpoint && !options.source_socket)) {
+    fprintf(stderr, "--source-endpoint selects one source; affordances and audio require a handshake source; session scope requires an endpoint\n"); options.invalid = 1;
   }
   if ((options.source_socket && (options.cpu_socket || options.input_socket || options.native || options.porthole_socket || options.session_id)) ||
       (options.input_policy_set && !options.source_socket && !options.source_endpoint)) {
@@ -416,10 +432,11 @@ static int run_native(const viewer_options *options) {
 
 #if defined(__APPLE__) || defined(__linux__)
 /* Handshake v3: select the offered video track (required) plus input and
- * affordances by policy (0 none, 1 optional, 2 required). On success *local is
- * the media connection, ready for CPU setup. */
+ * affordances by policy (0 none, 1 optional, 2 required), and the labelled
+ * playback track (optional) when it is offered now or later. On success *local
+ * is the media connection, ready for CPU setup. */
 static int select_tracks(ft_local_connection **local, const viewer_options *options, viewer_input *input,
-                         viewer_affordances *affordances) {
+                         viewer_affordances *affordances, viewer_playback *playback) {
   ft_handshake_offer *offer = NULL;
   const char *source = NULL;
   uint32_t clock = 0;
@@ -427,10 +444,22 @@ static int select_tracks(ft_local_connection **local, const viewer_options *opti
   size_t count = 0;
   if (require_ok(ft_handshake_connect_local(local, &offer), "handshake offer") ||
       require_ok(ft_handshake_offer_describe(offer, &source, &clock, &tracks, &count), "handshake describe")) return 1;
-  ft_track_selection selection[3];
-  size_t selected = 0;
+  /* Audio playout and video sync need host-time stamps. */
+  if (playback->label && clock != FT_CLOCK_DOMAIN_HOST_TIME) {
+    fprintf(stderr, "source clock domain %u is not host time; continuing without audio\n", clock);
+    playback->label = NULL;
+  }
+  ft_track_selection selection[4];
+  size_t selected = 0, audio = SIZE_MAX;
   int have_input = 0, have_affordances = 0;
-  for (size_t i = 0; i < count && selected < 3; i++) {
+  for (size_t i = 0; i < count && selected < 4; i++) {
+    if (viewer_playback_offered(playback, &tracks[i]) && audio == SIZE_MAX) {
+      audio = selected;
+      playback->track = tracks[i].id;
+      playback->descriptor = tracks[i].audio;
+      selection[selected++] = (ft_track_selection){tracks[i].id, 0, 0};
+      continue;
+    }
     uint32_t policy = !strcmp(tracks[i].kind, FT_TRACK_KIND_VIDEO) ? 2
         : !strcmp(tracks[i].kind, FT_TRACK_KIND_INPUT) && !have_input++ ? options->input_policy
         : !strcmp(tracks[i].kind, FT_TRACK_KIND_AFFORDANCES) && !have_affordances++ ? options->affordances : 0;
@@ -442,10 +471,12 @@ static int select_tracks(ft_local_connection **local, const viewer_options *opti
     fprintf(stderr, "required %s not offered by source %s\n", missing, source);
     ft_handshake_offer_destroy(&offer); return 1;
   }
-  ft_track_admission admissions[3];
+  ft_track_admission admissions[4];
+  ft_playback_ring *rings[4] = {NULL};
   ft_status input_status;
   ft_status status = ft_handshake_select(&offer, selection, selected, options->input_policy ? options->typing : 0,
-      admissions, local, &input->client, &input_status, &affordances->host, NULL, NULL, NULL);
+      admissions, local, &input->client, &input_status, &affordances->host, rings, NULL,
+      playback->label ? &playback->tracks : NULL);
   if (status != FT_STATUS_OK) {
     fprintf(stderr, "handshake selection failed: status=%d%s\n", status,
             options->affordances == 2 ? "; required affordances must be admitted" : "");
@@ -453,6 +484,7 @@ static int select_tracks(ft_local_connection **local, const viewer_options *opti
   }
   for (size_t i = 0; i < selected; i++)
     if (admissions[i].result != FT_TRACK_ADMITTED) fprintf(stderr, "track %" PRIu64 " refused: %u; continuing\n", admissions[i].id, admissions[i].result);
+  if (audio != SIZE_MAX) playback->ring = rings[audio];
   if (input->client) {
     uint64_t controller, epoch;
     if (require_ok(ft_input_client_describe(input->client, &input->config, &controller, &epoch), "input describe")) return 1;
@@ -464,7 +496,8 @@ static int select_tracks(ft_local_connection **local, const viewer_options *opti
 /* Generic CPU setup belongs to the connecting process. Selection and desktop
  * authorization, when needed, remain with the host that supplies this path. */
 static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **connection,
-                              ft_acquisition_consumer **consumer, const viewer_options *options, viewer_input *input, viewer_affordances *affordances) {
+                              ft_acquisition_consumer **consumer, const viewer_options *options, viewer_input *input, viewer_affordances *affordances,
+                              viewer_playback *playback) {
   struct sockaddr_un address = {0};
   address.sun_family = AF_UNIX;
   if (strlen(path) >= sizeof(address.sun_path)) {
@@ -500,7 +533,7 @@ static int connect_cpu_socket(const char *path, ft_cpu_acquisition_connection **
   if (options->source_socket) {
     ft_local_connection *local = NULL;
     int selected = require_ok(ft_local_connection_adopt(&fd, &local), "adopt source socket") ||
-        select_tracks(&local, options, input, affordances) ||
+        select_tracks(&local, options, input, affordances, playback) ||
         require_ok(ft_acquisition_cpu_connection_create_local(&local, connection), "CPU local setup");
     ft_local_connection_destroy(&local);
     if (selected || require_ok(ft_acquisition_cpu_attach(*connection, 1, consumer), "ft_acquisition_cpu_attach")) goto cleanup;
@@ -521,14 +554,15 @@ static int run_cpu(const viewer_options *options) {
   }
   viewer_input input = {.mode = options->typing};
   viewer_affordances affordances = {.input = &input};
+  viewer_playback playback = {.label = options->audio, .latency_ns = options->audio_latency_ms * UINT64_C(1000000), .muted = options->mute};
   int navigation_test_stage = 0;
   ft_cpu_acquisition_connection *connection = NULL;
   ft_cpu_producer *producer = NULL;
   uint8_t *pixels = NULL;
   ft_acquisition_consumer *consumer = NULL;
   ft_acquisition_cancellation *cancellation = NULL;
-  uint64_t track = 0, acquired = 0, requested_epoch = 0;
-  int failed = 1, sdl_started = 0, running = 1, requested_configuration = 0;
+  uint64_t track = 0, acquired = 0, requested_epoch = 0, shown = 0;
+  int failed = 1, sdl_started = 0, running = 1, requested_configuration = 0, lapped = 0;
   uint32_t width = 0, height = 0, format = 0;
   SDL_Window *window = NULL;
   SDL_Renderer *renderer = NULL;
@@ -538,14 +572,14 @@ static int run_cpu(const viewer_options *options) {
     ft_local_endpoint endpoint = {options->session_scope ? FT_ENDPOINT_SCOPE_SESSION : FT_ENDPOINT_SCOPE_USER,
                                   FT_ENDPOINT_TRANSPORT_LOCAL_STREAM, options->source_endpoint};
     ft_status setup = ft_local_connect(&endpoint, &local);
-    if (require_ok(setup, "source endpoint connect") || select_tracks(&local, options, &input, &affordances)) {
+    if (require_ok(setup, "source endpoint connect") || select_tracks(&local, options, &input, &affordances, &playback)) {
       ft_local_connection_destroy(&local); goto cleanup;
     }
     setup = ft_acquisition_cpu_connection_create_local(&local, &connection);
     ft_local_connection_destroy(&local);
     if (require_ok(setup, "CPU local setup") || require_ok(ft_acquisition_cpu_attach(connection, 1, &consumer), "CPU attach")) goto cleanup;
   } else if (options->cpu_socket != NULL || options->source_socket != NULL) {
-    if (connect_cpu_socket(options->source_socket ? options->source_socket : options->cpu_socket, &connection, &consumer, options, &input, &affordances)) goto cleanup;
+    if (connect_cpu_socket(options->source_socket ? options->source_socket : options->cpu_socket, &connection, &consumer, options, &input, &affordances, &playback)) goto cleanup;
   } else if (options->porthole_socket != NULL) {
     if (require_ok(ft_acquisition_cpu_connect_session(options->porthole_socket, session_id,
                       options->token != NULL ? options->token : getenv("PORTHOLE_AGENT_TOKEN"), 2,
@@ -570,6 +604,7 @@ static int run_cpu(const viewer_options *options) {
     if (renderer == NULL) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
   }
   if (renderer == NULL) { fprintf(stderr, "SDL setup: %s\n", SDL_GetError()); goto cleanup; }
+  if (playback.ring) viewer_playback_start(&playback);
   if (options->input_socket && viewer_input_open(&input, options->input_socket) != 0) { fprintf(stderr, "input connection failed\n"); goto cleanup; }
   if (input.client && input.mode != FT_INPUT_MODE_PHYSICAL) SDL_StartTextInput();
   input.renderer = renderer;
@@ -586,6 +621,7 @@ static int run_cpu(const viewer_options *options) {
     viewer_input_poll(&input);
     if (viewer_affordances_poll(&affordances, options->log_affordances)) { failed = 1; break; }
     if (viewer_affordances_tick(&affordances) || input.failed) { failed = 1; break; }
+    viewer_playback_poll(&playback);
     if (options->input_self_test && !input_test_sent && acquired >= 2 && !input.resetting) {
       viewer_input_self_test(&input, window); input_test_sent = 1;
     }
@@ -614,7 +650,13 @@ static int run_cpu(const viewer_options *options) {
     ft_acquisition_range range = {0};
     // Repeated presentations may acquire the same latest frame. This also
     // supports the daemon's static synthetic session with a bounded frame count.
-    ft_status status = ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &frame, &range);
+    // With audio, frames are presented in order, each when due on its clock.
+    // That needs the producer to retain the latency target's worth of frames:
+    // after a gap, the oldest retained frame shows at once.
+    int64_t clock = viewer_playback_clock(&playback);
+    ft_status status = clock == INT64_MIN ? ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &frame, &range)
+                                          : ft_acquisition_acquire(consumer, FT_ACQUIRE_NEXT, shown, &frame, &range);
+    if (status == FT_STATUS_GAP) { shown = range.last; lapped = 1; continue; }
     uint32_t interest = FT_WAIT_DATA;
     if (status == FT_STATUS_OK) {
       ft_acquired_frame_descriptor desc = {0};
@@ -624,6 +666,15 @@ static int run_cpu(const viewer_options *options) {
           require_ok(ft_acquired_frame_bytes(frame, &bytes, &len), "ft_acquired_frame_bytes")) {
         ft_acquired_frame_release(&frame); failed = 1; break;
       }
+      /* Not yet due (within a second, against a bad stamp): show it later. */
+      int64_t early = clock == INT64_MIN || lapped ? 0 : (int64_t)(desc.timestamp_ns - host_time_ns()) - clock;
+      if (early > 0 && early < 1000000000) {
+        ft_acquired_frame_release(&frame);
+        SDL_Delay(early < 16000000 ? (uint32_t)(early / 1000000) + 1 : 16);
+        continue;
+      }
+      shown = desc.cursor;
+      lapped = 0;
       if (options->hold_ms != 0) {
         uint8_t *before_hold = malloc(len);
         if (before_hold == NULL) {
@@ -681,7 +732,7 @@ static int run_cpu(const viewer_options *options) {
       SDL_RenderPresent(renderer);
       if (options->scroll_self_test) scroll_self_test(&affordances, window, (int)width, (int)height, &scroll_test_stage);
       acquired++;
-      SDL_Delay(16);
+      if (clock == INT64_MIN) SDL_Delay(16);
       continue;
     }
     if (status == FT_STATUS_CLOSED) break;
@@ -709,6 +760,7 @@ static int run_cpu(const viewer_options *options) {
   if (options->max_frames > 0 && acquired != (uint64_t)options->max_frames) failed = 1;
   printf("acquired_frames=%" PRIu64 "\n", acquired);
 cleanup:
+  viewer_playback_close(&playback);
   if (viewer_affordances_close(&affordances, options->log_affordances)) failed = 1;
   if (viewer_input_close(&input)) failed = 1;
   SDL_DestroyTexture(texture);

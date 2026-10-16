@@ -51,15 +51,18 @@ whose descriptor Jackstay treats as opaque.
 
 A `recording` track flows toward the source in the playback ring layout with
 the roles swapped. Selecting it requests writing, and one consumer at a time is
-admitted: it alone receives the ring, read-write, and any other request is
+admitted: it alone receives a ring, read-write, and any other request is
 refused `unavailable`. The admission lasts until that incarnation's `Notices`
-is dropped or the track is removed. Each writer's first block is a
-discontinuity, and the source's `RecordingReader` starts at the new writer's
-blocks. With no writer it reads silence. A host offers at most one video, one
-input and one affordances track. Admitting an app-kind track only records the
-agreement: Jackstay opens no channel for it, so its transport is the host's and
-consumer's own. Consumers skip kinds they do not know. Today's core
-kinds have empty descriptors.
+is dropped or the track is removed. Each admission creates a fresh ring, so a
+previous writer keeps only an orphaned mapping that the source never reads:
+it cannot reach the source after its admission ends. Each writer's first
+block is a discontinuity, and the source's `RecordingReader` switches to the
+new writer's ring at its latency target. With no writer it reads silence.
+
+A host offers at most one video, one input and one affordances track.
+Admitting an app-kind track only records the agreement: Jackstay opens no
+channel for it, so its transport is the host's and consumer's own. Consumers
+skip kinds they do not know. Today's core kinds have empty descriptors.
 
 One incarnation carries the selected tracks. An admitted video track continues
 on the same connection as [CPU setup](acquisition-cpu-setup.md), which keeps

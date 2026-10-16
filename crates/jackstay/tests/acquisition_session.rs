@@ -19,7 +19,8 @@ use jackstay::{
     daemon::{ConnectedSession, SessionInfo},
     ffi::*,
     ffi_acquisition::{session::*, *},
-    model::PixelFormat,
+    handshake::{self, Bytes, Direction, Kind, Offer, Track},
+    model::{ClockDomain, PixelFormat},
 };
 
 struct Host {
@@ -63,7 +64,24 @@ impl Host {
             );
             if accept {
                 writeln!(stream, "{{\"op\":\"cpu_opened\"}}").unwrap();
-                serve_cpu(stream, served).unwrap();
+                // Like portholed: offer the session's one video track (v3)
+                // before CPU setup.
+                let offer = Offer {
+                    source: "test-session".into(),
+                    clock: ClockDomain::Unknown,
+                    tracks: vec![Track {
+                        id: 7,
+                        kind: Kind::Video,
+                        direction: Direction::FromSource,
+                        label: "default".into(),
+                        descriptor: Bytes::default(),
+                    }],
+                };
+                let accepted = handshake::accept(stream, &offer, None, &[]).unwrap();
+                assert_eq!(accepted.admissions.len(), 1);
+                assert_eq!(accepted.admissions[0].id, 7);
+                assert_eq!(accepted.admissions[0].refusal, None);
+                serve_cpu(accepted.media, served).unwrap();
             } else {
                 writeln!(stream, "{{\"op\":\"rejected\",\"message\":\"session access denied\"}}").unwrap();
             }

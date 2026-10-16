@@ -189,7 +189,8 @@ pub unsafe extern "C" fn ft_acquisition_cpu_connection_cancel(connection: *const
     }
 }
 
-/// Select a trusted daemon's session, authorize it and request holding capacity.
+/// Select a trusted daemon's session, authorize it, select its video track and
+/// request holding capacity.
 ///
 /// # Safety
 /// Strings are live NUL-terminated UTF-8 (token may be null). Outputs are writable,

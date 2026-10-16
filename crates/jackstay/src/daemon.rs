@@ -37,7 +37,8 @@ impl ConnectedSession {
     }
 }
 
-/// Finish host routing/authorization without admitting a consumer yet.
+/// Finish host routing/authorization and select the session's video track
+/// (handshake v3) without admitting a consumer yet.
 ///
 /// # Safety
 /// The host must be a trusted conforming producer; this process remains the
@@ -81,8 +82,31 @@ pub(crate) unsafe fn open_cpu_setup(info: &SessionInfo) -> Result<crate::acquisi
         Reply::CpuOpened => {}
         Reply::Rejected { message } => return Err(daemon_error("open-cpu-session", message)),
     }
+    let media = select_video(stream).map_err(|error| daemon_error("select-cpu-session-track", error))?;
     // SAFETY: delegated to this method's sole-producer/process contract.
-    Ok(unsafe { CpuSetupClient::from_stream(stream) })
+    Ok(unsafe { CpuSetupClient::from_stream(media) })
+}
+
+/// Run the handshake v3 consumer side on an opened session: select its offered
+/// video track, required, and return the media stream for CPU setup.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn select_video(stream: UnixStream) -> std::result::Result<UnixStream, crate::handshake::Error> {
+    use crate::handshake::{self, Error, Kind, Selected};
+    let offered = handshake::connect(stream)?;
+    let video = offered
+        .offer()
+        .tracks
+        .iter()
+        .find(|track| track.kind == Kind::Video)
+        .ok_or(Error::Protocol("no video track offered"))?
+        .id;
+    let selection = [Selected {
+        id: video,
+        required: true,
+        write: false,
+    }];
+    // No input track is selected, so the input mode is never used.
+    Ok(offered.select(&selection, crate::input::Mode::Cooperative)?.media)
 }
 
 #[derive(Debug, Clone)]

@@ -21,7 +21,7 @@ extern "C" {
  * consumer needs the stability promise.
  */
 #define FT_ABI_VERSION_MAJOR 0
-#define FT_ABI_VERSION_MINOR 17
+#define FT_ABI_VERSION_MINOR 18
 #define FT_ABI_VERSION ((uint32_t)((FT_ABI_VERSION_MAJOR << 16) | FT_ABI_VERSION_MINOR))
 
 uint32_t ft_abi_version(void);
@@ -365,10 +365,11 @@ void ft_acquisition_cpu_connection_destroy(ft_cpu_acquisition_connection **);
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
-/* Select a trusted host session, authorize it with an optional token and admit
- * the requested holding capacity. Strings are UTF-8 and copied during setup.
- * Both output handles start NULL; track is set on success. Never fork, forward
- * or replay these mappings. Connection, consumer and frames are separate owners. */
+/* Select a trusted host session, authorize it with an optional token, select its
+ * video track on the track handshake and admit the requested holding capacity.
+ * Strings are UTF-8 and copied during setup. Both output handles start NULL;
+ * track is set on success. Never fork, forward or replay these mappings.
+ * Connection, consumer and frames are separate owners. */
 /* Generic setup on a connected, host-authorized Unix SOCK_STREAM. No daemon is
  * required. The peer must be the conforming sole producer; this process must be
  * the original peer and sole recipient of grants. No caller descriptor copies,

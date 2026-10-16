@@ -82,7 +82,7 @@ pub(crate) unsafe fn open_cpu_setup(info: &SessionInfo) -> Result<crate::acquisi
         Reply::CpuOpened => {}
         Reply::Rejected { message } => return Err(daemon_error("open-cpu-session", message)),
     }
-    let media = select_video(stream).map_err(|error| daemon_error("select-cpu-session-track", error))?;
+    let media = select_video(stream, info.track_id).map_err(|error| daemon_error("select-cpu-session-track", error))?;
     // SAFETY: delegated to this method's sole-producer/process contract.
     Ok(unsafe { CpuSetupClient::from_stream(media) })
 }
@@ -90,15 +90,15 @@ pub(crate) unsafe fn open_cpu_setup(info: &SessionInfo) -> Result<crate::acquisi
 /// Run the handshake v3 consumer side on an opened session: select its offered
 /// video track, required, and return the media stream for CPU setup.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn select_video(stream: UnixStream) -> std::result::Result<UnixStream, crate::handshake::Error> {
+fn select_video(stream: UnixStream, track_id: u64) -> std::result::Result<UnixStream, crate::handshake::Error> {
     use crate::handshake::{self, Error, Kind, Selected};
     let offered = handshake::connect(stream)?;
     let video = offered
         .offer()
         .tracks
         .iter()
-        .find(|track| track.kind == Kind::Video)
-        .ok_or(Error::Protocol("no video track offered"))?
+        .find(|track| track.kind == Kind::Video && track.id == track_id)
+        .ok_or(Error::Protocol("the session's video track was not offered"))?
         .id;
     let selection = [Selected {
         id: video,

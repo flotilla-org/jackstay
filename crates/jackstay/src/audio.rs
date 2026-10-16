@@ -372,7 +372,9 @@ struct Writers {
     /// The admitted writer's ring and the descriptor it maps.
     current: Option<(Arc<Ring>, OwnedFd)>,
     /// Previous writers' rings, kept until the source's reader lets go so it
-    /// never unmaps one on the audio thread.
+    /// never unmaps one on the audio thread. Pruned only on the next claim or
+    /// lease drop, so a ring the reader has just let go lingers until then:
+    /// bounded by the number of handovers, and deliberate.
     retired: Vec<Arc<Ring>>,
 }
 
@@ -962,5 +964,38 @@ impl RecordingReader {
             }),
             _ => self.reader.read(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_contended_handover_reads_silence_until_the_lock_is_free() {
+        let format = Format {
+            rate: 48_000,
+            channels: 1,
+            layout: Layout::Mono,
+            sample: Sample::U8,
+        };
+        let settings = Settings {
+            format,
+            block_frames: 480,
+            depth: MIN_DEPTH,
+        };
+        let mut reader = RecordingReader::new(1, settings, Duration::from_millis(20)).unwrap();
+        let _lease = reader.ring().claim().unwrap();
+        let shared = reader.shared.clone();
+        {
+            // The host holds the lock: the reader neither waits nor switches.
+            let _held = shared.writers();
+            assert_eq!(reader.read().unwrap().cursor, 0);
+            assert_eq!(reader.writer, 0);
+        }
+        // Once the lock is free it switches to the new writer's ring, which is
+        // still empty.
+        assert!(reader.read().is_none());
+        assert_eq!(reader.writer, 1);
     }
 }

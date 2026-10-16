@@ -57,11 +57,12 @@ is dropped or the track is removed. Each admission creates a fresh ring, so a
 previous writer keeps only an orphaned mapping that the source never reads:
 it cannot reach the source after its admission ends. Each writer's first
 block is a discontinuity, and the source's `RecordingReader` switches to the
-new writer's ring at its latency target. With no writer it reads silence. A host offers at most one video, one
-input and one affordances track. Admitting an app-kind track only records the
-agreement: Jackstay opens no channel for it, so its transport is the host's and
-consumer's own. Consumers skip kinds they do not know. Today's core
-kinds have empty descriptors.
+new writer's ring at its latency target. With no writer it reads silence.
+
+A host offers at most one video, one input and one affordances track.
+Admitting an app-kind track only records the agreement: Jackstay opens no
+channel for it, so its transport is the host's and consumer's own. Consumers
+skip kinds they do not know. Today's core kinds have empty descriptors.
 
 One incarnation carries the selected tracks. An admitted video track continues
 on the same connection as [CPU setup](acquisition-cpu-setup.md), which keeps

@@ -3,8 +3,9 @@
 //! framed like the handshake. The consumer may select an offered audio or
 //! app-kind track late with a one-track `selection`; the host answers with
 //! `admitted` and, for audio, the ring, preceded by the doorbell when this is
-//! the incarnation's first playback track and no video was admitted. Late selections take the next selection
-//! positions, so doorbell hint bits stay stable.
+//! the incarnation's first playback track and no video was admitted. Late
+//! selections take the next selection positions, so doorbell hint bits stay
+//! stable.
 
 use std::{
     collections::{HashSet, VecDeque},

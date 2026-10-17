@@ -16,7 +16,7 @@ use jackstay::{
         socket::{CpuSetupClient, serve_cpu_with_doorbell},
     },
     audio::{Descriptor, Doorbell, Format, Layout, PlaybackReader, PlaybackRing, PlaybackWriter, Sample, Settings},
-    handshake::{self, Accepted, Connected, Direction, Kind, Notice, Notices, Offer, Refusal, Selected, Track},
+    handshake::{self, Accepted, Connected, Direction, Kind, Notice, Notices, Offer, Refusal, Selected, Track, Tracks},
     input::Mode,
     local::Stream,
     model::ClockDomain,
@@ -348,6 +348,9 @@ struct Video {
     consumer: ArenaConsumer,
     doorbell: Option<Doorbell>,
     playback: Vec<PlaybackRing>,
+    /// Holds the playback doorbell and serves late selections.
+    notices: Notices,
+    tracks: Tracks,
 }
 
 /// Offer a video track (id 9) and `audio`'s playback tracks, make `selection`
@@ -379,19 +382,16 @@ fn connect_video(audio: &[&PlaybackWriter], selection: &[Selected]) -> Video {
         .unwrap(),
     ));
     let (host, peer) = pair();
-    let served = producer.clone();
-    thread::spawn(move || {
-        let Accepted {
-            media,
-            notices,
-            video_bell,
-            ..
-        } = handshake::accept(host, &offer, None, &rings).unwrap();
-        // Notices holds the playback doorbell: keep it while serving.
-        let _notices = notices;
-        serve_cpu_with_doorbell(media, served, video_bell)
-    });
+    let accept = thread::spawn(move || handshake::accept(host, &offer, None, &rings).unwrap());
     let connected = handshake::connect(peer).unwrap().select(selection, Mode::Cooperative).unwrap();
+    let Accepted {
+        media,
+        notices,
+        video_bell,
+        ..
+    } = accept.join().unwrap();
+    let served = producer.clone();
+    thread::spawn(move || serve_cpu_with_doorbell(media, served, video_bell));
     // SAFETY: the arena above is this stream's sole, conforming producer; this
     // test never forks or forwards its grant.
     let mut client = unsafe { CpuSetupClient::from_stream(connected.media) };
@@ -402,6 +402,8 @@ fn connect_video(audio: &[&PlaybackWriter], selection: &[Selected]) -> Video {
         consumer,
         doorbell: connected.doorbell,
         playback: connected.playback,
+        notices,
+        tracks: connected.tracks,
     }
 }
 
@@ -429,6 +431,8 @@ fn one_doorbell_wakes_a_consumer_for_video_and_playback() {
         doorbell,
         playback,
         _client: _setup,
+        notices: _notices,
+        tracks: _tracks,
     } = connect_video(&[&audio], &[select(9), select(1)]);
     let mut doorbell = doorbell.unwrap();
     let mut reader = PlaybackReader::new(playback[0].clone(), Duration::from_millis(250));
@@ -463,6 +467,8 @@ fn a_video_only_selection_gets_the_doorbell_and_keeps_the_arena_wait() {
         doorbell,
         playback,
         _client: _setup,
+        notices: _notices,
+        tracks: _tracks,
     } = connect_video(&[], &[select(9)]);
     assert!(playback.is_empty());
     let mut doorbell = doorbell.unwrap();
@@ -475,6 +481,37 @@ fn a_video_only_selection_gets_the_doorbell_and_keeps_the_arena_wait() {
         .wait(observed, WaitInterest::DATA, &cancel, Some(Duration::from_secs(5)))
         .unwrap();
     assert!(matches!(outcome, WaitOutcome::Changed(events) if events.data_cursor == 1));
+}
+
+#[test]
+fn a_late_playback_selection_rings_the_doorbell_video_created() {
+    let mut audio = writer(1);
+    // Video alone at position 0 creates the doorbell; playback is selected
+    // late at position 1.
+    let Video {
+        producer,
+        consumer: _consumer,
+        doorbell,
+        playback,
+        _client: _setup,
+        notices,
+        mut tracks,
+    } = connect_video(&[&audio], &[select(9)]);
+    assert!(playback.is_empty());
+    let mut doorbell = doorbell.unwrap();
+    let server = serve(notices);
+    let late = tracks.select(select(1)).unwrap();
+    let _notices = server.join().unwrap();
+    // No second doorbell: the late track rings the existing one at its bit.
+    assert_eq!((late.admission.refusal, late.position), (None, 1));
+    assert!(late.doorbell.is_none());
+    let mut reader = PlaybackReader::new(late.playback.unwrap(), Duration::from_millis(250));
+    let cancel = Cancellation::new().unwrap();
+    write(&mut audio, 1);
+    assert_eq!(doorbell.wait(&cancel, Some(Duration::from_secs(5))).unwrap(), 0b10);
+    assert_eq!(reader.read().unwrap().samples[0], 1);
+    publish(&producer);
+    assert_eq!(doorbell.wait(&cancel, Some(Duration::from_secs(5))).unwrap(), 0b01);
 }
 
 /// Answer one late selection on a host worker that polls with a zero timeout.

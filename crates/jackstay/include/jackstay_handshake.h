@@ -16,9 +16,9 @@ extern "C" {
  * the consumer's kernel identity. A required refusal closes setup on both
  * sides (FT_STATUS_UNSUPPORTED); optional refusals are reported per track.
  * Admitted video and playback tracks share one doorbell (jackstay_audio.h),
- * and each playback track maps a read-only ring. Offers, selections, admissions and notices are typed
- * here; their wire encoding never crosses the ABI. Messages are at most
- * 64 KiB, app-kind descriptors at most 4 KiB.
+ * and each playback track maps a read-only ring. Offers, selections,
+ * admissions and notices are typed here; their wire encoding never crosses
+ * the ABI. Messages are at most 64 KiB, app-kind descriptors at most 4 KiB.
  *
  * Calls block within a five-second bound from accept/connect to admission
  * (input admission adds its own five seconds): run them on a worker. POSIX

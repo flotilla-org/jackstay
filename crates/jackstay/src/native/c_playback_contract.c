@@ -74,6 +74,7 @@ static THREAD_FN accept_job(void *arg) {
   size_t count = 0;
   ft_input_server *input = NULL;
   ft_affordances_producer *affordances = NULL;
+  /* playback holds the rings first; unused slots are NULL. */
   size_t rings = 0;
   while (rings < h->count && h->playback[rings]) rings++;
   h->status = ft_handshake_accept_local(&h->connection, "C source", FT_CLOCK_DOMAIN_HOST_TIME, h->tracks, h->count,

@@ -12,10 +12,12 @@
 //! Each admitted writer gets a fresh ring, so a previous writer's mapping
 //! reaches nothing the source reads.
 //!
-//! Each consumer incarnation that selects playback tracks gets one doorbell:
-//! a shared changed-track hint (bit = selection position mod 64) and the
-//! coalescing wake from `acquisition::arena`. The hint is optional; readers may
-//! always check their cursors with [`PlaybackReader::available`].
+//! Each consumer incarnation that selects video or playback tracks gets one
+//! doorbell: a shared changed-track hint (bit = selection position mod 64) and
+//! the coalescing wake from `acquisition::arena`. CPU setup on the incarnation's
+//! connection hands the video track's [`VideoBell`] to the arena. The hint is
+//! optional; readers may always check their cursors with
+//! [`PlaybackReader::available`] and the arena's acquisition calls.
 
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -620,12 +622,28 @@ impl BellInner {
     }
 }
 
-/// The host's end of one incarnation's playback doorbell. Retain it for the
-/// incarnation's lifetime; dropping it stops the doorbell, not the rings.
+/// The host's end of one incarnation's doorbell. Retain it for the
+/// incarnation's lifetime; dropping it stops playback hints, not the rings.
 #[derive(Debug)]
 pub struct Bell(Arc<BellInner>);
 
+/// The video track's bit on its incarnation's doorbell. Pass it to
+/// `acquisition::socket::serve_cpu_with_doorbell` on the same connection: the
+/// arena rings it for new frames, reconfiguration and closure.
+#[derive(Clone, Debug)]
+pub struct VideoBell(Arc<BellInner>, u64);
+
+impl VideoBell {
+    pub(crate) fn ring(&self) {
+        self.0.ring(self.1);
+    }
+}
+
 impl Bell {
+    pub(crate) fn video(&self, position: usize) -> VideoBell {
+        VideoBell(self.0.clone(), 1 << (position % 64))
+    }
+
     /// The bell and the consumer's objects: hint page, then wake receiver.
     pub(crate) fn new() -> Result<(Self, Vec<OwnedFd>), Error> {
         let page = SharedMemorySegment::new(BELL_LEN)?;
@@ -641,7 +659,8 @@ fn hint(page: &SharedMemorySegment) -> &AtomicU64 {
     unsafe { &*page.as_ptr().cast::<AtomicU64>() }
 }
 
-/// A consumer incarnation's doorbell for its selected playback tracks.
+/// A consumer incarnation's doorbell for its selected video and playback
+/// tracks.
 #[derive(Debug)]
 pub struct Doorbell {
     page: SharedMemorySegment,

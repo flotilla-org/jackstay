@@ -59,6 +59,8 @@ pub struct FtLocalListener(Listener);
 pub struct FtLocalConnection {
     pub(crate) stream: Stream,
     pub(crate) peer: PeerIdentity,
+    /// Set by a track handshake that admitted video, for CPU setup to ring.
+    pub(crate) video_bell: Option<crate::audio::VideoBell>,
 }
 
 impl From<Connection> for FtLocalConnection {
@@ -67,6 +69,7 @@ impl From<Connection> for FtLocalConnection {
         Self {
             stream: connection.into_stream(),
             peer,
+            video_bell: None,
         }
     }
 }
@@ -277,7 +280,11 @@ pub unsafe extern "C" fn ft_local_connection_adopt(fd: *mut i32, out: *mut *mut 
     };
     match local::peer_identity(&stream) {
         Ok(peer) => {
-            *out = Box::into_raw(Box::new(FtLocalConnection { stream, peer }));
+            *out = Box::into_raw(Box::new(FtLocalConnection {
+                stream,
+                peer,
+                video_bell: None,
+            }));
             FT_STATUS_OK
         }
         Err(_) => FT_STATUS_ERROR,

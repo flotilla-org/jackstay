@@ -168,6 +168,12 @@ impl ArenaConsumer {
 
 impl super::ClaimMap {
     pub(super) fn signal(&self, interest: u64) -> io::Result<()> {
+        // The doorbell needs no armed wait: its hint coalesces the wakes.
+        if interest & (DATA | RECONFIGURATION | CLOSED) != 0
+            && let Some(bell) = self.bell.get()
+        {
+            bell.ring();
+        }
         if self.word(WAIT_INTEREST).load(SeqCst) & interest == 0 {
             return Ok(());
         }

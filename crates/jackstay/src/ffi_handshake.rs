@@ -276,7 +276,7 @@ pub unsafe extern "C" fn ft_handshake_accept_local(
     let Some(taken) = (unsafe { take_connection(connection) }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    let FtLocalConnection { stream, peer } = *taken;
+    let FtLocalConnection { stream, peer, .. } = *taken;
     match handshake::accept(stream, &Offer { source, clock, tracks }, target, &rings) {
         Ok(accepted) => {
             for (index, admission) in accepted.admissions.iter().enumerate() {
@@ -300,6 +300,7 @@ pub unsafe extern "C" fn ft_handshake_accept_local(
                     FtLocalConnection {
                         stream: accepted.media,
                         peer,
+                        video_bell: accepted.video_bell,
                     },
                 )
             };
@@ -332,7 +333,7 @@ pub unsafe extern "C" fn ft_handshake_connect_local(
     let Some(taken) = (unsafe { take_connection(connection) }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    let FtLocalConnection { stream, peer } = *taken;
+    let FtLocalConnection { stream, peer, .. } = *taken;
     let offered = match handshake::connect(stream) {
         Ok(offered) => offered,
         Err(error) => return status(error),
@@ -483,6 +484,7 @@ pub unsafe extern "C" fn ft_handshake_select(
             *connection = Box::into_raw(Box::new(FtLocalConnection {
                 stream: connected.media,
                 peer,
+                video_bell: None,
             }));
             FT_STATUS_OK
         }

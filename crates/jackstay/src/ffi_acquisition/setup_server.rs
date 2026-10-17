@@ -19,7 +19,8 @@ use super::producer::FtCpuProducer;
 #[cfg(unix)]
 use crate::acquisition::socket::peer_pid;
 use crate::{
-    acquisition::socket::serve_cpu,
+    acquisition::socket::serve_cpu_with_doorbell,
+    audio::VideoBell,
     ffi::*,
     ffi_local::{FtLocalConnection, take_connection},
     local::{ShutdownHandle, Stream},
@@ -115,7 +116,7 @@ pub unsafe extern "C" fn ft_cpu_producer_serve(producer: *mut FtCpuProducer, fd:
     let Ok(stream) = (unsafe { take_stream(fd) }) else {
         return FT_STATUS_ERROR;
     };
-    start(producer, stream, out)
+    start(producer, stream, None, out)
 }
 
 /// Serve CPU setup on a Local Endpoint connection the host accepted and
@@ -144,17 +145,18 @@ pub unsafe extern "C" fn ft_cpu_producer_serve_local(
     let Some(connection) = (unsafe { take_connection(connection) }) else {
         return FT_STATUS_INVALID_ARGUMENT;
     };
-    start(producer, connection.stream, out)
+    start(producer, connection.stream, connection.video_bell, out)
 }
 
-fn start(producer: &FtCpuProducer, stream: Stream, out: &mut *mut FtCpuSetupServer) -> FtStatus {
+fn start(producer: &FtCpuProducer, stream: Stream, bell: Option<VideoBell>, out: &mut *mut FtCpuSetupServer) -> FtStatus {
     let Ok(shutdown) = crate::local::shutdown_handle(&stream) else {
         return FT_STATUS_ERROR;
     };
     let arena = producer.0.clone();
+    let serve = move || serve_cpu_with_doorbell(stream, arena, bell);
     let worker = match thread::Builder::new()
         .name("jackstay-cpu-setup".into())
-        .spawn(move || match serve_cpu(stream, arena) {
+        .spawn(move || match serve() {
             Ok(()) => FT_STATUS_OK,
             Err(_) => FT_STATUS_ERROR,
         }) {

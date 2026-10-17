@@ -38,7 +38,7 @@ channel, on which it announces **added** (`track`), **removed** (`id`) and
 and the selection; a device reopen is one. The consumer may select an offered
 audio or app-kind track late with a one-track **selection**; the host
 answers **admitted** and, for audio, passes the ring, preceded by the doorbell
-if this is the incarnation's first playback track. A late selection takes the next
+if the incarnation has none yet. A late selection takes the next
 selection position, which is its doorbell hint bit. A removed track's mapping
 stays valid until the consumer drops it; its ring just stops advancing. The
 tracks channel is always sent, one extra channel per admission. It is separate
@@ -70,6 +70,18 @@ the consumer's kernel identity for grants; its frames use the CPU arena. The
 whole exchange, from the offer to the last channel receipt, has a five-second
 absolute deadline (`local::Bounded`); input admission then has its own
 five-second bound.
+
+The incarnation has one doorbell: a changed-track hint page, with bit i for
+the track at selection position i (mod 64), and one coalescing wake. The host
+passes it with the first ring transfer, or alone when only video is admitted.
+Playback writers ring their track's bit. For video, `Accepted::video_bell`
+goes to `serve_cpu_with_doorbell` (in C, the accepted connection carries it to
+`ft_cpu_producer_serve_local`), and the arena rings video's bit on new frames,
+reconfiguration and closure. The hint only says where to look: consumers still
+read cursors and acquisition. The arena keeps its own wake for
+`ArenaConsumer::wait`, release wakes and dead-consumer detection, and for
+native setup paths that have no handshake
+([#132](https://github.com/flotilla-org/jackstay/issues/132)).
 
 ## Clock
 

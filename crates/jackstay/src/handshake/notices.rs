@@ -3,7 +3,7 @@
 //! framed like the handshake. The consumer may select an offered audio or
 //! app-kind track late with a one-track `selection`; the host answers with
 //! `admitted` and, for audio, the ring, preceded by the doorbell when this is
-//! the incarnation's first playback track. Late selections take the next selection
+//! the incarnation's first playback track and no video was admitted. Late selections take the next selection
 //! positions, so doorbell hint bits stay stable.
 
 use std::{
@@ -156,7 +156,7 @@ impl Notices {
         }
         self.admitted.insert(id);
         let rings: Vec<_> = self.playback.iter().filter(|p| p.id() == id).map(|ring| (position, ring)).collect();
-        send_rings(&mut handshake, &mut self.bell, &rings)?;
+        send_rings(&mut handshake, &mut self.bell, false, &rings)?;
         Ok(true)
     }
 }
@@ -168,7 +168,8 @@ pub struct Late {
     pub position: usize,
     pub playback: Option<audio::PlaybackRing>,
     pub recording: Option<audio::RecordingWriter>,
-    /// Present when this is the incarnation's first playback track.
+    /// Present when this is the incarnation's first playback track and no
+    /// video was admitted.
     pub doorbell: Option<audio::Doorbell>,
 }
 
@@ -236,7 +237,7 @@ impl Tracks {
             doorbell,
             mut playback,
             mut recording,
-        } = receive_rings(&mut Handshake::new(&mut self.stream)?, self.doorbell, &tracks)?;
+        } = receive_rings(&mut Handshake::new(&mut self.stream)?, self.doorbell, false, &tracks)?;
         self.doorbell |= doorbell.is_some();
         Ok(Late {
             admission,

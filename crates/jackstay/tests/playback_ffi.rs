@@ -23,7 +23,7 @@ fn compiled_c_drives_the_playback_contract() {
         // SAFETY: the scenario takes ownership of both live connections.
         match unsafe { jackstay_c_playback_scenario(index, host.cast(), peer.cast()) } {
             -1 => {
-                assert_eq!(index, 10, "scenario count");
+                assert_eq!(index, 11, "scenario count");
                 break;
             }
             line => assert_eq!(line, 0, "scenario {index} failed at c_playback_contract.c:{line}"),

@@ -15,8 +15,8 @@ extern "C" {
  * admitted video track is carried by this connection's CPU setup, which keeps
  * the consumer's kernel identity. A required refusal closes setup on both
  * sides (FT_STATUS_UNSUPPORTED); optional refusals are reported per track.
- * Admitted playback tracks share one doorbell and each map a read-only ring
- * (jackstay_audio.h). Offers, selections, admissions and notices are typed
+ * Admitted video and playback tracks share one doorbell (jackstay_audio.h),
+ * and each playback track maps a read-only ring. Offers, selections, admissions and notices are typed
  * here; their wire encoding never crosses the ABI. Messages are at most
  * 64 KiB, app-kind descriptors at most 4 KiB.
  *
@@ -87,7 +87,8 @@ typedef struct ft_tracks ft_tracks;
  * target stays live until return; its executor keeps pumping. out_admissions
  * holds track_count entries and receives *out_admission_count of them in
  * selection order. On success the same connection returns in *connection:
- * serve CPU setup on it when a video track was admitted. After basic checks
+ * serve CPU setup on it with ft_cpu_producer_serve_local when a video track
+ * was admitted, which rings the doorbell's video bit. After basic checks
  * the connection is consumed on failure. Returned servers own workers; they
  * are not proof of input admission. *out_notices, NULL to decline, sends
  * notices and serves late selections; it also holds the playback doorbell,
@@ -120,7 +121,8 @@ ft_status ft_handshake_offer_describe(const ft_handshake_offer *offer, const cha
  * abandoning the source. These optional outputs may be NULL to decline:
  * out_playback receives count entries, the read-only ring of each admitted
  * playback track at its selection position and NULL elsewhere;
- * *out_doorbell is set when playback was admitted; *out_tracks receives
+ * *out_doorbell is set when video or playback was admitted (video since
+ * ABI 0.19); *out_tracks receives
  * notices and makes late selections. */
 ft_status ft_handshake_select(ft_handshake_offer **offer, const ft_track_selection *selections,
                               size_t count, uint32_t input_mode, ft_track_admission *out_admissions,
@@ -155,7 +157,7 @@ ft_status ft_tracks_next(ft_tracks *tracks, uint32_t timeout_ms, ft_track_notice
 /* Select one offered playback or app-kind track late, without disturbing
  * other selections; the host must be serving. *out_position is the doorbell
  * hint bit (mod 64). An admitted playback track's ring is in *out_ring, and
- * the incarnation's first one brings *out_doorbell. Handle outputs start
+ * brings *out_doorbell if the incarnation has none yet. Handle outputs start
  * NULL. Notices that arrive first stay queued for ft_tracks_next. */
 ft_status ft_tracks_select(ft_tracks *tracks, const ft_track_selection *selection,
                            ft_track_admission *out_admission, uint32_t *out_position,

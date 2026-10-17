@@ -1,11 +1,21 @@
 //! Playback track contract, in-process over a local connection: offer,
 //! selection, ring transfer, reading, the doorbell and notices while attached.
 
-use std::{thread, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use jackstay::{
-    acquisition::arena::Cancellation,
-    audio::{Descriptor, Format, Layout, PlaybackReader, PlaybackWriter, Sample, Settings},
+    acquisition::{
+        arena::{
+            AcquireOutcome, ArenaConfig, ArenaConsumer, ArenaProducer, Cancellation, FrameDescriptor, PublishOutcome, WaitInterest,
+            WaitOutcome,
+        },
+        socket::{CpuSetupClient, serve_cpu_with_doorbell},
+    },
+    audio::{Descriptor, Doorbell, Format, Layout, PlaybackReader, PlaybackRing, PlaybackWriter, Sample, Settings},
     handshake::{self, Accepted, Connected, Direction, Kind, Notice, Notices, Offer, Refusal, Selected, Track},
     input::Mode,
     local::Stream,
@@ -328,6 +338,143 @@ fn the_doorbell_hints_changed_tracks_and_cursors_remain_authoritative() {
     let mut reader = PlaybackReader::new(connected.playback[0].clone(), Duration::from_millis(30));
     assert_eq!(reader.available(), 3);
     assert_eq!(reader.read().unwrap().samples[0], 1);
+}
+
+/// What a consumer holds after selecting a CPU-served video track.
+struct Video {
+    producer: Arc<Mutex<ArenaProducer>>,
+    /// Dropping it ends CPU setup, which closes acquisition.
+    _client: CpuSetupClient,
+    consumer: ArenaConsumer,
+    doorbell: Option<Doorbell>,
+    playback: Vec<PlaybackRing>,
+}
+
+/// Offer a video track (id 9) and `audio`'s playback tracks, make `selection`
+/// and attach to the arena over CPU setup on the same connection.
+fn connect_video(audio: &[&PlaybackWriter], selection: &[Selected]) -> Video {
+    let video = Track {
+        id: 9,
+        kind: Kind::Video,
+        direction: Direction::FromSource,
+        label: "screen".into(),
+        descriptor: Default::default(),
+    };
+    let offer = Offer {
+        source: "test source".into(),
+        clock: ClockDomain::HostTime,
+        tracks: std::iter::once(video).chain(audio.iter().map(|w| w.track("default"))).collect(),
+    };
+    let rings: Vec<_> = audio.iter().map(|w| w.playback()).collect();
+    let producer = Arc::new(Mutex::new(
+        ArenaProducer::new(ArenaConfig {
+            resource_capacity: 4,
+            retained_history: 2,
+            producer_reserve: 1,
+            payload_capacity: 4,
+            memory_budget: 1024 * 1024,
+            max_incarnations: 1,
+            drain_timeout: Duration::from_secs(5),
+        })
+        .unwrap(),
+    ));
+    let (host, peer) = pair();
+    let served = producer.clone();
+    thread::spawn(move || {
+        let Accepted {
+            media,
+            notices,
+            video_bell,
+            ..
+        } = handshake::accept(host, &offer, None, &rings).unwrap();
+        // Notices holds the playback doorbell: keep it while serving.
+        let _notices = notices;
+        serve_cpu_with_doorbell(media, served, video_bell)
+    });
+    let connected = handshake::connect(peer).unwrap().select(selection, Mode::Cooperative).unwrap();
+    // SAFETY: the arena above is this stream's sole, conforming producer; this
+    // test never forks or forwards its grant.
+    let mut client = unsafe { CpuSetupClient::from_stream(connected.media) };
+    let consumer = client.attach(1).unwrap();
+    Video {
+        producer,
+        _client: client,
+        consumer,
+        doorbell: connected.doorbell,
+        playback: connected.playback,
+    }
+}
+
+fn publish(producer: &Mutex<ArenaProducer>) -> u64 {
+    match producer.lock().unwrap().publish(FrameDescriptor::default(), b"rgba").unwrap() {
+        PublishOutcome::Published { cursor } => cursor,
+        PublishOutcome::Dropped => panic!("frame dropped"),
+    }
+}
+
+fn latest(consumer: &ArenaConsumer) -> u64 {
+    match consumer.acquire_latest(0).unwrap() {
+        AcquireOutcome::Frame(frame) => frame.cursor(),
+        outcome => panic!("no frame: {outcome:?}"),
+    }
+}
+
+#[test]
+fn one_doorbell_wakes_a_consumer_for_video_and_playback() {
+    let mut audio = writer(1);
+    // Video is selection position 0 and playback position 1.
+    let Video {
+        producer,
+        consumer,
+        doorbell,
+        playback,
+        _client: _setup,
+    } = connect_video(&[&audio], &[select(9), select(1)]);
+    let mut doorbell = doorbell.unwrap();
+    let mut reader = PlaybackReader::new(playback[0].clone(), Duration::from_millis(250));
+    let cancel = Cancellation::new().unwrap();
+    assert_eq!(doorbell.wait(&cancel, Some(Duration::from_millis(10))).unwrap(), 0);
+    let waiter = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        publish(&producer);
+        producer
+    });
+    assert_eq!(doorbell.wait(&cancel, Some(Duration::from_secs(5))).unwrap(), 0b01);
+    let producer = waiter.join().unwrap();
+    assert_eq!(latest(&consumer), 1);
+    write(&mut audio, 1);
+    assert_eq!(doorbell.wait(&cancel, Some(Duration::from_secs(5))).unwrap(), 0b10);
+    assert_eq!(reader.read().unwrap().samples[0], 1);
+    publish(&producer);
+    write(&mut audio, 2);
+    assert_eq!(doorbell.wait(&cancel, None).unwrap(), 0b11);
+    assert_eq!((latest(&consumer), reader.read().unwrap().samples[0]), (2, 2));
+    // Closure rings video's bit too, and acquisition reports it.
+    producer.lock().unwrap().stop();
+    assert_eq!(doorbell.wait(&cancel, Some(Duration::from_secs(5))).unwrap(), 0b01);
+    assert!(matches!(consumer.acquire_latest(0).unwrap(), AcquireOutcome::Closed));
+}
+
+#[test]
+fn a_video_only_selection_gets_the_doorbell_and_keeps_the_arena_wait() {
+    let Video {
+        producer,
+        mut consumer,
+        doorbell,
+        playback,
+        _client: _setup,
+    } = connect_video(&[], &[select(9)]);
+    assert!(playback.is_empty());
+    let mut doorbell = doorbell.unwrap();
+    let cancel = Cancellation::new().unwrap();
+    let observed = consumer.events();
+    publish(&producer);
+    assert_eq!(doorbell.wait(&cancel, Some(Duration::from_secs(5))).unwrap(), 0b1);
+    // The arena's own wait still works for consumers that use it.
+    let outcome = consumer
+        .wait(observed, WaitInterest::DATA, &cancel, Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(matches!(outcome, WaitOutcome::Changed(events) if events.data_cursor == 1));
 }
 
 /// Answer one late selection on a host worker that polls with a zero timeout.

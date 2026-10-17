@@ -17,7 +17,7 @@ use std::{
     collections::BTreeMap,
     mem::{ManuallyDrop, align_of, size_of},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering::SeqCst},
     },
     time::Duration,
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{AdmissionBook, AdmissionError, AdmissionLimits, AllocationId, HoldingRequest, IncarnationId};
-use crate::{CaptureTransferError, model::host_time_ns, shm::SharedMemorySegment};
+use crate::{CaptureTransferError, audio::VideoBell, model::host_time_ns, shm::SharedMemorySegment};
 
 mod writer;
 pub use writer::{CpuReservation, DelegatedWriter, WriterDescriptor, WriterExport, WriterSlot};
@@ -234,6 +234,8 @@ struct ClaimMap {
     recipient_pid: u32,
     wake: Arc<wait::Wake>,
     release_wake: Arc<wait::Wake>,
+    /// The producer's ring on a track handshake's doorbell, if any.
+    bell: OnceLock<VideoBell>,
 }
 
 fn random_scope() -> Result<[u8; 16], ArenaError> {
@@ -326,6 +328,7 @@ impl ClaimMap {
             recipient_pid,
             wake,
             release_wake,
+            bell: OnceLock::new(),
         })
     }
 
@@ -358,6 +361,7 @@ impl ClaimMap {
             recipient_pid,
             wake,
             release_wake,
+            bell: OnceLock::new(),
         })
     }
 
@@ -415,6 +419,12 @@ impl RemoteConsumerGrant {
     #[must_use]
     pub fn incarnation(&self) -> IncarnationId {
         self.0.incarnation()
+    }
+
+    /// Also ring this incarnation's doorbell for new frames, reconfiguration
+    /// and closure. Set it before the grant leaves the producer.
+    pub(crate) fn ring(&self, bell: VideoBell) {
+        let _ = self.0.claims.bell.set(bell);
     }
 
     pub fn into_parts(self) -> Result<(GrantDescriptor, [OwnedFd; 6]), ArenaError> {

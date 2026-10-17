@@ -23,7 +23,7 @@ use super::{
         GrantDescriptor,
     },
 };
-use crate::{handshake::FRAMING, local::Stream};
+use crate::{audio::VideoBell, handshake::FRAMING, local::Stream};
 
 #[cfg(unix)]
 const TRANSFER_FINISHED: u8 = 1;
@@ -150,6 +150,7 @@ fn peer(stream: &Stream) -> Result<Peer, SocketError> {
 struct ServerSession {
     producer: Arc<Mutex<ArenaProducer>>,
     incarnation: Option<IncarnationId>,
+    bell: Option<VideoBell>,
 }
 
 impl ServerSession {
@@ -164,6 +165,9 @@ impl ServerSession {
                 let grant = producer.attach_process(holding, *peer)?;
                 #[cfg(windows)]
                 let grant = producer.attach_process_handle(holding, peer.as_handle())?;
+                if let Some(bell) = self.bell.take() {
+                    grant.ring(bell);
+                }
                 self.incarnation = Some(grant.incarnation());
                 let (descriptor, fds) = grant.into_parts()?;
                 Ok((Response::Attached { descriptor }, fds.into()))
@@ -202,7 +206,17 @@ impl Drop for ServerSession {
 /// on Unix, or on Windows its process handle (kept from
 /// [`crate::local::Listener::accept`], else opened from the pipe's client PID
 /// while the pipe is connected). Grants are duplicated into that same process.
-pub fn serve_cpu(mut stream: Stream, producer: Arc<Mutex<ArenaProducer>>) -> Result<(), SocketError> {
+pub fn serve_cpu(stream: Stream, producer: Arc<Mutex<ArenaProducer>>) -> Result<(), SocketError> {
+    serve_cpu_with_doorbell(stream, producer, None)
+}
+
+/// [`serve_cpu`] after a track handshake that admitted video: the arena also
+/// rings the incarnation's doorbell, `handshake::Accepted::video_bell`.
+pub fn serve_cpu_with_doorbell(
+    mut stream: Stream,
+    producer: Arc<Mutex<ArenaProducer>>,
+    bell: Option<VideoBell>,
+) -> Result<(), SocketError> {
     // macOS accepted sockets can inherit O_NONBLOCK from the listener. This
     // synchronous setup loop must not turn an idle read into peer closure.
     stream.set_nonblocking(false)?;
@@ -210,6 +224,7 @@ pub fn serve_cpu(mut stream: Stream, producer: Arc<Mutex<ArenaProducer>>) -> Res
     let mut session = ServerSession {
         producer,
         incarnation: None,
+        bell,
     };
     while let Some(request) = read_message(&mut stream)? {
         let (reply, fds) = match session.reply(request, &peer) {

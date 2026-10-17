@@ -74,8 +74,10 @@ static THREAD_FN accept_job(void *arg) {
   size_t count = 0;
   ft_input_server *input = NULL;
   ft_affordances_producer *affordances = NULL;
+  size_t rings = 0;
+  while (rings < h->count && h->playback[rings]) rings++;
   h->status = ft_handshake_accept_local(&h->connection, "C source", FT_CLOCK_DOMAIN_HOST_TIME, h->tracks, h->count,
-                                        h->playback, h->count, NULL, admissions, &count, &input, &affordances,
+                                        h->playback, rings, NULL, admissions, &count, &input, &affordances,
                                         &h->notices);
   return 0;
 }
@@ -92,7 +94,7 @@ static int attach(host *h, ft_local_connection *peer, const ft_track_selection *
   size_t offered = 0;
   if (status == FT_STATUS_OK) status = ft_handshake_offer_describe(handle, &source, &clock, &tracks, &offered);
   for (size_t i = 0; status == FT_STATUS_OK && i < offered; i++)
-    if (offered != h->count || tracks[i].id != h->tracks[i].id || strcmp(tracks[i].kind, FT_TRACK_KIND_PLAYBACK) ||
+    if (offered != h->count || tracks[i].id != h->tracks[i].id || strcmp(tracks[i].kind, h->tracks[i].kind) ||
         tracks[i].descriptor_len != 0 || memcmp(&tracks[i].audio, &h->tracks[i].audio, sizeof tracks[i].audio))
       status = FT_STATUS_ERROR;
   ft_input_client *input = NULL;
@@ -520,6 +522,69 @@ static int removal_ends_the_read_state_cleanly(ft_local_connection *a, ft_local_
   return 0;
 }
 
+static ft_status publish_frame(ft_cpu_producer *producer) {
+  ft_acquired_frame_descriptor frame = {0};
+  frame.width = 1, frame.height = 1, frame.stride = 4, frame.pixel_format = FT_PIXEL_FORMAT_BGRA8_UNORM;
+  uint64_t cursor = 0;
+  return ft_cpu_producer_publish(producer, &frame, (const uint8_t *)"rgba", 4, &cursor);
+}
+
+static int one_doorbell_wakes_for_video_and_playback(ft_local_connection *a, ft_local_connection *b) {
+  track t;
+  OK(create(1, &t));
+  ft_track_offer video = {9, FT_TRACK_KIND_VIDEO, "screen", NULL, 0, FT_TRACK_FROM_SOURCE, 0, {{0}, 0, 0}};
+  host h = {a, {video, offer(1, &t, "default")}, {t.playback}, 2, NULL, 0};
+  viewer v;
+  /* Video is selection position 0 and playback position 1. */
+  ft_track_selection order[2] = {selected(9), selected(1)};
+  CHECK(!attach(&h, b, order, 2, &v));
+  CHECK(v.doorbell && !v.rings[0] && v.rings[1]);
+  ft_cpu_producer_config config = {4, 2, 1, 1, 4, 1024 * 1024, 5000 * MS};
+  ft_cpu_producer *producer = NULL;
+  ft_cpu_setup_server *server = NULL;
+  ft_cpu_acquisition_connection *connection = NULL;
+  ft_acquisition_consumer *consumer = NULL;
+  OK(ft_cpu_producer_create(&config, &producer));
+  OK(ft_cpu_producer_serve_local(producer, &h.connection, &server));
+  OK(ft_acquisition_cpu_connection_create_local(&v.media, &connection));
+  OK(ft_acquisition_cpu_attach(connection, 1, &consumer));
+  ft_acquisition_cancellation *cancel = NULL;
+  OK(ft_acquisition_cancellation_create(&cancel));
+  uint64_t hint = 0;
+  CHECK(ft_playback_doorbell_wait(v.doorbell, cancel, 10 * MS, &hint) == FT_STATUS_TIMEOUT);
+  OK(publish_frame(producer));
+  OK(ft_playback_doorbell_wait(v.doorbell, cancel, 5000 * MS, &hint));
+  CHECK(hint == 1);
+  OK(write_block(&t, 1));
+  OK(ft_playback_doorbell_wait(v.doorbell, cancel, 5000 * MS, &hint));
+  CHECK(hint == 2);
+  OK(publish_frame(producer));
+  OK(write_block(&t, 2));
+  OK(ft_playback_doorbell_wait(v.doorbell, cancel, UINT64_MAX, &hint));
+  CHECK(hint == 3);
+  /* Cursors stay authoritative. */
+  ft_acquired_frame *frame = NULL;
+  ft_acquisition_range range;
+  ft_acquired_frame_descriptor described;
+  OK(ft_acquisition_acquire(consumer, FT_ACQUIRE_LATEST, 0, &frame, &range));
+  OK(ft_acquired_frame_describe(frame, &described));
+  CHECK(described.cursor == 2);
+  OK(ft_acquired_frame_release(&frame));
+  ft_playback_reader *reader = NULL;
+  OK(ft_playback_reader_create(v.rings[1], 250 * MS, &reader));
+  ft_audio_block block;
+  CHECK(read_block(reader, &block) && block.samples[0] == 1);
+  ft_playback_reader_destroy(&reader);
+  ft_acquisition_cancellation_destroy(&cancel);
+  ft_acquisition_consumer_destroy(&consumer);
+  ft_acquisition_cpu_connection_destroy(&connection);
+  ft_cpu_setup_server_destroy(&server);
+  OK(ft_cpu_producer_destroy(&producer));
+  detach(&h, &v);
+  discard(&t);
+  return 0;
+}
+
 typedef int (*scenario)(ft_local_connection *, ft_local_connection *);
 static const scenario SCENARIOS[] = {
     offer_carries_the_descriptor_and_settings_floor_the_depth,
@@ -532,6 +597,7 @@ static const scenario SCENARIOS[] = {
     a_track_added_after_attach_is_selected_late,
     a_reopen_updates_the_track_and_keeps_the_selection,
     removal_ends_the_read_state_cleanly,
+    one_doorbell_wakes_for_video_and_playback,
 };
 
 /* Run scenario `index` on a connected pair: 0 on success, the failing line,

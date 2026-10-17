@@ -114,9 +114,11 @@ ft_status ft_playback_reader_counters(const ft_playback_reader *reader, uint64_t
 void ft_playback_reader_destroy(ft_playback_reader **reader);
 void ft_playback_ring_destroy(ft_playback_ring **ring);
 
-/* One doorbell per incarnation with playback. Hint bit i means the track at
- * selection position i (mod 64) published since the last take. The hint is
- * optional: readers may always check their counters. Take clears it. */
+/* One doorbell per incarnation with video or playback (video since ABI 0.19).
+ * Hint bit i means the track at selection position i (mod 64) changed since
+ * the last take: a playback block, or a video frame, reconfiguration or
+ * closure from CPU setup (ft_cpu_producer_serve_local). The hint is optional:
+ * readers may always check their counters and acquisition. Take clears it. */
 uint64_t ft_playback_doorbell_take(const ft_playback_doorbell *doorbell);
 /* Sleep until the hint is non-zero, then take it: OK, TIMEOUT or CANCELLED.
  * timeout_ns=0 checks once, UINT64_MAX waits indefinitely. One waiter per

@@ -79,9 +79,11 @@ can allocate the replacement and the same connection resumes acquisition.
 
 `daemon::ConnectedSession::connect(info, holding)` sends a bounded JSON preface:
 `open_cpu_acquisition`, session ID, track ID and optional bearer token. Porthole
-checks session ownership and lifecycle before replying `cpu_opened` and handing
-the socket to `serve_cpu`. No grant is transferred on rejection. Exact preface
-reads leave the subsequent binary setup message intact.
+checks session ownership and lifecycle before replying `cpu_opened`. It then
+runs the [track handshake](track-handshake.md) as the producer, offering the
+session's one video track; the helper selects it, required, and the returned
+media stream carries `serve_cpu`. No grant is transferred on rejection. Exact
+preface reads leave the handshake's first frame intact.
 
 C ABI 0.4 adds `ft_acquisition_cpu_connect_session`, configuration installation
 and setup destruction. It returns the same common consumer/frame handles as

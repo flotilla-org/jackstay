@@ -19,7 +19,8 @@ use jackstay::{
     daemon::{ConnectedSession, SessionInfo},
     ffi::*,
     ffi_acquisition::{session::*, *},
-    model::PixelFormat,
+    handshake::{self, Bytes, Direction, Kind, Offer, Track},
+    model::{ClockDomain, PixelFormat},
 };
 
 struct Host {
@@ -31,6 +32,11 @@ struct Host {
 
 impl Host {
     fn new(accept: bool) -> Self {
+        Self::offering(accept, 7)
+    }
+
+    /// Like `new`, but the host offers its video track under `offered`.
+    fn offering(accept: bool, offered: u64) -> Self {
         // Keep sockaddr_un paths short even under macOS's long default TMPDIR.
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let socket = directory.path().join("setup");
@@ -63,7 +69,29 @@ impl Host {
             );
             if accept {
                 writeln!(stream, "{{\"op\":\"cpu_opened\"}}").unwrap();
-                serve_cpu(stream, served).unwrap();
+                // Like portholed: offer the session's one video track (v3)
+                // before CPU setup.
+                let offer = Offer {
+                    source: "test-session".into(),
+                    clock: ClockDomain::Unknown,
+                    tracks: vec![Track {
+                        id: offered,
+                        kind: Kind::Video,
+                        direction: Direction::FromSource,
+                        label: "default".into(),
+                        descriptor: Bytes::default(),
+                    }],
+                };
+                let accepted = handshake::accept(stream, &offer, None, &[]);
+                if offered != 7 {
+                    // The consumer refuses the offer; nothing reaches CPU setup.
+                    return;
+                }
+                let accepted = accepted.unwrap();
+                assert_eq!(accepted.admissions.len(), 1);
+                assert_eq!(accepted.admissions[0].id, 7);
+                assert_eq!(accepted.admissions[0].refusal, None);
+                serve_cpu(accepted.media, served).unwrap();
             } else {
                 writeln!(stream, "{{\"op\":\"rejected\",\"message\":\"session access denied\"}}").unwrap();
             }
@@ -123,6 +151,19 @@ fn rejection_does_not_admit_a_consumer_or_hide_the_host_error() {
         .err()
         .expect("accepted rejected session");
     assert!(error.to_string().contains("session access denied"));
+    host.task.join().unwrap();
+    host.producer.lock().unwrap().stop();
+    assert!(host.producer.lock().unwrap().poll_shutdown_ready().unwrap());
+}
+
+#[test]
+fn a_host_that_does_not_offer_the_session_track_is_refused_before_setup() {
+    let host = Host::offering(true, 8);
+    // SAFETY: the handshake fails before any mapping is transferred.
+    let error = unsafe { ConnectedSession::connect(host.info.clone(), 1) }
+        .err()
+        .expect("attached to a track the session does not own");
+    assert!(error.to_string().contains("the session's video track was not offered"), "{error}");
     host.task.join().unwrap();
     host.producer.lock().unwrap().stop();
     assert!(host.producer.lock().unwrap().poll_shutdown_ready().unwrap());

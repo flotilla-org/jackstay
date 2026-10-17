@@ -33,8 +33,10 @@ for the first connector. Release the frame after the copy; borrowing instead
 requires retaining it through every asynchronous use.
 
 `ft_acquisition_cpu_connect_session` remains the convenience route for a trusted
-Porthole-style host session. It returns the same connection/consumer owners and
-can use the same replacement and destruction calls. Its combined selection and
+Porthole-style host session. Since ABI 0.18 it selects the session's video
+track on the track handshake between the preface reply and CPU setup. It
+returns the same connection/consumer owners and can use the same replacement
+and destruction calls. Its combined selection and
 attachment call returns no handle for cancellation while it is still connecting;
 its shutdown descriptor is allocated before consumer admission. Clients needing
 that control use the generic create/attach sequence after host selection and

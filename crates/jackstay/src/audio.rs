@@ -635,6 +635,7 @@ pub struct VideoBell(Arc<BellInner>, u64);
 
 impl VideoBell {
     pub(crate) fn ring(&self) {
+        // Ignore "consumer gone": the arena's own wake detects a dead consumer.
         self.0.ring(self.1);
     }
 }

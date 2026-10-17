@@ -236,6 +236,8 @@ pub struct Accepted {
     pub notices: Notices,
     /// Present when video was admitted: pass it to
     /// [`crate::acquisition::socket::serve_cpu_with_doorbell`] with `media`.
+    /// Plain [`crate::acquisition::socket::serve_cpu`] leaves video's bit
+    /// unrung.
     pub video_bell: Option<audio::VideoBell>,
 }
 
